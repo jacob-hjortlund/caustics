@@ -96,6 +96,7 @@ class Backend:
         self.jit = self._jit_torch
         self.norm = self._norm_torch
         self.arange = self._arange_torch
+        self.cumsum = self._cumsum_torch
         self.linspace = self._linspace_torch
 
     def setup_jax(self):
@@ -157,6 +158,7 @@ class Backend:
         self.jit = self._jit_jax
         self.norm = self._norm_jax
         self.arange = self._arange_jax
+        self.cumsum = self._cumsum_jax
         self.linspace = self._linspace_jax
 
         self.key = self.jax.random.key(
@@ -349,6 +351,12 @@ class Backend:
 
     def _cumprod_jax(self, array, dim=None):
         return self.module.cumprod(array, axis=dim)
+
+    def _cumsum_torch(self, array, dim=0):
+        return self.module.cumsum(array, dim=dim)
+
+    def _cumsum_jax(self, array, dim=0):
+        return self.module.cumsum(array, axis=dim)
 
     def _max_torch(self, array, dim=None):
         return (
