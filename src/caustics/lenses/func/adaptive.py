@@ -58,6 +58,8 @@ def shape_matrix(tri):
     -------
     ndarray
         Shape ``(..., 2, 2)``, the two edge vectors as columns.
+
+        *Unit: arcsec*
     """
     return np.stack(
         (tri[..., 1, :] - tri[..., 0, :], tri[..., 2, :] - tri[..., 0, :]), axis=-1
@@ -75,8 +77,12 @@ def affine_from_triangles(p, q):
     ----------
     p: ndarray
         Lens-plane triangle, shape ``(..., 3, 2)``.
+
+        *Unit: arcsec*
     q: ndarray
         Source-plane triangle, shape ``(..., 3, 2)``.
+
+        *Unit: arcsec*
 
     Returns
     -------

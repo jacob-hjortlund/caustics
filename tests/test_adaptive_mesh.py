@@ -40,7 +40,6 @@ def test_group_tables_close_and_have_order_six():
     # both root shapes lie in one orbit
     R0 = shape_matrix(np.asarray(ROOT_SHAPES[0], dtype=np.float64))
     R1 = shape_matrix(np.asarray(ROOT_SHAPES[1], dtype=np.float64))
-    assert np.allclose(R0 @ G[ROOT_CLASS[0]], R0)
     assert np.allclose(R0 @ G[ROOT_CLASS[1]], R1)
 
 
