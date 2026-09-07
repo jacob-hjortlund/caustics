@@ -16,12 +16,14 @@ autodiff, no jit, no vmap. Candidate count is **not** image multiplicity -- a po
 on a shared edge returns both leaves, and near-critical leaves overlap.
 """
 
+from dataclasses import dataclass
 from enum import IntEnum
 from math import ceil, log2
 
 import numpy as np
 
-from .func.adaptive import CHILD_VERTEX_INDICES, ROOT_SHAPES
+from ..backend_obj import backend
+from .func.adaptive import CHILD_VERTEX_INDICES, ROOT_SHAPES, evaluate_criterion
 
 __all__ = ["LeafStatus"]
 
@@ -278,3 +280,161 @@ def _red_split(v, m, cls, compose):
     six = np.concatenate([v, m], axis=1)  # (n, 6)
     idx = np.asarray(CHILD_VERTEX_INDICES)  # (4, 3)
     return six[:, idx].reshape(-1, 3), compose[cls].reshape(-1)
+
+
+def _make_raytrace_np(raytrace, device):
+    """
+    Wrap a backend ``raytrace(x, y) -> (bx, by)`` as a host-side ``(N,2) -> (N,2)``.
+
+    Coordinates go out as float64. The criterion is a difference of ``O(fov)``
+    quantities, so its roundoff floor is ``eps * fov`` and it is meaningless below
+    ``h ~ sqrt(8 * eps * fov)``. For ``fov = 5`` that is ``2e-3`` arcsec in float32
+    -- comparable to a typical ``min_img_sep`` -- and below it the deviation cancels
+    to exactly zero, which the test reads as "perfectly affine" and converges. That
+    is the fail-open direction and no clamp fixes it, so the build is always float64.
+    """
+    checked = {"done": False}
+
+    def call(xy):
+        x = backend.as_array(xy[:, 0], dtype=backend.float64, device=device)
+        y = backend.as_array(xy[:, 1], dtype=backend.float64, device=device)
+        out = raytrace(x, y)
+        if not checked["done"]:
+            if not isinstance(out, tuple) or len(out) != 2:
+                raise ValueError(
+                    "raytrace must return a 2-tuple (bx, by) of arrays with shape "
+                    f"(N,); got {type(out).__name__}"
+                )
+            checked["done"] = True
+        bx = backend.to_numpy(out[0]).reshape(-1)
+        by = backend.to_numpy(out[1]).reshape(-1)
+        if bx.shape[0] != xy.shape[0] or by.shape[0] != xy.shape[0]:
+            raise ValueError(
+                f"raytrace returned {bx.shape[0]} points for {xy.shape[0]} inputs; "
+                "it must be shape-preserving on 1-D input"
+            )
+        return np.stack((bx, by), axis=-1).astype(np.float64)
+
+    return call
+
+
+def _evaluate(cache, lattice, keys, raytrace_np, batch_size):
+    """Evaluate every not-yet-cached key, in one logical batch per call."""
+    todo = cache.missing(keys)
+    if todo.size == 0:
+        return
+    ij = lattice.ij_from_key(todo)
+    xy = lattice.xy(ij)
+    if batch_size is None or xy.shape[0] <= batch_size:
+        beta = raytrace_np(xy)
+    else:
+        n_chunks = int(ceil(xy.shape[0] / batch_size))
+        beta = np.concatenate(
+            [raytrace_np(chunk) for chunk in np.array_split(xy, n_chunks)]
+        )
+    cache.insert(todo, ij, beta)
+
+
+@dataclass
+class _Refinement:
+    """Output of the level loop, before closure and freezing."""
+
+    cache: _VertexCache
+    active: _ActiveKeys
+    store: _LeafStore
+    counters: dict
+
+
+def _refine(
+    raytrace_np, lattice, init_res, h0, min_img_sep, max_level, tables, batch_size
+):
+    """
+    Level-synchronous refinement.
+
+    Processes the whole active set one level at a time: gathers all unique new
+    points for that level, calls ``raytrace`` once on the batch, applies the
+    criterion vectorized, then partitions into converged and to-split. No
+    Python-level recursion over individual triangles, no per-triangle ``raytrace``.
+
+    At ``max_level`` nothing splits, so there is no cascade, so no force-split, so
+    no leaf ever needs its midpoints -- and closure needs none either, because a
+    hanging node is a *vertex* of the finer neighbour. The evaluation set therefore
+    collapses to the vertices, saving the single largest batch in the build. The
+    non-finite check still runs there, on the vertices alone; without it a leaf with
+    a ``NaN`` vertex would enter the spatial index and swallow every query in its
+    cell.
+    """
+    M, G, COMPOSE, PINV0, ROOT_CLASS = tables
+    cache = _VertexCache()
+    active = _ActiveKeys()
+    store = _LeafStore()
+    counters = {
+        "converged_level0": 0,
+        "parity_splits": 0,
+        "deviation_splits": 0,
+        "sigma_zero": 0,
+        "forced": 0,
+        "cascade_rounds": 0,
+    }
+
+    active_ij, active_cls = _initial_triangles(init_res, max_level, ROOT_CLASS)
+    deferred = np.empty(0, dtype=np.int64)
+
+    for level in range(max_level + 1):
+        vert_keys = lattice.key(active_ij)  # (n, 3)
+        need = [vert_keys.reshape(-1)]
+        if level < max_level:
+            mid_ij = _midpoint_ij(active_ij)
+            need.append(lattice.key(mid_ij).reshape(-1))
+            need.append(deferred)
+            deferred = np.empty(0, dtype=np.int64)
+        _evaluate(cache, lattice, np.concatenate(need), raytrace_np, batch_size)
+
+        v = cache.lookup(vert_keys)
+        active.add(vert_keys.reshape(-1))
+        beta_v = cache.beta[v]
+        finite_v = np.isfinite(beta_v).all(axis=(1, 2))
+
+        if level == max_level:
+            store.add(v[~finite_v], level, active_cls[~finite_v], LeafStatus.INVALID)
+            store.add(v[finite_v], level, active_cls[finite_v], LeafStatus.SIZE_FLOOR)
+            break
+
+        m = cache.lookup(lattice.key(mid_ij))
+        beta_m = cache.beta[m]
+        good = finite_v & np.isfinite(beta_m).all(axis=(1, 2))
+        store.add(v[~good], level, active_cls[~good], LeafStatus.INVALID)
+
+        rows = np.flatnonzero(good)
+        keep, parity_ok, s = evaluate_criterion(
+            beta_v[rows],
+            beta_m[rows],
+            active_cls[rows],
+            level,
+            h0,
+            min_img_sep,
+            PINV0,
+            COMPOSE,
+        )
+        counters["parity_splits"] += int((~parity_ok).sum())
+        counters["deviation_splits"] += int((parity_ok & ~keep).sum())
+        counters["sigma_zero"] += int((s == 0).sum())
+
+        done, pending = rows[keep], rows[~keep]
+        store.add(v[done], level, active_cls[done], LeafStatus.CONVERGED)
+        if level == 0:
+            counters["converged_level0"] = int(done.size)
+
+        child_v, child_cls = _red_split(
+            v[pending], m[pending], active_cls[pending], COMPOSE
+        )
+        child_ij = cache.ij[child_v]
+        active.add(lattice.key(child_ij).reshape(-1))
+
+        # Task 8 inserts the balance cascade here, appending to `deferred`.
+
+        active_ij, active_cls = child_ij, child_cls
+        if active_ij.shape[0] == 0:
+            break
+
+    return _Refinement(cache=cache, active=active, store=store, counters=counters)

@@ -9,8 +9,10 @@ from caustics.lenses.adaptive import (
     _initial_triangles,
     _Lattice,
     _LeafStore,
+    _make_raytrace_np,
     _midpoint_ij,
     _red_split,
+    _refine,
     _validate_build_args,
     _VertexCache,
 )
@@ -433,3 +435,134 @@ def test_validate_build_args_rejects_bad_input(kwargs):
 def test_validate_build_args_rejects_lattice_overflow():
     with pytest.raises(ValueError, match="lattice"):
         _validate_build_args(fov=5.0, init_res=100, min_img_sep=1e-12, max_depth=60)
+
+
+def make_counting_raytrace(fn):
+    """Wrap a numpy (N,2)->(N,2) map as a backend raytrace, counting evaluations."""
+    calls = {"points": 0, "batches": 0}
+
+    def raytrace(x, y):
+        xy = np.stack([backend.to_numpy(x), backend.to_numpy(y)], axis=-1)
+        calls["points"] += xy.shape[0]
+        calls["batches"] += 1
+        out = fn(xy)
+        return backend.as_array(out[:, 0]), backend.as_array(out[:, 1])
+
+    return raytrace, calls
+
+
+def refine_with(fn, fov=4.0, init_res=4, min_img_sep=0.5, max_depth=25):
+    M, G, COMPOSE, PINV0, ROOT_CLASS = child_matrix_tables()
+    tables = (M, G, COMPOSE, PINV0, ROOT_CLASS)
+    max_level = min(max_depth, _depth_floor(fov, init_res, min_img_sep))
+    lat = _Lattice(fov, 0.0, 0.0, init_res, max_level)
+    raytrace, calls = make_counting_raytrace(fn)
+    ref = _refine(
+        _make_raytrace_np(raytrace, None),
+        lat,
+        init_res,
+        fov / init_res,
+        min_img_sep,
+        max_level,
+        tables,
+        None,
+    )
+    return ref, lat, calls, max_level
+
+
+AFFINE = np.array([[0.7, 0.1], [-0.2, 0.9]])
+
+
+def test_refine_converges_everywhere_at_level_zero_for_an_affine_map():
+    ref, lat, calls, max_level = refine_with(lambda p: p @ AFFINE.T)
+    v, level, cls, status = ref.store.compact()
+    assert v.shape[0] == 2 * 4**2
+    assert (level == 0).all()
+    assert (status == LeafStatus.CONVERGED).all()
+    assert ref.counters["converged_level0"] == v.shape[0]
+    assert ref.counters["parity_splits"] == 0
+    assert ref.counters["deviation_splits"] == 0
+
+
+def test_refine_never_evaluates_a_point_twice():
+    ref, lat, calls, max_level = refine_with(
+        lambda p: np.stack([p[:, 0], p[:, 1] ** 2], axis=-1), min_img_sep=0.05
+    )
+    assert calls["points"] == len(ref.cache)
+    assert len(np.unique(lat.key(ref.cache.ij))) == len(ref.cache)
+
+
+def test_refine_terminates_at_max_level_on_a_kappa_one_sheet():
+    """kappa == 1 maps the whole lens plane to a point: A == 0 everywhere."""
+    ref, lat, calls, max_level = refine_with(
+        lambda p: np.zeros_like(p), min_img_sep=0.5
+    )
+    v, level, cls, status = ref.store.compact()
+    assert (level == max_level).all()
+    assert (status == LeafStatus.SIZE_FLOOR).all()
+    assert ref.counters["sigma_zero"] > 0
+    assert np.isfinite(ref.cache.beta).all()
+
+
+def test_refine_marks_a_nonfinite_subregion_invalid_and_stops():
+    def broken(p):
+        out = p.copy()
+        bad = p[:, 0] > 0.5
+        out[bad] = np.nan
+        return out
+
+    ref, lat, calls, max_level = refine_with(broken, min_img_sep=0.5)
+    v, level, cls, status = ref.store.compact()
+    assert (status == LeafStatus.INVALID).any()
+    invalid_beta = ref.cache.beta[v[status == LeafStatus.INVALID]]
+    assert not np.isfinite(invalid_beta).all()
+    # a triangle wholly in the good half is untouched
+    good = status == LeafStatus.CONVERGED
+    assert good.any()
+    assert np.isfinite(ref.cache.beta[v[good]]).all()
+
+
+def test_refine_marks_nonfinite_vertices_invalid_even_at_max_level():
+    """The max_level short-circuit must not blanket-label everything SIZE_FLOOR.
+
+    ``min_img_sep`` forces ``max_level == 0``, so the loop's first and only
+    iteration *is* the max_level iteration. That is the only way a triangle can
+    reach this branch carrying a non-finite vertex: below ``max_level`` a triangle
+    splits only if all six of its points are finite, and a child's vertices are
+    drawn from exactly those six, so every triangle at level >= 1 has finite
+    vertices by construction. With ``max_level > 0`` the ``~finite_v`` branch adds
+    no rows at all and the test cannot fail for the reason it names.
+    """
+
+    def broken(p):
+        out = p.copy()
+        out[p[:, 0] > 0.5] = np.nan
+        return out
+
+    ref, lat, calls, max_level = refine_with(broken, min_img_sep=2.0)
+    assert max_level == 0
+    v, level, cls, status = ref.store.compact()
+    assert (status == LeafStatus.INVALID).any()
+    # Without this, a run producing zero SIZE_FLOOR rows would make the loop
+    # below vacuously true.
+    assert (status == LeafStatus.SIZE_FLOOR).any()
+    for row in np.flatnonzero(status == LeafStatus.SIZE_FLOOR):
+        assert np.isfinite(ref.cache.beta[v[row]]).all()
+    for row in np.flatnonzero(status == LeafStatus.INVALID):
+        assert not np.isfinite(ref.cache.beta[v[row]]).all()
+
+
+def test_refine_skips_the_midpoint_batch_at_max_level():
+    ref, lat, calls, max_level = refine_with(lambda p: p * 1.0, min_img_sep=0.5)
+    # a pure translation is affine, so everything converges at level 0 and the
+    # loop makes exactly one batch
+    assert calls["batches"] == 1
+
+
+def test_refine_all_leaves_are_positively_oriented():
+    ref, lat, calls, max_level = refine_with(
+        lambda p: np.stack([p[:, 0], p[:, 1] ** 2], axis=-1), min_img_sep=0.05
+    )
+    v, level, cls, status = ref.store.compact()
+    tri = lat.xy(ref.cache.ij[v])
+    assert (signed_area(tri) > 0).all()
