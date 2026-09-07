@@ -7,6 +7,7 @@ from caustics.lenses.func.adaptive import (
     affine_from_triangles,
     child_matrix_tables,
     shape_matrix,
+    sigma_min_2x2,
 )
 
 RNG = np.random.default_rng(20260904)
@@ -88,3 +89,55 @@ def test_affine_from_table_matches_explicit_inversion():
         table = Q @ ((2.0 ** (level + 1) / h0) * PINV0[COMPOSE[cls, k]])
         assert np.allclose(explicit, table, rtol=1e-10, atol=1e-12)
         assert np.allclose(explicit, lens_map, rtol=1e-10, atol=1e-12)
+
+
+def test_sigma_min_matches_svd():
+    A = RNG.normal(size=(2000, 2, 2))
+    expected = np.linalg.svd(A, compute_uv=False)[:, -1]
+    assert np.allclose(sigma_min_2x2(A), expected, rtol=1e-9, atol=1e-12)
+
+
+def test_sigma_min_near_and_exactly_singular():
+    a = RNG.normal(size=(500, 2))
+    perp = np.stack([-a[:, 1], a[:, 0]], axis=1)
+    # Rows offset perpendicularly, so det == eps * |a|^2 is genuinely small.
+    # Scaling one row instead would give a rank-1 matrix with det exactly zero,
+    # which tests the degenerate branch, not the near-degenerate one.
+    for eps in (1e-4, 1e-7):
+        A = np.stack([a, a + eps * perp], axis=1)
+        got = sigma_min_2x2(A)
+        expected = np.linalg.svd(A, compute_uv=False)[:, -1]
+        assert np.isfinite(got).all()
+        assert np.allclose(got, expected, rtol=1e-5, atol=0.0)
+    exact = np.stack([a, 2.0 * a], axis=1)  # rank 1: det is exactly 0 in IEEE
+    assert (sigma_min_2x2(exact) == 0.0).all()
+
+
+def test_sigma_min_of_zero_matrix_is_exactly_zero():
+    got = sigma_min_2x2(np.zeros((3, 2, 2)))
+    assert (got == 0.0).all()
+    assert not np.isnan(got).any()
+
+
+def test_sigma_min_handles_conformal_ulp_negativity():
+    """F - 2D is exactly zero in R but goes negative by an ulp in float.
+
+    Without the clip this returns NaN for a near-circularly-symmetric lens core,
+    which fail-closed then refines to max_level. See spec section 2.2.
+    """
+    ab = RNG.normal(size=(200000, 2)).astype(np.float32)
+    A = np.empty((ab.shape[0], 2, 2), dtype=np.float32)
+    A[:, 0, 0] = ab[:, 0]
+    A[:, 0, 1] = ab[:, 1]
+    A[:, 1, 0] = -ab[:, 1]
+    A[:, 1, 1] = ab[:, 0]
+    F = (A.astype(np.float32) ** 2).sum(axis=(-2, -1))
+    D = np.abs(A[:, 0, 0] * A[:, 1, 1] - A[:, 0, 1] * A[:, 1, 0])
+    assert (F - 2 * D < 0).any(), "test fixture no longer exercises the guard"
+    got = sigma_min_2x2(A.astype(np.float64))
+    assert np.isfinite(got).all()
+
+
+def test_sigma_min_propagates_nan_input():
+    A = np.full((1, 2, 2), np.nan)
+    assert np.isnan(sigma_min_2x2(A)).all()

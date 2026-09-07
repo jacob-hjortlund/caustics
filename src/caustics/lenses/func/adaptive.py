@@ -22,6 +22,7 @@ __all__ = (
     "shape_matrix",
     "child_matrix_tables",
     "affine_from_triangles",
+    "sigma_min_2x2",
 )
 
 # ---------------------------------------------------------------------------
@@ -161,3 +162,49 @@ def child_matrix_tables() -> (
         else:  # pragma: no cover - guarded by test_group_tables_close_...
             raise AssertionError(f"root shape {s} is not in the orbit of R")
     return M, G, COMPOSE, PINV0, ROOT_CLASS
+
+
+def sigma_min_2x2(A):
+    """
+    Smallest singular value of a batch of 2x2 matrices, in closed form.
+
+    Pulling a source-plane displacement back to the lens plane gives
+    ``||dtheta|| <= ||dbeta|| / sigma_min(A)``, so ``sigma_min`` is the correct
+    anisotropic contraction scale. ``det A = sigma_min * sigma_max`` conflates the
+    two directions and is wrong near folds, where ``sigma_min -> 0`` while
+    ``sigma_max`` stays order one.
+
+    With ``F = ||A||_F**2`` and ``D = |det A|``, ``(sigma_max +- sigma_min)**2 =
+    F +- 2D``. ``F - 2D >= 0`` holds in exact arithmetic but **not** in floating
+    point -- for a near-conformal ``A`` it goes negative by an ulp, and the
+    unguarded ``sqrt`` then returns ``NaN`` for the near-circularly-symmetric core
+    of essentially every lens model. Hence the clip.
+
+    ``sigma_min`` is returned as ``D / sigma_max`` rather than
+    ``(sqrt(F + 2D) - sqrt(F - 2D)) / 2`` because the former is stable in the
+    near-degenerate limit, which is exactly the near-caustic regime that drives
+    refinement.
+
+    The ``sigma_max == 0`` branch is exact, not a tolerance: ``sigma_max == 0`` iff
+    ``A == 0``, whose smallest singular value is exactly zero. Do not replace it
+    with ``max(sigma_min, eps)`` -- both ``np.maximum`` and ``torch.clamp``
+    propagate ``NaN``, so a floor would fail open.
+
+    Parameters
+    ----------
+    A: ndarray
+        Shape ``(..., 2, 2)``, float64.
+
+    Returns
+    -------
+    ndarray
+        Shape ``(...)``. Exactly ``0.0`` where ``A == 0``; ``NaN`` where ``A`` is
+        non-finite, so that step 7 fails closed.
+    """
+    F = (A**2).sum(axis=(-2, -1))
+    D = np.abs(A[..., 0, 0] * A[..., 1, 1] - A[..., 0, 1] * A[..., 1, 0])
+    sigma_max = (np.sqrt(F + 2 * D) + np.sqrt(np.clip(F - 2 * D, 0.0, None))) / 2
+    zero = sigma_max == 0
+    # Double `where` keeps the division away from 0/0 without masking a NaN input:
+    # a NaN sigma_max fails the `== 0` test, so NaN reaches the output.
+    return np.where(zero, 0.0, D / np.where(zero, 1.0, sigma_max))
