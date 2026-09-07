@@ -275,6 +275,12 @@ def test_shared_edge_weights_are_exactly_negated():
 
 
 def test_sanitize_bary_is_always_in_the_simplex():
+    """The clip path keeps wide-but-finite w/d ratios inside the simplex.
+
+    The 1e-300 scaling stresses the clamp with extreme ratios; it does not reach
+    the centroid fallback, because 1e-300 is a normal double and w/d is invariant
+    under a uniform scaling. The fallback is covered by the two tests below.
+    """
     w = RNG.normal(size=(1000, 3)) * 1e-300
     d = w.sum(axis=1)
     bary = to_np(sanitize_bary(as_arr(w), as_arr(d)))
@@ -288,6 +294,21 @@ def test_sanitize_bary_falls_back_to_the_centroid_on_total_degeneracy():
     d = np.zeros(4)
     bary = to_np(sanitize_bary(as_arr(w), as_arr(d)))
     assert np.array_equal(bary, np.full((4, 3), 1.0 / 3.0))
+
+
+def test_sanitize_bary_selects_per_row_between_normalized_and_centroid():
+    """Degenerate and ordinary rows in one call must be resolved independently.
+
+    Both other sanitize_bary tests are all-or-nothing -- every row ordinary, or
+    every row degenerate -- so neither would catch an implementation that decided
+    the fallback once for the whole batch instead of per row.
+    """
+    w = as_arr([[3.0, 1.5, 1.5], [0.0, 0.0, 0.0], [2.0, 1.0, 1.0], [0.0, 0.0, 0.0]])
+    d = as_arr([6.0, 0.0, 4.0, 0.0])
+    bary = to_np(sanitize_bary(w, d))
+    assert np.allclose(bary[[0, 2]], [[0.5, 0.25, 0.25], [0.5, 0.25, 0.25]])
+    assert np.allclose(bary[[1, 3]], 1.0 / 3.0)
+    assert np.allclose(bary.sum(axis=1), 1.0, rtol=0, atol=1e-12)
 
 
 def test_sanitize_bary_recovers_ordinary_coordinates():
