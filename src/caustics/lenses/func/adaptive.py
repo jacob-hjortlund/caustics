@@ -23,6 +23,9 @@ __all__ = (
     "child_matrix_tables",
     "affine_from_triangles",
     "sigma_min_2x2",
+    "midpoint_deviation",
+    "converged_from_deviation",
+    "evaluate_criterion",
 )
 
 # ---------------------------------------------------------------------------
@@ -208,3 +211,138 @@ def sigma_min_2x2(A):
     # Double `where` keeps the division away from 0/0 without masking a NaN input:
     # a NaN sigma_max fails the `== 0` test, so NaN reaches the output.
     return np.where(zero, 0.0, D / np.where(zero, 1.0, sigma_max))
+
+
+def midpoint_deviation(beta_v, beta_m):
+    """
+    Distance between each mapped edge midpoint and its affine prediction.
+
+    With ``m_i`` opposite ``theta_i``, the predicted image of ``m_i`` under an
+    affine map is the mean of the two ``beta`` values at the endpoints of the edge
+    it bisects, ``(beta_j + beta_k) / 2`` for cyclic ``(i, j, k)``.
+
+    Parameters
+    ----------
+    beta_v: ndarray
+        Source-plane vertices, shape ``(n, 3, 2)``.
+
+        *Unit: arcsec*
+
+    beta_m: ndarray
+        Source-plane edge midpoints ``m1, m2, m3``, shape ``(n, 3, 2)``.
+
+        *Unit: arcsec*
+
+    Returns
+    -------
+    ndarray
+        Shape ``(n, 3)``, a source-plane length.
+
+        *Unit: arcsec*
+    """
+    predicted = 0.5 * (beta_v[:, [1, 2, 0], :] + beta_v[:, [2, 0, 1], :])
+    return np.linalg.norm(predicted - beta_m, axis=-1)
+
+
+def converged_from_deviation(r, s, min_img_sep):
+    """
+    Step 7 of the refinement criterion.
+
+    Written as ``all(r < threshold)`` and never as ``not any(r >= threshold)``.
+    The two are not equivalent when ``s`` is ``NaN``: under IEEE every comparison
+    against ``NaN`` is False, so the ``>=`` form would mark a maximally degenerate
+    triangle *converged*, silently inverting the intended behaviour. The ``<`` form
+    puts ``NaN`` in the split branch. It also settles the exact-equality edge -- an
+    affine-but-singular triangle (``r == 0``, ``s == 0``) gives ``0 < 0``, False,
+    and splits, which is the conservative direction.
+
+    Note the comparison is evaluated in the **source plane**: ``r`` is a
+    source-plane length and ``s`` is dimensionless, so ``s * min_img_sep`` converts
+    the lens-plane tolerance ``min_img_sep`` into a source-plane one. The
+    equivalent lens-plane form ``r / s < min_img_sep`` must not be used, because
+    dividing by ``s`` breaks on the legal and expected ``s == 0``.
+
+    Parameters
+    ----------
+    r: ndarray
+        Midpoint deviations, shape ``(n, 3)``.
+    s: ndarray
+        Smallest singular value over the four children, shape ``(n,)``.
+    min_img_sep: float
+        Lens-plane tolerance.
+
+        *Unit: arcsec*
+
+    Returns
+    -------
+    ndarray
+        Shape ``(n,)`` bool.
+    """
+    return (r < (s * min_img_sep)[:, None]).all(axis=1)
+
+
+def evaluate_criterion(beta_v, beta_m, classes, level, h0, min_img_sep, pinv0, compose):
+    """
+    Steps 3 to 7 of the refinement criterion, vectorized over triangles.
+
+    Step 4 (parity) catches folds; step 7 (deviation) catches curvature. Neither
+    alone is sufficient. The parity test needs no ``P`` at all: ``sign(det A_k) =
+    sign(det Q_k) * sign(det P_k)`` and all four children share the parent's
+    ``sign(det P_k)`` because every ``det M_k == +1``, so constancy of
+    ``sign(det A_k)`` over ``k`` is equivalent to constancy of ``sign(det Q_k)``.
+
+    Parameters
+    ----------
+    beta_v: ndarray
+        Source-plane vertices, shape ``(n, 3, 2)``.
+    beta_m: ndarray
+        Source-plane midpoints ``m1, m2, m3``, shape ``(n, 3, 2)``.
+    classes: ndarray
+        Orientation class of each triangle, shape ``(n,)`` int64.
+    level: int
+        Refinement level of the triangles.
+    h0: float
+        Level-0 cell size ``fov / init_res``.
+
+        *Unit: arcsec*
+
+    min_img_sep: float
+        Lens-plane tolerance.
+
+        *Unit: arcsec*
+
+    pinv0: ndarray
+        ``PINV0`` from :func:`child_matrix_tables`.
+    compose: ndarray
+        ``COMPOSE`` from :func:`child_matrix_tables`.
+
+    Returns
+    -------
+    keep: ndarray
+        ``(n,)`` bool, True where the triangle is converged and terminal.
+    parity_ok: ndarray
+        ``(n,)`` bool, True where ``sign(det Q_k)`` is constant over the children.
+    s: ndarray
+        ``(n,)`` float64, ``min_k sigma_min(A_k)``. Exactly ``0.0`` is legal and
+        expected near a critical curve; it forces the split, and the size floor
+        terminates the descent.
+    """
+    stacked = np.concatenate([beta_v, beta_m], axis=1)  # (n, 6, 2)
+    idx = np.asarray(CHILD_VERTEX_INDICES)  # (4, 3)
+    q1 = stacked[:, idx[:, 0], :]
+    q2 = stacked[:, idx[:, 1], :]
+    q3 = stacked[:, idx[:, 2], :]
+    Q = np.stack((q2 - q1, q3 - q1), axis=-1)  # (n, 4, 2, 2)
+
+    det_q = Q[..., 0, 0] * Q[..., 1, 1] - Q[..., 0, 1] * Q[..., 1, 0]
+    sign_q = np.sign(det_q)
+    # A NaN never equals itself, so a non-finite child lands in the split branch.
+    # An exact zero gives sign 0, which differs from +-1 and also splits.
+    parity_ok = (sign_q == sign_q[:, :1]).all(axis=1)
+
+    A = Q @ pinv0[compose[classes]]  # (n, 4, 2, 2), up to the common 2**(d+1)/h0
+    s = sigma_min_2x2(A).min(axis=1) * (2.0 ** (level + 1)) / h0
+
+    r = midpoint_deviation(beta_v, beta_m)
+    keep = parity_ok & converged_from_deviation(r, s, min_img_sep)
+    return keep, parity_ok, s

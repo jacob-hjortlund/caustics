@@ -6,6 +6,9 @@ from caustics.lenses.func.adaptive import (
     ROOT_SHAPES,
     affine_from_triangles,
     child_matrix_tables,
+    converged_from_deviation,
+    evaluate_criterion,
+    midpoint_deviation,
     shape_matrix,
     sigma_min_2x2,
 )
@@ -25,6 +28,12 @@ def red_split(tri):
     six = np.stack([t1, t2, t3, (t2 + t3) / 2, (t3 + t1) / 2, (t1 + t2) / 2], axis=-2)
     idx = np.asarray(CHILD_VERTEX_INDICES)
     return six[..., idx, :].reshape(*tri.shape[:-2], 4, 3, 2)
+
+
+def _six_points(tri):
+    t1, t2, t3 = tri[:, 0, :], tri[:, 1, :], tri[:, 2, :]
+    mid = np.stack([(t2 + t3) / 2, (t3 + t1) / 2, (t1 + t2) / 2], axis=1)
+    return tri, mid
 
 
 def test_group_tables_close_and_have_order_six():
@@ -141,3 +150,79 @@ def test_sigma_min_handles_conformal_ulp_negativity():
 def test_sigma_min_propagates_nan_input():
     A = np.full((1, 2, 2), np.nan)
     assert np.isnan(sigma_min_2x2(A)).all()
+
+
+def test_converged_from_deviation_fails_closed():
+    r = np.zeros((3, 3))
+    assert converged_from_deviation(r, np.array([1.0, 1.0, 1.0]), 1.0).all()
+    # NaN must take the split branch, not the converged branch
+    assert not converged_from_deviation(r, np.full(3, np.nan), 1.0).any()
+    # s == 0 with r == 0 gives 0 < 0, False, split -- the conservative direction
+    assert not converged_from_deviation(r, np.zeros(3), 1.0).any()
+
+
+def test_criterion_converges_on_an_affine_map():
+    M, G, COMPOSE, PINV0, ROOT_CLASS = child_matrix_tables()
+    h0 = 0.05
+    tri = np.stack([np.asarray(ROOT_SHAPES[s], dtype=np.float64) * h0 for s in (0, 1)])
+    classes = ROOT_CLASS.copy()
+    lens_map = np.array([[0.7, 0.1], [-0.2, 0.9]])
+    v, m = _six_points(tri)
+    keep, parity_ok, s = evaluate_criterion(
+        v @ lens_map.T, m @ lens_map.T, classes, 0, h0, 1e-3, PINV0, COMPOSE
+    )
+    assert keep.all() and parity_ok.all()
+    assert np.allclose(s, np.linalg.svd(lens_map, compute_uv=False)[-1])
+
+
+def test_criterion_parity_fires_across_a_fold():
+    M, G, COMPOSE, PINV0, ROOT_CLASS = child_matrix_tables()
+    h0 = 1.0
+    tri = np.asarray(ROOT_SHAPES[1], dtype=np.float64)[None] * h0 - np.array([0.0, 0.5])
+    classes = ROOT_CLASS[1:2].copy()
+    fold = lambda p: np.stack([p[..., 0], p[..., 1] ** 2], axis=-1)  # noqa: E731
+    v, m = _six_points(tri)
+    keep, parity_ok, s = evaluate_criterion(
+        fold(v), fold(m), classes, 0, h0, 1e-3, PINV0, COMPOSE
+    )
+    assert not parity_ok[0] and not keep[0]
+
+
+def test_criterion_is_invariant_to_simultaneous_relabelling():
+    M, G, COMPOSE, PINV0, ROOT_CLASS = child_matrix_tables()
+    p = RNG.normal(size=(200, 3, 2))
+    q = RNG.normal(size=(200, 3, 2))
+    base = affine_from_triangles(p, q)
+    perm = np.argsort(RNG.random((200, 3)), axis=1)
+    pp = np.take_along_axis(p, perm[..., None], axis=1)
+    qp = np.take_along_axis(q, perm[..., None], axis=1)
+    permuted = affine_from_triangles(pp, qp)
+    assert np.allclose(base, permuted, rtol=1e-9, atol=1e-11)
+    assert np.array_equal(
+        np.sign(np.linalg.det(base)), np.sign(np.linalg.det(permuted))
+    )
+    assert np.allclose(sigma_min_2x2(base), sigma_min_2x2(permuted), rtol=1e-9)
+
+
+def test_criterion_reports_nonfinite_as_split():
+    M, G, COMPOSE, PINV0, ROOT_CLASS = child_matrix_tables()
+    h0 = 0.05
+    tri = np.asarray(ROOT_SHAPES[0], dtype=np.float64)[None] * h0
+    classes = ROOT_CLASS[0:1].copy()
+    v, m = _six_points(tri)
+    bad = m.copy()
+    bad[0, 0, 0] = np.nan
+    keep, parity_ok, s = evaluate_criterion(
+        v, bad, classes, 0, h0, 1e-3, PINV0, COMPOSE
+    )
+    assert not keep[0]
+
+
+def test_midpoint_deviation_pairs_midpoint_with_opposite_edge():
+    v = np.array([[[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]]])
+    m = np.array([[[0.5, 0.5], [0.0, 0.5], [0.5, 0.0]]])  # exact affine images
+    assert np.allclose(midpoint_deviation(v, m), 0.0)
+    shifted = m.copy()
+    shifted[0, 1] += np.array([0.0, 0.25])
+    got = midpoint_deviation(v, shifted)
+    assert np.allclose(got, [[0.0, 0.25, 0.0]])
