@@ -83,6 +83,7 @@ def affine_from_triangles(p, q):
         Lens-plane triangle, shape ``(..., 3, 2)``.
 
         *Unit: arcsec*
+
     q: ndarray
         Source-plane triangle, shape ``(..., 3, 2)``.
 
@@ -266,6 +267,9 @@ def converged_from_deviation(r, s, min_img_sep):
     ----------
     r: ndarray
         Midpoint deviations, shape ``(n, 3)``.
+
+        *Unit: arcsec*
+
     s: ndarray
         Smallest singular value over the four children, shape ``(n,)``.
     min_img_sep: float
@@ -295,8 +299,14 @@ def evaluate_criterion(beta_v, beta_m, classes, level, h0, min_img_sep, pinv0, c
     ----------
     beta_v: ndarray
         Source-plane vertices, shape ``(n, 3, 2)``.
+
+        *Unit: arcsec*
+
     beta_m: ndarray
         Source-plane midpoints ``m1, m2, m3``, shape ``(n, 3, 2)``.
+
+        *Unit: arcsec*
+
     classes: ndarray
         Orientation class of each triangle, shape ``(n,)`` int64.
     level: int
