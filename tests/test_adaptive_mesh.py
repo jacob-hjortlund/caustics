@@ -2,6 +2,18 @@ import numpy as np
 import pytest
 
 from caustics.backend_obj import backend
+from caustics.lenses.adaptive import (
+    LeafStatus,
+    _ActiveKeys,
+    _depth_floor,
+    _initial_triangles,
+    _Lattice,
+    _LeafStore,
+    _midpoint_ij,
+    _red_split,
+    _validate_build_args,
+    _VertexCache,
+)
 from caustics.lenses.func.adaptive import (
     CHILD_VERTEX_INDICES,
     ROOT_SHAPES,
@@ -318,3 +330,106 @@ def test_sanitize_bary_recovers_ordinary_coordinates():
     d = as_arr([2.0 * 3.0])
     bary = to_np(sanitize_bary(w, d))
     assert np.allclose(bary @ tri[0], beta, rtol=1e-12, atol=1e-14)
+
+
+def test_depth_floor_matches_the_size_criterion():
+    assert _depth_floor(5.0, 100, 10.0) == 0
+    d = _depth_floor(5.0, 100, 1e-3)
+    l0 = np.sqrt(2) * 5.0 / 100
+    assert l0 / 2**d <= 1e-3 < l0 / 2 ** (d - 1)
+
+
+def test_lattice_key_roundtrip_and_geometry():
+    lat = _Lattice(4.0, 0.0, 0.0, 4, 3)
+    assert lat.n == 32
+    ij = np.array([[0, 0], [32, 32], [7, 19]])
+    assert np.array_equal(lat.ij_from_key(lat.key(ij)), ij)
+    assert np.allclose(lat.xy(ij[0]), [-2.0, -2.0])
+    assert np.allclose(lat.xy(ij[1]), [2.0, 2.0])
+    assert lat.on_boundary(ij).tolist() == [True, True, False]
+
+
+def test_vertex_cache_lookup_missing_insert():
+    cache = _VertexCache()
+    keys = np.array([7, 3, 7, 11], dtype=np.int64)
+    assert np.array_equal(cache.missing(keys), np.array([3, 7, 11]))
+    todo = cache.missing(keys)
+    ij = np.stack([todo, todo], axis=-1)
+    cache.insert(todo, ij, ij.astype(np.float64))
+    assert len(cache) == 3
+    assert cache.missing(keys).size == 0
+    assert np.array_equal(cache.lookup(np.array([7, 99])), np.array([1, -1]))
+
+
+def test_active_keys_membership():
+    ak = _ActiveKeys()
+    assert not ak.contains(np.array([1])).any()
+    ak.add(np.array([5, 1, 5], dtype=np.int64))
+    assert ak.contains(np.array([1, 5, 6])).tolist() == [True, True, False]
+
+
+def test_leaf_store_add_remove_compact():
+    store = _LeafStore()
+    rows = store.add(
+        np.arange(6).reshape(2, 3), 0, np.zeros(2, np.int64), LeafStatus.CONVERGED
+    )
+    store.add(np.arange(3).reshape(1, 3), 1, np.zeros(1, np.int64), LeafStatus.FORCED)
+    store.remove(rows[:1])
+    v, level, cls, status = store.compact()
+    assert v.shape == (2, 3)
+    assert level.tolist() == [0, 1]
+    assert status.tolist() == [LeafStatus.CONVERGED, LeafStatus.FORCED]
+
+
+def test_initial_triangles_tile_the_square_and_are_positively_oriented():
+    M, G, COMPOSE, PINV0, ROOT_CLASS = child_matrix_tables()
+    init_res, max_level = 4, 2
+    ij, cls = _initial_triangles(init_res, max_level, ROOT_CLASS)
+    assert ij.shape == (2 * init_res**2, 3, 2)
+    area = signed_area(ij.astype(np.float64))
+    assert (area > 0).all()
+    step = 1 << max_level
+    assert np.isclose(area.sum() / 2, (init_res * step) ** 2)
+    assert set(np.unique(cls)) == {int(ROOT_CLASS[0]), int(ROOT_CLASS[1])}
+
+
+def test_midpoints_are_exact_integers_and_opposite_their_vertex():
+    ij = np.array([[[0, 0], [4, 0], [0, 4]]], dtype=np.int64)
+    m = _midpoint_ij(ij)
+    assert np.array_equal(m[0], np.array([[2, 2], [0, 2], [2, 0]]))
+
+
+def test_red_split_is_triangle_major_and_advances_the_class():
+    M, G, COMPOSE, PINV0, ROOT_CLASS = child_matrix_tables()
+    v = np.array([[0, 1, 2], [3, 4, 5]], dtype=np.int64)
+    m = np.array([[6, 7, 8], [9, 10, 11]], dtype=np.int64)
+    cls = np.array([0, 4], dtype=np.int64)
+    cv, cc = _red_split(v, m, cls, COMPOSE)
+    assert cv.shape == (8, 3) and cc.shape == (8,)
+    assert cv[0].tolist() == [0, 8, 7]  # C_1 = (theta1, m3, m2)
+    assert cv[3].tolist() == [6, 7, 8]  # C_4 = (m1, m2, m3)
+    assert cc[:4].tolist() == COMPOSE[0].tolist()
+    assert cc[4:].tolist() == COMPOSE[4].tolist()
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        dict(fov=0.0),
+        dict(fov=-1.0),
+        dict(init_res=0),
+        dict(min_img_sep=0.0),
+        dict(min_img_sep=-1.0),
+        dict(max_depth=-1),
+    ],
+)
+def test_validate_build_args_rejects_bad_input(kwargs):
+    args = dict(fov=5.0, init_res=8, min_img_sep=1e-2, max_depth=10)
+    args.update(kwargs)
+    with pytest.raises(ValueError):
+        _validate_build_args(**args)
+
+
+def test_validate_build_args_rejects_lattice_overflow():
+    with pytest.raises(ValueError, match="lattice"):
+        _validate_build_args(fov=5.0, init_res=100, min_img_sep=1e-12, max_depth=60)
