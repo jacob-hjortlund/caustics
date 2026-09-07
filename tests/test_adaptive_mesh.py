@@ -502,6 +502,13 @@ def test_refine_terminates_at_max_level_on_a_kappa_one_sheet():
     assert (status == LeafStatus.SIZE_FLOOR).all()
     assert ref.counters["sigma_zero"] > 0
     assert np.isfinite(ref.cache.beta).all()
+    # This fixture genuinely reaches max_level, so it is the one that pins the
+    # loop's batch structure on the full-descent path: one raytrace batch per
+    # level that needs new points, and the max_level iteration needs none
+    # because its vertices are all already cached -- hence max_level batches,
+    # not max_level + 1. Every lattice point is evaluated exactly once.
+    assert calls["batches"] == max_level
+    assert calls["points"] == (lat.n + 1) ** 2
 
 
 def test_refine_marks_a_nonfinite_subregion_invalid_and_stops():
@@ -552,10 +559,32 @@ def test_refine_marks_nonfinite_vertices_invalid_even_at_max_level():
         assert not np.isfinite(ref.cache.beta[v[row]]).all()
 
 
-def test_refine_skips_the_midpoint_batch_at_max_level():
+def test_refine_makes_one_batch_per_level_and_exits_early_when_affine():
+    """One raytrace batch per level that needs new points, and no more.
+
+    The identity map is affine everywhere, so every level-0 triangle converges
+    and the loop exits through the empty-``active`` break without ever reaching
+    ``max_level``. This pins the level-synchronous one-batch-per-level structure
+    on the early-exit path.
+
+    This deliberately does NOT claim to test the ``max_level`` midpoint-batch
+    skip, tempting though a batch count is: at ``max_level`` a triangle's edges
+    are one lattice unit, so ``_midpoint_ij``'s floor division collapses its
+    midpoints onto lattice points that are *already cached*. Requesting them
+    would add no ``raytrace`` call at all, which makes the skip invisible to
+    ``calls`` -- verified numerically: all 512 max-level triangles yield 288
+    distinct floored midpoints, none outside the finest lattice. The skip's
+    observable behaviour is its *labelling* -- SIZE_FLOOR and INVALID without
+    running the criterion -- and that is covered by
+    ``test_refine_terminates_at_max_level_on_a_kappa_one_sheet`` and
+    ``test_refine_marks_nonfinite_vertices_invalid_even_at_max_level``.
+    """
     ref, lat, calls, max_level = refine_with(lambda p: p * 1.0, min_img_sep=0.5)
-    # a pure translation is affine, so everything converges at level 0 and the
-    # loop makes exactly one batch
+    v, level, cls, status = ref.store.compact()
+    assert (
+        max_level > 0
+    ), "fixture must allow deeper levels for early exit to mean anything"
+    assert (level == 0).all()
     assert calls["batches"] == 1
 
 
