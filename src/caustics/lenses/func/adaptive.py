@@ -16,6 +16,8 @@ from typing import Tuple
 
 import numpy as np
 
+from ...backend_obj import ArrayLike, backend
+
 __all__ = (
     "CHILD_VERTEX_INDICES",
     "ROOT_SHAPES",
@@ -26,6 +28,9 @@ __all__ = (
     "midpoint_deviation",
     "converged_from_deviation",
     "evaluate_criterion",
+    "triangle_weights",
+    "contains",
+    "sanitize_bary",
 )
 
 # ---------------------------------------------------------------------------
@@ -356,3 +361,131 @@ def evaluate_criterion(beta_v, beta_m, classes, level, h0, min_img_sep, pinv0, c
     r = midpoint_deviation(beta_v, beta_m)
     keep = parity_ok & converged_from_deviation(r, s, min_img_sep)
     return keep, parity_ok, s
+
+
+# ---------------------------------------------------------------------------
+# Query kernels (backend-dispatched)
+# ---------------------------------------------------------------------------
+
+
+def triangle_weights(tri, beta) -> ArrayLike:
+    """
+    The three cross products that give containment and barycentric coordinates.
+
+    With ``q1, q2, q3`` the triangle's mapped vertices, ``w_i`` is the cross
+    product of the two edges of the sub-triangle opposite vertex ``i``. Then
+    ``w1 + w2 + w3 == d`` identically, where ``d`` is twice the signed area, so
+    ``w / d`` sums to one by construction and no matrix inverse is needed.
+
+    Because a mesh vertex is stored once and referenced by index, two leaves
+    sharing an edge form these products from bit-identical operands in opposite
+    order. IEEE multiplication is commutative, so their weights on that edge are
+    **exactly** negated and a query point can never fall through the seam between
+    them.
+
+    Parameters
+    ----------
+    tri: ArrayLike
+        Source-plane triangle vertices, shape ``(T, 3, 2)``.
+
+        *Unit: arcsec*
+
+    beta: ArrayLike
+        Query points, one per candidate, shape ``(T, 2)``.
+
+        *Unit: arcsec*
+
+    Returns
+    -------
+    ArrayLike
+        Shape ``(T, 3)``.
+    """
+    q1 = tri[:, 0, :] - beta
+    q2 = tri[:, 1, :] - beta
+    q3 = tri[:, 2, :] - beta
+    return backend.stack(
+        (
+            q2[:, 0] * q3[:, 1] - q2[:, 1] * q3[:, 0],
+            q3[:, 0] * q1[:, 1] - q3[:, 1] * q1[:, 0],
+            q1[:, 0] * q2[:, 1] - q1[:, 1] * q2[:, 0],
+        ),
+        dim=-1,
+    )
+
+
+def contains(w) -> ArrayLike:
+    """
+    Containment test: all three weights share a sign, zeros counting as inside.
+
+    Source-plane images flip handedness across critical curves by design, so a
+    fixed positive convention would be wrong on half the mesh. Since
+    ``w1 + w2 + w3 == d``, "all three share a sign" implies that sign is
+    ``sign(d)`` whenever ``d != 0`` -- so this is equivalent to testing against the
+    triangle's own ``d``, while also being well defined when ``d`` is *exactly*
+    zero. That case is reachable: three source-plane vertices can be exactly
+    collinear in floating point, and a ``kappa = 1`` sheet maps every leaf to a
+    point. Testing against ``sign(d) == 0`` would make every such leaf a hit for
+    every query.
+
+    Zeros counting as inside means a point on a shared edge returns both leaves.
+    That is intended, and is the main reason candidate count is not image
+    multiplicity.
+
+    Parameters
+    ----------
+    w: ArrayLike
+        Weights from :func:`triangle_weights`, shape ``(T, 3)``.
+
+    Returns
+    -------
+    ArrayLike
+        Shape ``(T,)`` bool.
+    """
+    nonneg = (w[..., 0] >= 0) & (w[..., 1] >= 0) & (w[..., 2] >= 0)
+    nonpos = (w[..., 0] <= 0) & (w[..., 1] <= 0) & (w[..., 2] <= 0)
+    return nonneg | nonpos
+
+
+def sanitize_bary(w, d) -> ArrayLike:
+    """
+    Normalize weights to barycentric coordinates, clamping then falling back.
+
+    ``d`` goes to zero on leaves straddling a critical curve, so ``w / d`` there is
+    a ratio of two quantities at the roundoff floor -- unbounded, possibly outside
+    the triangle, or ``NaN``. Two regimes, handled in order.
+
+    The clip handles ordinary roundoff: a hit passed containment, so
+    ``bary in [0, 1]**3`` holds mathematically and small excursions are numerical
+    only. The centroid branch handles genuine breakdown, where ``w`` and ``d`` are
+    both noise and the clipped components carry no information; it is also the only
+    defined answer when they clip to all-zero. ``isfinite`` is checked *after* the
+    clip, because clipping propagates ``NaN``.
+
+    The centroid is a bounded fallback, not a guess. A leaf with ``d`` near zero
+    reached the size floor, so its longest edge is at most ``min_img_sep`` and the
+    centroid is within ``(2/3) * l_max`` of every point in it.
+
+    Parameters
+    ----------
+    w: ArrayLike
+        Weights of the hits, shape ``(K, 3)``.
+    d: ArrayLike
+        Twice the signed source-plane area of each hit leaf, shape ``(K,)``.
+
+    Returns
+    -------
+    ArrayLike
+        Shape ``(K, 3)``, guaranteed to lie in the simplex.
+    """
+    bary = backend.clamp(w / backend.unsqueeze(d, -1), 0.0, 1.0)
+    total = bary[..., 0] + bary[..., 1] + bary[..., 2]
+    ok = (
+        (total > 0)
+        & backend.isfinite(bary[..., 0])
+        & backend.isfinite(bary[..., 1])
+        & backend.isfinite(bary[..., 2])
+    )
+    safe = backend.where(ok, total, backend.ones_like(total))
+    normed = bary / backend.unsqueeze(safe, -1)
+    third = backend.ones_like(bary) / 3
+    return backend.where(backend.unsqueeze(ok, -1), normed, third)

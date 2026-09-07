@@ -1,19 +1,31 @@
 import numpy as np
 import pytest
 
+from caustics.backend_obj import backend
 from caustics.lenses.func.adaptive import (
     CHILD_VERTEX_INDICES,
     ROOT_SHAPES,
     affine_from_triangles,
     child_matrix_tables,
+    contains,
     converged_from_deviation,
     evaluate_criterion,
     midpoint_deviation,
+    sanitize_bary,
     shape_matrix,
     sigma_min_2x2,
+    triangle_weights,
 )
 
 RNG = np.random.default_rng(20260904)
+
+
+def to_np(x):
+    return backend.to_numpy(x)
+
+
+def as_arr(x):
+    return backend.as_array(np.asarray(x, dtype=np.float64))
 
 
 def signed_area(tri):
@@ -226,3 +238,62 @@ def test_midpoint_deviation_pairs_midpoint_with_opposite_edge():
     shifted[0, 1] += np.array([0.0, 0.25])
     got = midpoint_deviation(v, shifted)
     assert np.allclose(got, [[0.0, 0.25, 0.0]])
+
+
+def test_weights_sum_to_twice_the_signed_area():
+    tri = RNG.normal(size=(500, 3, 2))
+    beta = RNG.normal(size=(500, 2))
+    w = to_np(triangle_weights(as_arr(tri), as_arr(beta)))
+    P = shape_matrix(tri)
+    d = P[:, 0, 0] * P[:, 1, 1] - P[:, 0, 1] * P[:, 1, 0]
+    assert np.allclose(w.sum(axis=1), d, rtol=1e-9, atol=1e-12)
+
+
+@pytest.mark.parametrize("flip", [False, True])
+def test_containment_agrees_with_barycentric_truth_on_both_parities(flip):
+    tri = np.array([[[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]]])
+    if flip:
+        tri = tri[:, ::-1, :]
+    pts = RNG.uniform(-0.5, 1.5, size=(4000, 2))
+    tiled = np.repeat(tri, len(pts), axis=0)
+    hit = to_np(contains(triangle_weights(as_arr(tiled), as_arr(pts))))
+    truth = (pts[:, 0] >= 0) & (pts[:, 1] >= 0) & (pts[:, 0] + pts[:, 1] <= 1)
+    assert (hit == truth).all()
+
+
+def test_shared_edge_weights_are_exactly_negated():
+    """Two leaves meeting on an edge must not both reject a point on that edge."""
+    verts = np.array([[0.0, 0.0], [1.0, 0.3], [0.4, 1.0], [1.3, 1.2]])
+    left = verts[[0, 1, 2]][None]
+    right = verts[[1, 3, 2]][None]  # shares the edge (1, 2), opposite traversal
+    beta = np.array([[0.62, 0.71]])
+    wl = to_np(triangle_weights(as_arr(left), as_arr(beta)))
+    wr = to_np(triangle_weights(as_arr(right), as_arr(beta)))
+    # left's weight opposite vertex 0 uses the (1, 2) edge; right's opposite
+    # vertex 3 uses (2, 1). They must be bit-exact negatives.
+    assert wl[0, 0] == -wr[0, 1]
+
+
+def test_sanitize_bary_is_always_in_the_simplex():
+    w = RNG.normal(size=(1000, 3)) * 1e-300
+    d = w.sum(axis=1)
+    bary = to_np(sanitize_bary(as_arr(w), as_arr(d)))
+    assert np.isfinite(bary).all()
+    assert (bary >= 0).all() and (bary <= 1).all()
+    assert np.allclose(bary.sum(axis=1), 1.0, rtol=0, atol=1e-12)
+
+
+def test_sanitize_bary_falls_back_to_the_centroid_on_total_degeneracy():
+    w = np.zeros((4, 3))
+    d = np.zeros(4)
+    bary = to_np(sanitize_bary(as_arr(w), as_arr(d)))
+    assert np.array_equal(bary, np.full((4, 3), 1.0 / 3.0))
+
+
+def test_sanitize_bary_recovers_ordinary_coordinates():
+    tri = np.array([[[0.0, 0.0], [2.0, 0.0], [0.0, 3.0]]])
+    beta = np.array([[0.5, 0.75]])
+    w = triangle_weights(as_arr(tri), as_arr(beta))
+    d = as_arr([2.0 * 3.0])
+    bary = to_np(sanitize_bary(w, d))
+    assert np.allclose(bary @ tri[0], beta, rtol=1e-12, atol=1e-14)
