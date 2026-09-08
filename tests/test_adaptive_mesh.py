@@ -10,6 +10,7 @@ from caustics.lenses.adaptive import (
     _depth_floor,
     _edge_quarter_keys,
     _initial_triangles,
+    _invalidate_nonfinite_origins,
     _Lattice,
     _LeafStore,
     _make_raytrace_np,
@@ -1015,6 +1016,52 @@ def test_stats_report_level_zero_convergence_and_termination_split():
     assert s.n_converged_at_level_0 >= 0
     assert s.cancellation_floor < 1e-6  # float64 build
     assert s.n_vertices == mesh.vertices_lens.shape[0]
+
+
+def test_leaf_area2_uses_the_downcast_vertices_at_reduced_precision():
+    """The downcast-before-compute ordering, at a dtype where it is observable.
+
+    At float64 -- the dtype every other test uses -- ``vs.astype(np_dtype)`` is a
+    value-preserving no-op, so cast-then-compute and compute-then-cast are
+    bit-identical and neither ordering can be distinguished. The property only
+    has teeth at a precision-losing dtype: here the two orderings disagree on
+    the great majority of leaves, so this is the test that actually pins it.
+    """
+    mesh, _ = build(localised_fold, min_img_sep=0.05, dtype=backend.float32)
+    vs = backend.to_numpy(mesh.vertices_source)
+    assert vs.dtype == np.float32
+    P = shape_matrix(vs[backend.to_numpy(mesh.leaves)])
+    from_stored = P[:, 0, 0] * P[:, 1, 1] - P[:, 0, 1] * P[:, 1, 0]
+    assert np.array_equal(backend.to_numpy(mesh.leaf_area2), from_stored)
+
+    mesh64, _ = build(localised_fold, min_img_sep=0.05)
+    vs64 = backend.to_numpy(mesh64.vertices_source)
+    Q = shape_matrix(vs64[backend.to_numpy(mesh64.leaves)])
+    computed_then_cast = (Q[:, 0, 0] * Q[:, 1, 1] - Q[:, 0, 1] * Q[:, 1, 0]).astype(
+        np.float32
+    )
+    assert not np.array_equal(
+        from_stored, computed_then_cast
+    ), "fixture no longer distinguishes the two orderings"
+
+
+def test_freeze_invalidates_a_whole_origin_group_from_one_bad_vertex():
+    """The freeze-time finiteness re-check, exercised directly.
+
+    It cannot be reached through a full build: every vertex that becomes a
+    corner or midpoint of an evaluated triangle is finiteness-checked by
+    ``_refine`` first, except on a narrow cascade path (a FORCED leaf re-forced
+    in a later round via a deferred, never-checked midpoint) that no available
+    fixture reaches. Unit-tested on a synthetic triple instead -- otherwise the
+    re-check could be deleted with no test failing.
+    """
+    vs = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [np.nan, 0.5]])
+    leaves = np.array([[0, 1, 2], [0, 1, 3], [0, 1, 2]])
+    origin = np.array([0, 0, 1])  # leaf 1 is non-finite and shares origin 0
+    pre_status = np.array([LeafStatus.CONVERGED, LeafStatus.CONVERGED], dtype=np.int8)
+    out = _invalidate_nonfinite_origins(vs, leaves, origin, pre_status)
+    assert out[0] == LeafStatus.INVALID, "one bad leaf must invalidate its origin"
+    assert out[1] == LeafStatus.CONVERGED, "a clean origin must be untouched"
 
 
 def test_kappa_one_sheet_builds_without_nan():

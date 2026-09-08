@@ -749,6 +749,40 @@ def _numpy_dtype(dtype):
     return backend.to_numpy(backend.zeros((), dtype=dtype)).dtype
 
 
+def _invalidate_nonfinite_origins(vs, leaves, origin, pre_status):
+    """
+    Re-check finiteness at freeze and propagate invalidity through the origin.
+
+    A ``FORCED`` leaf inherits its vertices from a parent whose midpoints were
+    never finiteness-tested, and a closure triangle can pick up a midpoint no
+    criterion ever saw, so a non-finite vertex can reach freeze on a leaf not
+    already marked ``INVALID``. Without this it would enter the spatial index and
+    swallow every query in its cell.
+
+    Invalidity is propagated UP to the origin and then back down, rather than
+    applied to the leaf alone: the termination-reason counts are pre-closure, so
+    marking only the leaf would leave ``n_converged + n_size_floor + n_forced +
+    n_invalid`` disagreeing with ``n_leaves_pre_closure``. It is also the
+    conservative direction -- if one triangle of a region has a bad vertex, the
+    region is not trustworthy.
+
+    Factored out of :func:`build_adaptive_mesh` so it can be exercised directly:
+    every vertex reaching a full build has already been finiteness-checked by
+    :func:`_refine`, except on a narrow cascade path no available fixture
+    reaches, so inline this logic would be untestable.
+
+    Returns
+    -------
+    ndarray
+        ``pre_status`` with every origin owning a non-finite leaf set to
+        ``INVALID``.
+    """
+    leaf_finite = np.isfinite(vs[leaves]).all(axis=(1, 2))
+    origin_bad = np.zeros(pre_status.shape[0], dtype=bool)
+    np.logical_or.at(origin_bad, origin, ~leaf_finite)
+    return np.where(origin_bad, np.int8(LeafStatus.INVALID), pre_status)
+
+
 def _build_index(vs, leaves, valid_rows, index_cells):
     """
     Uniform-grid CSR index over source-plane axis-aligned bounding boxes.
@@ -987,14 +1021,17 @@ def build_adaptive_mesh(
     # + n_forced + n_invalid` disagreeing with `n_leaves_pre_closure`. It is also
     # the conservative direction -- if one triangle of a region has a bad vertex,
     # the region is not trustworthy.
-    leaf_finite = np.isfinite(vs[leaves_np]).all(axis=(1, 2))
-    origin_bad = np.zeros(pre_v.shape[0], dtype=bool)
-    np.logical_or.at(origin_bad, origin, ~leaf_finite)
-    pre_status = np.where(origin_bad, np.int8(LeafStatus.INVALID), pre_status)
+    pre_status = _invalidate_nonfinite_origins(vs, leaves_np, origin, pre_status)
     leaf_status = pre_status[origin]
 
-    P = shape_matrix(vs[leaves_np])
-    leaf_area2 = P[:, 0, 0] * P[:, 1, 1] - P[:, 0, 1] * P[:, 1, 0]
+    # INVALID leaves may carry inf/nan vertices, and their `leaf_area2` is never
+    # consumed -- they are excluded from the index below. Suppressing here keeps a
+    # build over a lens with a non-finite region from spraying numpy
+    # RuntimeWarnings at the caller; it changes no value. Same pattern as
+    # `_min_angle`.
+    with np.errstate(invalid="ignore"):
+        P = shape_matrix(vs[leaves_np])
+        leaf_area2 = P[:, 0, 0] * P[:, 1, 1] - P[:, 0, 1] * P[:, 1, 0]
     valid_rows = np.flatnonzero(leaf_status != LeafStatus.INVALID)
     index = _build_index(vs, leaves_np, valid_rows, index_cells)
 
