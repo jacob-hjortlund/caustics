@@ -725,15 +725,46 @@ def undirected_edges(lat, cache, leaves):
     return np.sort(e, axis=-1).reshape(-1, 2)
 
 
+def gated_hanging_nodes(lat, cache, active, slots):
+    """Hanging-node mask, applying the same exactness gate ``_close`` applies.
+
+    Without the gate a max_level triangle's edges are one lattice unit long, so
+    ``_midpoint_ij``'s floor division collapses each "midpoint" onto one of that
+    same edge's own endpoints -- a real, trivially active mesh vertex -- and
+    every max_level leaf reads as having three hanging nodes. Any test that asks
+    "does a hanging node exist here" must gate, or it is measuring that artifact.
+    """
+    ij = cache.ij[slots]
+    mid_keys = lat.key(_midpoint_ij(ij))
+    exact = ((ij[:, [1, 2, 0]] + ij[:, [2, 0, 1]]) % 2 == 0).all(axis=-1)
+    return exact & active.contains(mid_keys)
+
+
 def closed_mesh(fn, **kw):
     ref, lat, calls, max_level = refine_with(fn, **kw)
     v, level, cls, status = ref.store.compact()
     order = _canonical_order(lat, ref.cache, v)
     v, level, status = v[order], level[order], status[order]
+    # Captured BEFORE closure. `_close` must add no vertices, so a test checking
+    # `leaves` against the cache size has to use a bound that predates the call;
+    # reading `len(cache)` afterwards would silently absorb any growth into the
+    # bound and the check could never fail.
+    n_cache_pre = len(ref.cache)
     leaves, origin, out_level, out_status = _close(
         lat, ref.cache, ref.active, v, level, status
     )
-    return ref, lat, v, level, status, leaves, origin, out_level, out_status
+    return (
+        ref,
+        lat,
+        v,
+        level,
+        status,
+        leaves,
+        origin,
+        out_level,
+        out_status,
+        n_cache_pre,
+    )
 
 
 def test_min_angle_of_an_equilateral_triangle():
@@ -751,12 +782,28 @@ def test_canonical_order_is_independent_of_input_order():
 
 
 def test_closure_makes_every_edge_appear_once_or_twice():
-    ref, lat, v, pre_lvl, pre_st, leaves, origin, lvl, st = closed_mesh(
+    ref, lat, v, pre_lvl, pre_st, leaves, origin, lvl, st, n_pre = closed_mesh(
         localised_fold, min_img_sep=0.05
     )
     edges = undirected_edges(lat, ref.cache, leaves)
     _, counts = np.unique(edges, axis=0, return_counts=True)
     assert set(np.unique(counts)) <= {1, 2}
+
+
+def test_closure_leaves_no_hanging_node():
+    """The property closure exists for, checked directly on the closed mesh.
+
+    Edge multiplicity cannot substitute for this: a hanging node never raises
+    any edge's count (the coarse triangle contributes ``(A, B)`` once, the finer
+    neighbours contribute only ``(A, M)`` and ``(M, B)``), so a closure that
+    left hanging nodes behind would still show multiplicities inside ``{1, 2}``.
+    Multiplicity catches over-generation; this catches under-closure.
+    """
+    ref, lat, v, pre_lvl, pre_st, leaves, origin, lvl, st, n_pre = closed_mesh(
+        localised_fold, min_img_sep=0.05
+    )
+    assert gated_hanging_nodes(lat, ref.cache, ref.active, v).any(), "nothing to close"
+    assert not gated_hanging_nodes(lat, ref.cache, ref.active, leaves).any()
 
 
 def test_pre_closure_mesh_is_not_already_conforming():
@@ -770,16 +817,21 @@ def test_pre_closure_mesh_is_not_already_conforming():
     a mesh riddled with hanging nodes has the same ``{1, 2}`` multiplicity
     profile as a conforming one, and hanging nodes are indistinguishable from
     domain-boundary edges by counting alone. This is the same predicate
-    :func:`_close` itself uses to classify each leaf.
+    :func:`_close` itself uses to classify each leaf, **including its exactness
+    gate**. The gate is not optional here: ungated, a max_level triangle's
+    collapsed pseudo-midpoints are trivially active, so ``.any()`` would be
+    satisfied by that artifact alone and this guard would pass whether or not a
+    genuine hanging node existed anywhere in the mesh.
     """
     ref, lat, calls, max_level = refine_with(localised_fold, min_img_sep=0.05)
     v, level, cls, status = ref.store.compact()
-    mid_keys = lat.key(_midpoint_ij(ref.cache.ij[v]))
-    assert ref.active.contains(mid_keys).any(), "fixture has no hanging nodes"
+    assert gated_hanging_nodes(
+        lat, ref.cache, ref.active, v
+    ).any(), "fixture has no hanging nodes"
 
 
 def test_closure_preserves_orientation_and_inherits_level_and_status():
-    ref, lat, v, pre_lvl, pre_st, leaves, origin, lvl, st = closed_mesh(
+    ref, lat, v, pre_lvl, pre_st, leaves, origin, lvl, st, n_pre = closed_mesh(
         localised_fold, min_img_sep=0.05
     )
     assert (signed_area(lat.xy(ref.cache.ij[leaves])) > 0).all()
@@ -789,7 +841,7 @@ def test_closure_preserves_orientation_and_inherits_level_and_status():
 
 
 def test_leaf_origin_groups_are_contiguous_and_tile_their_origin():
-    ref, lat, v, pre_lvl, pre_st, leaves, origin, lvl, st = closed_mesh(
+    ref, lat, v, pre_lvl, pre_st, leaves, origin, lvl, st, n_pre = closed_mesh(
         localised_fold, min_img_sep=0.05
     )
     assert (np.diff(origin) >= 0).all(), "origin must be non-decreasing"
@@ -801,7 +853,7 @@ def test_leaf_origin_groups_are_contiguous_and_tile_their_origin():
 
 
 def test_unclosed_leaf_is_its_own_origin_geometry():
-    ref, lat, v, pre_lvl, pre_st, leaves, origin, lvl, st = closed_mesh(
+    ref, lat, v, pre_lvl, pre_st, leaves, origin, lvl, st, n_pre = closed_mesh(
         localised_fold, min_img_sep=0.05
     )
     _, counts = np.unique(origin, return_counts=True)
@@ -813,7 +865,14 @@ def test_unclosed_leaf_is_its_own_origin_geometry():
 
 
 def test_closure_adds_no_new_vertices():
-    ref, lat, v, pre_lvl, pre_st, leaves, origin, lvl, st = closed_mesh(
+    """Bound taken before closure, so the assertion can actually fail.
+
+    Reading ``len(ref.cache)`` after ``_close`` returns would fold any vertices
+    it inserted into the bound itself, making the check unfalsifiable -- it
+    passed against a known-buggy ``_close`` for exactly that reason.
+    """
+    ref, lat, v, pre_lvl, pre_st, leaves, origin, lvl, st, n_pre = closed_mesh(
         localised_fold, min_img_sep=0.05
     )
-    assert set(np.unique(leaves)) <= set(range(len(ref.cache)))
+    assert leaves.max() < n_pre
+    assert set(np.unique(leaves)) <= set(range(n_pre))
