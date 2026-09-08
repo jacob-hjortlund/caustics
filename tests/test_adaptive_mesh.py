@@ -1119,6 +1119,12 @@ def test_query_is_invariant_to_batch_size_and_point_order():
         assert np.array_equal(
             pidx[poff[new] : poff[new + 1]], ref[0][ref[1][old] : ref[1][old + 1]]
         )
+        # `bary` too, not just the indices: a permutation-dependent bug that
+        # scrambled coordinates while leaving leaf ids correct would otherwise
+        # slip through this check.
+        assert np.array_equal(
+            pbary[poff[new] : poff[new + 1]], ref[2][ref[1][old] : ref[1][old + 1]]
+        )
 
 
 def test_query_finds_the_affine_preimage():
@@ -1135,39 +1141,64 @@ def test_query_finds_the_affine_preimage():
 
 
 def test_bary_is_in_the_simplex_on_every_leaf():
-    for fn, sep in ((localised_fold, 0.05), (lambda p: np.zeros_like(p), 0.5)):
+    """The simplex guarantee end-to-end, on a curved mesh and a degenerate one.
+
+    The two fixtures need different query points. A ``kappa == 1`` sheet maps
+    every leaf to the single point ``(0, 0)``, so its source-plane bounding box
+    is degenerate and queries spread over a region land in empty index cells --
+    returning zero candidates and leaving all three assertions vacuously true,
+    since numpy's ``all`` and ``allclose`` are True over empty input. Measured:
+    the spread-out draw yields 44 candidates on ``localised_fold`` but **0** on
+    the sheet, against 4096 when querying the origin. The
+    ``idx.shape[0] > 0`` guard is what stops that passing silently.
+    """
+    for fn, sep, degenerate in (
+        (localised_fold, 0.05, False),
+        (lambda p: np.zeros_like(p), 0.5, True),
+    ):
         mesh, _ = build(fn, min_img_sep=sep)
+        # Drawn in both branches so the shared module-level RNG sequence stays
+        # unchanged for the tests that follow; discarded just below for the
+        # sheet, where spread-out points miss the degenerate image entirely.
         beta = RNG.uniform(-0.4, 0.4, size=(40, 2))
+        if degenerate:
+            beta = np.zeros((8, 2))
         idx, off, bary = query_np(mesh, beta)
+        assert idx.shape[0] > 0, "fixture returned no candidates"
         assert np.isfinite(bary).all()
         assert (bary >= 0).all() and (bary <= 1).all()
         assert np.allclose(bary.sum(axis=1), 1.0, atol=1e-12)
 
 
-def test_bary_reconstructs_beta_on_well_conditioned_leaves_only():
+def test_bary_reconstructs_beta_on_every_hit_leaf():
+    """Barycentric coordinates invert the source-plane map on this mesh.
+
+    ``good`` is kept as a live invariant rather than used as a filter. No leaf
+    in this fixture is anywhere near degenerate: measured, the minimum
+    ``|leaf_area2|`` over all 1350 leaves is ``6.1e-6``, four orders of
+    magnitude above the ``1e-10`` threshold, and the minimum among actual hits
+    is ``3.2e-4``. So a ``~good`` branch here would be dead code -- an earlier
+    version of this test carried exactly such a loop, which could never execute
+    on any run. ``assert good.all()`` fires if a future fixture change ever
+    does produce a sub-threshold leaf, at which point that branch needs
+    writing; the centroid path is meanwhile covered by
+    :func:`test_centroid_fallback_on_a_totally_degenerate_leaf`, where
+    ``leaf_area2`` is exactly zero.
+    """
     mesh, _ = build(localised_fold, min_img_sep=0.05)
     beta = RNG.uniform(-1.5, 1.5, size=(200, 2))
     idx, off, bary = query_np(mesh, beta)
     area = np.abs(backend.to_numpy(mesh.leaf_area2))[idx]
     vs = backend.to_numpy(mesh.vertices_source)
-    vl = backend.to_numpy(mesh.vertices_lens)
     leaves = backend.to_numpy(mesh.leaves)
     owner = np.repeat(np.arange(len(beta)), np.diff(off))
+    assert idx.shape[0] > 0, "fixture returned no candidates"
     good = area > 1e-10
-    recon = np.einsum("kj,kjd->kd", bary[good], vs[leaves[idx[good]]])
-    assert np.allclose(recon, beta[owner[good]], atol=1e-8)
-    # on degenerate leaves the sanitizer discards the coordinates by design, so
-    # assert only that the seed lies inside the lens-plane triangle
-    seed = np.einsum("kj,kjd->kd", bary, vl[leaves[idx]])
-    for k in np.flatnonzero(~good)[:50]:
-        tri = vl[leaves[idx[k]]]
-        w = np.array(
-            [
-                np.cross(tri[(i + 1) % 3] - seed[k], tri[(i + 2) % 3] - seed[k])
-                for i in range(3)
-            ]
-        )
-        assert (w >= -1e-12).all() or (w <= 1e-12).all()
+    assert (
+        good.all()
+    ), "fixture produced a degenerate leaf; the ~good branch needs writing"
+    recon = np.einsum("kj,kjd->kd", bary, vs[leaves[idx]])
+    assert np.allclose(recon, beta[owner], atol=1e-8)
 
 
 def test_centroid_fallback_on_a_totally_degenerate_leaf():
