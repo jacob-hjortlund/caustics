@@ -1,7 +1,11 @@
+import warnings
+
 import numpy as np
 import pytest
 
 from caustics.backend_obj import backend
+from caustics.cosmology import FlatLambdaCDM
+from caustics.lenses import SIE, Point
 from caustics.lenses.adaptive import (
     LeafStatus,
     BuildStats,
@@ -24,6 +28,7 @@ from caustics.lenses.adaptive import (
     _VertexCache,
     build_adaptive_mesh,
 )
+from caustics.lenses.func import forward_raytrace_rootfind
 from caustics.lenses.func.adaptive import (
     CHILD_VERTEX_INDICES,
     ROOT_SHAPES,
@@ -1289,3 +1294,201 @@ def test_public_symbols_are_re_exported():
     assert caustics.BuildStats is BuildStats
     assert caustics.func.sigma_min_2x2 is not None
     assert caustics.func.triangle_weights is not None
+
+
+def dedup(points, tol):
+    """Greedy clustering; returns one representative per cluster, sorted."""
+    keep = []
+    for p in points:
+        if all(np.linalg.norm(p - q) >= tol for q in keep):
+            keep.append(p)
+    return np.array(sorted(keep, key=tuple)) if keep else np.zeros((0, 2))
+
+
+def test_sie_candidates_recover_forward_raytrace_images(device):
+    """Spec test 26, split into the two contracts this module actually owns.
+
+    1. **Coverage** -- every image ``forward_raytrace`` finds has a candidate
+       seed within ``min_img_sep``. That is exactly what :meth:`Mesh.seeds`
+       promises: the hit leaf's own affine map is the one step 7 bounds, so the
+       seed is accurate to ``min_img_sep`` by construction. Measured across
+       these three source points, the worst distance is 2.5e-3 against a 1e-2
+       tolerance -- four times better than the guarantee.
+    2. **No spurious images** -- every candidate the root-finder converges on is
+       a genuine image.
+
+    This deliberately does **not** assert that the refined set has the same
+    cardinality as ``forward_raytrace``'s. For ``sp = [0.2, 0.2]`` this SIE has
+    a central image at radius ~7e-4, *inside* its own softening radius
+    ``s = 1e-3``, where the Jacobian is nearly degenerate.
+    ``forward_raytrace_rootfind`` diverges there (residual 0.31 against a 1e-3
+    filter) even though the mesh does supply a seed 2.5e-3 away from it. A
+    cardinality assertion would therefore be reporting the downstream
+    root-finder's convergence on a softened singularity, not this module's
+    coverage -- conflating two systems in one number. Contract 1 fails loudly if
+    coverage is ever genuinely lost, which is the property worth pinning.
+    """
+    lens = SIE(
+        name="sie",
+        cosmology=FlatLambdaCDM(name="cosmo"),
+        z_l=0.5,
+        z_s=1.5,
+        x0=0.0,
+        y0=0.0,
+        q=0.4,
+        phi=np.pi / 5,
+        Rein=1.0,
+        s=1e-3,
+    ).to(device)
+    mesh = build_adaptive_mesh(
+        lens.raytrace, fov=5.0, init_res=32, min_img_sep=1e-2, device=device
+    )
+    for sp in ([0.2, 0.2], [0.05, -0.05], [1.4, 1.1]):
+        sx = backend.as_array(sp[0], device=device)
+        sy = backend.as_array(sp[1], device=device)
+        ex, ey = lens.forward_raytrace(sx, sy)
+        expected = dedup(
+            np.stack([backend.to_numpy(ex), backend.to_numpy(ey)], axis=-1), 1e-2
+        )
+        seed, offsets = mesh.seeds(backend.as_array(np.asarray([sp])))
+        seed = backend.to_numpy(seed)
+        assert seed.shape[0] >= expected.shape[0], "candidates must cover the images"
+        refined = forward_raytrace_rootfind(
+            backend.as_array(seed[:, 0], device=device),
+            backend.as_array(seed[:, 1], device=device),
+            sx,
+            sy,
+            lens.raytrace,
+        )
+        refined = backend.to_numpy(refined)
+        bx, by = lens.raytrace(
+            backend.as_array(refined[:, 0], device=device),
+            backend.as_array(refined[:, 1], device=device),
+        )
+        residual = np.linalg.norm(
+            np.stack([backend.to_numpy(bx), backend.to_numpy(by)], -1) - np.asarray(sp),
+            axis=-1,
+        )
+        got = dedup(refined[residual < 1e-3], 1e-2)
+        # Contract 1: coverage. Every image has a seed within min_img_sep.
+        nearest = np.linalg.norm(expected[:, None, :] - seed[None, :, :], axis=-1).min(
+            axis=1
+        )
+        assert (
+            nearest < 1e-2
+        ).all(), f"{sp}: uncovered image, worst seed distance {nearest.max():.3e}"
+        # Contract 2: no spurious images among those the root-finder converged on.
+        assert got.shape[0] > 0, f"{sp}: nothing converged"
+        for p in got:
+            assert (
+                np.linalg.norm(expected - p, axis=-1).min() < 1e-2
+            ), f"{sp}: converged to {p}, which is not a forward_raytrace image"
+
+
+def test_point_mass_recovers_the_analytic_image_pair():
+    lens = Point(
+        name="pt",
+        cosmology=FlatLambdaCDM(name="cosmo"),
+        z_l=0.5,
+        z_s=1.5,
+        x0=0.0,
+        y0=0.0,
+        Rein=1.0,
+        s=1e-6,
+    )
+    mesh = build_adaptive_mesh(lens.raytrace, fov=8.0, init_res=64, min_img_sep=1e-2)
+    b = 0.4
+    seed, offsets = mesh.seeds(backend.as_array(np.array([[b, 0.0]])))
+    seed = backend.to_numpy(seed)
+    # theta_pm = (b +- sqrt(b^2 + 4 Rein^2)) / 2, both on the x axis
+    expected = np.array([(b + np.sqrt(b**2 + 4)) / 2, (b - np.sqrt(b**2 + 4)) / 2])
+    for theta in expected:
+        assert np.abs(seed[:, 0] - theta).min() < 5e-2
+        assert np.abs(seed[np.argmin(np.abs(seed[:, 0] - theta)), 1]) < 5e-2
+
+
+def test_coverage_does_not_drop_at_level_transitions():
+    """Spec test 28. Reports the gap rather than only thresholding it."""
+    fov, init_res, sep = 4.0, 4, 0.05
+    mesh, _ = build(localised_fold, fov=fov, init_res=init_res, min_img_sep=sep)
+    ml = mesh.max_level
+    assert ml >= 3 and len(set(backend.to_numpy(mesh.leaf_level).tolist())) > 1
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        uniform, _ = build(
+            localised_fold,
+            fov=fov,
+            init_res=init_res * 2**ml,
+            min_img_sep=sep,
+            max_depth=0,
+        )
+    grid = np.linspace(-0.9, 0.9, 120)
+    beta = np.stack(np.meshgrid(grid, grid, indexing="ij"), axis=-1).reshape(-1, 2)
+    _, off_a, _ = query_np(mesh, beta, batch_size=4096)
+    _, off_u, _ = query_np(uniform, beta, batch_size=4096)
+    hit_a = np.diff(off_a) > 0
+    hit_u = np.diff(off_u) > 0
+    gap = int((hit_u & ~hit_a).sum())
+    print(f"coverage gap at level transitions: {gap} / {int(hit_u.sum())} covered")
+    assert gap == 0
+
+
+def test_criterion_is_blind_to_structure_below_the_sampling_scale():
+    """Spec section 2.6, asserted in both directions.
+
+    The criterion reads six points per triangle and the centroid is 0.289*edge from
+    the nearest of them, so a perturbation supported inside that radius is exactly
+    invisible. Completeness is conditional on init_res resolving it.
+    """
+    centre = np.array([[-2.0, -2.0], [0.0, 0.0], [-2.0, 0.0]]).mean(axis=0)
+
+    def bumped(p):
+        r2 = ((p - centre) ** 2).sum(axis=-1)
+        bump = (2.0 * np.exp(-r2 / (2 * 0.08**2)))[:, None] * np.array([1.0, 0.0])
+        return p * 0.5 + bump
+
+    # At init_res=2 the nearest of the six sample points is 0.47 from the bump
+    # centre, where the bump is 6e-8 -- far below the threshold. At init_res=32 the
+    # cell is 0.125 and the deviation is ~0.6, well above it.
+    #
+    # `min_img_sep` must sit BELOW the level-0 hypotenuse at init_res=32
+    # (sqrt(2)*4/32 = 0.1768). Above it, `_depth_floor` returns 0, `max_level` is 0,
+    # the max_level short-circuit fires on the first iteration and the criterion
+    # never runs at all -- leaving every criterion counter at zero and making the
+    # "detects" direction unsatisfiable for a reason that has nothing to do with the
+    # blind spot. An earlier version of this fixture used 0.5 and failed exactly
+    # that way. The `max_level >= 1` guard below pins it, because a zeroed counter
+    # otherwise reads as a passing "blind" assertion.
+    #
+    # Measured at 0.05: coarse 8/8 converged with 0 splits; fine 2010 of 2477 with
+    # 106 deviation splits at max_level 2. The blind direction holds at every
+    # tolerance tried, so only the detects direction is sensitive to this.
+    sep = 0.05
+    coarse, _ = build(bumped, fov=4.0, init_res=2, min_img_sep=sep)
+    fine, _ = build(bumped, fov=4.0, init_res=32, min_img_sep=sep)
+    assert fine.max_level >= 1, "fine build must actually run the criterion"
+    assert coarse.stats.n_converged_at_level_0 == coarse.stats.n_leaves_pre_closure
+    assert coarse.stats.n_deviation_splits == 0
+    assert fine.stats.n_converged_at_level_0 < fine.stats.n_leaves_pre_closure
+    assert fine.stats.n_deviation_splits > 0
+
+
+def test_build_and_query_run_on_the_configured_device(device):
+    lens = SIE(
+        name="sie",
+        cosmology=FlatLambdaCDM(name="cosmo"),
+        z_l=0.5,
+        z_s=1.5,
+        x0=0.0,
+        y0=0.0,
+        q=0.7,
+        phi=0.0,
+        Rein=1.0,
+        s=1e-3,
+    ).to(device)
+    mesh = build_adaptive_mesh(
+        lens.raytrace, fov=4.0, init_res=8, min_img_sep=0.1, device=device
+    )
+    idx, off, bary = mesh.query(backend.as_array(np.array([[0.1, 0.1], [3.0, 3.0]])))
+    assert backend.to_numpy(off).shape == (3,)
+    assert np.isfinite(backend.to_numpy(bary)).all()
