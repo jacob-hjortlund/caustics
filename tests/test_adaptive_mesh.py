@@ -1232,6 +1232,18 @@ def test_geometry_wrappers_match_a_manual_gather():
         assert np.array_equal(backend.to_numpy(offsets), backend.to_numpy(off))
 
 
+def cross2(u, v):
+    """Scalar cross product of 2-D vectors.
+
+    ``np.cross`` on 2-vectors is deprecated in NumPy 2.0 and emits a
+    ``DeprecationWarning`` per call -- 141 of them across this file's runs, and
+    a hard failure under ``-W error::DeprecationWarning``. This is the same
+    value, computed the way :func:`signed_area` above already does it, and is
+    bit-identical to the ``np.cross`` result.
+    """
+    return u[..., 0] * v[..., 1] - u[..., 1] * v[..., 0]
+
+
 def test_seeds_lie_inside_their_lens_triangle():
     mesh, _ = build(localised_fold, min_img_sep=0.05)
     beta = RNG.uniform(-1.5, 1.5, size=(50, 2))
@@ -1245,7 +1257,7 @@ def test_seeds_lie_inside_their_lens_triangle():
     for k in range(len(s)):
         w = np.array(
             [
-                np.cross(tri[k, (i + 1) % 3] - s[k], tri[k, (i + 2) % 3] - s[k])
+                cross2(tri[k, (i + 1) % 3] - s[k], tri[k, (i + 2) % 3] - s[k])
                 for i in range(3)
             ]
         )
