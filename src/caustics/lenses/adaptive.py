@@ -19,13 +19,21 @@ on a shared edge returns both leaves, and near-critical leaves overlap.
 from dataclasses import dataclass
 from enum import IntEnum
 from math import ceil, log2
+from typing import Any, Callable, Optional, Tuple
+from warnings import warn
 
 import numpy as np
 
-from ..backend_obj import backend
-from .func.adaptive import CHILD_VERTEX_INDICES, ROOT_SHAPES, evaluate_criterion
+from ..backend_obj import ArrayLike, backend
+from .func.adaptive import (
+    CHILD_VERTEX_INDICES,
+    ROOT_SHAPES,
+    child_matrix_tables,
+    evaluate_criterion,
+    shape_matrix,
+)
 
-__all__ = ["LeafStatus"]
+__all__ = ["LeafStatus", "BuildStats", "Mesh", "build_adaptive_mesh"]
 
 _MAX_KEY = 2**63 - 1
 
@@ -293,21 +301,22 @@ def _make_raytrace_np(raytrace, device):
     to exactly zero, which the test reads as "perfectly affine" and converges. That
     is the fail-open direction and no clamp fixes it, so the build is always float64.
     """
-    checked = {"done": False}
+    info = {"done": False, "dtype": np.dtype(np.float64)}
 
     def call(xy):
         x = backend.as_array(xy[:, 0], dtype=backend.float64, device=device)
         y = backend.as_array(xy[:, 1], dtype=backend.float64, device=device)
         out = raytrace(x, y)
-        if not checked["done"]:
+        if not info["done"]:
             if not isinstance(out, tuple) or len(out) != 2:
                 raise ValueError(
                     "raytrace must return a 2-tuple (bx, by) of arrays with shape "
                     f"(N,); got {type(out).__name__}"
                 )
-            checked["done"] = True
+            info["done"] = True
         bx = backend.to_numpy(out[0]).reshape(-1)
         by = backend.to_numpy(out[1]).reshape(-1)
+        info["dtype"] = bx.dtype
         if bx.shape[0] != xy.shape[0] or by.shape[0] != xy.shape[0]:
             raise ValueError(
                 f"raytrace returned {bx.shape[0]} points for {xy.shape[0]} inputs; "
@@ -315,6 +324,7 @@ def _make_raytrace_np(raytrace, device):
             )
         return np.stack((bx, by), axis=-1).astype(np.float64)
 
+    call.info = info
     return call
 
 
@@ -690,3 +700,363 @@ def _close(lattice, cache, active, v, level, status):
             leaves[o + t] = kids[:, t, :]
 
     return leaves, origin, level[origin], status[origin]
+
+
+@dataclass(frozen=True)
+class BuildStats:
+    """
+    Diagnostics from a mesh build. All leaf counts are **pre-closure** except
+    ``n_leaves``, since closure only re-tiles existing leaves.
+
+    ``n_converged_at_level_0`` is the diagnostic for the module's known blind spot:
+    the criterion samples six points per triangle and cannot see structure below
+    that scale, so completeness is conditional on ``init_res`` already resolving the
+    smallest curvature scale in the lens. A large level-0 convergence fraction means
+    the mesh never looked below ``init_res`` anywhere and that precondition went
+    untested.
+
+    A triangle failing both parity and deviation is counted in ``n_parity_splits``;
+    ``n_deviation_splits`` counts only among parity-passers.
+    """
+
+    d_floor: int
+    max_level: int
+    depth_limited: bool
+    l_max_final: float
+    n_converged: int
+    n_size_floor: int
+    n_forced: int
+    n_invalid: int
+    n_converged_at_level_0: int
+    n_parity_splits: int
+    n_deviation_splits: int
+    leaves_by_level: Tuple[int, ...]
+    n_nonfinite_vertices: int
+    n_sigma_min_exactly_zero: int
+    n_boundary_leaves_at_floor: int
+    n_vertices: int
+    n_leaves_pre_closure: int
+    n_leaves: int
+    n_closure_by_pattern: Tuple[int, int, int]
+    raytrace_dtype: str
+    cancellation_floor: float
+
+
+def _numpy_dtype(dtype):
+    """NumPy equivalent of a backend float dtype; float64 when unspecified."""
+    if dtype is None:
+        return np.dtype(np.float64)
+    return backend.to_numpy(backend.zeros((), dtype=dtype)).dtype
+
+
+def _build_index(vs, leaves, valid_rows, index_cells):
+    """
+    Uniform-grid CSR index over source-plane axis-aligned bounding boxes.
+
+    One cell lookup per query is complete: ``beta`` lies in the triangle, which lies
+    in its AABB, which is covered by the cells the leaf registered in, so ``beta``'s
+    own cell always contains any leaf containing ``beta``. No neighbour search is
+    needed. Per-cell lists are stored ascending, which gives ``query`` its sorted
+    CSR blocks with no sort at query time.
+    """
+    tri = vs[leaves[valid_rows]].astype(np.float64)
+    if tri.shape[0] == 0:
+        lo = np.zeros(2)
+        return lo, np.ones(2), 1, 1, np.zeros(2, np.int64), np.empty(0, np.int64)
+    flat = tri.reshape(-1, 2)
+    lo, hi = flat.min(axis=0), flat.max(axis=0)
+    span = np.where(hi > lo, hi - lo, 1.0)  # a degenerate axis becomes one cell
+    if index_cells is None:
+        c = np.sqrt(span[0] * span[1] / tri.shape[0])
+    else:
+        c = float(span.max()) / int(index_cells)
+    c = max(float(c), np.finfo(np.float64).tiny)
+    nx = max(1, int(ceil(span[0] / c)))
+    ny = max(1, int(ceil(span[1] / c)))
+    cell = span / np.array([nx, ny], dtype=np.float64)
+
+    upper = np.array([nx - 1, ny - 1], dtype=np.int64)
+    i0 = np.clip(((tri.min(axis=1) - lo) / cell).astype(np.int64), 0, upper)
+    i1 = np.clip(((tri.max(axis=1) - lo) / cell).astype(np.int64), 0, upper)
+    tall = i1[:, 1] - i0[:, 1] + 1
+    counts = (i1[:, 0] - i0[:, 0] + 1) * tall
+    owner = np.repeat(np.arange(counts.size), counts)
+    within = np.arange(int(counts.sum())) - np.repeat(
+        np.cumsum(counts) - counts, counts
+    )
+    cell_id = (i0[owner, 0] + within // tall[owner]) * ny + (
+        i0[owner, 1] + within % tall[owner]
+    )
+    leaf_id = valid_rows[owner]
+    order = np.lexsort((leaf_id, cell_id))  # ascending leaf id within each cell
+    cell_leaves = leaf_id[order]
+    cell_offsets = np.searchsorted(cell_id[order], np.arange(nx * ny + 1))
+    return lo, cell, nx, ny, cell_offsets.astype(np.int64), cell_leaves
+
+
+class Mesh:
+    """
+    A frozen adaptive mesh of the lens plane, queryable from the source plane.
+
+    One topology, two embeddings. Vertex index ``v`` is shared across both planes;
+    there is no separate source-plane triangle table, so the correspondence is
+    structural rather than an invariant kept in sync.
+
+    ``INVALID`` leaves remain in ``leaves``, ``leaf_status`` and the conformity
+    relation but are never registered in the spatial index, so :meth:`query` cannot
+    return them. That is a genuine coverage hole in the lens plane.
+    """
+
+    def __init__(
+        self,
+        vertices_lens,
+        vertices_source,
+        leaves,
+        leaf_area2,
+        leaf_origin,
+        leaf_status,
+        leaf_level,
+        origin_leaves,
+        index,
+        stats,
+        d_floor,
+        max_level,
+        dtype,
+        device,
+    ):
+        self.vertices_lens = vertices_lens
+        self.vertices_source = vertices_source
+        self.leaves = leaves
+        self.leaf_area2 = leaf_area2
+        self.leaf_origin = leaf_origin
+        self.leaf_status = leaf_status
+        self.leaf_level = leaf_level
+        self.origin_leaves = origin_leaves
+        self.stats = stats
+        self.d_floor = d_floor
+        self.max_level = max_level
+        self.dtype = dtype
+        self.device = device
+        (
+            self._index_lo,
+            self._index_cell,
+            self._nx,
+            self._ny,
+            self._cell_offsets,
+            self._cell_leaves,
+        ) = index
+
+
+def build_adaptive_mesh(
+    raytrace: Callable[[ArrayLike, ArrayLike], Tuple[ArrayLike, ArrayLike]],
+    fov: float,
+    init_res: int,
+    min_img_sep: float,
+    max_depth: int = 25,
+    *,
+    x0: float = 0.0,
+    y0: float = 0.0,
+    device: Optional[Any] = None,
+    dtype: Optional[Any] = None,
+    raytrace_batch_size: Optional[int] = None,
+    index_cells: Optional[int] = None,
+) -> Mesh:
+    """
+    Build an adaptively refined triangular mesh of the lens plane.
+
+    The mesh is built once and reused across many queries; it does not depend on any
+    query point.
+
+    Parameters
+    ----------
+    raytrace: Callable
+        Maps lens-plane to source-plane coordinates, called as
+        ``raytrace(x, y) -> (bx, by)`` on 1-D arrays of shape ``(N,)``.
+    fov: float
+        Side length of the square lens-plane domain.
+
+        *Unit: arcsec*
+
+    init_res: int
+        Number of **cells** per axis, giving ``2 * init_res**2`` level-0 triangles.
+        Note this differs from ``forward_raytrace``'s ``divisions``, which counts
+        ``linspace`` *points* and yields ``(n - 1)**2`` cells.
+
+        This is also the parameter carrying the completeness obligation: the
+        criterion samples six points per triangle, so structure below the level-0
+        scale is invisible to it. ``init_res`` must already resolve the smallest
+        curvature scale in the lens; ``stats.n_converged_at_level_0`` is the check.
+    min_img_sep: float
+        Lens-plane tolerance, in two roles: the size floor ``l_max <= min_img_sep``
+        and the step-7 threshold. No converged leaf hides an image pair separated by
+        more than ``min_img_sep / 4``.
+
+        *Unit: arcsec*
+
+    max_depth: int
+        Hard cap on refinement level. Refinement runs to
+        ``min(max_depth, d_floor)``; a warning is raised if ``max_depth`` binds.
+    x0, y0: float
+        Centre of the domain.
+
+        *Unit: arcsec*
+
+    device: Optional
+        Device for the coordinates handed to ``raytrace`` and for the frozen mesh.
+    dtype: Optional
+        Frozen-mesh dtype. Defaults to float64, the build dtype. Pass
+        ``backend.float32`` to halve query memory.
+    raytrace_batch_size: Optional[int]
+        Splits each per-level ``raytrace`` call for memory. One logical batch per
+        level is preserved.
+    index_cells: Optional[int]
+        Spatial-index cells along the longer axis of the source-plane bounding box.
+
+    Returns
+    -------
+    Mesh
+    """
+    _validate_build_args(fov, init_res, min_img_sep, max_depth)
+    d_floor = _depth_floor(fov, init_res, min_img_sep)
+    max_level = min(int(max_depth), d_floor)
+    l_max_final = float(np.sqrt(2.0) * fov / (init_res * 2**max_level))
+    if d_floor > max_depth:
+        warn(
+            f"Adaptive mesh is depth-limited: max_depth={max_depth} is below "
+            f"d_floor={d_floor}, the depth required to reach "
+            f"min_img_sep={min_img_sep:g} arcsec. Refinement stops at level "
+            f"{max_level}, where the maximum leaf edge is {l_max_final:.3g} arcsec. "
+            f"Set max_depth >= {d_floor} to restore the size-floor guarantee, or "
+            f"raise init_res / min_img_sep."
+        )
+
+    tables = child_matrix_tables()
+    lattice = _Lattice(fov, x0, y0, init_res, max_level)
+    raytrace_np = _make_raytrace_np(raytrace, device)
+    ref = _refine(
+        raytrace_np,
+        lattice,
+        init_res,
+        fov / init_res,
+        min_img_sep,
+        max_level,
+        tables,
+        raytrace_batch_size,
+    )
+
+    eps = float(np.finfo(raytrace_np.info["dtype"]).eps)
+    cancellation_floor = float(np.sqrt(8.0 * eps * fov))
+    if cancellation_floor > min_img_sep:
+        warn(
+            f"raytrace returned {raytrace_np.info['dtype']}, whose cancellation "
+            f"floor sqrt(8*eps*fov) = {cancellation_floor:.3g} arcsec exceeds "
+            f"min_img_sep={min_img_sep:g}. Below that scale the midpoint deviation "
+            "cancels to zero, which the criterion reads as 'affine' and converges. "
+            "Supply a raytrace that preserves float64."
+        )
+
+    pre_v, pre_level, pre_cls, pre_status = ref.store.compact()
+    order = _canonical_order(lattice, ref.cache, pre_v)
+    pre_v, pre_level, pre_status = pre_v[order], pre_level[order], pre_status[order]
+    leaf_v, origin, leaf_level, leaf_status = _close(
+        lattice, ref.cache, ref.active, pre_v, pre_level, pre_status
+    )
+
+    # Compaction: sorting by lattice key makes vertex order a function of the
+    # geometry alone and gives row-major locality for query-time gathers.
+    used = np.unique(np.concatenate([leaf_v.reshape(-1), pre_v.reshape(-1)]))
+    used = used[np.argsort(lattice.key(ref.cache.ij[used]), kind="stable")]
+    remap = np.zeros(len(ref.cache), dtype=np.int64)
+    remap[used] = np.arange(used.size, dtype=np.int64)
+    leaves_np = remap[leaf_v]
+    origin_leaves_np = remap[pre_v]
+
+    np_dtype = _numpy_dtype(dtype)
+    vl = lattice.xy(ref.cache.ij[used]).astype(np_dtype)
+    vs = ref.cache.beta[used].astype(np_dtype)
+
+    # Re-check finiteness at freeze. A FORCED leaf inherits vertices from a parent
+    # whose midpoints were never finiteness-tested, and a closure triangle can pick
+    # up a midpoint that no criterion ever saw, so a non-finite vertex can reach
+    # here on a leaf not already marked INVALID. Without this it would enter the
+    # index and swallow every query in its cell.
+    #
+    # Invalidity is propagated UP to the origin and then back down, rather than
+    # being applied to the leaves alone: the termination-reason counts are
+    # pre-closure, so marking only the leaf would leave `n_converged + n_size_floor
+    # + n_forced + n_invalid` disagreeing with `n_leaves_pre_closure`. It is also
+    # the conservative direction -- if one triangle of a region has a bad vertex,
+    # the region is not trustworthy.
+    leaf_finite = np.isfinite(vs[leaves_np]).all(axis=(1, 2))
+    origin_bad = np.zeros(pre_v.shape[0], dtype=bool)
+    np.logical_or.at(origin_bad, origin, ~leaf_finite)
+    pre_status = np.where(origin_bad, np.int8(LeafStatus.INVALID), pre_status)
+    leaf_status = pre_status[origin]
+
+    P = shape_matrix(vs[leaves_np])
+    leaf_area2 = P[:, 0, 0] * P[:, 1, 1] - P[:, 0, 1] * P[:, 1, 0]
+    valid_rows = np.flatnonzero(leaf_status != LeafStatus.INVALID)
+    index = _build_index(vs, leaves_np, valid_rows, index_cells)
+
+    group_sizes = np.bincount(origin, minlength=pre_v.shape[0])
+    boundary = lattice.on_boundary(ref.cache.ij[pre_v]).any(axis=1)
+    stats = BuildStats(
+        d_floor=d_floor,
+        max_level=max_level,
+        depth_limited=d_floor > max_depth,
+        l_max_final=l_max_final,
+        n_converged=int((pre_status == LeafStatus.CONVERGED).sum()),
+        n_size_floor=int((pre_status == LeafStatus.SIZE_FLOOR).sum()),
+        n_forced=int((pre_status == LeafStatus.FORCED).sum()),
+        n_invalid=int((pre_status == LeafStatus.INVALID).sum()),
+        n_converged_at_level_0=int(ref.counters["converged_level0"]),
+        n_parity_splits=int(ref.counters["parity_splits"]),
+        n_deviation_splits=int(ref.counters["deviation_splits"]),
+        leaves_by_level=tuple(
+            int(n) for n in np.bincount(pre_level, minlength=max_level + 1)
+        ),
+        n_nonfinite_vertices=int((~np.isfinite(ref.cache.beta).all(axis=1)).sum()),
+        n_sigma_min_exactly_zero=int(ref.counters["sigma_zero"]),
+        n_boundary_leaves_at_floor=int(
+            (boundary & (pre_status == LeafStatus.SIZE_FLOOR)).sum()
+        ),
+        n_vertices=int(used.size),
+        n_leaves_pre_closure=int(pre_v.shape[0]),
+        n_leaves=int(leaves_np.shape[0]),
+        n_closure_by_pattern=(
+            int((group_sizes == 2).sum()),
+            int((group_sizes == 3).sum()),
+            int((group_sizes == 4).sum()),
+        ),
+        raytrace_dtype=str(raytrace_np.info["dtype"]),
+        cancellation_floor=cancellation_floor,
+    )
+
+    def to_backend(array, integer=False):
+        if integer:
+            return backend.as_array(array, dtype=backend.module.int64, device=device)
+        return backend.as_array(array, device=device)
+
+    return Mesh(
+        vertices_lens=to_backend(vl),
+        vertices_source=to_backend(vs),
+        leaves=to_backend(leaves_np, integer=True),
+        leaf_area2=to_backend(leaf_area2),
+        leaf_origin=to_backend(origin, integer=True),
+        leaf_status=to_backend(leaf_status.astype(np.int64), integer=True),
+        leaf_level=to_backend(leaf_level, integer=True),
+        origin_leaves=to_backend(origin_leaves_np, integer=True),
+        index=(
+            to_backend(index[0]),
+            to_backend(index[1]),
+            index[2],
+            index[3],
+            to_backend(index[4], integer=True),
+            to_backend(index[5], integer=True),
+        ),
+        stats=stats,
+        d_floor=d_floor,
+        max_level=max_level,
+        dtype=np_dtype,
+        device=device,
+    )

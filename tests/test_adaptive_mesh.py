@@ -19,6 +19,7 @@ from caustics.lenses.adaptive import (
     _refine,
     _validate_build_args,
     _VertexCache,
+    build_adaptive_mesh,
 )
 from caustics.lenses.func.adaptive import (
     CHILD_VERTEX_INDICES,
@@ -876,3 +877,148 @@ def test_closure_adds_no_new_vertices():
     )
     assert leaves.max() < n_pre
     assert set(np.unique(leaves)) <= set(range(n_pre))
+
+
+def build(fn, fov=4.0, init_res=4, min_img_sep=0.25, **kw):
+    raytrace, calls = make_counting_raytrace(fn)
+    mesh = build_adaptive_mesh(raytrace, fov, init_res, min_img_sep, **kw)
+    return mesh, calls
+
+
+def test_build_returns_a_consistent_mesh_for_an_affine_map():
+    mesh, calls = build(lambda p: p @ AFFINE.T)
+    L = mesh.leaves.shape[0]
+    assert L == 2 * 4**2
+    assert mesh.stats.n_converged == L and mesh.stats.n_invalid == 0
+    assert mesh.stats.n_leaves_pre_closure == L
+    assert np.array_equal(backend.to_numpy(mesh.leaf_origin), np.arange(L))
+    src = backend.to_numpy(mesh.vertices_source)
+    lens = backend.to_numpy(mesh.vertices_lens)
+    assert np.allclose(src, lens @ AFFINE.T, rtol=1e-10, atol=1e-12)
+
+
+def test_leaf_area2_is_computed_from_the_stored_source_vertices():
+    mesh, calls = build(localised_fold, min_img_sep=0.05)
+    tri = backend.to_numpy(mesh.vertices_source)[backend.to_numpy(mesh.leaves)]
+    P = shape_matrix(tri)
+    expected = P[:, 0, 0] * P[:, 1, 1] - P[:, 0, 1] * P[:, 1, 0]
+    assert np.array_equal(backend.to_numpy(mesh.leaf_area2), expected)
+
+
+def test_vertices_are_compacted_and_ordered_by_lattice_key():
+    mesh, calls = build(localised_fold, min_img_sep=0.05)
+    used = np.unique(backend.to_numpy(mesh.leaves))
+    assert used.tolist() == list(range(mesh.vertices_lens.shape[0]))
+    lens = backend.to_numpy(mesh.vertices_lens)
+    key = np.lexsort((lens[:, 1], lens[:, 0]))
+    assert np.array_equal(key, np.arange(len(lens)))
+
+
+def test_leaf_origin_survives_the_vertex_remap():
+    """Spec test 15, at Mesh level: the compaction must not scramble origins."""
+    mesh, _ = build(localised_fold, min_img_sep=0.05)
+    leaves = backend.to_numpy(mesh.leaves)
+    origin = backend.to_numpy(mesh.leaf_origin)
+    origins = backend.to_numpy(mesh.origin_leaves)
+    vl = backend.to_numpy(mesh.vertices_lens)
+    assert (origin >= 0).all() and (origin < origins.shape[0]).all()
+    assert (np.diff(origin) >= 0).all()
+    _, counts = np.unique(origin, return_counts=True)
+    solo = np.flatnonzero(counts == 1)
+    assert solo.size > 0
+    for o in solo[:20]:
+        row = np.flatnonzero(origin == o)[0]
+        assert np.array_equal(leaves[row], origins[o])
+    child = signed_area(vl[leaves])
+    parent = signed_area(vl[origins])
+    summed = np.zeros_like(parent)
+    np.add.at(summed, origin, child)
+    assert np.allclose(summed, parent, rtol=1e-10)
+
+
+def test_build_is_deterministic():
+    a, _ = build(localised_fold, min_img_sep=0.05)
+    b, _ = build(localised_fold, min_img_sep=0.05)
+    for name in ("leaves", "leaf_area2", "leaf_origin", "leaf_status", "leaf_level"):
+        assert np.array_equal(
+            backend.to_numpy(getattr(a, name)), backend.to_numpy(getattr(b, name))
+        )
+    assert np.array_equal(
+        backend.to_numpy(a.vertices_source), backend.to_numpy(b.vertices_source)
+    )
+
+
+def test_depth_limit_warns_and_names_the_required_max_depth():
+    with pytest.warns(UserWarning, match=r"Set max_depth >= \d+"):
+        mesh, _ = build(localised_fold, min_img_sep=1e-4, max_depth=2)
+    assert mesh.stats.depth_limited
+    assert mesh.stats.max_level == 2
+    assert mesh.stats.d_floor > 2
+
+
+def test_invalid_leaves_are_kept_but_excluded_from_the_index():
+    def broken(p):
+        out = localised_fold(p)
+        out[p[:, 0] > 1.0] = np.inf
+        return out
+
+    mesh, _ = build(broken, min_img_sep=0.05)
+    status = backend.to_numpy(mesh.leaf_status)
+    assert (status == LeafStatus.INVALID).any()
+    assert mesh.stats.n_invalid > 0
+    assert mesh.stats.n_nonfinite_vertices > 0
+    indexed = set(backend.to_numpy(mesh._cell_leaves).tolist())
+    assert not indexed & set(np.flatnonzero(status == LeafStatus.INVALID).tolist())
+
+
+def test_every_indexed_leaf_has_finite_source_vertices():
+    def broken(p):
+        out = localised_fold(p)
+        out[p[:, 0] > 1.0] = np.nan
+        return out
+
+    mesh, _ = build(broken, min_img_sep=0.05)
+    vs = backend.to_numpy(mesh.vertices_source)
+    leaves = backend.to_numpy(mesh.leaves)
+    for leaf in np.unique(backend.to_numpy(mesh._cell_leaves)):
+        assert np.isfinite(vs[leaves[leaf]]).all()
+
+
+def test_index_registers_every_leaf_in_the_cell_of_each_of_its_vertices():
+    mesh, _ = build(localised_fold, min_img_sep=0.05)
+    vs = backend.to_numpy(mesh.vertices_source)
+    leaves = backend.to_numpy(mesh.leaves)
+    offs = backend.to_numpy(mesh._cell_offsets)
+    cells = backend.to_numpy(mesh._cell_leaves)
+    lo = backend.to_numpy(mesh._index_lo)
+    cell = backend.to_numpy(mesh._index_cell)
+    status = backend.to_numpy(mesh.leaf_status)
+    for leaf in RNG.choice(len(leaves), size=50, replace=False):
+        if status[leaf] == LeafStatus.INVALID:
+            continue
+        for q in vs[leaves[leaf]]:
+            ix = int(np.clip((q[0] - lo[0]) // cell[0], 0, mesh._nx - 1))
+            iy = int(np.clip((q[1] - lo[1]) // cell[1], 0, mesh._ny - 1))
+            c = ix * mesh._ny + iy
+            assert leaf in cells[offs[c] : offs[c + 1]]
+
+
+def test_stats_report_level_zero_convergence_and_termination_split():
+    mesh, _ = build(localised_fold, min_img_sep=0.05)
+    s = mesh.stats
+    assert (
+        s.n_converged + s.n_size_floor + s.n_forced + s.n_invalid
+        == s.n_leaves_pre_closure
+    )
+    assert len(s.leaves_by_level) == s.max_level + 1
+    assert sum(s.leaves_by_level) == s.n_leaves_pre_closure
+    assert s.n_converged_at_level_0 >= 0
+    assert s.cancellation_floor < 1e-6  # float64 build
+    assert s.n_vertices == mesh.vertices_lens.shape[0]
+
+
+def test_kappa_one_sheet_builds_without_nan():
+    mesh, calls = build(lambda p: np.zeros_like(p), min_img_sep=0.5)
+    assert mesh.stats.n_sigma_min_exactly_zero > 0
+    assert not np.isnan(backend.to_numpy(mesh.vertices_source)).any()
+    assert backend.to_numpy(mesh.leaf_level).max() == mesh.max_level
