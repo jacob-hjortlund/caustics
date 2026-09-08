@@ -672,7 +672,22 @@ def test_cascade_produces_forced_children():
     assert ref.counters["cascade_rounds"] > 0
 
 
-def test_forced_children_inherit_invalid_from_their_parent():
+def test_forced_and_invalid_statuses_are_mutually_consistent():
+    """FORCED leaves are finite; INVALID leaves are not.
+
+    Each status is asserted independently. A single ``.any()`` over the union of
+    the two would be satisfied by FORCED alone -- which ``localised_fold``
+    already guarantees via ``test_cascade_produces_forced_children`` -- leaving
+    the INVALID half of the claim unfalsifiable.
+
+    Note this does NOT pin the cascade's INVALID-*inheritance* arm (the
+    ``np.where`` that gives a forced child INVALID when its parent was INVALID).
+    Reaching that arm requires an INVALID leaf to become a 2:1 violator, and
+    whether this fixture produces one is not determinable from the frozen mesh:
+    an inherited-INVALID child may itself contain the bad point, so it is
+    indistinguishable from a criterion-path INVALID leaf after the fact.
+    """
+
     def half_bad(p):
         out = localised_fold(p)
         out[p[:, 0] > 1.0] = np.nan
@@ -682,10 +697,16 @@ def test_forced_children_inherit_invalid_from_their_parent():
         half_bad, fov=4.0, init_res=4, min_img_sep=0.05
     )
     v, level, cls, status = ref.store.compact()
-    forced_or_invalid = np.isin(status, [LeafStatus.FORCED, LeafStatus.INVALID])
-    assert forced_or_invalid.any()
+    assert (status == LeafStatus.FORCED).any()
+    assert (status == LeafStatus.INVALID).any()
+    # A FORCED child descends from a non-INVALID parent, whose vertices were
+    # verified finite before it was allowed to split.
     for row in np.flatnonzero(status == LeafStatus.FORCED):
         assert np.isfinite(ref.cache.beta[v[row]]).all()
+    # Conversely, no INVALID leaf may have all-finite vertices: the label is
+    # only ever applied because some point of the triangle failed the check.
+    inv_beta = ref.cache.beta[v[status == LeafStatus.INVALID]]
+    assert not np.isfinite(inv_beta).all(axis=(1, 2)).any()
 
 
 def test_cascade_still_evaluates_every_point_exactly_once():

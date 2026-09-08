@@ -372,7 +372,31 @@ def _find_unbalanced(store, cache, lattice, active, max_level, frontier_level):
     have been invalidated by it, so the scan skips most of the store.
     ``level <= max_level - 2`` is an integrality requirement: below it the quarter
     points are not lattice points and no finer neighbour can exist.
+
+    Parameters
+    ----------
+    store: _LeafStore
+        Terminal triangles; only rows with ``valid`` set are scanned.
+    cache: _VertexCache
+        Supplies the lattice coordinates of each row's vertices.
+    lattice: _Lattice
+        Used to key the quarter points.
+    active: _ActiveKeys
+        Pre-existing active-vertex set; membership decides a violation.
+    max_level: int
+        Finest allowed level.
+    frontier_level: int
+        Level of the finest triangles created in the current round.
+
+    Returns
+    -------
+    ndarray
+        Int64 indices into ``store``'s rows.
     """
+    # ``frontier_level <= max_level`` holds for every call `_refine` makes, so the
+    # first term always binds and the second is unreachable defensive code today.
+    # Keep the min(): it is what makes the integrality precondition of
+    # `_edge_quarter_keys` a property of this function rather than of its caller.
     bound = min(frontier_level - 2, max_level - 2)
     cand = np.flatnonzero(store.valid & (store.level <= bound))
     if cand.size == 0:
