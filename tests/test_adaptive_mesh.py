@@ -1474,6 +1474,14 @@ def test_criterion_is_blind_to_structure_below_the_sampling_scale():
 
 
 def test_build_and_query_run_on_the_configured_device(device):
+    """Build and query complete on the configured device and return sane CSR.
+
+    Note what this does **not** verify: every array is converted through
+    ``backend.to_numpy`` before inspection, so this test cannot distinguish
+    "computed on the requested device" from "computed elsewhere and converted
+    back". It pins that the pipeline runs end to end under the ``device``
+    fixture and returns coherent results, not placement.
+    """
     lens = SIE(
         name="sie",
         cosmology=FlatLambdaCDM(name="cosmo"),
@@ -1490,5 +1498,14 @@ def test_build_and_query_run_on_the_configured_device(device):
         lens.raytrace, fov=4.0, init_res=8, min_img_sep=0.1, device=device
     )
     idx, off, bary = mesh.query(backend.as_array(np.array([[0.1, 0.1], [3.0, 3.0]])))
-    assert backend.to_numpy(off).shape == (3,)
-    assert np.isfinite(backend.to_numpy(bary)).all()
+    off_np = backend.to_numpy(off)
+    bary_np = backend.to_numpy(bary)
+    assert off_np.shape == (3,)
+    # The hit/miss pair is what makes this falsifiable. `off.shape` is
+    # `(B + 1,)` for any B by the CSR contract, and `np.isfinite` is vacuously
+    # True on an empty array, so shape-plus-finiteness alone would pass even if
+    # the query silently returned nothing for both points. Measured: [0, 3, 3].
+    assert off_np[1] > off_np[0], "the interior source point must hit a leaf"
+    assert off_np[2] == off_np[1], "the far exterior point must hit nothing"
+    assert bary_np.shape[0] == off_np[-1], "bary rows must match the CSR total"
+    assert np.isfinite(bary_np).all()
