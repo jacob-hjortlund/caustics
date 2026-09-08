@@ -4,6 +4,8 @@ import pytest
 from caustics.backend_obj import backend
 from caustics.lenses.adaptive import (
     LeafStatus,
+    BuildStats,
+    Mesh,
     _ActiveKeys,
     _canonical_order,
     _close,
@@ -1212,3 +1214,66 @@ def test_centroid_fallback_on_a_totally_degenerate_leaf():
     assert (lvl == mesh.max_level).all()
     l_max = np.sqrt(2) * 4.0 / (4 * 2**mesh.max_level)
     assert l_max <= 0.5
+
+
+def test_geometry_wrappers_match_a_manual_gather():
+    mesh, _ = build(localised_fold, min_img_sep=0.05)
+    beta = RNG.uniform(-1.5, 1.5, size=(30, 2))
+    idx, off, bary = mesh.query(beta)
+    for name, verts in (
+        ("triangles_lens", mesh.vertices_lens),
+        ("triangles_source", mesh.vertices_source),
+    ):
+        via_beta, offsets = getattr(mesh, name)(beta)
+        via_idx = getattr(mesh, name)(leaf_indices=idx)
+        manual = verts[mesh.leaves[idx]]
+        assert np.array_equal(backend.to_numpy(via_beta), backend.to_numpy(manual))
+        assert np.array_equal(backend.to_numpy(via_idx), backend.to_numpy(manual))
+        assert np.array_equal(backend.to_numpy(offsets), backend.to_numpy(off))
+
+
+def test_seeds_lie_inside_their_lens_triangle():
+    mesh, _ = build(localised_fold, min_img_sep=0.05)
+    beta = RNG.uniform(-1.5, 1.5, size=(50, 2))
+    idx, off, bary = mesh.query(beta)
+    seed, offsets = mesh.seeds(beta)
+    direct = mesh.seeds(leaf_indices=idx, bary=bary)
+    assert np.allclose(backend.to_numpy(seed), backend.to_numpy(direct))
+    assert np.array_equal(backend.to_numpy(offsets), backend.to_numpy(off))
+    tri = backend.to_numpy(mesh.triangles_lens(leaf_indices=idx))
+    s = backend.to_numpy(seed)
+    for k in range(len(s)):
+        w = np.array(
+            [
+                np.cross(tri[k, (i + 1) % 3] - s[k], tri[k, (i + 2) % 3] - s[k])
+                for i in range(3)
+            ]
+        )
+        assert (w >= -1e-9).all() or (w <= 1e-9).all()
+
+
+@pytest.mark.parametrize("name", ["triangles_lens", "triangles_source", "seeds"])
+def test_wrappers_reject_ambiguous_arguments(name):
+    mesh, _ = build(lambda p: p @ AFFINE.T)
+    fn = getattr(mesh, name)
+    with pytest.raises(ValueError):
+        fn()
+    with pytest.raises(ValueError):
+        fn(np.zeros((1, 2)), leaf_indices=backend.as_array([0]))
+
+
+def test_seeds_requires_bary_with_leaf_indices():
+    mesh, _ = build(lambda p: p @ AFFINE.T)
+    with pytest.raises(ValueError, match="bary"):
+        mesh.seeds(leaf_indices=backend.as_array([0]))
+
+
+def test_public_symbols_are_re_exported():
+    import caustics
+
+    assert caustics.build_adaptive_mesh is build_adaptive_mesh
+    assert caustics.Mesh is Mesh
+    assert caustics.LeafStatus is LeafStatus
+    assert caustics.BuildStats is BuildStats
+    assert caustics.func.sigma_min_2x2 is not None
+    assert caustics.func.triangle_weights is not None

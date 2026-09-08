@@ -82,6 +82,18 @@ from .multipole import (
     potential_multipole,
     convergence_multipole,
 )
+from .adaptive import (
+    affine_from_triangles,
+    child_matrix_tables,
+    contains,
+    converged_from_deviation,
+    evaluate_criterion,
+    midpoint_deviation,
+    sanitize_bary,
+    shape_matrix,
+    sigma_min_2x2,
+    triangle_weights,
+)
 
 __all__ = (
     "forward_raytrace",
@@ -149,4 +161,14 @@ __all__ = (
     "convergence_multipole",
     "physical_deflection_angle_enclosed_mass",
     "convergence_enclosed_mass",
+    "affine_from_triangles",
+    "child_matrix_tables",
+    "contains",
+    "converged_from_deviation",
+    "evaluate_criterion",
+    "midpoint_deviation",
+    "sanitize_bary",
+    "shape_matrix",
+    "sigma_min_2x2",
+    "triangle_weights",
 )

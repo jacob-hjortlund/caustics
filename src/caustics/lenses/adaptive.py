@@ -1004,6 +1004,63 @@ class Mesh:
             backend.concatenate(bary_parts, dim=0),
         )
 
+    @staticmethod
+    def _check_call(beta, leaf_indices):
+        if (beta is None) == (leaf_indices is None):
+            raise ValueError(
+                "pass exactly one of `beta` (query and gather) or `leaf_indices` "
+                "(gather only)"
+            )
+
+    def triangles_lens(self, beta=None, batch_size=None, *, leaf_indices=None):
+        """
+        Lens-plane vertices of hit leaves, shape ``(K, 3, 2)``.
+
+        With ``beta`` returns ``(triangles, offsets)``; with ``leaf_indices``
+        returns ``triangles`` alone.
+
+        *Unit: arcsec*
+        """
+        self._check_call(beta, leaf_indices)
+        if leaf_indices is not None:
+            return self.vertices_lens[self.leaves[leaf_indices]]
+        idx, offsets, _ = self.query(beta, batch_size=batch_size)
+        return self.vertices_lens[self.leaves[idx]], offsets
+
+    def triangles_source(self, beta=None, batch_size=None, *, leaf_indices=None):
+        """
+        Source-plane vertices of hit leaves, shape ``(K, 3, 2)``.
+
+        *Unit: arcsec*
+        """
+        self._check_call(beta, leaf_indices)
+        if leaf_indices is not None:
+            return self.vertices_source[self.leaves[leaf_indices]]
+        idx, offsets, _ = self.query(beta, batch_size=batch_size)
+        return self.vertices_source[self.leaves[idx]], offsets
+
+    def seeds(self, beta=None, batch_size=None, *, leaf_indices=None, bary=None):
+        """
+        Lens-plane preimage under each hit leaf's own affine map, shape ``(K, 2)``.
+
+        That map is exactly the one step 7 bounds, so the result is a Newton seed
+        accurate to ``min_img_sep`` by construction. Because ``bary`` is guaranteed
+        to lie in the simplex, the seed always lies inside the leaf.
+
+        *Unit: arcsec*
+        """
+        self._check_call(beta, leaf_indices)
+        if leaf_indices is not None:
+            if bary is None:
+                raise ValueError("`bary` is required alongside `leaf_indices`")
+            return self._seed(leaf_indices, bary)
+        idx, offsets, computed = self.query(beta, batch_size=batch_size)
+        return self._seed(idx, computed), offsets
+
+    def _seed(self, leaf_indices, bary):
+        tri = self.vertices_lens[self.leaves[leaf_indices]]
+        return backend.sum(tri * backend.unsqueeze(bary, -1), dim=1)
+
 
 def build_adaptive_mesh(
     raytrace: Callable[[ArrayLike, ArrayLike], Tuple[ArrayLike, ArrayLike]],
