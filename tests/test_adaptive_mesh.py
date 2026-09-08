@@ -6,6 +6,7 @@ from caustics.lenses.adaptive import (
     LeafStatus,
     _ActiveKeys,
     _depth_floor,
+    _edge_quarter_keys,
     _initial_triangles,
     _Lattice,
     _LeafStore,
@@ -595,3 +596,100 @@ def test_refine_all_leaves_are_positively_oriented():
     v, level, cls, status = ref.store.compact()
     tri = lat.xy(ref.cache.ij[v])
     assert (signed_area(tri) > 0).all()
+
+
+def assert_balanced(ref, lat, max_level):
+    """No leaf edge carries an active quarter point."""
+    v, level, cls, status = ref.store.compact()
+    for lv in np.unique(level):
+        if lv > max_level - 2:
+            continue
+        sel = level == lv
+        keys = _edge_quarter_keys(lat, ref.cache.ij[v[sel]])
+        assert not ref.active.contains(keys).any(), f"unbalanced at level {lv}"
+
+
+def test_edge_quarter_keys_are_lattice_points_of_both_quarters():
+    lat = _Lattice(4.0, 0.0, 0.0, 1, 4)  # n = 16
+    ij = np.array([[[0, 0], [16, 0], [0, 16]]], dtype=np.int64)
+    keys = _edge_quarter_keys(lat, ij)
+    got = {tuple(p) for p in lat.ij_from_key(keys[0])}
+    assert (4, 0) in got and (12, 0) in got  # edge (0,1)
+    assert (0, 4) in got and (0, 12) in got  # edge (2,0)
+
+
+def test_leaf_store_add_accepts_per_row_level_and_status():
+    store = _LeafStore()
+    store.add(
+        np.arange(6).reshape(2, 3),
+        np.array([1, 3]),
+        np.zeros(2, np.int64),
+        np.array([LeafStatus.FORCED, LeafStatus.INVALID]),
+    )
+    v, level, cls, status = store.compact()
+    assert level.tolist() == [1, 3]
+    assert status.tolist() == [LeafStatus.FORCED, LeafStatus.INVALID]
+
+
+def localised_fold(p):
+    """Affine away from a narrow band, curved and fold-bearing inside it.
+
+    Outside |y| < 0.5 the map is exactly affine with sigma_min = 0.6, so those
+    triangles converge at level 0. Inside, beta2 = 0.6y + y^2 - 0.25 is curved and
+    its Jacobian 0.6 + 2y changes sign at y = -0.3, so both the deviation test and
+    the parity test fire. The result is a mesh with real level transitions for the
+    cascade, closure, and crack tests to work on.
+
+    Continuous at |y| = 0.5, where y^2 - 0.25 vanishes.
+
+    Do NOT replace the bend with a constant outside the band (e.g. 0.25*sign(y)):
+    that makes the map degenerate in y everywhere outside, so sigma_min == 0, every
+    triangle splits, and the mesh refines uniformly to max_level with no level
+    transitions at all -- silently voiding every test that depends on them.
+    """
+    y = p[:, 1]
+    bend = np.where(np.abs(y) < 0.5, y**2 - 0.25, 0.0)
+    return np.stack([p[:, 0], 0.6 * y + bend], axis=-1)
+
+
+def test_mesh_is_edge_balanced_after_refinement():
+    ref, lat, calls, max_level = refine_with(
+        localised_fold, fov=4.0, init_res=4, min_img_sep=0.05
+    )
+    assert max_level >= 4, "fixture must allow several levels"
+    v, level, cls, status = ref.store.compact()
+    assert len(np.unique(level)) > 1, "fixture must produce level transitions"
+    assert_balanced(ref, lat, max_level)
+
+
+def test_cascade_produces_forced_children():
+    ref, lat, calls, max_level = refine_with(
+        localised_fold, fov=4.0, init_res=4, min_img_sep=0.05
+    )
+    v, level, cls, status = ref.store.compact()
+    assert (status == LeafStatus.FORCED).any()
+    assert ref.counters["forced"] > 0
+    assert ref.counters["cascade_rounds"] > 0
+
+
+def test_forced_children_inherit_invalid_from_their_parent():
+    def half_bad(p):
+        out = localised_fold(p)
+        out[p[:, 0] > 1.0] = np.nan
+        return out
+
+    ref, lat, calls, max_level = refine_with(
+        half_bad, fov=4.0, init_res=4, min_img_sep=0.05
+    )
+    v, level, cls, status = ref.store.compact()
+    forced_or_invalid = np.isin(status, [LeafStatus.FORCED, LeafStatus.INVALID])
+    assert forced_or_invalid.any()
+    for row in np.flatnonzero(status == LeafStatus.FORCED):
+        assert np.isfinite(ref.cache.beta[v[row]]).all()
+
+
+def test_cascade_still_evaluates_every_point_exactly_once():
+    ref, lat, calls, max_level = refine_with(
+        localised_fold, fov=4.0, init_res=4, min_img_sep=0.05
+    )
+    assert calls["points"] == len(ref.cache)

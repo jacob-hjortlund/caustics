@@ -210,11 +210,11 @@ class _LeafStore:
         k = v.shape[0]
         self.v = np.concatenate([self.v, v])
         self.level = np.concatenate(
-            [self.level, np.full(k, int(level), dtype=np.int64)]
+            [self.level, np.broadcast_to(np.asarray(level, dtype=np.int64), (k,))]
         )
         self.cls = np.concatenate([self.cls, np.asarray(cls, dtype=np.int64)])
         self.status = np.concatenate(
-            [self.status, np.full(k, int(status), dtype=np.int8)]
+            [self.status, np.broadcast_to(np.asarray(status, dtype=np.int8), (k,))]
         )
         self.valid = np.concatenate([self.valid, np.ones(k, dtype=bool)])
         return np.arange(start, start + k, dtype=np.int64)
@@ -335,6 +335,52 @@ def _evaluate(cache, lattice, keys, raytrace_np, batch_size):
     cache.insert(todo, ij, beta)
 
 
+def _edge_quarter_keys(lattice, ij):
+    """
+    Keys of both quarter points on each of the three edges.
+
+    A neighbour across an edge that is two or more levels finer has one of these as
+    a vertex, so six hash lookups decide balance for a triangle -- no
+    edge-to-triangle adjacency table and no ancestry walk. Both quarter points are
+    checked because the neighbour across an edge can itself be non-uniform.
+
+    The caller must only pass triangles at level ``<= max_level - 2``, where the
+    edge vectors are divisible by four and the quarter points are lattice points.
+
+    Parameters
+    ----------
+    ij: ndarray
+        Lattice coordinates, shape ``(n, 3, 2)``.
+
+    Returns
+    -------
+    ndarray
+        Shape ``(n, 6)`` int64.
+    """
+    a = ij[:, [0, 1, 2], :]
+    b = ij[:, [1, 2, 0], :]
+    delta = (b - a) // 4
+    return np.concatenate((lattice.key(a + delta), lattice.key(b - delta)), axis=1)
+
+
+def _find_unbalanced(store, cache, lattice, active, max_level, frontier_level):
+    """
+    Rows of ``store`` carrying an active quarter point on some edge.
+
+    Two independent level bounds apply. ``level <= frontier_level - 2`` is an
+    optimization: only triangles at least two levels coarser than the frontier can
+    have been invalidated by it, so the scan skips most of the store.
+    ``level <= max_level - 2`` is an integrality requirement: below it the quarter
+    points are not lattice points and no finer neighbour can exist.
+    """
+    bound = min(frontier_level - 2, max_level - 2)
+    cand = np.flatnonzero(store.valid & (store.level <= bound))
+    if cand.size == 0:
+        return cand
+    keys = _edge_quarter_keys(lattice, cache.ij[store.v[cand]])
+    return cand[active.contains(keys).any(axis=1)]
+
+
 @dataclass
 class _Refinement:
     """Output of the level loop, before closure and freezing."""
@@ -431,7 +477,53 @@ def _refine(
         child_ij = cache.ij[child_v]
         active.add(lattice.key(child_ij).reshape(-1))
 
-        # Task 8 inserts the balance cascade here, appending to `deferred`.
+        # Balance cascade. The children above are already registered as active
+        # vertices, which is what makes the quarter-point test able to see them --
+        # the split must precede the cascade, not follow it.
+        frontier_level = level + 1
+        while True:
+            violators = _find_unbalanced(
+                store, cache, lattice, active, max_level, frontier_level
+            )
+            if violators.size == 0:
+                break
+            counters["cascade_rounds"] += 1
+            store.remove(violators)
+            vv = store.v[violators]
+            vij = cache.ij[vv]
+            vm = cache.lookup(lattice.key(_midpoint_ij(vij)))
+            # Trip-wire for the re-forcing invariant. A violator's midpoints are
+            # normally already cached, but a forced child re-forced within the
+            # same cascade would still have its midpoints sitting in `deferred`,
+            # and a -1 slot here would silently negative-index `cache.ij` into
+            # wrong geometry rather than raising. See spec section 2.3.
+            assert (vm >= 0).all(), "cascade hit an unevaluated midpoint"
+            kid_v, kid_cls = _red_split(vv, vm, store.cls[violators], COMPOSE)
+            kid_level = np.repeat(store.level[violators] + 1, 4)
+            # A forced child is auto-converged: steps 3-7 are skipped so the
+            # cascade cannot re-enter the split machinery from inside itself.
+            kid_status = np.where(
+                np.repeat(store.status[violators] == LeafStatus.INVALID, 4),
+                np.int8(LeafStatus.INVALID),
+                np.int8(LeafStatus.FORCED),
+            )
+            store.add(kid_v, kid_level, kid_cls, kid_status)
+            counters["forced"] += int((kid_status == LeafStatus.FORCED).sum())
+            kid_ij = cache.ij[kid_v]
+            active.add(lattice.key(kid_ij).reshape(-1))
+            # Forced children are produced after this level's raytrace call has
+            # gone out, and land at levels the loop will never revisit. Queue
+            # their midpoints and drain at the top of the next level, so the
+            # one-batch-per-level structure survives. A forced child cannot be
+            # re-forced within the same cascade, because the frontier only moves
+            # coarser -- so the deferral is never more than one level deep.
+            deferred = np.concatenate(
+                (deferred, lattice.key(_midpoint_ij(kid_ij)).reshape(-1))
+            )
+            # The MAXIMUM kid level, not the minimum: a kid at level L invalidates
+            # neighbours at level <= L-2, so the minimum would skip violators.
+            # The maximum strictly decreases each round, which terminates the loop.
+            frontier_level = int(kid_level.max())
 
         active_ij, active_cls = child_ij, child_cls
         if active_ij.shape[0] == 0:
