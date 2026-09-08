@@ -554,3 +554,139 @@ def _refine(
             break
 
     return _Refinement(cache=cache, active=active, store=store, counters=counters)
+
+
+def _canonical_order(lattice, cache, v):
+    """
+    Deterministic leaf ordering, independent of the order the cascade produced.
+
+    Sorts by the row-wise-sorted triple of vertex lattice keys, which is unique per
+    triangle since a triangle is determined by its vertex set. This makes
+    byte-identical output a property of the data rather than of control flow.
+    """
+    keys = np.sort(lattice.key(cache.ij[v]), axis=1)
+    return np.lexsort((keys[:, 2], keys[:, 1], keys[:, 0]))
+
+
+def _min_angle(tri):
+    """
+    Smallest interior angle of each triangle, in radians.
+
+    Parameters
+    ----------
+    tri: ndarray
+        Shape ``(n, 3, 2)``.
+
+    Returns
+    -------
+    ndarray
+        Shape ``(n,)``. Degenerate triangles give ``0.0`` rather than ``NaN``.
+    """
+    a = np.linalg.norm(tri[:, 2] - tri[:, 1], axis=-1)
+    b = np.linalg.norm(tri[:, 0] - tri[:, 2], axis=-1)
+    c = np.linalg.norm(tri[:, 1] - tri[:, 0], axis=-1)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        cosines = np.stack(
+            (
+                (b * b + c * c - a * a) / (2 * b * c),
+                (c * c + a * a - b * b) / (2 * c * a),
+                (a * a + b * b - c * c) / (2 * a * b),
+            ),
+            axis=1,
+        )
+    angles = np.arccos(np.clip(cosines, -1.0, 1.0))
+    return np.nan_to_num(angles.min(axis=1), nan=0.0)
+
+
+def _close(lattice, cache, active, v, level, status):
+    """
+    Make the balanced mesh conforming, using the pre-closure active-vertex set.
+
+    Fixed pattern table, all vertices already cached:
+
+    - 1 hanging node at ``m_i``: bisect from the opposite vertex into two triangles.
+    - 2 hanging nodes: emit the corner triangle at the vertex opposite the whole
+      edge, then split the remaining quadrilateral along whichever of its two
+      diagonals maximizes the minimum angle.
+    - 3 hanging nodes: the canonical red split, free.
+
+    Parameters
+    ----------
+    v: ndarray
+        Pre-closure leaf vertex slots in canonical order, shape ``(L0, 3)``.
+    level, status: ndarray
+        Shape ``(L0,)``, inherited by the emitted triangles.
+
+    Returns
+    -------
+    leaves: ndarray
+        ``(L, 3)`` vertex slots, positively oriented.
+    origin: ndarray
+        ``(L,)`` index into ``v``. Non-decreasing, so each origin's terminal
+        triangles are contiguous and grouping is a slice.
+    out_level, out_status: ndarray
+        ``(L,)``, inherited from the origin.
+    """
+    v_ij = cache.ij[v]
+    mid_ij = _midpoint_ij(v_ij)
+    mid_keys = lattice.key(mid_ij)
+    m = cache.lookup(mid_keys)
+    # A max_level leaf's edges are one lattice unit long, so their true midpoints
+    # are not lattice points at all -- `_midpoint_ij`'s floor division silently
+    # collapses onto one of that same edge's own (trivially active) endpoints
+    # instead. Gating on exact reconstruction sends those leaves through as
+    # count == 0, matching `_refine`'s invariant that no leaf at max_level has a
+    # hanging node; below max_level the sums are always even by construction (see
+    # `_midpoint_ij`), so the gate has no effect there.
+    exact = ((v_ij[:, [1, 2, 0]] + v_ij[:, [2, 0, 1]]) % 2 == 0).all(axis=-1)
+    hanging = exact & active.contains(mid_keys)  # (L0, 3)
+    count = hanging.sum(axis=1)
+
+    n_children = np.choose(count, [1, 2, 3, 4])
+    offsets = np.concatenate(([0], np.cumsum(n_children)))
+    leaves = np.empty((int(offsets[-1]), 3), dtype=np.int64)
+    origin = np.repeat(np.arange(v.shape[0], dtype=np.int64), n_children)
+
+    def geom(slots):
+        return lattice.xy(cache.ij[slots])
+
+    sel = np.flatnonzero(count == 0)
+    leaves[offsets[sel]] = v[sel]
+
+    for i in range(3):
+        j, k = (i + 1) % 3, (i + 2) % 3
+        sel = np.flatnonzero((count == 1) & hanging[:, i])
+        if sel.size == 0:
+            continue
+        o = offsets[sel]
+        leaves[o] = np.stack((v[sel, i], v[sel, j], m[sel, i]), axis=1)
+        leaves[o + 1] = np.stack((v[sel, i], m[sel, i], v[sel, k]), axis=1)
+
+    for c in range(3):
+        a, b = (c + 1) % 3, (c + 2) % 3
+        sel = np.flatnonzero((count == 2) & ~hanging[:, c])
+        if sel.size == 0:
+            continue
+        o = offsets[sel]
+        # Corner triangle at theta_c: exactly red-split child C_c, so positively
+        # oriented by construction.
+        leaves[o] = np.stack((v[sel, c], m[sel, b], m[sel, a]), axis=1)
+        a1 = np.stack((v[sel, a], v[sel, b], m[sel, a]), axis=1)
+        a2 = np.stack((v[sel, a], m[sel, a], m[sel, b]), axis=1)
+        b1 = np.stack((v[sel, a], v[sel, b], m[sel, b]), axis=1)
+        b2 = np.stack((v[sel, b], m[sel, a], m[sel, b]), axis=1)
+        score_a = np.minimum(_min_angle(geom(a1)), _min_angle(geom(a2)))
+        score_b = np.minimum(_min_angle(geom(b1)), _min_angle(geom(b2)))
+        use_b = score_b > score_a  # ties take candidate A, deterministically
+        leaves[o + 1] = np.where(use_b[:, None], b1, a1)
+        leaves[o + 2] = np.where(use_b[:, None], b2, a2)
+
+    sel = np.flatnonzero(count == 3)
+    if sel.size:
+        o = offsets[sel]
+        idx = np.asarray(CHILD_VERTEX_INDICES)
+        kids = np.concatenate([v[sel], m[sel]], axis=1)[:, idx]  # (k, 4, 3)
+        for t in range(4):
+            leaves[o + t] = kids[:, t, :]
+
+    return leaves, origin, level[origin], status[origin]

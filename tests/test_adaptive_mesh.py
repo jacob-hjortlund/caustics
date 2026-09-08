@@ -5,6 +5,8 @@ from caustics.backend_obj import backend
 from caustics.lenses.adaptive import (
     LeafStatus,
     _ActiveKeys,
+    _canonical_order,
+    _close,
     _depth_floor,
     _edge_quarter_keys,
     _initial_triangles,
@@ -12,6 +14,7 @@ from caustics.lenses.adaptive import (
     _LeafStore,
     _make_raytrace_np,
     _midpoint_ij,
+    _min_angle,
     _red_split,
     _refine,
     _validate_build_args,
@@ -714,3 +717,103 @@ def test_cascade_still_evaluates_every_point_exactly_once():
         localised_fold, fov=4.0, init_res=4, min_img_sep=0.05
     )
     assert calls["points"] == len(ref.cache)
+
+
+def undirected_edges(lat, cache, leaves):
+    k = lat.key(cache.ij[leaves])  # (L, 3)
+    e = np.stack([k[:, [0, 1]], k[:, [1, 2]], k[:, [2, 0]]], axis=1)
+    return np.sort(e, axis=-1).reshape(-1, 2)
+
+
+def closed_mesh(fn, **kw):
+    ref, lat, calls, max_level = refine_with(fn, **kw)
+    v, level, cls, status = ref.store.compact()
+    order = _canonical_order(lat, ref.cache, v)
+    v, level, status = v[order], level[order], status[order]
+    leaves, origin, out_level, out_status = _close(
+        lat, ref.cache, ref.active, v, level, status
+    )
+    return ref, lat, v, level, status, leaves, origin, out_level, out_status
+
+
+def test_min_angle_of_an_equilateral_triangle():
+    tri = np.array([[[0.0, 0.0], [1.0, 0.0], [0.5, np.sqrt(3) / 2]]])
+    assert np.allclose(_min_angle(tri), np.pi / 3)
+
+
+def test_canonical_order_is_independent_of_input_order():
+    ref, lat, calls, max_level = refine_with(localised_fold, min_img_sep=0.05)
+    v, level, cls, status = ref.store.compact()
+    perm = RNG.permutation(v.shape[0])
+    a = v[_canonical_order(lat, ref.cache, v)]
+    b = v[perm][_canonical_order(lat, ref.cache, v[perm])]
+    assert np.array_equal(a, b)
+
+
+def test_closure_makes_every_edge_appear_once_or_twice():
+    ref, lat, v, pre_lvl, pre_st, leaves, origin, lvl, st = closed_mesh(
+        localised_fold, min_img_sep=0.05
+    )
+    edges = undirected_edges(lat, ref.cache, leaves)
+    _, counts = np.unique(edges, axis=0, return_counts=True)
+    assert set(np.unique(counts)) <= {1, 2}
+
+
+def test_pre_closure_mesh_is_not_already_conforming():
+    """Guard against a fixture where closure has nothing to do.
+
+    Tested with the hanging-node predicate directly rather than via
+    undirected-edge multiplicity, because a hanging node does not raise any
+    edge's count: a coarse triangle contributes its edge ``(A, B)`` exactly once
+    while the finer neighbours contribute the half-edges ``(A, M)`` and
+    ``(M, B)`` -- never ``(A, B)``, since no fine triangle has both endpoints. So
+    a mesh riddled with hanging nodes has the same ``{1, 2}`` multiplicity
+    profile as a conforming one, and hanging nodes are indistinguishable from
+    domain-boundary edges by counting alone. This is the same predicate
+    :func:`_close` itself uses to classify each leaf.
+    """
+    ref, lat, calls, max_level = refine_with(localised_fold, min_img_sep=0.05)
+    v, level, cls, status = ref.store.compact()
+    mid_keys = lat.key(_midpoint_ij(ref.cache.ij[v]))
+    assert ref.active.contains(mid_keys).any(), "fixture has no hanging nodes"
+
+
+def test_closure_preserves_orientation_and_inherits_level_and_status():
+    ref, lat, v, pre_lvl, pre_st, leaves, origin, lvl, st = closed_mesh(
+        localised_fold, min_img_sep=0.05
+    )
+    assert (signed_area(lat.xy(ref.cache.ij[leaves])) > 0).all()
+    assert np.array_equal(lvl, pre_lvl[origin])
+    assert np.array_equal(st, pre_st[origin])
+    assert lvl.shape == (leaves.shape[0],) and st.shape == (leaves.shape[0],)
+
+
+def test_leaf_origin_groups_are_contiguous_and_tile_their_origin():
+    ref, lat, v, pre_lvl, pre_st, leaves, origin, lvl, st = closed_mesh(
+        localised_fold, min_img_sep=0.05
+    )
+    assert (np.diff(origin) >= 0).all(), "origin must be non-decreasing"
+    child_area = signed_area(lat.xy(ref.cache.ij[leaves]))
+    origin_area = signed_area(lat.xy(ref.cache.ij[v]))
+    summed = np.zeros_like(origin_area)
+    np.add.at(summed, origin, child_area)
+    assert np.allclose(summed, origin_area, rtol=1e-12)
+
+
+def test_unclosed_leaf_is_its_own_origin_geometry():
+    ref, lat, v, pre_lvl, pre_st, leaves, origin, lvl, st = closed_mesh(
+        localised_fold, min_img_sep=0.05
+    )
+    _, counts = np.unique(origin, return_counts=True)
+    solo = np.flatnonzero(counts == 1)
+    assert solo.size > 0
+    for o in solo[:20]:
+        row = np.flatnonzero(origin == o)[0]
+        assert np.array_equal(leaves[row], v[o])
+
+
+def test_closure_adds_no_new_vertices():
+    ref, lat, v, pre_lvl, pre_st, leaves, origin, lvl, st = closed_mesh(
+        localised_fold, min_img_sep=0.05
+    )
+    assert set(np.unique(leaves)) <= set(range(len(ref.cache)))
