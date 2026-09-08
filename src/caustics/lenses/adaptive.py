@@ -29,8 +29,11 @@ from .func.adaptive import (
     CHILD_VERTEX_INDICES,
     ROOT_SHAPES,
     child_matrix_tables,
+    contains,
     evaluate_criterion,
+    sanitize_bary,
     shape_matrix,
+    triangle_weights,
 )
 
 __all__ = ["LeafStatus", "BuildStats", "Mesh", "build_adaptive_mesh"]
@@ -879,6 +882,127 @@ class Mesh:
             self._cell_offsets,
             self._cell_leaves,
         ) = index
+
+    def _empty_result(self, n_queries):
+        int64 = backend.module.int64
+        zeros = backend.zeros((n_queries + 1,), dtype=int64, device=self.device)
+        return (
+            backend.zeros((0,), dtype=int64, device=self.device),
+            zeros,
+            backend.zeros((0, 3), dtype=self.vertices_source.dtype, device=self.device),
+        )
+
+    def query(self, beta, batch_size: Optional[int] = None):
+        """
+        Terminal leaves whose source-plane image contains each query point.
+
+        Returns candidate regions, not images. A point on a shared edge returns
+        both leaves -- zeros count as inside, which is what guarantees no query
+        falls through a seam -- and near-critical leaves overlap, so **candidate
+        count is not image multiplicity**.
+
+        Parameters
+        ----------
+        beta: ArrayLike
+            Source-plane query points, shape ``(B, 2)`` strictly. A bare ``(2,)``
+            raises rather than being promoted, so output shapes are never ambiguous.
+
+            *Unit: arcsec*
+
+        batch_size: Optional[int]
+            Chunk size over query points. ``None`` processes all at once. Results
+            are byte-identical for every value; this only bounds peak memory, which
+            spikes for chunks landing near a caustic.
+
+        Returns
+        -------
+        leaf_indices: ArrayLike
+            ``(K,)`` indices into ``leaves``, strictly ascending within each block.
+        offsets: ArrayLike
+            ``(B + 1,)`` CSR offsets, ``offsets[0] == 0`` and ``offsets[B] == K``.
+        bary: ArrayLike
+            ``(K, 3)`` barycentric coordinates of ``beta`` in the source-plane image
+            of the hit triangle, guaranteed to lie in the simplex.
+        """
+        beta = backend.as_array(
+            beta, dtype=self.vertices_source.dtype, device=self.device
+        )
+        if len(beta.shape) != 2 or beta.shape[1] != 2:
+            raise ValueError(
+                f"beta must have shape (B, 2), got {tuple(beta.shape)}. A single "
+                "point must be passed as shape (1, 2)."
+            )
+        n = beta.shape[0]
+        if n == 0:
+            return self._empty_result(0)
+
+        int64 = backend.module.int64
+        step = n if batch_size is None else max(1, int(batch_size))
+        idx_parts, bary_parts, count_parts = [], [], []
+
+        for lo in range(0, n, step):
+            chunk = beta[lo : lo + step]
+            b = chunk.shape[0]
+            u = backend.long(backend.floor((chunk - self._index_lo) / self._index_cell))
+            inside = (
+                (u[:, 0] >= 0)
+                & (u[:, 0] < self._nx)
+                & (u[:, 1] >= 0)
+                & (u[:, 1] < self._ny)
+            )
+            # Clipped only to keep the gather in range; `inside` forces an empty
+            # block for out-of-bbox points.
+            cell = backend.clamp(u[:, 0], 0, self._nx - 1) * self._ny + backend.clamp(
+                u[:, 1], 0, self._ny - 1
+            )
+            start = self._cell_offsets[cell]
+            count = backend.where(
+                inside, self._cell_offsets[cell + 1] - start, backend.zeros_like(start)
+            )
+            total = int(backend.to_numpy(backend.sum(count)))
+            if total == 0:
+                count_parts.append(np.zeros(b, dtype=np.int64))
+                continue
+
+            qidx = backend.repeat(
+                backend.arange(b, dtype=int64, device=self.device), count, axis=0
+            )
+            base = backend.cumsum(count) - count
+            within = backend.arange(
+                total, dtype=int64, device=self.device
+            ) - backend.repeat(base, count, axis=0)
+            cand = self._cell_leaves[start[qidx] + within]
+
+            w = triangle_weights(self.vertices_source[self.leaves[cand]], chunk[qidx])
+            hit = contains(w)
+
+            # Per-query hit counts by cumsum differences. Never add_at_indices:
+            # torch keeps the last write on duplicate indices, jax accumulates.
+            csum = backend.concatenate(
+                (
+                    backend.zeros((1,), dtype=int64, device=self.device),
+                    backend.cumsum(backend.long(hit)),
+                ),
+                dim=0,
+            )
+            count_parts.append(backend.to_numpy(csum[base + count] - csum[base]))
+            idx_parts.append(cand[hit])
+            bary_parts.append(sanitize_bary(w[hit], self.leaf_area2[cand][hit]))
+
+        counts = np.concatenate(count_parts)
+        offsets = backend.as_array(
+            np.concatenate(([0], np.cumsum(counts))).astype(np.int64),
+            dtype=int64,
+            device=self.device,
+        )
+        if not idx_parts:
+            empty = self._empty_result(n)
+            return empty[0], offsets, empty[2]
+        return (
+            backend.concatenate(idx_parts, dim=0),
+            offsets,
+            backend.concatenate(bary_parts, dim=0),
+        )
 
 
 def build_adaptive_mesh(

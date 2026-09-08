@@ -1069,3 +1069,115 @@ def test_kappa_one_sheet_builds_without_nan():
     assert mesh.stats.n_sigma_min_exactly_zero > 0
     assert not np.isnan(backend.to_numpy(mesh.vertices_source)).any()
     assert backend.to_numpy(mesh.leaf_level).max() == mesh.max_level
+
+
+def query_np(mesh, beta, batch_size=None):
+    idx, off, bary = mesh.query(beta, batch_size=batch_size)
+    return backend.to_numpy(idx), backend.to_numpy(off), backend.to_numpy(bary)
+
+
+def test_query_csr_is_well_formed():
+    mesh, _ = build(localised_fold, min_img_sep=0.05)
+    beta = RNG.uniform(-2.5, 2.5, size=(64, 2))
+    idx, off, bary = query_np(mesh, beta)
+    assert off.shape == (65,) and off[0] == 0 and off[-1] == idx.shape[0]
+    assert (np.diff(off) >= 0).all()
+    assert bary.shape == (idx.shape[0], 3)
+    for b in range(64):
+        block = idx[off[b] : off[b + 1]]
+        assert (np.diff(block) > 0).all(), "blocks must be strictly ascending"
+
+
+def test_query_handles_empty_input_and_misses():
+    mesh, _ = build(lambda p: p @ AFFINE.T)
+    idx, off, bary = query_np(mesh, np.zeros((0, 2)))
+    assert off.tolist() == [0] and idx.shape == (0,) and bary.shape == (0, 3)
+    far = np.array([[1e6, 1e6], [-1e6, 0.0]])
+    idx, off, bary = query_np(mesh, far)
+    assert off.tolist() == [0, 0, 0]
+
+
+def test_query_rejects_wrong_shapes():
+    mesh, _ = build(lambda p: p @ AFFINE.T)
+    with pytest.raises(ValueError):
+        mesh.query(np.array([0.0, 0.0]))
+    with pytest.raises(ValueError):
+        mesh.query(np.zeros((4, 3)))
+
+
+def test_query_is_invariant_to_batch_size_and_point_order():
+    mesh, _ = build(localised_fold, min_img_sep=0.05)
+    beta = RNG.uniform(-1.5, 1.5, size=(97, 2))
+    ref = query_np(mesh, beta)
+    for bs in (1, 7, 96, 97, 1000):
+        got = query_np(mesh, beta, batch_size=bs)
+        for a, b in zip(ref, got):
+            assert np.array_equal(a, b)
+    perm = RNG.permutation(97)
+    pidx, poff, pbary = query_np(mesh, beta[perm])
+    for new, old in enumerate(perm):
+        assert np.array_equal(
+            pidx[poff[new] : poff[new + 1]], ref[0][ref[1][old] : ref[1][old + 1]]
+        )
+
+
+def test_query_finds_the_affine_preimage():
+    mesh, _ = build(lambda p: p @ AFFINE.T, fov=4.0, init_res=4, min_img_sep=0.25)
+    lens_pts = RNG.uniform(-1.8, 1.8, size=(200, 2))
+    beta = lens_pts @ AFFINE.T
+    idx, off, bary = query_np(mesh, beta)
+    assert (np.diff(off) >= 1).all(), "every interior point must hit a leaf"
+    leaves = backend.to_numpy(mesh.leaves)
+    vl = backend.to_numpy(mesh.vertices_lens)
+    seed = np.einsum("kj,kjd->kd", bary, vl[leaves[idx]])
+    first = seed[off[:-1]]
+    assert np.allclose(first, lens_pts, atol=1e-9)
+
+
+def test_bary_is_in_the_simplex_on_every_leaf():
+    for fn, sep in ((localised_fold, 0.05), (lambda p: np.zeros_like(p), 0.5)):
+        mesh, _ = build(fn, min_img_sep=sep)
+        beta = RNG.uniform(-0.4, 0.4, size=(40, 2))
+        idx, off, bary = query_np(mesh, beta)
+        assert np.isfinite(bary).all()
+        assert (bary >= 0).all() and (bary <= 1).all()
+        assert np.allclose(bary.sum(axis=1), 1.0, atol=1e-12)
+
+
+def test_bary_reconstructs_beta_on_well_conditioned_leaves_only():
+    mesh, _ = build(localised_fold, min_img_sep=0.05)
+    beta = RNG.uniform(-1.5, 1.5, size=(200, 2))
+    idx, off, bary = query_np(mesh, beta)
+    area = np.abs(backend.to_numpy(mesh.leaf_area2))[idx]
+    vs = backend.to_numpy(mesh.vertices_source)
+    vl = backend.to_numpy(mesh.vertices_lens)
+    leaves = backend.to_numpy(mesh.leaves)
+    owner = np.repeat(np.arange(len(beta)), np.diff(off))
+    good = area > 1e-10
+    recon = np.einsum("kj,kjd->kd", bary[good], vs[leaves[idx[good]]])
+    assert np.allclose(recon, beta[owner[good]], atol=1e-8)
+    # on degenerate leaves the sanitizer discards the coordinates by design, so
+    # assert only that the seed lies inside the lens-plane triangle
+    seed = np.einsum("kj,kjd->kd", bary, vl[leaves[idx]])
+    for k in np.flatnonzero(~good)[:50]:
+        tri = vl[leaves[idx[k]]]
+        w = np.array(
+            [
+                np.cross(tri[(i + 1) % 3] - seed[k], tri[(i + 2) % 3] - seed[k])
+                for i in range(3)
+            ]
+        )
+        assert (w >= -1e-12).all() or (w <= 1e-12).all()
+
+
+def test_centroid_fallback_on_a_totally_degenerate_leaf():
+    """kappa == 1 maps every leaf to a point: w and d are exactly zero."""
+    mesh, _ = build(lambda p: np.zeros_like(p), fov=4.0, init_res=4, min_img_sep=0.5)
+    idx, off, bary = query_np(mesh, np.zeros((1, 2)))
+    assert idx.shape[0] > 0
+    assert np.array_equal(bary, np.full((idx.shape[0], 3), 1.0 / 3.0))
+    assert (np.abs(backend.to_numpy(mesh.leaf_area2)[idx]) == 0).all()
+    lvl = backend.to_numpy(mesh.leaf_level)[idx]
+    assert (lvl == mesh.max_level).all()
+    l_max = np.sqrt(2) * 4.0 / (4 * 2**mesh.max_level)
+    assert l_max <= 0.5
