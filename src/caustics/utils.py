@@ -1623,14 +1623,30 @@ def batch_lm(
     L = L * backend.ones(B, device=backend.device(X), dtype=X.dtype)
     for _ in range(max_iter):
         Xnew, L, C = v_lm_step(X, Y, Cinv, L)
-        if (
-            backend.all(backend.abs(Xnew - X) < stopping)
-            and backend.sum(L < 1e-2).item() > B / 3
-        ):
-            break
-        if backend.all(L >= L_max):
-            break
+        step = backend.max(backend.abs(Xnew - X), dim=-1)
         X = Xnew
+
+        # Termination is per element, then reduced -- never a majority vote.
+        # Elements are mathematically independent and only the loop is shared, so
+        # a criterion that stops the batch while any element is still descending
+        # makes that element's answer depend on the company it keeps.
+        #
+        # A small step alone does not mean converged. `_lm_step` leaves `X`
+        # exactly unchanged when it rejects a trial step, so an element whose
+        # steps are being rejected -- precisely one that needs more iterations --
+        # reports a zero step. The conjunction with `L < 1e-2` is what separates
+        # the two: low damping is only reached through a run of *accepted* steps,
+        # while a rejecting element multiplies its `L` by `L_up` every iteration
+        # and climbs away from the threshold.
+        #
+        # An element already at its root also rejects (its gradient and step both
+        # vanish, so `rho` is 0/0), which walks its `L` up to `L_max`. That is why
+        # exhaustion counts as done: it is how a converged element that finished
+        # early keeps the loop from spinning until `max_iter` while a slower one
+        # is still working. Either way `X` no longer moves.
+        converged = (step < stopping) & (L < 1e-2)
+        if backend.all(converged | (L >= L_max)):
+            break
 
     return X, L, C
 
