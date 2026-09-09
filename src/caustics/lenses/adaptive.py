@@ -534,7 +534,13 @@ def _refine(
             # same cascade would still have its midpoints sitting in `deferred`,
             # and a -1 slot here would silently negative-index `cache.ij` into
             # wrong geometry rather than raising. See spec section 2.3.
-            assert (vm >= 0).all(), "cascade hit an unevaluated midpoint"
+            #
+            # `raise AssertionError` rather than a bare `assert`: `python -O`
+            # strips bare asserts, and this one guards against silent geometric
+            # corruption, not just a debugging convenience. `func/adaptive.py`
+            # uses `raise AssertionError` for the same class of guard.
+            if not (vm >= 0).all():
+                raise AssertionError("cascade hit an unevaluated midpoint")
             kid_v, kid_cls = _red_split(vv, vm, store.cls[violators], COMPOSE)
             kid_level = np.repeat(store.level[violators] + 1, 4)
             # A forced child is auto-converged: steps 3-7 are skipped so the
@@ -651,6 +657,18 @@ def _close(lattice, cache, active, v, level, status):
     # count == 0, matching `_refine`'s invariant that no leaf at max_level has a
     # hanging node; below max_level the sums are always even by construction (see
     # `_midpoint_ij`), so the gate has no effect there.
+    #
+    # That covers the gate being a no-op *below* max_level; the other half is that
+    # it always *fires* -- is never merely usually True -- *at* max_level, i.e.
+    # `exact` is exactly equivalent to `level < max_level`. Proof: at max_level
+    # every leaf is a unimodular lattice triangle, |det(edge matrix)| == 1. If any
+    # edge's two endpoints shared parity in both coordinates, that edge vector
+    # would be all-even; using it as one column of an edge matrix built from the
+    # triangle's other two edges would then force the determinant to be even (or,
+    # were a second edge also all-even, divisible by four) -- both impossible when
+    # |det| == 1. So no edge of a max_level leaf can ever have matching endpoint
+    # parity, `exact` is False on every edge, and the count == 0 pass-through
+    # above is that leaf's only route through -- not an artifact of this fixture.
     exact = ((v_ij[:, [1, 2, 0]] + v_ij[:, [2, 0, 1]]) % 2 == 0).all(axis=-1)
     hanging = exact & active.contains(mid_keys)  # (L0, 3)
     count = hanging.sum(axis=1)
@@ -717,6 +735,19 @@ class BuildStats:
     smallest curvature scale in the lens. A large level-0 convergence fraction means
     the mesh never looked below ``init_res`` anywhere and that precondition went
     untested.
+
+    ``n_converged_at_level_0`` is an EVENT count, not a leaf count, and is the one
+    exception to the "all leaf counts are pre-closure" framing above: it counts
+    triangles that *passed step 7* at level 0, not triangles that are still
+    level-0 leaves by the time refinement finishes. The balance cascade can later
+    force-split a level-0 triangle that passed step 7 (to satisfy a coarser
+    neighbour's 2:1 balance against a finer one elsewhere), which removes it from
+    ``leaves_by_level[0]`` while leaving it counted here -- so
+    ``n_converged_at_level_0`` can exceed ``leaves_by_level[0]``. That is correct
+    and intentional: a force-split level-0 leaf still received no criterion
+    evidence below level 0 (its children are ``FORCED``, not re-evaluated), so the
+    event count is the more informative blind-spot diagnostic, not a bug to be
+    reconciled against the leaf count.
 
     A triangle failing both parity and deviation is counted in ``n_parity_splits``;
     ``n_deviation_splits`` counts only among parity-passers.
@@ -795,11 +826,24 @@ def _build_index(vs, leaves, valid_rows, index_cells):
     own cell always contains any leaf containing ``beta``. No neighbour search is
     needed. Per-cell lists are stored ascending, which gives ``query`` its sorted
     CSR blocks with no sort at query time.
+
+    Deliberately float64 regardless of the mesh's ``dtype``: build-side and
+    query-side cell arithmetic (``Mesh.query``'s ``(chunk - lo) / cell``) must agree
+    by construction, and forcing this to the mesh's own dtype would let the two
+    sides round independently right at cell boundaries -- worse, not cleaner.
     """
     tri = vs[leaves[valid_rows]].astype(np.float64)
     if tri.shape[0] == 0:
         lo = np.zeros(2)
-        return lo, np.ones(2), 1, 1, np.zeros(2, np.int64), np.empty(0, np.int64)
+        return (
+            lo,
+            np.ones(2),
+            1,
+            1,
+            np.zeros(2, np.int64),
+            np.empty(0, np.int64),
+            np.ones(2),
+        )
     flat = tri.reshape(-1, 2)
     lo, hi = flat.min(axis=0), flat.max(axis=0)
     span = np.where(hi > lo, hi - lo, 1.0)  # a degenerate axis becomes one cell
@@ -828,7 +872,7 @@ def _build_index(vs, leaves, valid_rows, index_cells):
     order = np.lexsort((leaf_id, cell_id))  # ascending leaf id within each cell
     cell_leaves = leaf_id[order]
     cell_offsets = np.searchsorted(cell_id[order], np.arange(nx * ny + 1))
-    return lo, cell, nx, ny, cell_offsets.astype(np.int64), cell_leaves
+    return lo, cell, nx, ny, cell_offsets.astype(np.int64), cell_leaves, hi
 
 
 class Mesh:
@@ -881,6 +925,7 @@ class Mesh:
             self._ny,
             self._cell_offsets,
             self._cell_leaves,
+            self._index_hi,
         ) = index
 
     def _empty_result(self, n_queries):
@@ -944,11 +989,22 @@ class Mesh:
             chunk = beta[lo : lo + step]
             b = chunk.shape[0]
             u = backend.long(backend.floor((chunk - self._index_lo) / self._index_cell))
+            # Containment is a coordinate test against the stored exact `hi`, not a
+            # cell-index test on `u`. `cell = span / [nx, ny]`, so a point sitting
+            # exactly on the upper bbox edge (x == hi_x) gives u_x == nx, which
+            # fails `u_x < nx` even though `_build_index` clips leaf registration
+            # to column nx - 1 -- i.e. a leaf whose AABB reaches `hi` *is* indexed,
+            # in the very column `u_x < nx` rejects. Recomputing `hi` here as
+            # `lo + cell * [nx, ny]` would reintroduce the same fragility, since
+            # `(span / n) * n` need not equal `span` to the ulp; the exact `hi`
+            # from the build is used instead. A leaf containing a `beta` with
+            # x == hi has its `i1_x` clipped to `nx - 1`, the column the clamp
+            # below selects, so this coordinate test is provably complete.
             inside = (
-                (u[:, 0] >= 0)
-                & (u[:, 0] < self._nx)
-                & (u[:, 1] >= 0)
-                & (u[:, 1] < self._ny)
+                (chunk[:, 0] >= self._index_lo[0])
+                & (chunk[:, 0] <= self._index_hi[0])
+                & (chunk[:, 1] >= self._index_lo[1])
+                & (chunk[:, 1] <= self._index_hi[1])
             )
             # Clipped only to keep the gather in range; `inside` forces an empty
             # block for out-of-bbox points.
@@ -1123,7 +1179,12 @@ def build_adaptive_mesh(
         ``backend.float32`` to halve query memory.
     raytrace_batch_size: Optional[int]
         Splits each per-level ``raytrace`` call for memory. One logical batch per
-        level is preserved.
+        level is preserved. This bounds only the size of each ``raytrace`` call,
+        **not** ``_VertexCache.beta``, which retains the source-plane image of
+        every point ever evaluated for the whole build: a converged leaf's
+        midpoints cannot be pruned, since the balance cascade may force-split
+        that leaf later and need them. A caller setting this to bound peak
+        memory should budget for the whole vertex cache, not just one level.
     index_cells: Optional[int]
         Spatial-index cells along the longer axis of the source-plane bounding box.
 
@@ -1271,6 +1332,7 @@ def build_adaptive_mesh(
             index[3],
             to_backend(index[4], integer=True),
             to_backend(index[5], integer=True),
+            to_backend(index[6]),
         ),
         stats=stats,
         d_floor=d_floor,

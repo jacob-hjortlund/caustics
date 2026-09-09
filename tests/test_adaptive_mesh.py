@@ -227,7 +227,7 @@ def test_criterion_parity_fires_across_a_fold():
     assert not parity_ok[0] and not keep[0]
 
 
-def test_criterion_is_invariant_to_simultaneous_relabelling():
+def test_affine_and_sigma_min_are_invariant_to_simultaneous_relabelling():
     M, G, COMPOSE, PINV0, ROOT_CLASS = child_matrix_tables()
     p = RNG.normal(size=(200, 3, 2))
     q = RNG.normal(size=(200, 3, 2))
@@ -692,12 +692,18 @@ def test_forced_and_invalid_statuses_are_mutually_consistent():
     already guarantees via ``test_cascade_produces_forced_children`` -- leaving
     the INVALID half of the claim unfalsifiable.
 
-    Note this does NOT pin the cascade's INVALID-*inheritance* arm (the
-    ``np.where`` that gives a forced child INVALID when its parent was INVALID).
-    Reaching that arm requires an INVALID leaf to become a 2:1 violator, and
-    whether this fixture produces one is not determinable from the frozen mesh:
-    an inherited-INVALID child may itself contain the bad point, so it is
-    indistinguishable from a criterion-path INVALID leaf after the fact.
+    This DOES reach the cascade's INVALID-*inheritance* arm (the ``np.where``
+    that gives a forced child INVALID when its parent was INVALID), and this
+    test's own loop below is what pins it. ``_find_unbalanced`` filters
+    candidates on ``store.valid & (store.level <= bound)`` and not on status, so
+    an INVALID leaf is an ordinary violator candidate like any other -- which is
+    exactly what the spec mandates. Instrumented on this fixture: of the 40
+    violators the cascade processes, 10 are INVALID, and all four children of
+    every one of those 10 carry a non-finite vertex. So if the ``np.where(... ==
+    INVALID, INVALID, FORCED)`` below were replaced by an unconditional
+    ``FORCED``, the FORCED-finiteness loop just below would fail on 40 rows
+    instead of the finite ``FORCED`` set it currently sees. The arm is reached,
+    and already discriminated by this test as written.
     """
 
     def half_bad(p):
@@ -887,6 +893,47 @@ def test_closure_adds_no_new_vertices():
     assert set(np.unique(leaves)) <= set(range(n_pre))
 
 
+def test_close_reaches_the_count_equals_3_branch_via_a_gaussian_bump():
+    """`_close`'s ``count == 3`` branch, which no other fixture reaches.
+
+    That branch re-derives the red split with a raw ``concatenate`` + fancy-index
+    gather rather than calling ``_red_split``, so ``_red_split``'s own tests give
+    it zero coverage. A narrow Gaussian bump gives an ``init_res=8`` grid coarse
+    enough that most triangles converge quickly while a few interior ones split
+    deep enough to leave a fully-hanging (3-node) origin behind for ``_close`` to
+    red-split. Measured: ``n_closure_by_pattern == (244, 42, 6)``.
+    """
+
+    def bump(p, w=0.08, amp=1.0, c=(0.13, 0.07)):
+        centre = np.asarray(c)
+        r2 = ((p - centre) ** 2).sum(axis=-1)
+        return p * 0.5 + (amp * np.exp(-r2 / (2 * w**2)))[:, None] * np.array(
+            [1.0, 0.3]
+        )
+
+    ref, lat, v, pre_lvl, pre_st, leaves, origin, lvl, st, n_pre = closed_mesh(
+        bump, fov=4.0, init_res=8, min_img_sep=0.02
+    )
+    group_sizes = np.bincount(origin, minlength=v.shape[0])
+    pattern = (
+        int((group_sizes == 2).sum()),
+        int((group_sizes == 3).sum()),
+        int((group_sizes == 4).sum()),
+    )
+    assert pattern[2] > 0, f"fixture must reach the count == 3 branch, got {pattern}"
+    assert pattern == (244, 42, 6), f"measured n_closure_by_pattern={pattern}"
+
+    tri = lat.xy(ref.cache.ij[leaves])
+    assert (signed_area(tri) > 0).all(), "every leaf must be positively oriented"
+
+    origin_area = signed_area(lat.xy(ref.cache.ij[v]))
+    summed = np.zeros_like(origin_area)
+    np.add.at(summed, origin, signed_area(tri))
+    assert np.allclose(
+        summed, origin_area, rtol=1e-12
+    ), "origin-group areas must tile their origin exactly"
+
+
 def build(fn, fov=4.0, init_res=4, min_img_sep=0.25, **kw):
     raytrace, calls = make_counting_raytrace(fn)
     mesh = build_adaptive_mesh(raytrace, fov, init_res, min_img_sep, **kw)
@@ -1011,6 +1058,68 @@ def test_index_registers_every_leaf_in_the_cell_of_each_of_its_vertices():
             assert leaf in cells[offs[c] : offs[c + 1]]
 
 
+def test_query_covers_points_on_the_source_bbox_upper_edge():
+    """Regression: the upper bbox edge used to return zero candidates.
+
+    `cell = span / [nx, ny]`, so a point at `x == hi_x` yields `u_x == nx`. The
+    old cell-index containment test rejected it, while `_build_index` clips leaf
+    registration to `nx - 1` -- so leaves whose AABB reaches `hi` were indexed
+    but unreachable. Measured before the fix: 18 of 18 upper-edge vertices
+    returned nothing where brute-force containment found candidates.
+    """
+    mesh, _ = build(localised_fold, min_img_sep=0.05)
+    vs = backend.to_numpy(mesh.vertices_source)
+    leaves = backend.to_numpy(mesh.leaves)
+    status = backend.to_numpy(mesh.leaf_status)
+    hi = backend.to_numpy(mesh._index_hi)
+    on_edge = np.flatnonzero((vs[:, 0] == hi[0]) | (vs[:, 1] == hi[1]))
+    assert on_edge.size > 0, "fixture must have vertices on the upper bbox edge"
+    for v in on_edge:
+        beta = vs[v]
+        tri = backend.as_array(vs[leaves])
+        pts = backend.as_array(np.repeat(beta[None], leaves.shape[0], axis=0))
+        truth = backend.to_numpy(contains(triangle_weights(tri, pts)))
+        expected = set(
+            np.flatnonzero(truth & (status != int(LeafStatus.INVALID))).tolist()
+        )
+        idx, off, _ = query_np(mesh, beta[None])
+        assert (
+            set(idx[off[0] : off[1]].tolist()) >= expected
+        ), f"upper-edge point {beta} lost candidates"
+
+
+def test_query_matches_brute_force_containment_on_multi_cell_leaves():
+    """The one-cell-lookup completeness claim, on a mesh with wide leaf AABBs.
+
+    `_build_index` registers each leaf across its full cell rectangle, not just
+    its three vertex cells -- and no other test distinguishes those, since the
+    vertex-cell test checks only vertices and the crack test's uniform reference
+    shares `_build_index` so a common bug cancels. Measured on this fixture:
+    263 of 1350 leaves span three or more index cells on an axis.
+    """
+    mesh, _ = build(localised_fold, min_img_sep=0.05)
+    vs = backend.to_numpy(mesh.vertices_source)
+    leaves = backend.to_numpy(mesh.leaves)
+    status = backend.to_numpy(mesh.leaf_status)
+    lo = backend.to_numpy(mesh._index_lo)
+    cell = backend.to_numpy(mesh._index_cell)
+    tri = vs[leaves]
+    i0 = np.floor((tri.min(axis=1) - lo) / cell).astype(np.int64)
+    i1 = np.floor((tri.max(axis=1) - lo) / cell).astype(np.int64)
+    span = i1 - i0 + 1
+    assert (span >= 3).any(), "fixture must contain multi-cell leaf AABBs"
+    beta = RNG.uniform(-0.9, 0.9, size=(200, 2))
+    idx, off, _ = query_np(mesh, beta)
+    tri_b = backend.as_array(tri)
+    for b in range(beta.shape[0]):
+        pts = backend.as_array(np.repeat(beta[b][None], leaves.shape[0], axis=0))
+        truth = backend.to_numpy(contains(triangle_weights(tri_b, pts)))
+        expected = set(
+            np.flatnonzero(truth & (status != int(LeafStatus.INVALID))).tolist()
+        )
+        assert set(idx[off[b] : off[b + 1]].tolist()) >= expected
+
+
 def test_stats_report_level_zero_convergence_and_termination_split():
     mesh, _ = build(localised_fold, min_img_sep=0.05)
     s = mesh.stats
@@ -1020,7 +1129,11 @@ def test_stats_report_level_zero_convergence_and_termination_split():
     )
     assert len(s.leaves_by_level) == s.max_level + 1
     assert sum(s.leaves_by_level) == s.n_leaves_pre_closure
-    assert s.n_converged_at_level_0 >= 0
+    # A level-0 step-7 pass is one of the pre-closure leaves counted at *some*
+    # level, so this is a true invariant of the event count -- not the
+    # unfalsifiable `>= 0` an unsigned count trivially satisfies -- and it would
+    # catch a counter that ran away.
+    assert s.n_converged_at_level_0 <= s.n_leaves_pre_closure
     assert s.cancellation_floor < 1e-6  # float64 build
     assert s.n_vertices == mesh.vertices_lens.shape[0]
 
@@ -1350,6 +1463,9 @@ def test_sie_candidates_recover_forward_raytrace_images(device):
         expected = dedup(
             np.stack([backend.to_numpy(ex), backend.to_numpy(ey)], axis=-1), 1e-2
         )
+        # The coverage contract below goes vacuous if `dedup` ever returned an
+        # empty `expected`: `.all()` over an empty array is True.
+        assert expected.shape[0] > 0, f"{sp}: forward_raytrace found no images"
         seed, offsets = mesh.seeds(backend.as_array(np.asarray([sp])))
         seed = backend.to_numpy(seed)
         assert seed.shape[0] >= expected.shape[0], "candidates must cover the images"
