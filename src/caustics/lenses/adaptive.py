@@ -10,10 +10,18 @@ the frozen result.
 The build is a host-side NumPy float64 algorithm whose only array-API contact is the
 ``raytrace`` callback; the frozen mesh and ``Mesh.query`` are backend-dispatched.
 
-Non-goals, by design: no root finding, no image deduplication
-(``forward_raytrace_rootfind`` composes with :meth:`Mesh.seeds` for that), no
-autodiff, no jit, no vmap. Candidate count is **not** image multiplicity -- a point
-on a shared edge returns both leaves, and near-critical leaves overlap.
+Two layers sit on the frozen mesh. :meth:`Mesh.query` and its accessors return
+*candidate regions* and Newton seeds; :meth:`Mesh.forward_raytrace` and
+:meth:`Mesh.multiplicity_map` go on to root-find and deduplicate, and return images.
+
+The distinction matters and is not cosmetic. **Candidate count is not image
+multiplicity** -- a point on a shared edge returns both leaves, and near-critical
+leaves overlap -- so anything that needs a count has to go through the root-finding
+layer, which is what :meth:`Mesh.multiplicity_map` is.
+
+Non-goals, by design: no autodiff, no jit, no vmap. :meth:`Mesh.query` has
+data-dependent output shapes, so the mesh is structurally unjittable rather than
+merely undocumented for it.
 """
 
 from dataclasses import dataclass
@@ -25,6 +33,7 @@ from warnings import warn
 import numpy as np
 
 from ..backend_obj import ArrayLike, backend
+from ..utils import batch_lm, meshgrid
 from .func.adaptive import (
     CHILD_VERTEX_INDICES,
     ROOT_SHAPES,
@@ -914,6 +923,94 @@ def _build_index(vs, leaves, valid_rows, index_cells):
     return lo, cell, nx, ny, cell_offsets.astype(np.int64), cell_leaves, hi
 
 
+def _dedup_representatives(points, counts, tol):
+    """
+    One representative per cluster of near-coincident points, within each block.
+
+    Clusters are the **connected components** of the ``distance < tol`` graph, not
+    the greedy clusters :func:`~caustics.lenses.func.base.remove_duplicate_points`
+    produces. The difference is order dependence: for three collinear points
+    spaced ``0.9 * tol`` apart, greedy returns two representatives in one input
+    order and one in another, so the image count would depend on the order
+    :meth:`Mesh.query` happened to emit candidates in. Components are a function
+    of the point set alone, which is what makes a multiplicity map reproducible.
+
+    Adjacency is strict ``<``, so a pair separated by exactly ``tol`` stays
+    distinct. That matches the build contract, where ``min_img_sep`` is a size
+    floor the mesh resolves *to* rather than a scale it merges away.
+
+    Vectorized by padding each block to the longest, because the greedy loop is
+    one Python iteration per point -- fine for the handful of images of a single
+    source, hopeless for the ``nx * ny`` blocks of a multiplicity map. The cost is
+    a ``(B, M, M)`` intermediate with ``M = max(counts)``, which is why callers
+    chunk over query points rather than passing every block at once.
+
+    Parameters
+    ----------
+    points: ArrayLike
+        Shape ``(K, 2)``, laid out block-major: block ``b`` occupies the
+        ``counts[b]`` rows following those of blocks ``0 .. b - 1``.
+
+        *Unit: arcsec*
+
+    counts: ndarray
+        Shape ``(B,)`` int, with ``counts.sum() == K``. Zero-length blocks are
+        allowed.
+    tol: float
+        Separation below which two points are the same image.
+
+        *Unit: arcsec*
+
+    Returns
+    -------
+    ArrayLike
+        ``(K,)`` bool, True on exactly one point per cluster.
+    """
+    counts = np.asarray(counts, dtype=np.int64)
+    total = int(counts.sum())
+    device = backend.device(points)
+    n_slots = int(counts.max()) if counts.size else 0
+    if total == 0 or n_slots == 0:
+        return backend.as_array(np.zeros(total, dtype=bool), device=device)
+
+    # Pad to (B, M): slot j of block b is real where j < counts[b], and gathers a
+    # repeat of the block's last row otherwise. The clip keeps the gather in range
+    # for an empty trailing block, whose slots are masked out anyway.
+    slot = np.arange(n_slots, dtype=np.int64)
+    starts = np.cumsum(counts) - counts
+    valid_np = slot[None, :] < counts[:, None]
+    gather = np.clip(starts[:, None] + slot[None, :], 0, total - 1)
+
+    int64 = backend.module.int64
+    padded = points[backend.as_array(gather.reshape(-1), dtype=int64, device=device)]
+    padded = padded.reshape(counts.shape[0], n_slots, 2)
+    valid = backend.long(backend.as_array(valid_np, device=device))
+
+    delta = backend.unsqueeze(padded, 2) - backend.unsqueeze(padded, 1)
+    # Squared distances against a squared tolerance: no sqrt, and the comparison
+    # is exact for the diagonal, so every valid point is its own neighbour and the
+    # label update below is a true minimum over the closed neighbourhood.
+    adjacent = backend.long(backend.sum(delta * delta, dim=-1) < tol * tol)
+    adjacent = adjacent * backend.unsqueeze(valid, 2) * backend.unsqueeze(valid, 1)
+
+    # Min-label propagation. `n_slots` is the sentinel for "no label": padded
+    # slots keep it, and it exceeds every real slot index so it never wins a
+    # minimum against a valid neighbour.
+    index = backend.unsqueeze(backend.arange(n_slots, dtype=int64, device=device), 0)
+    labels = valid * index + (1 - valid) * n_slots
+    for _ in range(n_slots):
+        neighbour = adjacent * backend.unsqueeze(labels, 1) + (1 - adjacent) * n_slots
+        updated = backend.min(neighbour, dim=2)
+        if bool(backend.to_numpy(backend.all(updated == labels))):
+            break
+        labels = updated
+
+    # Each component now carries the lowest slot index it contains, and that slot
+    # is its own label -- so the fixed points are exactly one per component.
+    keep = (labels == index) & backend.as_array(valid_np, device=device)
+    return keep.reshape(-1)[backend.as_array(valid_np.reshape(-1), device=device)]
+
+
 class Mesh:
     """
     A frozen adaptive mesh of the lens plane, queryable from the source plane.
@@ -929,6 +1026,13 @@ class Mesh:
     refines rather than terminating, so it can only come to rest at ``max_level``.
     ``stats.n_invalid`` sizes the hole and ``stats.n_nonfinite_splits`` the descent
     that shrank it.
+
+    ``min_img_sep`` is stored because it is the mesh's own defining tolerance, in
+    both of its build roles and again as the dedup radius in
+    :meth:`forward_raytrace`. ``raytrace`` deliberately is **not** stored and is
+    passed per call: a callable carries no identity the mesh could check, so
+    holding one would imply a guarantee that it matches the build when nothing can
+    enforce it.
     """
 
     def __init__(
@@ -945,6 +1049,7 @@ class Mesh:
         stats,
         d_floor,
         max_level,
+        min_img_sep,
         dtype,
         device,
     ):
@@ -959,6 +1064,7 @@ class Mesh:
         self.stats = stats
         self.d_floor = d_floor
         self.max_level = max_level
+        self.min_img_sep = min_img_sep
         self.dtype = dtype
         self.device = device
         (
@@ -979,6 +1085,18 @@ class Mesh:
             zeros,
             backend.zeros((0, 3), dtype=self.vertices_source.dtype, device=self.device),
         )
+
+    def _as_beta(self, beta):
+        """Coerce query points to the mesh's dtype and device, shape ``(B, 2)``."""
+        beta = backend.as_array(
+            beta, dtype=self.vertices_source.dtype, device=self.device
+        )
+        if len(beta.shape) != 2 or beta.shape[1] != 2:
+            raise ValueError(
+                f"beta must have shape (B, 2), got {tuple(beta.shape)}. A single "
+                "point must be passed as shape (1, 2)."
+            )
+        return beta
 
     def query(self, beta, batch_size: Optional[int] = None):
         """
@@ -1012,14 +1130,7 @@ class Mesh:
             ``(K, 3)`` barycentric coordinates of ``beta`` in the source-plane image
             of the hit triangle, guaranteed to lie in the simplex.
         """
-        beta = backend.as_array(
-            beta, dtype=self.vertices_source.dtype, device=self.device
-        )
-        if len(beta.shape) != 2 or beta.shape[1] != 2:
-            raise ValueError(
-                f"beta must have shape (B, 2), got {tuple(beta.shape)}. A single "
-                "point must be passed as shape (1, 2)."
-            )
+        beta = self._as_beta(beta)
         n = beta.shape[0]
         if n == 0:
             return self._empty_result(0)
@@ -1159,6 +1270,267 @@ class Mesh:
     def _seed(self, leaf_indices, bary):
         tri = self.vertices_lens[self.leaves[leaf_indices]]
         return backend.sum(tri * backend.unsqueeze(bary, -1), dim=1)
+
+    def forward_raytrace(
+        self,
+        beta,
+        raytrace: Callable[[ArrayLike, ArrayLike], Tuple[ArrayLike, ArrayLike]],
+        batch_size: Optional[int] = None,
+        *,
+        residual_tol: Optional[float] = None,
+        lm_kwargs: Optional[dict] = None,
+    ):
+        """
+        Image-plane positions of every image of each source-plane point.
+
+        :meth:`seeds` supplies a Newton seed per candidate leaf, accurate to
+        ``min_img_sep`` by construction; Levenberg-Marquardt refines each seed to a
+        root of the lens equation, unconverged roots are discarded, and the
+        survivors are deduplicated at ``min_img_sep``.
+
+        Parameters
+        ----------
+        beta: ArrayLike
+            Source-plane points, shape ``(B, 2)`` strictly. A single point must be
+            passed as ``(1, 2)``.
+
+            *Unit: arcsec*
+
+        raytrace: Callable
+            **Must be the same callable this mesh was built from**, called as
+            ``raytrace(x, y) -> (bx, by)``. The seeds handed to the root finder are
+            preimages under *this* mesh's leaves, so a different lens would be
+            root-found from meaningless starting points -- silently, since the
+            residual filter would simply reject most of them and return too few
+            images rather than raising. This cannot be checked: a callable carries
+            no identity the mesh could have recorded at build time.
+        batch_size: Optional[int]
+            Chunk size over source points. Bounds peak memory for the whole
+            pipeline, not just :meth:`query` -- the root finder holds ``(K, 2)``
+            states and the dedup a ``(B, M, M)`` adjacency. Results are identical
+            for every value.
+        residual_tol: Optional[float]
+            Source-plane tolerance on ``|raytrace(x) - beta|`` for accepting a
+            root. Defaults to ``min_img_sep``.
+
+            *Unit: arcsec*
+
+        lm_kwargs: Optional[dict]
+            Extra keyword arguments for :func:`~caustics.utils.batch_lm`, e.g.
+            ``max_iter``.
+
+        Returns
+        -------
+        images: ArrayLike
+            ``(K, 2)`` lens-plane image positions, laid out block-major: the
+            ``counts[b]`` images of source ``b`` follow those of sources
+            ``0 .. b - 1``.
+
+            *Unit: arcsec*
+
+        counts: ArrayLike
+            ``(B,)`` int64 image multiplicity of each source point.
+
+        Notes
+        -----
+        Two filters decide that a root is an image, and both are needed.
+
+        The **residual** test alone is weak near a fold caustic, where the lens map
+        is quadratic: a point sitting well over ``min_img_sep`` from the true image
+        in the lens plane can still have a small source-plane residual, so it
+        survives the residual test, escapes the dedup, and inflates the count
+        exactly where multiplicity structure matters most.
+
+        The **displacement** test closes that hole using a guarantee the mesh
+        already makes -- the seed lies inside its leaf and is accurate to
+        ``min_img_sep`` -- so a root that left its own neighbourhood is not the root
+        its seed was pointing at. It is a disjunction rather than plain containment
+        because a leaf at the size floor is itself only about ``min_img_sep``
+        across, so a genuine root near a leaf edge can legitimately land just
+        outside it; requiring containment alone would drop real images.
+
+        Root finding runs in the dtype of the frozen mesh, so a mesh built with
+        ``dtype=backend.float32`` caps the achievable accuracy near the
+        ``stats.cancellation_floor`` the build already warns about.
+        """
+        beta = self._as_beta(beta)
+        n = beta.shape[0]
+        tol = self.min_img_sep if residual_tol is None else float(residual_tol)
+        lm_kwargs = {} if lm_kwargs is None else dict(lm_kwargs)
+        int64 = backend.module.int64
+
+        def to_source(xy):
+            return backend.stack(raytrace(xy[..., 0], xy[..., 1]), dim=-1)
+
+        def as_counts(counts):
+            return backend.as_array(
+                np.asarray(counts, dtype=np.int64), dtype=int64, device=self.device
+            )
+
+        def no_images():
+            return backend.zeros(
+                (0, 2), dtype=self.vertices_lens.dtype, device=self.device
+            )
+
+        if n == 0:
+            return no_images(), as_counts(np.empty(0))
+
+        step = n if batch_size is None else max(1, int(batch_size))
+        image_parts, count_parts = [], []
+
+        for lo in range(0, n, step):
+            chunk = beta[lo : lo + step]
+            b = chunk.shape[0]
+            idx, offsets, bary = self.query(chunk)
+            seed = self.seeds(leaf_indices=idx, bary=bary)
+            if seed.shape[0] == 0:
+                count_parts.append(np.zeros(b, dtype=np.int64))
+                continue
+
+            # One target per seed, so a source with several candidate leaves
+            # root-finds each of them against its own beta.
+            spans = offsets[1:] - offsets[:-1]
+            target = backend.repeat(chunk, spans, axis=0)
+            root, _, _ = batch_lm(seed, target, to_source, **lm_kwargs)
+
+            converged = backend.sum((to_source(root) - target) ** 2, dim=-1) < tol * tol
+            # See the note above on why containment and the ball are OR-ed.
+            tri = self.vertices_lens[self.leaves[idx]]
+            near = contains(triangle_weights(tri, root)) | (
+                backend.sum((root - seed) ** 2, dim=-1) <= self.min_img_sep**2
+            )
+            keep = converged & near
+
+            # Block bookkeeping in NumPy: the counts are host-side integers the
+            # dedup and the caller both need, and this module is already a
+            # host-driven build, so a device round trip buys nothing.
+            keep_np = backend.to_numpy(keep).astype(np.int64)
+            off_np = backend.to_numpy(offsets)
+            csum = np.concatenate(([0], np.cumsum(keep_np)))
+            kept = csum[off_np[1:]] - csum[off_np[:-1]]
+            if kept.sum() == 0:
+                count_parts.append(np.zeros(b, dtype=np.int64))
+                continue
+
+            survivors = root[keep]
+            unique = _dedup_representatives(survivors, kept, self.min_img_sep)
+            unique_np = backend.to_numpy(unique).astype(np.int64)
+            kept_off = np.concatenate(([0], np.cumsum(kept)))
+            csum = np.concatenate(([0], np.cumsum(unique_np)))
+            count_parts.append(csum[kept_off[1:]] - csum[kept_off[:-1]])
+            image_parts.append(survivors[unique])
+
+        counts = as_counts(np.concatenate(count_parts))
+        if not image_parts:
+            return no_images(), counts
+        return backend.concatenate(image_parts, dim=0), counts
+
+    def multiplicity_map(
+        self,
+        raytrace: Callable[[ArrayLike, ArrayLike], Tuple[ArrayLike, ArrayLike]],
+        pixelscale: float,
+        nx: Optional[int] = None,
+        ny: Optional[int] = None,
+        *,
+        x0: Optional[float] = None,
+        y0: Optional[float] = None,
+        batch_size: Optional[int] = None,
+        residual_tol: Optional[float] = None,
+        lm_kwargs: Optional[dict] = None,
+    ):
+        """
+        Image multiplicity on a regular grid of source-plane positions.
+
+        A :meth:`forward_raytrace` per pixel, reduced to its image count. The
+        caustics are where the count changes.
+
+        Parameters
+        ----------
+        raytrace: Callable
+            The same callable this mesh was built from -- see
+            :meth:`forward_raytrace`.
+        pixelscale: float
+            Side length of a source-plane pixel. Pixels are square, and this is
+            the knob to compare against ``min_img_sep``: much below it the map
+            resolves structure the mesh itself cannot, and much above it the
+            multiplicity jumps at the caustics alias.
+
+            *Unit: arcsec*
+
+        nx, ny: Optional[int]
+            Pixel counts. Each defaults to covering the source-plane bounding box
+            of the indexed leaves, ``ceil(span / pixelscale)`` -- so the default
+            field of view is the extent of the source-plane mesh, and square
+            pixels give it a slight overhang.
+        x0, y0: Optional[float]
+            Grid centre, defaulting to the centre of that same bounding box.
+
+            *Unit: arcsec*
+
+        batch_size: Optional[int]
+            Chunk size over pixels, forwarded to :meth:`forward_raytrace`. This
+            matters more here than anywhere else in the module: the default
+            ``None`` root-finds every pixel of the map in one batch.
+        residual_tol, lm_kwargs
+            Forwarded to :meth:`forward_raytrace`.
+
+        Returns
+        -------
+        multiplicity: ArrayLike
+            ``(ny, nx)`` int64 image count, with ``multiplicity[j, i]`` the pixel
+            at ``(x_i, y_j)``.
+        extent: Tuple[float, float, float, float]
+            ``(x_min, x_max, y_min, y_max)`` outer pixel edges, ready for
+            ``imshow(multiplicity, origin="lower", extent=extent)``. Worth
+            returning even though it is derivable, because with ``nx``, ``ny``,
+            ``x0`` and ``y0`` defaulted the caller does not know them.
+
+        Notes
+        -----
+        Cost is ``nx * ny`` root-finding solves over the mesh's mean candidate
+        count, so it grows quadratically in ``1 / pixelscale``.
+
+        Multiplicity here is the count of *distinct converged roots*, which is why
+        it needed :meth:`forward_raytrace` rather than :meth:`query`: candidate
+        count is not multiplicity, since a query on a shared edge returns both
+        leaves and near-critical leaves overlap.
+        """
+        if not pixelscale > 0:
+            raise ValueError(f"pixelscale must be positive, got {pixelscale}")
+        lo = backend.to_numpy(self._index_lo)
+        hi = backend.to_numpy(self._index_hi)
+        nx = max(1, int(ceil((hi[0] - lo[0]) / pixelscale))) if nx is None else int(nx)
+        ny = max(1, int(ceil((hi[1] - lo[1]) / pixelscale))) if ny is None else int(ny)
+        cx = float((lo[0] + hi[0]) / 2) if x0 is None else float(x0)
+        cy = float((lo[1] + hi[1]) / 2) if y0 is None else float(y0)
+
+        # `utils.meshgrid` already produces pixel *centres*, zero-centred, with
+        # `indexing="xy"` -- so it gives (ny, nx) directly and only needs shifting
+        # onto the requested centre. Sampling centres rather than a `linspace`
+        # over the bounding box also keeps every query off the bbox edge, which is
+        # the degenerate case `query`'s containment test has to special-case.
+        gx, gy = meshgrid(
+            pixelscale,
+            nx,
+            ny,
+            device=self.device,
+            dtype=self.vertices_source.dtype,
+        )
+        beta = backend.stack((gx + cx, gy + cy), dim=-1).reshape(-1, 2)
+        _, counts = self.forward_raytrace(
+            beta,
+            raytrace,
+            batch_size=batch_size,
+            residual_tol=residual_tol,
+            lm_kwargs=lm_kwargs,
+        )
+        extent = (
+            cx - pixelscale * nx / 2,
+            cx + pixelscale * nx / 2,
+            cy - pixelscale * ny / 2,
+            cy + pixelscale * ny / 2,
+        )
+        return counts.reshape(ny, nx), extent
 
 
 def build_adaptive_mesh(
@@ -1381,6 +1753,7 @@ def build_adaptive_mesh(
         stats=stats,
         d_floor=d_floor,
         max_level=max_level,
+        min_img_sep=float(min_img_sep),
         dtype=np_dtype,
         device=device,
     )
