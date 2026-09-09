@@ -3,6 +3,7 @@ import pytest
 from astropy.wcs import WCS
 
 from caustics.utils import (
+    batch_lm,
     meshgrid,
     pixel_to_world,
     world_to_pixel,
@@ -262,3 +263,54 @@ def test_caustics_vs_astropy_wcs_sip(crpix, crval):
         (backend.to_numpy(caustics_wy) + 90) % 180,
         atol=1e-7,
     )
+
+
+def _rosenbrock(x):
+    """Residuals whose least-squares root is ``(1, 1)``.
+
+    A long curved valley, so Levenberg-Marquardt needs many iterations from a
+    distant start while a nearby start converges almost immediately -- exactly the
+    mix of easy and hard elements a batched solve has to survive.
+    """
+    return backend.stack((10 * (x[..., 1] - x[..., 0] ** 2), 1 - x[..., 0]), dim=-1)
+
+
+def _solve(starts):
+    X = backend.as_array(np.asarray(starts, dtype=np.float64))
+    Y = backend.as_array(np.zeros((len(starts), 2)))
+    root, _, _ = batch_lm(X, Y, _rosenbrock)
+    return backend.to_numpy(root)
+
+
+def test_batch_lm_converges_on_a_slow_element_alone():
+    """Baseline: the distant start does reach the root when solved by itself."""
+    assert np.allclose(_solve([[-1.2, 1.0]])[0], [1.0, 1.0], atol=1e-4)
+
+
+def test_batch_lm_does_not_abandon_a_slow_element_when_others_converge():
+    """A batch must not stop iterating while one of its elements is still moving.
+
+    The stopping rule reads "step is small" as convergence, but a *rejected* step
+    leaves ``X`` exactly unchanged -- so an element whose trial steps are being
+    rejected, which is precisely one that needs more iterations, scores as
+    finished. Paired with a majority test on the damping, two easy elements can
+    end the loop while a third is still at its starting point.
+    """
+    roots = _solve([[-1.2, 1.0], [0.99, 0.99], [0.99, 0.99]])
+    assert np.allclose(
+        roots[0], [1.0, 1.0], atol=1e-4
+    ), f"slow element abandoned at {roots[0]}"
+
+
+def test_batch_lm_is_independent_of_batch_composition():
+    """The property the bug above violates, stated directly.
+
+    A batched solve must agree with solving each element on its own; the elements
+    are mathematically independent and only the termination is shared.
+    """
+    alone = _solve([[-1.2, 1.0]])[0]
+    for companions in ([[0.99, 0.99]], [[0.99, 0.99], [1.01, 1.02]]):
+        together = _solve([[-1.2, 1.0]] + companions)[0]
+        assert np.allclose(
+            alone, together, atol=1e-6
+        ), f"same element gave {alone} alone and {together} with {len(companions)} companions"
