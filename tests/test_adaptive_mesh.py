@@ -13,6 +13,7 @@ from caustics.lenses.adaptive import (
     _ActiveKeys,
     _canonical_order,
     _close,
+    _dedup_representatives,
     _depth_floor,
     _edge_quarter_keys,
     _initial_triangles,
@@ -1725,3 +1726,339 @@ def test_build_and_query_run_on_the_configured_device(device):
     assert off_np[2] == off_np[1], "the far exterior point must hit nothing"
     assert bary_np.shape[0] == off_np[-1], "bary rows must match the CSR total"
     assert np.isfinite(bary_np).all()
+
+
+def test_mesh_stores_min_img_sep():
+    """`forward_raytrace` needs the dedup radius, and only the build knows it.
+
+    `raytrace` is deliberately *not* stored -- it is passed per call -- but
+    `min_img_sep` is the mesh's own defining tolerance, so a caller should never
+    have to restate it and risk restating it wrong.
+    """
+    lens = Point(
+        name="pt",
+        cosmology=FlatLambdaCDM(name="cosmo"),
+        z_l=0.5,
+        z_s=1.5,
+        x0=0.0,
+        y0=0.0,
+        Rein=1.0,
+        s=1e-6,
+    )
+    mesh = build_adaptive_mesh(lens.raytrace, fov=4.0, init_res=8, min_img_sep=0.05)
+    assert mesh.min_img_sep == 0.05
+
+
+def test_dedup_collapses_points_closer_than_the_tolerance():
+    points = as_arr([[0.0, 0.0], [0.0, 0.001], [1.0, 0.0]])
+    keep = to_np(_dedup_representatives(points, np.array([3]), 0.01))
+    assert keep.sum() == 2, "the coincident pair must collapse to one image"
+    assert keep[2], "the distant point must survive"
+
+
+def test_dedup_keeps_points_separated_by_the_tolerance():
+    """Separation *of* min_img_sep means distinct, matching the build contract.
+
+    The size floor is ``l_max <= min_img_sep`` and step 7 hides no pair separated
+    by more than ``min_img_sep / 4``, so the boundary belongs to the distinct
+    side. Adjacency is ``d < tol``, not ``<=``.
+    """
+    points = as_arr([[0.0, 0.0], [0.01, 0.0]])
+    keep = to_np(_dedup_representatives(points, np.array([2]), 0.01))
+    assert keep.sum() == 2
+
+
+def test_dedup_counts_connected_components_not_greedy_clusters():
+    """Order independence, which greedy clustering does not have.
+
+    Three collinear points spaced ``0.9 * tol`` apart form one connected
+    component. Greedy returns 2 for the order below and 1 for ``[1, 0, 2]`` --
+    the answer would depend on the order ``query`` happened to emit candidates
+    in, which is not something a multiplicity map may depend on.
+    """
+    p = np.array([[0.0, 0.0], [0.009, 0.0], [0.018, 0.0]])
+    counts = np.array([3])
+    base = to_np(_dedup_representatives(as_arr(p), counts, 0.01)).sum()
+    assert base == 1, f"one chained component expected, got {base}"
+    for order in ([1, 0, 2], [2, 1, 0], [0, 2, 1], [2, 0, 1]):
+        got = to_np(_dedup_representatives(as_arr(p[order]), counts, 0.01)).sum()
+        assert got == base, f"order {order} gave {got}, not {base}"
+
+
+def test_dedup_never_merges_across_blocks():
+    """Two source points whose images coincide must not collapse into one.
+
+    The padded ``(B, M, M)`` formulation makes cross-block bleed the natural bug
+    here, and it would silently halve a multiplicity map.
+    """
+    points = as_arr([[0.0, 0.0], [0.0, 0.0]])
+    keep = to_np(_dedup_representatives(points, np.array([1, 1]), 0.01))
+    assert keep.sum() == 2, "identical points in different blocks are distinct"
+
+
+def test_dedup_handles_ragged_blocks_and_empty_blocks():
+    """Padding must not invent images in a block that found none."""
+    points = as_arr([[0.0, 0.0], [5.0, 5.0], [5.0, 5.0005]])
+    keep = to_np(_dedup_representatives(points, np.array([1, 0, 2]), 0.01))
+    assert keep.tolist() == [True, True, False]
+
+
+def sie_fixture(device=None):
+    lens = SIE(
+        name="sie",
+        cosmology=FlatLambdaCDM(name="cosmo"),
+        z_l=0.5,
+        z_s=1.5,
+        x0=0.0,
+        y0=0.0,
+        q=0.4,
+        phi=np.pi / 5,
+        Rein=1.0,
+        s=1e-3,
+    )
+    if device is not None:
+        lens = lens.to(device)
+    mesh = build_adaptive_mesh(
+        lens.raytrace, fov=5.0, init_res=32, min_img_sep=1e-2, device=device
+    )
+    return lens, mesh
+
+
+def test_forward_raytrace_finds_no_spurious_sie_images():
+    """Every returned image is an image `lens.forward_raytrace` also finds.
+
+    The residual and leaf-or-ball filters exist for this: a stalled
+    Levenberg-Marquardt solve leaves a point that is not an image, and dedup will
+    not absorb it when it sits further than `min_img_sep` from a real one.
+    """
+    lens, mesh = sie_fixture()
+    for sp in ([0.2, 0.2], [0.05, -0.05]):
+        images, counts = mesh.forward_raytrace(as_arr([sp]), lens.raytrace)
+        images = to_np(images)
+        assert to_np(counts).tolist() == [images.shape[0]]
+        assert images.shape[0] > 0, f"{sp}: no images found"
+        # The reference path is float32-only: `LensBase.forward_raytrace` raises
+        # "expected scalar type Float but found Double" on float64 input. The mesh
+        # itself is float64, so only this comparison call is narrowed.
+        ex, ey = lens.forward_raytrace(backend.as_array(sp[0]), backend.as_array(sp[1]))
+        expected = dedup(np.stack([to_np(ex), to_np(ey)], axis=-1), 1e-2)
+        for p in images:
+            assert (
+                np.linalg.norm(expected - p, axis=-1).min() < 1e-2
+            ), f"{sp}: returned {p}, which is not a forward_raytrace image"
+
+
+def test_forward_raytrace_covers_every_sie_image():
+    """The converse contract: no image is dropped by the filters or the dedup."""
+    lens, mesh = sie_fixture()
+    for sp in ([0.2, 0.2], [0.05, -0.05]):
+        images, _ = mesh.forward_raytrace(as_arr([sp]), lens.raytrace)
+        images = to_np(images)
+        # The reference path is float32-only: `LensBase.forward_raytrace` raises
+        # "expected scalar type Float but found Double" on float64 input. The mesh
+        # itself is float64, so only this comparison call is narrowed.
+        ex, ey = lens.forward_raytrace(backend.as_array(sp[0]), backend.as_array(sp[1]))
+        expected = dedup(np.stack([to_np(ex), to_np(ey)], axis=-1), 1e-2)
+        assert expected.shape[0] > 0, f"{sp}: reference found no images"
+        nearest = np.linalg.norm(expected[:, None, :] - images[None, :, :], axis=-1)
+        worst = nearest.min(axis=1).max()
+        assert worst < 1e-2, f"{sp}: uncovered image, worst distance {worst:.3e}"
+
+
+def test_forward_raytrace_recovers_the_analytic_point_mass_pair():
+    """The one case with a closed form: exactly two images, at known positions.
+
+    ``theta = (b +- sqrt(b^2 + 4 Rein^2)) / 2``, both on the x axis. Asserting
+    the cardinality is only defensible here, where it is a theorem rather than a
+    measurement.
+    """
+    lens = Point(
+        name="pt",
+        cosmology=FlatLambdaCDM(name="cosmo"),
+        z_l=0.5,
+        z_s=1.5,
+        x0=0.0,
+        y0=0.0,
+        Rein=1.0,
+        s=1e-6,
+    )
+    mesh = build_adaptive_mesh(lens.raytrace, fov=8.0, init_res=64, min_img_sep=1e-2)
+    b = 0.4
+    images, counts = mesh.forward_raytrace(as_arr([[b, 0.0]]), lens.raytrace)
+    images = to_np(images)
+    assert to_np(counts).tolist() == [2], f"expected 2 images, got {images}"
+    expected = np.sort([(b + np.sqrt(b**2 + 4)) / 2, (b - np.sqrt(b**2 + 4)) / 2])
+    assert np.allclose(np.sort(images[:, 0]), expected, atol=1e-4)
+    assert np.abs(images[:, 1]).max() < 1e-4
+
+
+def test_forward_raytrace_batches_independently():
+    """A batched call equals looping one source at a time.
+
+    Falsifiable against the two bugs the ragged layout invites: targets paired
+    with the wrong seeds, and dedup merging images of different sources.
+    """
+    lens, mesh = sie_fixture()
+    points = [[0.2, 0.2], [0.05, -0.05], [0.4, -0.3]]
+    images, counts = mesh.forward_raytrace(as_arr(points), lens.raytrace)
+    counts = to_np(counts)
+    assert counts.shape == (3,)
+    assert counts.sum() == to_np(images).shape[0]
+    offsets = np.concatenate(([0], np.cumsum(counts)))
+    for i, sp in enumerate(points):
+        one, one_counts = mesh.forward_raytrace(as_arr([sp]), lens.raytrace)
+        assert to_np(one_counts).tolist() == [counts[i]], f"{sp}: count differs"
+        block = to_np(images)[offsets[i] : offsets[i + 1]]
+        assert np.allclose(block, to_np(one), atol=1e-8), f"{sp}: images differ"
+
+
+def test_forward_raytrace_batch_size_does_not_change_the_answer():
+    lens, mesh = sie_fixture()
+    beta = as_arr([[0.2, 0.2], [0.05, -0.05], [0.4, -0.3], [0.0, 0.3]])
+    full, full_counts = mesh.forward_raytrace(beta, lens.raytrace)
+    for size in (1, 2, 3):
+        part, part_counts = mesh.forward_raytrace(beta, lens.raytrace, batch_size=size)
+        assert to_np(part_counts).tolist() == to_np(full_counts).tolist()
+        assert np.allclose(to_np(part), to_np(full), atol=1e-8)
+
+
+def test_forward_raytrace_returns_an_empty_block_outside_the_source_plane():
+    """A source the mesh never maps to has zero images, not a raised error."""
+    lens, mesh = sie_fixture()
+    images, counts = mesh.forward_raytrace(as_arr([[50.0, 50.0]]), lens.raytrace)
+    assert to_np(counts).tolist() == [0]
+    assert to_np(images).shape == (0, 2)
+
+
+def test_multiplicity_map_has_the_requested_shape_and_extent():
+    lens, mesh = sie_fixture()
+    m, extent = mesh.multiplicity_map(lens.raytrace, 0.2, nx=7, ny=5, x0=0.0, y0=0.0)
+    assert to_np(m).shape == (5, 7), "shape is (ny, nx), imshow-ready"
+    # Outer pixel edges, not first/last centres: `extent` is what `imshow` wants.
+    assert np.allclose(extent, (-0.7, 0.7, -0.5, 0.5))
+
+
+def test_multiplicity_map_agrees_with_forward_raytrace_pixel_by_pixel():
+    """Pins the grid orientation, which a transposed reshape would silently flip.
+
+    The map must be the per-pixel image count of the very same source points
+    ``forward_raytrace`` would be given, laid out so that ``m[j, i]`` is the pixel
+    at ``(x_i, y_j)``.
+    """
+    lens, mesh = sie_fixture()
+    pixelscale, nx, ny = 0.25, 4, 3
+    m, _ = mesh.multiplicity_map(lens.raytrace, pixelscale, nx=nx, ny=ny)
+    m = to_np(m)
+    xs = (np.arange(nx) - (nx - 1) / 2) * pixelscale
+    ys = (np.arange(ny) - (ny - 1) / 2) * pixelscale
+    lo, hi = to_np(mesh._index_lo), to_np(mesh._index_hi)
+    x0, y0 = (lo + hi) / 2
+    # A non-square grid makes the transpose check falsifiable.
+    assert m.shape == (ny, nx)
+    for j, y in enumerate(ys):
+        for i, x in enumerate(xs):
+            _, counts = mesh.forward_raytrace(as_arr([[x + x0, y + y0]]), lens.raytrace)
+            assert m[j, i] == to_np(counts)[0], f"pixel ({i}, {j}) at ({x}, {y})"
+
+
+def test_multiplicity_map_defaults_its_field_of_view_to_the_source_plane_mesh():
+    """With no x0/y0/nx/ny, the grid covers the indexed leaves' source-plane bbox."""
+    lens, mesh = sie_fixture()
+    lo, hi = to_np(mesh._index_lo), to_np(mesh._index_hi)
+    pixelscale = 0.5
+    m, extent = mesh.multiplicity_map(lens.raytrace, pixelscale)
+    ny, nx = to_np(m).shape
+    assert nx == int(np.ceil((hi[0] - lo[0]) / pixelscale))
+    assert ny == int(np.ceil((hi[1] - lo[1]) / pixelscale))
+    # Centred on the bbox, and covering it -- square pixels mean slight overhang.
+    assert extent[0] <= lo[0] and extent[1] >= hi[0]
+    assert extent[2] <= lo[1] and extent[3] >= hi[1]
+    assert np.isclose((extent[0] + extent[1]) / 2, (lo[0] + hi[0]) / 2)
+    assert np.isclose((extent[2] + extent[3]) / 2, (lo[1] + hi[1]) / 2)
+
+
+def test_multiplicity_map_of_a_point_lens_is_two_away_from_the_centre():
+    """A point lens has exactly two images for every source but the origin.
+
+    Sampled away from the centre, where the softening core's demagnified third
+    image lives at a scale ``min_img_sep`` cannot resolve.
+    """
+    lens = Point(
+        name="pt",
+        cosmology=FlatLambdaCDM(name="cosmo"),
+        z_l=0.5,
+        z_s=1.5,
+        x0=0.0,
+        y0=0.0,
+        Rein=1.0,
+        s=1e-6,
+    )
+    mesh = build_adaptive_mesh(lens.raytrace, fov=8.0, init_res=64, min_img_sep=1e-2)
+    m, _ = mesh.multiplicity_map(lens.raytrace, 0.1, nx=5, ny=5, x0=1.5, y0=0.0)
+    assert (to_np(m) == 2).all(), f"expected all 2, got\n{to_np(m)}"
+
+
+def test_multiplicity_map_of_a_centred_sie_is_symmetric_under_point_reflection():
+    """`beta -> -beta` must not change the image count.
+
+    A centred SIE has an even convergence, so ``alpha(-theta) = -alpha(theta)``
+    and the images of ``-beta`` are exactly the negatives of those of ``beta``.
+    `utils.meshgrid` centres its samples on zero, so the reflection is a pixel
+    permutation and the comparison is exact rather than interpolated.
+    """
+    lens, mesh = sie_fixture()
+    m, _ = mesh.multiplicity_map(lens.raytrace, 0.15, nx=9, ny=9, x0=0.0, y0=0.0)
+    m = to_np(m)
+    assert (m == m[::-1, ::-1]).all(), f"not point-symmetric:\n{m}"
+    assert m.max() > m.min(), "a caustic must show up as a change in multiplicity"
+
+
+def test_multiplicity_map_of_a_cored_sie_obeys_the_odd_image_theorem():
+    """A non-singular lens produces an odd number of images.
+
+    The SIE's ``s = 1e-3`` core makes it non-singular, so every source off a
+    caustic has odd multiplicity -- 1 outside the radial caustic, 3 between the
+    two, 5 inside the tangential caustic. This is the sharpest available check on
+    the whole pipeline, because any single dropped or spurious image flips the
+    parity of the pixel it lands in. It caught nothing less than the
+    ``batch_lm`` stopping bug: before that fix the central image was abandoned
+    whenever its faster siblings converged, and those pixels read 4.
+    """
+    lens, mesh = sie_fixture()
+    m = to_np(
+        mesh.multiplicity_map(lens.raytrace, 0.08, nx=25, ny=25, x0=0.0, y0=0.0)[0]
+    )
+    assert set(np.unique(m).tolist()) <= {
+        1,
+        3,
+        5,
+    }, f"even counts present: {np.unique(m)}"
+    assert (
+        (m == 5).any() and (m == 3).any() and (m == 1).any()
+    ), "the grid must span both caustics for this to be a real test"
+
+
+def test_the_odd_image_theorem_test_can_actually_fail():
+    """Falsifiability guard for the test above.
+
+    Starve the root finder of iterations and images go missing; the parity check
+    must notice. Without this, a pipeline that silently returned the same count
+    everywhere would pass the theorem vacuously.
+    """
+    lens, mesh = sie_fixture()
+    m = to_np(
+        mesh.multiplicity_map(
+            lens.raytrace,
+            0.08,
+            nx=25,
+            ny=25,
+            x0=0.0,
+            y0=0.0,
+            lm_kwargs={"max_iter": 2},
+        )[0]
+    )
+    assert not set(np.unique(m).tolist()) <= {
+        1,
+        3,
+        5,
+    }, f"under-convergence still gave odd counts everywhere: {np.unique(m)}"
