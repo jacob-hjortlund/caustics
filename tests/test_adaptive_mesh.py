@@ -524,7 +524,35 @@ def test_refine_terminates_at_max_level_on_a_kappa_one_sheet():
     assert calls["points"] == (lat.n + 1) ** 2
 
 
-def test_refine_marks_a_nonfinite_subregion_invalid_and_stops():
+def sis_raytrace(p, b=1.0):
+    """SIS deflection ``beta = theta (1 - b/|theta|)``, non-finite at ``theta = 0``.
+
+    A *point* non-finite set, unlike the half-plane fixtures: the origin is a
+    lattice vertex for even ``init_res``, so exactly one sample point in the
+    whole build is non-finite and the six level-0 triangles sharing it are the
+    ones the old terminate-on-non-finite policy condemned wholesale. An
+    area-shaped fixture cannot distinguish a policy that refines into the bad
+    set from one that stops at its boundary, because there the boundary is
+    where all the leaves are anyway.
+
+    The Jacobian is non-degenerate away from the critical curve ``|theta| = b``,
+    so most of the domain converges early and the refinement that does happen is
+    attributable.
+    """
+    with np.errstate(divide="ignore", invalid="ignore"):
+        r = np.linalg.norm(p, axis=-1, keepdims=True)
+        return p * (1.0 - b / r)
+
+
+def test_refine_splits_a_nonfinite_subregion_down_to_max_level():
+    """Non-finite is maximal ignorance, so it refines rather than terminating.
+
+    The bad half-plane is condemned only at ``max_level``, where no split is
+    available -- not at whatever level it was first sampled. Reinstating the
+    early ``store.add(v[~good], ..., INVALID)`` puts INVALID rows at level 0 and
+    fails the level assertion.
+    """
+
     def broken(p):
         out = p.copy()
         bad = p[:, 0] > 0.5
@@ -532,26 +560,47 @@ def test_refine_marks_a_nonfinite_subregion_invalid_and_stops():
         return out
 
     ref, lat, calls, max_level = refine_with(broken, min_img_sep=0.5)
+    assert max_level > 0, "fixture must allow at least one split"
     v, level, cls, status = ref.store.compact()
-    assert (status == LeafStatus.INVALID).any()
-    invalid_beta = ref.cache.beta[v[status == LeafStatus.INVALID]]
-    assert not np.isfinite(invalid_beta).all()
+    invalid = status == LeafStatus.INVALID
+    assert invalid.any()
+    assert (level[invalid] == max_level).all()
+    assert not np.isfinite(ref.cache.beta[v[invalid]]).all()
     # a triangle wholly in the good half is untouched
     good = status == LeafStatus.CONVERGED
     assert good.any()
     assert np.isfinite(ref.cache.beta[v[good]]).all()
 
 
+def test_refine_splits_only_the_triangles_that_touch_a_point_singularity():
+    """The cost of refining on non-finite, counted exactly.
+
+    Six level-0 triangles share the origin, and a red split hands the bad vertex
+    to exactly one of the four children -- the corner child at that vertex -- so
+    the non-finite frontier stays six triangles wide at every level rather than
+    quadrupling. Hand-derived total: ``6 * max_level`` splits over levels
+    ``0 .. max_level - 1``, with no non-finite triangle left to split at
+    ``max_level``.
+
+    This is the counter that would expose an area-shaped non-finite region
+    driving an ``O(4**max_level)`` descent, which is the one real cost of
+    inverting the policy.
+    """
+    ref, lat, calls, max_level = refine_with(sis_raytrace, min_img_sep=0.05)
+    assert max_level == 5, "hand-derived counts below assume this depth"
+    assert ref.counters["nonfinite_splits"] == 6 * max_level
+
+
 def test_refine_marks_nonfinite_vertices_invalid_even_at_max_level():
     """The max_level short-circuit must not blanket-label everything SIZE_FLOOR.
 
     ``min_img_sep`` forces ``max_level == 0``, so the loop's first and only
-    iteration *is* the max_level iteration. That is the only way a triangle can
-    reach this branch carrying a non-finite vertex: below ``max_level`` a triangle
-    splits only if all six of its points are finite, and a child's vertices are
-    drawn from exactly those six, so every triangle at level >= 1 has finite
-    vertices by construction. With ``max_level > 0`` the ``~finite_v`` branch adds
-    no rows at all and the test cannot fail for the reason it names.
+    iteration *is* the max_level iteration, and the ``~finite_v`` branch is the
+    whole of this build's non-finite handling -- there is no deeper level for a
+    non-finite triangle to be pushed down to. That isolation is the point: with
+    ``max_level > 0`` a failure here could equally be the split path
+    misbehaving, whereas at ``max_level == 0`` only the short-circuit's own
+    INVALID-versus-SIZE_FLOOR discrimination can be at fault.
     """
 
     def broken(p):
@@ -692,18 +741,17 @@ def test_forced_and_invalid_statuses_are_mutually_consistent():
     already guarantees via ``test_cascade_produces_forced_children`` -- leaving
     the INVALID half of the claim unfalsifiable.
 
-    This DOES reach the cascade's INVALID-*inheritance* arm (the ``np.where``
-    that gives a forced child INVALID when its parent was INVALID), and this
-    test's own loop below is what pins it. ``_find_unbalanced`` filters
-    candidates on ``store.valid & (store.level <= bound)`` and not on status, so
-    an INVALID leaf is an ordinary violator candidate like any other -- which is
-    exactly what the spec mandates. Instrumented on this fixture: of the 40
-    violators the cascade processes, 10 are INVALID, and all four children of
-    every one of those 10 carry a non-finite vertex. So if the ``np.where(... ==
-    INVALID, INVALID, FORCED)`` below were replaced by an unconditional
-    ``FORCED``, the FORCED-finiteness loop just below would fail on 40 rows
-    instead of the finite ``FORCED`` set it currently sees. The arm is reached,
-    and already discriminated by this test as written.
+    The cascade has no INVALID-inheritance arm to reach, and this fixture is
+    what shows why one is unnecessary rather than merely unused.
+    ``_find_unbalanced`` filters candidates on ``store.valid & (store.level <=
+    min(frontier_level, max_level) - 2)`` and not on status, so an INVALID leaf
+    would be an ordinary violator candidate like any other -- but INVALID only
+    ever lands at ``max_level``, two levels above that bound, and the
+    ``max_level`` branch breaks out of the level loop before any cascade runs.
+    Instrumented on this fixture: the cascade processes 103 violators and none
+    of them is INVALID, while 2728 non-finite triangles were split on the way
+    down. So the unconditional ``FORCED`` in ``_refine`` is exact here, not a
+    simplification that happens to hold.
     """
 
     def half_bad(p):
@@ -718,13 +766,21 @@ def test_forced_and_invalid_statuses_are_mutually_consistent():
     assert (status == LeafStatus.FORCED).any()
     assert (status == LeafStatus.INVALID).any()
     # A FORCED child descends from a non-INVALID parent, whose vertices were
-    # verified finite before it was allowed to split.
+    # verified finite before it was allowed to split. Not an invariant of the
+    # module -- a parent's midpoints are deferred, never criterion-checked, so a
+    # re-forced child can carry a non-finite vertex to freeze, which is what
+    # `_invalidate_nonfinite_origins` exists to catch. It does hold on this
+    # fixture, and a cascade that leaked non-finite geometry into FORCED rows on
+    # the ordinary path would break it.
     for row in np.flatnonzero(status == LeafStatus.FORCED):
         assert np.isfinite(ref.cache.beta[v[row]]).all()
     # Conversely, no INVALID leaf may have all-finite vertices: the label is
     # only ever applied because some point of the triangle failed the check.
     inv_beta = ref.cache.beta[v[status == LeafStatus.INVALID]]
     assert not np.isfinite(inv_beta).all(axis=(1, 2)).any()
+    # INVALID is unreachable below max_level, which is what makes the
+    # unconditional FORCED above exact rather than lucky.
+    assert (level[status == LeafStatus.INVALID] == max_level).all()
 
 
 def test_cascade_still_evaluates_every_point_exactly_once():
@@ -1024,6 +1080,50 @@ def test_invalid_leaves_are_kept_but_excluded_from_the_index():
     assert mesh.stats.n_nonfinite_vertices > 0
     indexed = set(backend.to_numpy(mesh._cell_leaves).tolist())
     assert not indexed & set(np.flatnonzero(status == LeafStatus.INVALID).tolist())
+
+
+def test_query_seeds_an_inner_image_that_runs_into_the_lens_centre():
+    """The coverage the old terminate-on-non-finite policy destroyed.
+
+    For the SIS the inner image runs continuously into the lens centre as the
+    source approaches the cut: ``|theta_minus| = b - beta``. Terminating the six
+    level-0 triangles that share the origin therefore removed a hexagon of
+    half-width ``fov / init_res`` from the spatial index -- 1.0 arcsec on this
+    fixture -- and with it the seed for every inner image inside it, exactly
+    where a grid-and-Newton forward_raytrace is already weakest.
+
+    Hand-derived, not read off the mesh: at ``beta = 0.8`` and ``b = 1`` the two
+    images are ``theta = 1.8`` and ``theta = -0.2``, since
+    ``1.8 * (1 - 1/1.8) = 0.8`` and ``-0.2 * (1 - 1/0.2) = 0.8``. The inner one
+    sits 5x deeper inside the old hexagon than its half-width, so the old policy
+    returns only the outer seed, 2.0 arcsec away.
+    """
+    mesh, _ = build(sis_raytrace, min_img_sep=0.05)
+    seed, offsets = mesh.seeds(backend.as_array(np.array([[0.8, 0.0]])))
+    seed = backend.to_numpy(seed)
+    assert offsets.shape[0] == 2 and seed.shape[0] > 0
+    for image in ([-0.2, 0.0], [1.8, 0.0]):
+        gap = np.linalg.norm(seed - np.asarray(image), axis=1).min()
+        assert gap <= 0.05, f"no seed within min_img_sep of {image}, closest {gap:.3g}"
+
+
+def test_stats_count_splits_driven_by_ignorance_apart_from_the_criterion():
+    """``n_nonfinite_splits`` is a third split reason, not folded into the other two.
+
+    A non-finite triangle carries no criterion evidence at all -- the criterion
+    cannot be evaluated on it -- so counting it as a parity or deviation split
+    would misattribute refinement the criterion never asked for, and counting it
+    nowhere would hide the ``O(4**max_level)`` descent an area-shaped non-finite
+    region provokes.
+    """
+    mesh, _ = build(sis_raytrace, min_img_sep=0.05)
+    s = mesh.stats
+    assert s.n_nonfinite_splits == 6 * s.max_level
+    # The origin is the only non-finite sample, and it is a *vertex* of every
+    # triangle that ever sees it, so no midpoint-driven split is miscounted here.
+    assert s.n_nonfinite_vertices == 1
+    clean, _ = build(localised_fold, min_img_sep=0.05)
+    assert clean.stats.n_nonfinite_splits == 0
 
 
 def test_every_indexed_leaf_has_finite_source_vertices():

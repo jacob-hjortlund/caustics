@@ -48,6 +48,12 @@ class LeafStatus(IntEnum):
     criterion evidence at all -- that is exactly what auto-converging decides -- so
     a caller auditing coverage must be able to tell them apart. Closure triangles
     have no status of their own; they inherit their origin's.
+
+    ``INVALID`` is not a refinement outcome the criterion can reach: a non-finite
+    triangle is split unconditionally, so ``INVALID`` arises only at ``max_level``,
+    where no split is left, plus the freeze-time propagation in
+    :func:`_invalidate_nonfinite_origins`. That bounds the coverage hole around a
+    singularity by the ``max_level`` leaf size rather than by ``fov / init_res``.
     """
 
     CONVERGED = 0
@@ -446,6 +452,21 @@ def _refine(
     non-finite check still runs there, on the vertices alone; without it a leaf with
     a ``NaN`` vertex would enter the spatial index and swallow every query in its
     cell.
+
+    **Non-finite triangles split unconditionally.** A non-finite sample point is
+    maximal ignorance about a triangle, so it triggers refinement like every other
+    unresolved condition rather than terminating it -- the criterion simply cannot
+    be evaluated there, which is why the split carries no verdict. A red split
+    hands the bad vertex to exactly one of the four children, so the other three
+    re-enter the criterion normally and the singularity ends up ringed by a band of
+    ``INVALID`` leaves at the smallest allowed size instead of a hexagon of
+    ``fov / init_res``. Terminating on the spot instead would put the hole at
+    whatever level the triangle was first sampled, and ``INVALID`` leaves are
+    excluded from the spatial index -- so on a singular model that hole is exactly
+    the region where the mesh is most needed. The cost is
+    ``counters["nonfinite_splits"]``: six triangles per level for a point
+    singularity, but ``O(area * 4**max_level)`` should a ``raytrace`` return
+    non-finite values over a whole region.
     """
     M, G, COMPOSE, PINV0, ROOT_CLASS = tables
     cache = _VertexCache()
@@ -456,6 +477,7 @@ def _refine(
         "parity_splits": 0,
         "deviation_splits": 0,
         "sigma_zero": 0,
+        "nonfinite_splits": 0,
         "forced": 0,
         "cascade_rounds": 0,
     }
@@ -486,7 +508,7 @@ def _refine(
         m = cache.lookup(lattice.key(mid_ij))
         beta_m = cache.beta[m]
         good = finite_v & np.isfinite(beta_m).all(axis=(1, 2))
-        store.add(v[~good], level, active_cls[~good], LeafStatus.INVALID)
+        counters["nonfinite_splits"] += int((~good).sum())
 
         rows = np.flatnonzero(good)
         keep, parity_ok, s = evaluate_criterion(
@@ -503,7 +525,12 @@ def _refine(
         counters["deviation_splits"] += int((parity_ok & ~keep).sum())
         counters["sigma_zero"] += int((s == 0).sum())
 
-        done, pending = rows[keep], rows[~keep]
+        # A non-finite triangle joins the criterion's failures in `pending`
+        # rather than terminating: the criterion cannot be evaluated on it, so
+        # the split is unconditional. Sorted, so which reason condemned a
+        # triangle never reaches the child ordering.
+        done = rows[keep]
+        pending = np.sort(np.concatenate((np.flatnonzero(~good), rows[~keep])))
         store.add(v[done], level, active_cls[done], LeafStatus.CONVERGED)
         if level == 0:
             counters["converged_level0"] = int(done.size)
@@ -545,13 +572,17 @@ def _refine(
             kid_level = np.repeat(store.level[violators] + 1, 4)
             # A forced child is auto-converged: steps 3-7 are skipped so the
             # cascade cannot re-enter the split machinery from inside itself.
-            kid_status = np.where(
-                np.repeat(store.status[violators] == LeafStatus.INVALID, 4),
-                np.int8(LeafStatus.INVALID),
-                np.int8(LeafStatus.FORCED),
-            )
-            store.add(kid_v, kid_level, kid_cls, kid_status)
-            counters["forced"] += int((kid_status == LeafStatus.FORCED).sum())
+            #
+            # FORCED unconditionally, with no INVALID arm to inherit: a violator
+            # is bounded to `level <= max_level - 2` by `_find_unbalanced`, and
+            # the only INVALID leaves in the store sit at `max_level` -- the
+            # branch above adds them and breaks out of the loop before any
+            # cascade runs. So no violator is ever INVALID. A forced child can
+            # still reach freeze with a non-finite vertex, via a deferred
+            # midpoint the criterion never saw; that is what
+            # `_invalidate_nonfinite_origins` is for.
+            store.add(kid_v, kid_level, kid_cls, LeafStatus.FORCED)
+            counters["forced"] += int(kid_v.shape[0])
             kid_ij = cache.ij[kid_v]
             active.add(lattice.key(kid_ij).reshape(-1))
             # Forced children are produced after this level's raytrace call has
@@ -751,6 +782,13 @@ class BuildStats:
 
     A triangle failing both parity and deviation is counted in ``n_parity_splits``;
     ``n_deviation_splits`` counts only among parity-passers.
+
+    ``n_nonfinite_splits`` is disjoint from both: a triangle with a non-finite
+    sample point never reaches the criterion at all, and splitting it is a decision
+    made in the absence of evidence rather than because of it. It is also the cost
+    diagnostic for that decision -- a point singularity contributes six per level,
+    so a count growing like ``4**level`` means ``raytrace`` is returning non-finite
+    values over an area and the descent is quadrupling inside it.
     """
 
     d_floor: int
@@ -764,6 +802,7 @@ class BuildStats:
     n_converged_at_level_0: int
     n_parity_splits: int
     n_deviation_splits: int
+    n_nonfinite_splits: int
     leaves_by_level: Tuple[int, ...]
     n_nonfinite_vertices: int
     n_sigma_min_exactly_zero: int
@@ -885,7 +924,11 @@ class Mesh:
 
     ``INVALID`` leaves remain in ``leaves``, ``leaf_status`` and the conformity
     relation but are never registered in the spatial index, so :meth:`query` cannot
-    return them. That is a genuine coverage hole in the lens plane.
+    return them. That is a genuine coverage hole in the lens plane -- but a
+    ``min_img_sep``-scale one, not an ``init_res``-scale one: a non-finite triangle
+    refines rather than terminating, so it can only come to rest at ``max_level``.
+    ``stats.n_invalid`` sizes the hole and ``stats.n_nonfinite_splits`` the descent
+    that shrank it.
     """
 
     def __init__(
@@ -1291,6 +1334,7 @@ def build_adaptive_mesh(
         n_converged_at_level_0=int(ref.counters["converged_level0"]),
         n_parity_splits=int(ref.counters["parity_splits"]),
         n_deviation_splits=int(ref.counters["deviation_splits"]),
+        n_nonfinite_splits=int(ref.counters["nonfinite_splits"]),
         leaves_by_level=tuple(
             int(n) for n in np.bincount(pre_level, minlength=max_level + 1)
         ),
