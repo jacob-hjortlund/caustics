@@ -1803,6 +1803,56 @@ def test_dedup_handles_ragged_blocks_and_empty_blocks():
     assert keep.tolist() == [True, True, False]
 
 
+def test_dedup_is_unchanged_by_bucketing_on_randomised_blocks():
+    """The bucketed kernel must agree with a per-block reference exactly.
+
+    Blocks are grouped by count and run at their own M rather than padded to
+    the global maximum, so the risk is a scatter that puts one block's answer
+    on another block's rows. Running each block *alone* through the same
+    function is the independent reference: a single-block call has nothing to
+    mis-scatter.
+    """
+    rng = np.random.default_rng(20260910)
+    # The all-empty vector is explicit: 20 random draws from this seed never
+    # produce one, and it is the case that reaches the `total == 0` early exit.
+    cases = [np.zeros(4, dtype=np.int64)]
+    cases += [rng.integers(0, 6, size=rng.integers(1, 12)) for _ in range(20)]
+    for counts in cases:
+        pts = rng.normal(scale=0.01, size=(int(counts.sum()), 2)).reshape(-1, 2)
+        got = to_np(_dedup_representatives(as_arr(pts), counts, 0.01))
+        starts = np.cumsum(counts) - counts
+        want = np.concatenate(
+            [
+                to_np(
+                    _dedup_representatives(as_arr(pts[s : s + c]), np.array([c]), 0.01)
+                )
+                for s, c in zip(starts, counts)
+            ]
+            + [np.zeros(0, dtype=bool)]
+        )
+        assert got.tolist() == want.tolist(), f"counts={counts.tolist()}"
+
+
+def test_dedup_keeps_exactly_one_point_per_singleton_block():
+    """Blocks of one bypass the clustering kernel; they must still be kept."""
+    points = as_arr([[0.0, 0.0], [1.0, 1.0], [2.0, 2.0]])
+    keep = to_np(_dedup_representatives(points, np.array([1, 1, 1]), 0.01))
+    assert keep.tolist() == [True, True, True]
+
+
+def test_dedup_mixes_singleton_and_clustered_blocks_in_order():
+    """The bypass and the kernel write into one output; order must survive.
+
+    Block 0 is a singleton, block 1 collapses to one image, block 2 is a
+    singleton again. A scatter that appends the bypassed blocks after the
+    clustered ones would pass every count-based assertion and still return the
+    representatives in the wrong rows.
+    """
+    points = as_arr([[9.0, 9.0], [0.0, 0.0], [0.0, 0.001], [5.0, 5.0]])
+    keep = to_np(_dedup_representatives(points, np.array([1, 2, 1]), 0.01))
+    assert keep.tolist() == [True, True, False, True]
+
+
 def sie_fixture(device=None):
     lens = SIE(
         name="sie",

@@ -923,6 +923,67 @@ def _build_index(vs, leaves, valid_rows, index_cells):
     return lo, cell, nx, ny, cell_offsets.astype(np.int64), cell_leaves, hi
 
 
+def _dedup_block_group(points, rows, n_blocks, m, tol):
+    """
+    Connected-component representatives for blocks of exactly ``m`` points.
+
+    Every slot is real, so this carries none of the padding machinery a
+    ragged formulation needs: no validity mask, no clipped gather, and the
+    "no label" sentinel is ``m`` rather than a global maximum. Grouping the
+    caller's blocks by count and calling this once per distinct count is what
+    keeps the ``(n_blocks, m, m)`` intermediate proportional to
+    ``sum_c B_c * c**2`` instead of ``B * max(c)**2``.
+
+    Parameters
+    ----------
+    points: ArrayLike
+        The caller's full point array, shape ``(K, 2)``.
+
+        *Unit: arcsec*
+
+    rows: ndarray
+        ``(n_blocks * m,)`` int64 indices into ``points``, block-major.
+    n_blocks, m: int
+        Block count and the common per-block point count.
+    tol: float
+        Separation below which two points are the same image.
+
+        *Unit: arcsec*
+
+    Returns
+    -------
+    ArrayLike
+        ``(n_blocks * m,)`` bool, in the order of ``rows``.
+    """
+    device = backend.device(points)
+    int64 = backend.module.int64
+    p = points[backend.as_array(rows, dtype=int64, device=device)]
+    p = p.reshape(n_blocks, m, 2)
+
+    delta = backend.unsqueeze(p, 2) - backend.unsqueeze(p, 1)
+    # Squared distances against a squared tolerance: no sqrt, and the
+    # comparison is exact on the diagonal, so every point is its own
+    # neighbour and the label update below is a true minimum over the closed
+    # neighbourhood.
+    adjacent = backend.long(backend.sum(delta * delta, dim=-1) < tol * tol)
+
+    # Min-label propagation. `m` is the sentinel for "no label": it exceeds
+    # every real slot index, so it never wins a minimum against a neighbour.
+    index = backend.unsqueeze(backend.arange(m, dtype=int64, device=device), 0)
+    labels = index + backend.zeros((n_blocks, m), dtype=int64, device=device)
+    for _ in range(m):
+        neighbour = adjacent * backend.unsqueeze(labels, 1) + (1 - adjacent) * m
+        updated = backend.min(neighbour, dim=2)
+        if bool(backend.to_numpy(backend.all(updated == labels))):
+            break
+        labels = updated
+
+    # Each component now carries the lowest slot index it contains, and that
+    # slot is its own label -- so the fixed points are exactly one per
+    # component.
+    return (labels == index).reshape(-1)
+
+
 def _dedup_representatives(points, counts, tol):
     """
     One representative per cluster of near-coincident points, within each block.
@@ -939,11 +1000,13 @@ def _dedup_representatives(points, counts, tol):
     distinct. That matches the build contract, where ``min_img_sep`` is a size
     floor the mesh resolves *to* rather than a scale it merges away.
 
-    Vectorized by padding each block to the longest, because the greedy loop is
-    one Python iteration per point -- fine for the handful of images of a single
-    source, hopeless for the ``nx * ny`` blocks of a multiplicity map. The cost is
-    a ``(B, M, M)`` intermediate with ``M = max(counts)``, which is why callers
-    chunk over query points rather than passing every block at once.
+    Vectorized by grouping blocks that share a count and running each group at
+    its own width, because the greedy loop is one Python iteration per point --
+    fine for the handful of images of a single source, hopeless for the
+    ``nx * ny`` blocks of a multiplicity map. Blocks of zero or one point never
+    reach the kernel; their answer is already known. The cost is a
+    ``(B_c, c, c)`` intermediate per distinct count ``c``, which is why callers
+    may still want to chunk over query points when a single block is enormous.
 
     Parameters
     ----------
@@ -969,46 +1032,44 @@ def _dedup_representatives(points, counts, tol):
     counts = np.asarray(counts, dtype=np.int64)
     total = int(counts.sum())
     device = backend.device(points)
-    n_slots = int(counts.max()) if counts.size else 0
-    if total == 0 or n_slots == 0:
-        return backend.as_array(np.zeros(total, dtype=bool), device=device)
+    if total == 0:
+        return backend.as_array(np.zeros(0, dtype=bool), device=device)
 
-    # Pad to (B, M): slot j of block b is real where j < counts[b], and gathers a
-    # repeat of the block's last row otherwise. The clip keeps the gather in range
-    # for an empty trailing block, whose slots are masked out anyway.
-    slot = np.arange(n_slots, dtype=np.int64)
     starts = np.cumsum(counts) - counts
-    valid_np = slot[None, :] < counts[:, None]
-    gather = np.clip(starts[:, None] + slot[None, :], 0, total - 1)
+    row_groups, keep_groups = [], []
 
-    int64 = backend.module.int64
-    padded = points[backend.as_array(gather.reshape(-1), dtype=int64, device=device)]
-    padded = padded.reshape(counts.shape[0], n_slots, 2)
-    valid = backend.long(backend.as_array(valid_np, device=device))
+    # A block of one point is its own representative and a block of none
+    # contributes nothing, so neither reaches the clustering kernel at all.
+    # On a multiplicity map those are the large majority of blocks -- 88% at
+    # the reference configuration -- and skipping them is the single biggest
+    # reduction in what the kernel has to hold.
+    singles = np.flatnonzero(counts == 1)
+    if singles.size:
+        row_groups.append(starts[singles])
+        keep_groups.append(
+            backend.as_array(np.ones(singles.size, dtype=bool), device=device)
+        )
 
-    delta = backend.unsqueeze(padded, 2) - backend.unsqueeze(padded, 1)
-    # Squared distances against a squared tolerance: no sqrt, and the comparison
-    # is exact for the diagonal, so every valid point is its own neighbour and the
-    # label update below is a true minimum over the closed neighbourhood.
-    adjacent = backend.long(backend.sum(delta * delta, dim=-1) < tol * tol)
-    adjacent = adjacent * backend.unsqueeze(valid, 2) * backend.unsqueeze(valid, 1)
+    # The rest are grouped by *equal* count so each group runs at its own M.
+    # Padding every block to the global maximum is what made the intermediate
+    # `B * max(c)**2` and put a fine multiplicity map out of memory.
+    for m in np.unique(counts[counts > 1]):
+        blocks = np.flatnonzero(counts == m)
+        rows = (
+            starts[blocks][:, None] + np.arange(int(m), dtype=np.int64)[None, :]
+        ).reshape(-1)
+        row_groups.append(rows)
+        keep_groups.append(_dedup_block_group(points, rows, blocks.size, int(m), tol))
 
-    # Min-label propagation. `n_slots` is the sentinel for "no label": padded
-    # slots keep it, and it exceeds every real slot index so it never wins a
-    # minimum against a valid neighbour.
-    index = backend.unsqueeze(backend.arange(n_slots, dtype=int64, device=device), 0)
-    labels = valid * index + (1 - valid) * n_slots
-    for _ in range(n_slots):
-        neighbour = adjacent * backend.unsqueeze(labels, 1) + (1 - adjacent) * n_slots
-        updated = backend.min(neighbour, dim=2)
-        if bool(backend.to_numpy(backend.all(updated == labels))):
-            break
-        labels = updated
-
-    # Each component now carries the lowest slot index it contains, and that slot
-    # is its own label -- so the fixed points are exactly one per component.
-    keep = (labels == index) & backend.as_array(valid_np, device=device)
-    return keep.reshape(-1)[backend.as_array(valid_np.reshape(-1), device=device)]
+    # Restore block-major order by inverse permutation rather than a scatter:
+    # torch keeps the last write on duplicate indices and jax accumulates, so
+    # a gather is the only form that means the same thing on both backends.
+    # Every row belongs to exactly one group, so `perm` is a permutation.
+    perm = np.concatenate(row_groups)
+    inverse = np.empty(total, dtype=np.int64)
+    inverse[perm] = np.arange(total, dtype=np.int64)
+    stacked = backend.concatenate(keep_groups, dim=0)
+    return stacked[backend.as_array(inverse, dtype=backend.module.int64, device=device)]
 
 
 class Mesh:
