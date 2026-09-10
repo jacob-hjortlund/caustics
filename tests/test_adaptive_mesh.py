@@ -414,6 +414,45 @@ def test_vertex_cache_keys_stay_sorted_across_interleaved_inserts():
     assert (order >= 0).all()
 
 
+def test_vertex_cache_survives_reallocation_past_the_capacity_floor():
+    """Exercise the doubling arithmetic itself, not just the first 0->1024 jump.
+
+    ``_reserve`` grows to ``max(need, 2 * capacity, 1024)``. A test that never
+    inserts past 1024 elements only ever exercises the one-time floor
+    allocation -- the ``2 * capacity`` branch, run when the buffer must grow a
+    second and third time, is untouched. Two thousand five hundred keys, added
+    in permuted chunks so the merge lands at both ends and the middle of the
+    existing sorted key array rather than only ever appending at one end,
+    cross the floor twice (0->1024->2048->4096). Every key inserted before
+    *and* after each crossing must still resolve to its original, unmoved
+    slot, with its ``ij``/``beta`` row intact.
+    """
+    n_chunks, chunk = 50, 50
+    total = n_chunks * chunk  # 2500: two reallocations past the 1024 floor
+    cache = _VertexCache()
+    rng = np.random.default_rng(0)
+    order = rng.permutation(n_chunks)
+    expected_slot = {}
+    seen = 0
+    for c in order.tolist():
+        block = np.arange(c * chunk, c * chunk + chunk, dtype=np.int64)
+        ij = np.stack([block, block], axis=-1)
+        slots = cache.insert(block, ij, ij.astype(np.float64) * 2.0)
+        assert slots.tolist() == list(range(seen, seen + chunk))
+        for key, slot in zip(block.tolist(), slots.tolist()):
+            expected_slot[key] = slot
+        seen += chunk
+
+    assert len(cache) == total
+    assert cache.ij.shape == (total, 2)
+    assert cache.beta.shape == (total, 2)
+    keys = np.array(sorted(expected_slot), dtype=np.int64)
+    slots = np.array([expected_slot[k] for k in keys.tolist()], dtype=np.int64)
+    assert cache.lookup(keys).tolist() == slots.tolist()
+    assert np.array_equal(cache.ij[slots, 0], keys)
+    assert np.allclose(cache.beta[slots, 0], keys.astype(np.float64) * 2.0)
+
+
 def test_leaf_store_survives_many_small_adds_and_removals():
     """Buffered growth must not break `remove`, which writes through a view."""
     store = _LeafStore()
@@ -429,6 +468,51 @@ def test_leaf_store_survives_many_small_adds_and_removals():
     v, level, cls, status = store.compact()
     assert v.shape == (20, 3)
     assert level.tolist() == [k for k in range(30) if k % 3 != 0]
+
+
+def test_leaf_store_survives_reallocation_past_the_capacity_floor():
+    """Exercise the doubling arithmetic itself, with `remove` on both sides of a growth.
+
+    ``_LeafStore._reserve`` uses the same ``max(need, 2 * capacity, 1024)``
+    rule as the vertex cache, so a test that stays under 1024 rows never
+    reaches the branch where an existing buffer must be doubled rather than
+    allocated fresh. Adds 2500 rows in chunks, crossing the floor twice
+    (0->1024->2048->4096), and removes chunks before the first crossing,
+    between the two crossings, and after the second -- so ``remove``'s
+    write-through is checked against a buffer that has already been swapped
+    out and copied at least once underneath it. ``compact`` must return
+    exactly the surviving rows, with their original values, in row order.
+    """
+    store = _LeafStore()
+    chunk = 50
+    n_chunks = 50
+    total = n_chunks * chunk  # 2500: two reallocations past the 1024 floor
+    # Crossings happen at chunk index 20 (1024->2048) and 40 (2048->4096);
+    # remove before the first, between the two, and after the second.
+    removed_chunks = {5, 25, 45}
+    expected_v_chunks = []
+    expected_level_chunks = []
+    for c in range(n_chunks):
+        v = np.arange(3 * c * chunk, 3 * c * chunk + 3 * chunk, dtype=np.int64).reshape(
+            chunk, 3
+        )
+        rows = store.add(v, c, np.zeros(chunk, np.int64), LeafStatus.CONVERGED)
+        if c in removed_chunks:
+            store.remove(rows)
+        else:
+            expected_v_chunks.append(v)
+            expected_level_chunks.append(np.full(chunk, c, dtype=np.int64))
+
+    assert store.v.shape == (total, 3)
+    assert store.valid.shape == (total,)
+    v, level, cls, status = store.compact()
+    expected_v = np.concatenate(expected_v_chunks)
+    expected_level = np.concatenate(expected_level_chunks)
+    assert v.shape == (total - chunk * len(removed_chunks), 3)
+    assert np.array_equal(v, expected_v)
+    assert np.array_equal(level, expected_level)
+    assert (cls == 0).all()
+    assert (status == LeafStatus.CONVERGED).all()
 
 
 def test_active_keys_membership():
