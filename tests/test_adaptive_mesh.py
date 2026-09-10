@@ -44,6 +44,7 @@ from caustics.lenses.func.adaptive import (
     sigma_min_2x2,
     triangle_weights,
 )
+from caustics.utils import meshgrid
 
 RNG = np.random.default_rng(20260904)
 
@@ -1986,7 +1987,6 @@ def test_forward_raytrace_rejects_an_unknown_method():
         mesh.forward_raytrace(as_arr([[0.05, 0.02]]), lens.raytrace, method="nope")
 
 
-@pytest.mark.xfail(reason="multiplicity_map gains `method` in the next task")
 def test_multiplicity_map_rejects_an_unknown_method():
     lens, mesh = sie_fixture()
     with pytest.raises(ValueError, match="dedup"):
@@ -2210,3 +2210,67 @@ def test_the_odd_image_theorem_test_can_actually_fail():
         3,
         5,
     }, f"under-convergence still gave odd counts everywhere: {np.unique(m)}"
+
+
+def test_multiplicity_map_dedup_method_never_calls_raytrace():
+    lens, mesh = sie_fixture()
+
+    def exploding_raytrace(x, y):
+        raise AssertionError("raytrace must not be called for method='dedup'")
+
+    mult, extent = mesh.multiplicity_map(
+        exploding_raytrace, pixelscale=0.1, nx=9, ny=7, method="dedup"
+    )
+    assert tuple(mult.shape) == (7, 9)
+    assert len(extent) == 4
+
+
+def test_multiplicity_map_dedup_agrees_with_forward_raytrace_pixel_by_pixel():
+    """The map must be exactly its own per-pixel `forward_raytrace`.
+
+    The map consumes counts from a generator that does not build the image
+    array, so this is the check that dropping the positions did not drop or
+    reorder a count with them.
+    """
+    lens, mesh = sie_fixture()
+    nx, ny, pixelscale = 11, 9, 0.08
+    mult, extent = mesh.multiplicity_map(
+        lens.raytrace,
+        pixelscale=pixelscale,
+        nx=nx,
+        ny=ny,
+        x0=0.0,
+        y0=0.0,
+        method="dedup",
+    )
+    gx, gy = meshgrid(
+        pixelscale, nx, ny, device=mesh.device, dtype=mesh.vertices_source.dtype
+    )
+    beta = backend.stack((gx, gy), dim=-1).reshape(-1, 2)
+    _, counts = mesh.forward_raytrace(beta, lens.raytrace, method="dedup")
+    assert to_np(mult).reshape(-1).tolist() == to_np(counts).tolist()
+
+
+def test_multiplicity_map_dedup_tracks_rootfind_to_within_a_caustic_sliver():
+    """Dedup must reproduce the root-finding map except very near a caustic.
+
+    Note what this deliberately does NOT assert: the odd-image theorem. That
+    invariant holds for `method="rootfind"` and is tested above, but dedup
+    counts distinct *seeds*, and a near-tangential pair within min_img_sep of
+    the caustic can merge -- on this fixture two of 625 pixels read 2 instead
+    of 3. Asserting parity here would be asserting something the method does
+    not promise (spec section 4.3).
+
+    What it does promise is that the disagreement is rare and never off by
+    more than one image. Measured: 2 pixels (0.32%), all delta = -1. A broken
+    bucket or a mis-scattered representative blows past 1% immediately.
+    """
+    lens, mesh = sie_fixture()
+    kw = dict(pixelscale=0.08, nx=25, ny=25, x0=0.0, y0=0.0)
+    dedup = to_np(mesh.multiplicity_map(lens.raytrace, method="dedup", **kw)[0])
+    root = to_np(mesh.multiplicity_map(lens.raytrace, method="rootfind", **kw)[0])
+    delta = dedup.astype(np.int64) - root.astype(np.int64)
+    differing = int((delta != 0).sum())
+    assert differing <= 0.01 * delta.size, f"{differing}/{delta.size} pixels differ"
+    assert np.abs(delta).max() <= 1, f"off by {np.abs(delta).max()} images"
+    assert set(np.unique(root).tolist()) <= {1, 3, 5}, "rootfind reference is wrong"

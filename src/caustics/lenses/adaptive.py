@@ -12,7 +12,10 @@ The build is a host-side NumPy float64 algorithm whose only array-API contact is
 
 Two layers sit on the frozen mesh. :meth:`Mesh.query` and its accessors return
 *candidate regions* and Newton seeds; :meth:`Mesh.forward_raytrace` and
-:meth:`Mesh.multiplicity_map` go on to root-find and deduplicate, and return images.
+:meth:`Mesh.multiplicity_map` go on to return images. Their ``method``
+argument chooses how: ``"rootfind"`` refines every seed to machine precision,
+``"dedup"`` deduplicates the seeds as they stand and never calls ``raytrace``
+at all.
 
 The distinction matters and is not cosmetic. **Candidate count is not image
 multiplicity** -- a point on a shared edge returns both leaves, and near-critical
@@ -1266,7 +1269,10 @@ class Mesh:
             )
             count_parts.append(backend.to_numpy(csum[base + count] - csum[base]))
             idx_parts.append(cand[hit])
-            bary_parts.append(sanitize_bary(w[hit], self.leaf_area2[cand][hit]))
+            # Gather after masking, not before: `cand` is the pre-containment
+            # candidate list, so `leaf_area2[cand]` is a full-length temporary
+            # thrown away by the mask on the very next operation.
+            bary_parts.append(sanitize_bary(w[hit], self.leaf_area2[cand[hit]]))
 
         counts = np.concatenate(count_parts)
         offsets = backend.as_array(
@@ -1581,6 +1587,7 @@ class Mesh:
         *,
         x0: Optional[float] = None,
         y0: Optional[float] = None,
+        method: str = "rootfind",
         batch_size: Optional[int] = None,
         residual_tol: Optional[float] = None,
         lm_kwargs: Optional[dict] = None,
@@ -1596,6 +1603,11 @@ class Mesh:
         raytrace: Callable
             The same callable this mesh was built from -- see
             :meth:`forward_raytrace`.
+        method: str
+            ``"rootfind"`` (default) or ``"dedup"``; see
+            :meth:`forward_raytrace`. ``"dedup"`` is roughly two orders of
+            magnitude faster here and is usually the right choice for a map,
+            which needs counts rather than positions.
         pixelscale: float
             Side length of a source-plane pixel. Pixels are square, and this is
             the knob to compare against ``min_img_sep``: much below it the map
@@ -1634,14 +1646,19 @@ class Mesh:
 
         Notes
         -----
-        Cost is ``nx * ny`` root-finding solves over the mesh's mean candidate
-        count, so it grows quadratically in ``1 / pixelscale``.
+        Under ``method="rootfind"`` the cost is ``nx * ny`` root-finding solves
+        over the mesh's mean candidate count, so it grows quadratically in
+        ``1 / pixelscale`` and the solver dominates everything else -- 99% of
+        the runtime at ``pixelscale=1e-2`` on a typical mesh. Under
+        ``method="dedup"`` there is no solver, and the cost is the spatial
+        query alone.
 
         Multiplicity here is the count of *distinct converged roots*, which is why
         it needed :meth:`forward_raytrace` rather than :meth:`query`: candidate
         count is not multiplicity, since a query on a shared edge returns both
         leaves and near-critical leaves overlap.
         """
+        _check_method(method)
         if not pixelscale > 0:
             raise ValueError(f"pixelscale must be positive, got {pixelscale}")
         lo = backend.to_numpy(self._index_lo)
@@ -1664,12 +1681,27 @@ class Mesh:
             dtype=self.vertices_source.dtype,
         )
         beta = backend.stack((gx + cx, gy + cy), dim=-1).reshape(-1, 2)
-        _, counts = self.forward_raytrace(
-            beta,
-            raytrace,
-            batch_size=batch_size,
-            residual_tol=residual_tol,
-            lm_kwargs=lm_kwargs,
+        # Counts only: `want_images=False` stops the per-chunk representatives
+        # being gathered at all. The map discards them on the next line, and at
+        # a fine `pixelscale` that array is hundreds of MB -- accumulated
+        # across every chunk when `batch_size` is set.
+        counts = backend.as_array(
+            np.concatenate(
+                [
+                    part
+                    for _, part in self._image_chunks(
+                        beta,
+                        raytrace,
+                        batch_size,
+                        method,
+                        residual_tol,
+                        lm_kwargs,
+                        False,
+                    )
+                ]
+            ),
+            dtype=backend.module.int64,
+            device=self.device,
         )
         extent = (
             cx - pixelscale * nx / 2,
