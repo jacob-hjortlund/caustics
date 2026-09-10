@@ -582,16 +582,29 @@ def _find_unbalanced(store, cache, lattice, active, max_level, frontier_level):
     ndarray
         Int64 indices into ``store``'s rows.
     """
-    # ``frontier_level <= max_level`` holds for every call `_refine` makes, so the
-    # first term always binds and the second is unreachable defensive code today.
-    # Keep the min(): it is what makes the integrality precondition of
-    # `_edge_quarter_keys` a property of this function rather than of its caller.
+    # ``frontier_level <= max_level`` holds for every call `_refine` makes, so
+    # the first term always binds and the second is unreachable defensive code
+    # today. Keep the min(): it is what makes the integrality precondition of
+    # the quarter-point arithmetic below -- edge vectors divisible by four -- a
+    # property of this function rather than of its caller.
     bound = min(frontier_level - 2, max_level - 2)
     cand = np.flatnonzero(store.valid & (store.level <= bound))
     if cand.size == 0:
         return cand
-    keys = _edge_quarter_keys(lattice, cache.ij[store.v[cand]])
-    return cand[active.contains(keys).any(axis=1)]
+    ij = cache.ij[store.v[cand]]  # (n, 3, 2)
+    # One edge at a time, accumulating into a single `(n,)` mask. The batch
+    # form built `a`, `b`, `delta` at `(n, 3, 2)` and the keys at `(n, 6)`, so
+    # this function alone held ~200 MB at a million leaves -- the largest
+    # transient inside `_refine`. The disjunction is over the same six keys
+    # `_edge_quarter_keys` returns; only the association changes.
+    hit = np.zeros(cand.size, dtype=bool)
+    for e in range(3):
+        a = ij[:, e, :]
+        b = ij[:, (e + 1) % 3, :]
+        delta = (b - a) // 4
+        for quarter in (a + delta, b - delta):
+            np.logical_or(hit, active.contains(lattice.key(quarter)), out=hit)
+    return cand[hit]
 
 
 @dataclass

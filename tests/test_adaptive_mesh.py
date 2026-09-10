@@ -16,6 +16,7 @@ from caustics.lenses.adaptive import (
     _dedup_representatives,
     _depth_floor,
     _edge_quarter_keys,
+    _find_unbalanced,
     _initial_triangles,
     _invalidate_nonfinite_origins,
     _Lattice,
@@ -853,6 +854,32 @@ def test_edge_quarter_keys_are_lattice_points_of_both_quarters():
     got = {tuple(p) for p in lat.ij_from_key(keys[0])}
     assert (4, 0) in got and (12, 0) in got  # edge (0,1)
     assert (0, 4) in got and (0, 12) in got  # edge (2,0)
+
+
+def test_find_unbalanced_matches_the_six_quarter_key_reference():
+    """The edge-at-a-time scan must select exactly the rows the batch form did.
+
+    `_find_unbalanced` no longer builds the whole `(cand, 6)` key array -- it
+    tests the six quarter points one at a time to keep the temporary
+    `(cand,)`-shaped. That is a reassociation of the same disjunction, so
+    `_edge_quarter_keys`, which is unchanged and separately tested, is the
+    reference it must reproduce row for row.
+    """
+    ref, lat, calls, max_level = refine_with(localised_fold, min_img_sep=0.02)
+    checked = 0
+    for frontier in range(2, max_level + 1):
+        got = _find_unbalanced(
+            ref.store, ref.cache, lat, ref.active, max_level, frontier
+        )
+        bound = min(frontier - 2, max_level - 2)
+        cand = np.flatnonzero(ref.store.valid & (ref.store.level <= bound))
+        if cand.size == 0:
+            continue
+        checked += 1
+        keys = _edge_quarter_keys(lat, ref.cache.ij[ref.store.v[cand]])
+        want = cand[ref.active.contains(keys).any(axis=1)]
+        assert got.tolist() == want.tolist(), f"frontier_level={frontier}"
+    assert checked > 0, "no frontier level produced candidates to compare"
 
 
 def test_leaf_store_add_accepts_per_row_level_and_status():
