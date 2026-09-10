@@ -1980,6 +1980,104 @@ def test_forward_raytrace_returns_an_empty_block_outside_the_source_plane():
     assert to_np(images).shape == (0, 2)
 
 
+def test_forward_raytrace_rejects_an_unknown_method():
+    lens, mesh = sie_fixture()
+    with pytest.raises(ValueError, match="rootfind"):
+        mesh.forward_raytrace(as_arr([[0.05, 0.02]]), lens.raytrace, method="nope")
+
+
+@pytest.mark.xfail(reason="multiplicity_map gains `method` in the next task")
+def test_multiplicity_map_rejects_an_unknown_method():
+    lens, mesh = sie_fixture()
+    with pytest.raises(ValueError, match="dedup"):
+        mesh.multiplicity_map(lens.raytrace, pixelscale=0.2, method="nope")
+
+
+def test_dedup_method_never_calls_raytrace():
+    """The whole point of `method="dedup"` is that the lens is not evaluated.
+
+    A mesh seed is the preimage of beta under its own leaf's affine map, so it
+    is already an approximate image; there is nothing left to solve. If this
+    fails, the method is doing the work it exists to skip.
+    """
+    lens, mesh = sie_fixture()
+
+    def exploding_raytrace(x, y):
+        raise AssertionError("raytrace must not be called for method='dedup'")
+
+    images, counts = mesh.forward_raytrace(
+        as_arr([[0.05, 0.02], [0.4, 0.3]]), exploding_raytrace, method="dedup"
+    )
+    assert int(to_np(counts).sum()) == images.shape[0]
+
+
+def test_dedup_method_matches_rootfind_layout():
+    lens, mesh = sie_fixture()
+    beta = as_arr([[0.05, 0.02], [3.0, 3.0], [0.0, 0.0]])
+    images, counts = mesh.forward_raytrace(beta, lens.raytrace, method="dedup")
+    counts_np = to_np(counts)
+    assert images.shape[1] == 2
+    assert counts_np.shape == (3,)
+    assert int(counts_np.sum()) == images.shape[0]
+    assert counts_np[1] == 0, "a point outside the source-plane mesh has no images"
+
+
+def test_dedup_method_is_invariant_to_batch_size():
+    lens, mesh = sie_fixture()
+    beta = as_arr(RNG.uniform(-0.3, 0.3, size=(40, 2)))
+    ref_i, ref_c = mesh.forward_raytrace(beta, lens.raytrace, method="dedup")
+    for step in (1, 7, 40, 1000):
+        got_i, got_c = mesh.forward_raytrace(
+            beta, lens.raytrace, batch_size=step, method="dedup"
+        )
+        assert to_np(got_c).tolist() == to_np(ref_c).tolist(), f"batch_size={step}"
+        assert np.allclose(to_np(got_i), to_np(ref_i)), f"batch_size={step}"
+
+
+def test_dedup_method_agrees_with_rootfind_away_from_the_caustic():
+    """Counts must match where the answer is unambiguous.
+
+    Inside the tangential caustic an SIE has four images, outside it two, and
+    the two methods may legitimately disagree only within about min_img_sep of
+    the caustic itself (spec section 4.3). Sampling well inside and well
+    outside keeps the assertion on the part of the contract that is exact.
+    """
+    lens, mesh = sie_fixture()
+    beta = as_arr([[0.01, 0.0], [0.0, 0.01], [-0.015, 0.008], [0.8, 0.8], [-0.9, 0.7]])
+    _, rootfind = mesh.forward_raytrace(beta, lens.raytrace, method="rootfind")
+    _, dedup = mesh.forward_raytrace(beta, lens.raytrace, method="dedup")
+    assert to_np(dedup).tolist() == to_np(rootfind).tolist()
+
+
+def test_dedup_positions_are_within_min_img_sep_of_the_refined_roots():
+    """Positions are accurate to min_img_sep, the build's *lens-plane* tolerance.
+
+    Not to a source-plane residual: `min_img_sep` bounds the seed's distance
+    from the image in the lens plane, and the source-plane residual is that
+    distance times the local Jacobian. On a SIZE_FLOOR leaf, which stopped
+    because it hit the floor rather than because the deviation test passed,
+    there is no source-plane bound at all -- measured residuals there reach
+    7e-2 against a min_img_sep of 1e-2. Comparing against the root finder's
+    own answer is what the documented contract actually claims.
+
+    Measured worst case on this fixture: 3.7e-3 against min_img_sep = 1e-2.
+    """
+    lens, mesh = sie_fixture()
+    beta = as_arr([[0.02, 0.01], [0.05, 0.02], [-0.03, 0.04], [0.3, 0.2]])
+    dedup_i, dedup_c = mesh.forward_raytrace(beta, lens.raytrace, method="dedup")
+    root_i, root_c = mesh.forward_raytrace(beta, lens.raytrace, method="rootfind")
+    dedup_c, root_c = to_np(dedup_c), to_np(root_c)
+    assert dedup_c.tolist() == root_c.tolist(), "fixture must not straddle a caustic"
+
+    do = np.concatenate(([0], np.cumsum(dedup_c)))
+    ro = np.concatenate(([0], np.cumsum(root_c)))
+    di, ri = to_np(dedup_i), to_np(root_i)
+    for b in range(dedup_c.size):
+        D, R = di[do[b] : do[b + 1]], ri[ro[b] : ro[b + 1]]
+        nearest = np.linalg.norm(D[:, None, :] - R[None, :, :], axis=-1).min(axis=1)
+        assert (nearest <= mesh.min_img_sep).all(), f"source {b}: {nearest}"
+
+
 def test_multiplicity_map_has_the_requested_shape_and_extent():
     lens, mesh = sie_fixture()
     m, extent = mesh.multiplicity_map(lens.raytrace, 0.2, nx=7, ny=5, x0=0.0, y0=0.0)
