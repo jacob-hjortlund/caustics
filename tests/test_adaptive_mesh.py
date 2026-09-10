@@ -379,10 +379,47 @@ def test_vertex_cache_lookup_missing_insert():
 
 
 def test_active_keys_membership():
-    ak = _ActiveKeys()
-    assert not ak.contains(np.array([1])).any()
-    ak.add(np.array([5, 1, 5], dtype=np.int64))
-    assert ak.contains(np.array([1, 5, 6])).tolist() == [True, True, False]
+    """Activation is by cache slot; membership is still asked by key.
+
+    The set is stored as a flag per vertex-cache slot rather than as a second
+    sorted key array, because every active key is by construction a vertex
+    that has already been evaluated -- so the cache's own key index is the
+    only sorted structure needed.
+    """
+    cache = _VertexCache()
+    keys = np.array([1, 5, 9], dtype=np.int64)
+    ij = np.stack([keys, keys], axis=-1)
+    slots = cache.insert(keys, ij, ij.astype(np.float64))
+
+    ak = _ActiveKeys(cache)
+    assert not ak.contains(np.array([1])).any(), "nothing is active yet"
+    ak.add_slots(slots[[0, 1]])
+    assert ak.contains(np.array([1, 5, 9])).tolist() == [True, True, False]
+
+
+def test_active_keys_reject_an_uncached_key():
+    """A key never evaluated cannot be a vertex, so it is not active."""
+    cache = _VertexCache()
+    keys = np.array([4], dtype=np.int64)
+    ij = np.stack([keys, keys], axis=-1)
+    ak = _ActiveKeys(cache)
+    ak.add_slots(cache.insert(keys, ij, ij.astype(np.float64)))
+    assert ak.contains(np.array([4, 99])).tolist() == [True, False]
+
+
+def test_active_keys_refuse_a_negative_slot():
+    """A -1 slot would activate the last cache entry instead of raising.
+
+    `_VertexCache.lookup` returns -1 for an absent key, so a caller that
+    forwards a lookup result without checking would silently corrupt the
+    active set and produce an unbalanced mesh rather than an error.
+    """
+    cache = _VertexCache()
+    keys = np.array([2], dtype=np.int64)
+    ij = np.stack([keys, keys], axis=-1)
+    cache.insert(keys, ij, ij.astype(np.float64))
+    with pytest.raises(AssertionError, match="uncached"):
+        _ActiveKeys(cache).add_slots(np.array([-1], dtype=np.int64))
 
 
 def test_leaf_store_add_remove_compact():

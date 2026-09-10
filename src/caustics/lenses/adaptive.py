@@ -206,22 +206,69 @@ class _ActiveKeys:
     """
     Lattice points that are currently vertices of some triangle in the mesh.
 
+    Stored as one flag per **vertex-cache slot**, not as a sorted key set.
+    Every active key is by construction a vertex of some triangle, so it has
+    already been evaluated and is already in the cache -- a second sorted
+    structure duplicated the cache's own key index, and keeping it sorted cost
+    an ``np.union1d`` over the whole active set on every insertion, which was
+    the single largest term in the build.
+
     Separate from the vertex cache, which also holds midpoints of
-    tested-but-never-split triangles. Only ever grows, since a parent's vertices are
-    inherited by all its children.
+    tested-but-never-split triangles. Only ever grows, since a parent's
+    vertices are inherited by all its children.
     """
 
-    def __init__(self):
-        self._keys = np.empty(0, dtype=np.int64)
+    def __init__(self, cache):
+        self._cache = cache
+        self._flags = np.zeros(0, dtype=bool)
 
-    def add(self, keys):
-        self._keys = np.union1d(self._keys, np.asarray(keys, dtype=np.int64))
+    def _grow(self):
+        n = len(self._cache)
+        if self._flags.size < n:
+            flags = np.zeros(n, dtype=bool)
+            flags[: self._flags.size] = self._flags
+            self._flags = flags
+
+    def add_slots(self, slots):
+        """
+        Activate vertex-cache slots.
+
+        Takes slots rather than keys because every caller already holds them:
+        re-keying a triangle's vertices only to look them up again is exactly
+        the work this class exists to avoid.
+        """
+        slots = np.asarray(slots, dtype=np.int64)
+        # Trip-wire for the `active subset of cache` invariant. A -1 slot --
+        # what `_VertexCache.lookup` returns for an absent key -- would
+        # negative-index into the last cache entry and activate the wrong
+        # vertex, and the mesh would come out unbalanced rather than raising.
+        #
+        # `raise AssertionError` rather than a bare `assert`: `python -O`
+        # strips bare asserts, and this guards against silent geometric
+        # corruption. `_refine` guards its cascade the same way.
+        if slots.size and not (slots >= 0).all():
+            raise AssertionError("cannot activate an uncached vertex")
+        self._grow()
+        self._flags[slots] = True
+
+    def contains_slots(self, slots):
+        """True where the slot is an active vertex. ``-1`` reads as False."""
+        if self._flags.size == 0:
+            return np.zeros(np.shape(slots), dtype=bool)
+        self._grow()
+        present = slots >= 0
+        return present & self._flags[np.where(present, slots, 0)]
 
     def contains(self, keys):
-        if self._keys.size == 0:
-            return np.zeros(np.shape(keys), dtype=bool)
-        pos = np.clip(np.searchsorted(self._keys, keys), 0, self._keys.size - 1)
-        return self._keys[pos] == keys
+        """
+        True where the key is an active vertex.
+
+        A key absent from the cache was never evaluated, so it cannot be a
+        triangle vertex and cannot be active -- ``lookup`` returns ``-1`` and
+        :meth:`contains_slots` reads that as False.
+        """
+        self._grow()
+        return self.contains_slots(self._cache.lookup(keys))
 
 
 class _LeafStore:
@@ -490,7 +537,7 @@ def _refine(
     """
     M, G, COMPOSE, PINV0, ROOT_CLASS = tables
     cache = _VertexCache()
-    active = _ActiveKeys()
+    active = _ActiveKeys(cache)
     store = _LeafStore()
     counters = {
         "converged_level0": 0,
@@ -516,7 +563,7 @@ def _refine(
         _evaluate(cache, lattice, np.concatenate(need), raytrace_np, batch_size)
 
         v = cache.lookup(vert_keys)
-        active.add(vert_keys.reshape(-1))
+        active.add_slots(v.reshape(-1))
         beta_v = cache.beta[v]
         finite_v = np.isfinite(beta_v).all(axis=(1, 2))
 
@@ -559,7 +606,7 @@ def _refine(
             v[pending], m[pending], active_cls[pending], COMPOSE
         )
         child_ij = cache.ij[child_v]
-        active.add(lattice.key(child_ij).reshape(-1))
+        active.add_slots(child_v.reshape(-1))
 
         # Balance cascade. The children above are already registered as active
         # vertices, which is what makes the quarter-point test able to see them --
@@ -604,7 +651,7 @@ def _refine(
             store.add(kid_v, kid_level, kid_cls, LeafStatus.FORCED)
             counters["forced"] += int(kid_v.shape[0])
             kid_ij = cache.ij[kid_v]
-            active.add(lattice.key(kid_ij).reshape(-1))
+            active.add_slots(kid_v.reshape(-1))
             # Forced children are produced after this level's raytrace call has
             # gone out, and land at levels the loop will never revisit. Queue
             # their midpoints and drain at the top of the next level, so the
@@ -721,7 +768,9 @@ def _close(lattice, cache, active, v, level, status):
     # parity, `exact` is False on every edge, and the count == 0 pass-through
     # above is that leaf's only route through -- not an artifact of this fixture.
     exact = ((v_ij[:, [1, 2, 0]] + v_ij[:, [2, 0, 1]]) % 2 == 0).all(axis=-1)
-    hanging = exact & active.contains(mid_keys)  # (L0, 3)
+    # `m` is already `cache.lookup(mid_keys)`; asking by slot skips a second
+    # searchsorted over the same keys.
+    hanging = exact & active.contains_slots(m)  # (L0, 3)
     count = hanging.sum(axis=1)
 
     n_children = np.choose(count, [1, 2, 3, 4])
