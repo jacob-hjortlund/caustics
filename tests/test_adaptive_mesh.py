@@ -2274,3 +2274,59 @@ def test_multiplicity_map_dedup_tracks_rootfind_to_within_a_caustic_sliver():
     assert differing <= 0.01 * delta.size, f"{differing}/{delta.size} pixels differ"
     assert np.abs(delta).max() <= 1, f"off by {np.abs(delta).max()} images"
     assert set(np.unique(root).tolist()) <= {1, 3, 5}, "rootfind reference is wrong"
+
+
+def test_forward_chunk_want_images_false_returns_none_but_same_counts():
+    """`want_images` must gate only the image gather, never the counts.
+
+    `_forward_chunk` computes `counts` before it ever looks at `want_images`
+    (adaptive.py:1404-1415) -- the flag only decides whether the deduplicated
+    representatives are also returned. This pins that contract directly on the
+    helper: flip `want_images` and the images slot changes from an array to
+    `None`, but the counts must not move by a single element.
+    """
+    lens, mesh = sie_fixture()
+    beta = as_arr([[0.05, 0.02], [3.0, 3.0], [0.0, 0.0]])
+    tol = mesh.min_img_sep
+    images, counts_true = mesh._forward_chunk(
+        beta, lens.raytrace, "dedup", tol, {}, True
+    )
+    none_images, counts_false = mesh._forward_chunk(
+        beta, lens.raytrace, "dedup", tol, {}, False
+    )
+    assert images is not None, "sanity: this beta must produce at least one image"
+    assert none_images is None, "want_images=False must not materialize positions"
+    assert counts_false.tolist() == counts_true.tolist(), (
+        f"counts must be identical regardless of want_images: "
+        f"{counts_false.tolist()} != {counts_true.tolist()}"
+    )
+
+
+def test_multiplicity_map_calls_forward_chunk_with_want_images_false(monkeypatch):
+    """`multiplicity_map` must request counts only, never the image gather.
+
+    This is the wiring half of the counts-only path: Task 4's whole point was
+    to stop `multiplicity_map` materializing the per-chunk image array it was
+    always going to discard, via `want_images=False` at the `_image_chunks`
+    call site. Nothing else in the suite calls through `Mesh._forward_chunk`
+    with a spy, so a regression that silently flipped that `False` back to
+    `True` -- reintroducing the discarded gather -- would otherwise pass every
+    existing test, since they only check the final counts, not how they were
+    obtained.
+    """
+    lens, mesh = sie_fixture()
+    seen = []
+    original = Mesh._forward_chunk
+
+    def spy(self, chunk, raytrace, method, tol, lm_kwargs, want_images):
+        seen.append(want_images)
+        return original(self, chunk, raytrace, method, tol, lm_kwargs, want_images)
+
+    monkeypatch.setattr(Mesh, "_forward_chunk", spy)
+    mesh.multiplicity_map(lens.raytrace, pixelscale=0.1, nx=5, ny=5)
+
+    assert seen, "no calls observed -- test is vacuous"
+    assert all(w is False for w in seen), (
+        f"multiplicity_map must call _forward_chunk with want_images=False "
+        f"for every chunk, got {seen}"
+    )
