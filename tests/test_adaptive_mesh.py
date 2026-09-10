@@ -1334,6 +1334,31 @@ def test_index_registers_every_leaf_in_the_cell_of_each_of_its_vertices():
             assert leaf in cells[offs[c] : offs[c + 1]]
 
 
+def test_build_index_orders_leaves_ascending_within_every_cell():
+    """CSR blocks must come out sorted with no sort at query time.
+
+    The ordering used to come from `np.lexsort((leaf_id, cell_id))`. It now
+    comes from a stable sort on `cell_id` alone, which is only equivalent
+    because `leaf_id` is already non-decreasing in generation order. If that
+    premise ever breaks, the blocks stop being ascending -- and `query`'s
+    contract that `leaf_indices` is "strictly ascending within each block"
+    breaks with it, silently.
+    """
+    lens, mesh = sie_fixture()
+    offsets = to_np(mesh._cell_offsets)
+    leaves = to_np(mesh._cell_leaves)
+    assert offsets[0] == 0
+    assert offsets[-1] == leaves.size
+    assert (np.diff(offsets) >= 0).all()
+    nonempty = 0
+    for start, stop in zip(offsets[:-1], offsets[1:]):
+        block = leaves[start:stop]
+        if block.size > 1:
+            nonempty += 1
+            assert (np.diff(block) > 0).all(), "cell block is not strictly ascending"
+    assert nonempty > 0, "fixture is too coarse to exercise multi-leaf cells"
+
+
 def test_query_covers_points_on_the_source_bbox_upper_edge():
     """Regression: the upper bbox edge used to return zero candidates.
 

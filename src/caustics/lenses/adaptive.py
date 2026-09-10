@@ -1043,7 +1043,10 @@ def _build_index(vs, leaves, valid_rows, index_cells):
     by construction, and forcing this to the mesh's own dtype would let the two
     sides round independently right at cell boundaries -- worse, not cleaner.
     """
-    tri = vs[leaves[valid_rows]].astype(np.float64)
+    # `copy=False`: `vs` is already float64 unless the caller asked for a
+    # float32 mesh, and this gather is the largest single array in the
+    # function -- copying it unconditionally doubled it for nothing.
+    tri = vs[leaves[valid_rows]].astype(np.float64, copy=False)
     if tri.shape[0] == 0:
         lo = np.zeros(2)
         return (
@@ -1079,10 +1082,26 @@ def _build_index(vs, leaves, valid_rows, index_cells):
     cell_id = (i0[owner, 0] + within // tall[owner]) * ny + (
         i0[owner, 1] + within % tall[owner]
     )
-    leaf_id = valid_rows[owner]
-    order = np.lexsort((leaf_id, cell_id))  # ascending leaf id within each cell
-    cell_leaves = leaf_id[order]
-    cell_offsets = np.searchsorted(cell_id[order], np.arange(nx * ny + 1))
+    # A stable sort on `cell_id` alone, not `np.lexsort((leaf_id, cell_id))`.
+    # `owner` is non-decreasing by construction and `valid_rows` is ascending,
+    # so `leaf_id = valid_rows[owner]` is already sorted in generation order
+    # and a stable sort reproduces the lexsort's tie-breaking exactly. Ties in
+    # the pair cannot occur at all: within one leaf the cell rectangle is
+    # enumerated bijectively, so a leaf never registers in a cell twice.
+    # NumPy dispatches `kind="stable"` to radix sort for integer dtypes.
+    order = np.argsort(cell_id, kind="stable")
+    # `leaf_id` is deferred past the sort. It is only needed to fill
+    # `cell_leaves`, and materialising it beforehand costs another array as
+    # long as the (cell, leaf) pair list -- in the function that already
+    # dominates the build's peak memory.
+    cell_leaves = valid_rows[owner[order]]
+    # Counting the pairs per cell is the same thing as `searchsorted` over a
+    # sorted key array, by the definition of a CSR offset -- and `bincount`
+    # runs on the *unsorted* ids, so the sorted copy `cell_id[order]` and the
+    # `np.arange(nx * ny + 1)` probe array are both never built.
+    cell_offsets = np.concatenate(
+        ([0], np.cumsum(np.bincount(cell_id, minlength=nx * ny)))
+    )
     return lo, cell, nx, ny, cell_offsets.astype(np.int64), cell_leaves, hi
 
 
