@@ -162,19 +162,53 @@ class _VertexCache:
     """
     Lattice key to slot, with the source-plane image of every evaluated point.
 
-    Lookup is ``np.searchsorted`` against a sorted key array rather than a Python
-    dict, so a whole level's worth of points resolves in one vectorized call. Slots
-    are assigned monotonically in order of first evaluation and never move.
+    Lookup is ``np.searchsorted`` against a sorted key array rather than a
+    Python dict, so a whole level's worth of points resolves in one vectorized
+    call. Slots are assigned monotonically in order of first evaluation and
+    never move.
+
+    Storage is a capacity-doubling buffer, not ``np.concatenate``: appending by
+    concatenation reallocates and copies every row on every call, which across
+    a build's levels and cascade rounds is the dominant cost of maintaining the
+    cache. ``ij`` and ``beta`` are truncated views, so no consumer ever sees
+    capacity slack.
     """
 
     def __init__(self):
+        self._n = 0
+        self._ij = np.empty((0, 2), dtype=np.int64)
+        self._beta = np.empty((0, 2), dtype=np.float64)
         self._keys = np.empty(0, dtype=np.int64)
         self._slots = np.empty(0, dtype=np.int64)
-        self.ij = np.empty((0, 2), dtype=np.int64)
-        self.beta = np.empty((0, 2), dtype=np.float64)
 
     def __len__(self):
-        return self.ij.shape[0]
+        return self._n
+
+    @property
+    def ij(self):
+        """Lattice coordinates of every evaluated point, shape ``(N, 2)``."""
+        return self._ij[: self._n]
+
+    @property
+    def beta(self):
+        """Source-plane image of every evaluated point, shape ``(N, 2)``.
+
+        *Unit: arcsec*
+        """
+        return self._beta[: self._n]
+
+    def _reserve(self, extra):
+        need = self._n + extra
+        capacity = self._ij.shape[0]
+        if need <= capacity:
+            return
+        grown = max(need, 2 * capacity, 1024)
+        ij = np.empty((grown, 2), dtype=np.int64)
+        ij[: self._n] = self._ij[: self._n]
+        self._ij = ij
+        beta = np.empty((grown, 2), dtype=np.float64)
+        beta[: self._n] = self._beta[: self._n]
+        self._beta = beta
 
     def lookup(self, keys):
         """Slot of each key, or ``-1`` where absent."""
@@ -189,16 +223,38 @@ class _VertexCache:
         return uniq[self.lookup(uniq) < 0]
 
     def insert(self, keys, ij, beta):
-        """Assign slots to new keys. ``keys`` must be unique and absent."""
-        start = len(self)
-        slots = np.arange(start, start + keys.size, dtype=np.int64)
-        self.ij = np.concatenate([self.ij, ij])
-        self.beta = np.concatenate([self.beta, beta])
-        merged_k = np.concatenate([self._keys, keys])
-        merged_s = np.concatenate([self._slots, slots])
-        order = np.argsort(merged_k, kind="stable")
-        self._keys = merged_k[order]
-        self._slots = merged_s[order]
+        """
+        Assign slots to new keys. ``keys`` must be unique, absent, and sorted.
+
+        The key index is merged rather than re-sorted. Both sides are already
+        sorted -- ``keys`` comes from :meth:`missing`, which returns
+        ``np.unique`` output, and ``self._keys`` is maintained sorted -- and no
+        key appears on both sides, so ``searchsorted`` plus a running offset
+        gives each new key its position in the merged array outright. The
+        result is identical to sorting the concatenation, because with all keys
+        distinct the sorted order is unique.
+        """
+        start = self._n
+        k = int(np.size(keys))
+        slots = np.arange(start, start + k, dtype=np.int64)
+
+        self._reserve(k)
+        self._ij[start : start + k] = ij
+        self._beta[start : start + k] = beta
+        self._n = start + k
+
+        total = self._keys.size + k
+        dest = np.searchsorted(self._keys, keys) + np.arange(k, dtype=np.int64)
+        merged_k = np.empty(total, dtype=np.int64)
+        merged_s = np.empty(total, dtype=np.int64)
+        merged_k[dest] = keys
+        merged_s[dest] = slots
+        stay = np.ones(total, dtype=bool)
+        stay[dest] = False
+        merged_k[stay] = self._keys
+        merged_s[stay] = self._slots
+        self._keys = merged_k
+        self._slots = merged_s
         return slots
 
 
@@ -275,32 +331,79 @@ class _LeafStore:
     """
     Terminal triangles, keyed by row index with a validity flag.
 
-    Not append-only: a triangle marked converged at level ``d`` can be removed and
-    replaced by descendants several levels later, when a distant refinement cascades
-    back to it. Hence the flag and the single compaction at the end, rather than
-    streaming into a flat array as we go.
+    Not append-only: a triangle marked converged at level ``d`` can be removed
+    and replaced by descendants several levels later, when a distant refinement
+    cascades back to it. Hence the flag and the single compaction at the end,
+    rather than streaming into a flat array as we go.
+
+    Storage is a capacity-doubling buffer for the same reason as
+    :class:`_VertexCache`: the balance cascade appends many times per build and
+    ``np.concatenate`` copies the whole store on each. The attributes are
+    truncated views, and they are writable through -- :meth:`remove` depends on
+    that.
     """
 
     def __init__(self):
-        self.v = np.empty((0, 3), dtype=np.int64)
-        self.level = np.empty(0, dtype=np.int64)
-        self.cls = np.empty(0, dtype=np.int64)
-        self.status = np.empty(0, dtype=np.int8)
-        self.valid = np.empty(0, dtype=bool)
+        self._n = 0
+        self._v = np.empty((0, 3), dtype=np.int64)
+        self._level = np.empty(0, dtype=np.int64)
+        self._cls = np.empty(0, dtype=np.int64)
+        self._status = np.empty(0, dtype=np.int8)
+        self._valid = np.empty(0, dtype=bool)
+
+    @property
+    def v(self):
+        return self._v[: self._n]
+
+    @property
+    def level(self):
+        return self._level[: self._n]
+
+    @property
+    def cls(self):
+        return self._cls[: self._n]
+
+    @property
+    def status(self):
+        return self._status[: self._n]
+
+    @property
+    def valid(self):
+        return self._valid[: self._n]
+
+    def _reserve(self, extra):
+        need = self._n + extra
+        capacity = self._v.shape[0]
+        if need <= capacity:
+            return
+        grown = max(need, 2 * capacity, 1024)
+
+        def regrow(old, shape, dtype):
+            new = np.empty(shape, dtype=dtype)
+            new[: self._n] = old[: self._n]
+            return new
+
+        self._v = regrow(self._v, (grown, 3), np.int64)
+        self._level = regrow(self._level, (grown,), np.int64)
+        self._cls = regrow(self._cls, (grown,), np.int64)
+        self._status = regrow(self._status, (grown,), np.int8)
+        self._valid = regrow(self._valid, (grown,), bool)
 
     def add(self, v, level, cls, status):
-        """Append triangles, returning their row indices."""
-        start = self.v.shape[0]
+        """Append triangles, returning their row indices.
+
+        ``level`` and ``status`` may be scalars or per-row arrays; assignment
+        into the slice broadcasts either.
+        """
+        start = self._n
         k = v.shape[0]
-        self.v = np.concatenate([self.v, v])
-        self.level = np.concatenate(
-            [self.level, np.broadcast_to(np.asarray(level, dtype=np.int64), (k,))]
-        )
-        self.cls = np.concatenate([self.cls, np.asarray(cls, dtype=np.int64)])
-        self.status = np.concatenate(
-            [self.status, np.broadcast_to(np.asarray(status, dtype=np.int8), (k,))]
-        )
-        self.valid = np.concatenate([self.valid, np.ones(k, dtype=bool)])
+        self._reserve(k)
+        self._v[start : start + k] = v
+        self._level[start : start + k] = level
+        self._cls[start : start + k] = cls
+        self._status[start : start + k] = status
+        self._valid[start : start + k] = True
+        self._n = start + k
         return np.arange(start, start + k, dtype=np.int64)
 
     def remove(self, rows):

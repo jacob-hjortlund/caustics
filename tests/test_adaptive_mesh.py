@@ -378,6 +378,59 @@ def test_vertex_cache_lookup_missing_insert():
     assert np.array_equal(cache.lookup(np.array([7, 99])), np.array([1, -1]))
 
 
+def test_vertex_cache_survives_many_small_inserts():
+    """Capacity doubling must not expose slack or misplace a slot.
+
+    Slots are assigned monotonically in order of first evaluation and never
+    move, and `ij`/`beta` are views into an over-allocated buffer -- so an
+    off-by-one in the truncation shows up as a length or a stale row, not as
+    an exception.
+    """
+    cache = _VertexCache()
+    for k in range(40):
+        keys = np.array([1000 - k], dtype=np.int64)  # descending, to force merges
+        ij = np.stack([keys, keys], axis=-1)
+        slots = cache.insert(keys, ij, ij.astype(np.float64) * 0.5)
+        assert slots.tolist() == [k]
+    assert len(cache) == 40
+    assert cache.ij.shape == (40, 2)
+    assert cache.beta.shape == (40, 2)
+    probe = np.array([1000 - k for k in range(40)], dtype=np.int64)
+    assert cache.lookup(probe).tolist() == list(range(40))
+    assert np.array_equal(cache.ij[:, 0], probe)
+    assert np.allclose(cache.beta[:, 0], probe * 0.5)
+
+
+def test_vertex_cache_keys_stay_sorted_across_interleaved_inserts():
+    """The key index is merged, not re-sorted; the merge must be correct."""
+    cache = _VertexCache()
+    for block in ([5, 9], [1, 7], [3, 11], [0, 6]):
+        keys = np.array(block, dtype=np.int64)
+        ij = np.stack([keys, keys], axis=-1)
+        cache.insert(keys, ij, ij.astype(np.float64))
+    assert cache.missing(np.arange(12)).tolist() == [2, 4, 8, 10]
+    order = cache.lookup(np.array([0, 1, 3, 5, 6, 7, 9, 11]))
+    assert sorted(order.tolist()) == list(range(8))
+    assert (order >= 0).all()
+
+
+def test_leaf_store_survives_many_small_adds_and_removals():
+    """Buffered growth must not break `remove`, which writes through a view."""
+    store = _LeafStore()
+    for k in range(30):
+        rows = store.add(
+            np.arange(3 * k, 3 * k + 3).reshape(1, 3),
+            k,
+            np.zeros(1, np.int64),
+            LeafStatus.CONVERGED,
+        )
+        if k % 3 == 0:
+            store.remove(rows)
+    v, level, cls, status = store.compact()
+    assert v.shape == (20, 3)
+    assert level.tolist() == [k for k in range(30) if k % 3 != 0]
+
+
 def test_active_keys_membership():
     """Activation is by cache slot; membership is still asked by key.
 
