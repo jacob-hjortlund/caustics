@@ -1191,6 +1191,7 @@ def test_closure_re_emits_every_origin_vertex():
     for fn, kw in (
         (localised_fold, dict(min_img_sep=0.02)),
         (lambda p: np.stack([p[:, 0], p[:, 1] ** 2], axis=-1), dict(min_img_sep=0.05)),
+        (gaussian_bump, dict(fov=4.0, init_res=8, min_img_sep=0.02)),
     ):
         ref, lat, *_ = refine_with(fn, **kw)
         v, level, cls, status = ref.store.compact()
@@ -1205,6 +1206,18 @@ def test_closure_re_emits_every_origin_vertex():
             assert set(v[row].tolist()) <= emitted, f"origin {row} lost a vertex"
 
 
+def gaussian_bump(p, w=0.08, amp=1.0, c=(0.13, 0.07)):
+    """Narrow Gaussian bump, curved enough to reach ``_close``'s ``count == 3`` branch.
+
+    An ``init_res=8`` grid over this map is coarse enough that most triangles
+    converge quickly while a few interior ones split deep enough to leave a
+    fully-hanging (3-node) origin behind for ``_close`` to red-split.
+    """
+    centre = np.asarray(c)
+    r2 = ((p - centre) ** 2).sum(axis=-1)
+    return p * 0.5 + (amp * np.exp(-r2 / (2 * w**2)))[:, None] * np.array([1.0, 0.3])
+
+
 def test_close_reaches_the_count_equals_3_branch_via_a_gaussian_bump():
     """`_close`'s ``count == 3`` branch, which no other fixture reaches.
 
@@ -1215,16 +1228,8 @@ def test_close_reaches_the_count_equals_3_branch_via_a_gaussian_bump():
     deep enough to leave a fully-hanging (3-node) origin behind for ``_close`` to
     red-split. Measured: ``n_closure_by_pattern == (244, 42, 6)``.
     """
-
-    def bump(p, w=0.08, amp=1.0, c=(0.13, 0.07)):
-        centre = np.asarray(c)
-        r2 = ((p - centre) ** 2).sum(axis=-1)
-        return p * 0.5 + (amp * np.exp(-r2 / (2 * w**2)))[:, None] * np.array(
-            [1.0, 0.3]
-        )
-
     ref, lat, v, pre_lvl, pre_st, leaves, origin, lvl, st, n_pre = closed_mesh(
-        bump, fov=4.0, init_res=8, min_img_sep=0.02
+        gaussian_bump, fov=4.0, init_res=8, min_img_sep=0.02
     )
     group_sizes = np.bincount(origin, minlength=v.shape[0])
     pattern = (
@@ -2091,6 +2096,11 @@ def test_dedup_is_unchanged_by_bucketing_on_randomised_blocks():
     on another block's rows. Running each block *alone* through the same
     function is the independent reference: a single-block call has nothing to
     mis-scatter.
+
+    What this does NOT check: both sides call the same clustering kernel
+    (:func:`_dedup_block_group` via :func:`_dedup_representatives`), so a bug
+    inside that kernel itself -- a wrong sentinel, a wrong iteration bound --
+    reproduces identically on both sides and is invisible to this comparison.
     """
     rng = np.random.default_rng(20260910)
     # The all-empty vector is explicit: 20 random draws from this seed never

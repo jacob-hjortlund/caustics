@@ -168,11 +168,13 @@ class _VertexCache:
     call. Slots are assigned monotonically in order of first evaluation and
     never move.
 
-    Storage is a capacity-doubling buffer, not ``np.concatenate``: appending by
-    concatenation reallocates and copies every row on every call, which across
-    a build's levels and cascade rounds is the dominant cost of maintaining the
-    cache. ``ij`` and ``beta`` are truncated views, so no consumer ever sees
-    capacity slack.
+    ``ij`` and ``beta`` are stored in a capacity-doubling buffer, not appended
+    by ``np.concatenate``: concatenation reallocates and copies every row on
+    every call, which across a build's levels and cascade rounds is the
+    dominant cost of maintaining the cache. ``ij`` and ``beta`` are truncated
+    views over that buffer, so no consumer ever sees capacity slack. ``_keys``
+    and ``_slots`` are not capacity-doubled the same way -- they are still
+    fully reallocated on every :meth:`insert`.
     """
 
     def __init__(self):
@@ -199,6 +201,11 @@ class _VertexCache:
         return self._beta[: self._n]
 
     def _reserve(self, extra):
+        # The capacity slack past `self._n` is `np.empty` -- uninitialised, not
+        # zeroed -- so `ij`/`beta` (the truncating properties) are the only safe
+        # way to read this buffer. `build_adaptive_mesh` computes
+        # `n_nonfinite_vertices` over `ref.cache.beta`; reading the untruncated
+        # array there would count garbage as non-finite.
         need = self._n + extra
         capacity = self._ij.shape[0]
         if need <= capacity:
@@ -324,7 +331,6 @@ class _ActiveKeys:
         triangle vertex and cannot be active -- ``lookup`` returns ``-1`` and
         :meth:`contains_slots` reads that as False.
         """
-        self._grow()
         return self.contains_slots(self._cache.lookup(keys))
 
 
@@ -373,6 +379,9 @@ class _LeafStore:
         return self._valid[: self._n]
 
     def _reserve(self, extra):
+        # As in `_VertexCache._reserve`: the capacity slack past `self._n` is
+        # `np.empty`, not zeroed, so the truncating properties (`v`, `level`,
+        # `cls`, `status`, `valid`) are the only safe way to read this buffer.
         need = self._n + extra
         capacity = self._v.shape[0]
         if need <= capacity:
@@ -595,7 +604,7 @@ def _find_unbalanced(store, cache, lattice, active, max_level, frontier_level):
     ij = cache.ij[store.v[cand]]  # (n, 3, 2)
     # One edge at a time, accumulating into a single `(n,)` mask. The batch
     # form built `a`, `b`, `delta` at `(n, 3, 2)` and the keys at `(n, 6)`, so
-    # this function alone held ~200 MB at a million leaves -- the largest
+    # this function alone held 153 MB at a million leaves -- the largest
     # transient inside `_refine`. The disjunction is over the same six keys
     # `_edge_quarter_keys` returns; only the association changes.
     hit = np.zeros(cand.size, dtype=bool)
@@ -884,6 +893,7 @@ def _close(lattice, cache, active, v, level, status):
     # |det| == 1. So no edge of a max_level leaf can ever have matching endpoint
     # parity, `exact` is False on every edge, and the count == 0 pass-through
     # above is that leaf's only route through -- not an artifact of this fixture.
+    #
     # Edge at a time: the batch form gathered two `(L0, 3, 2)` copies of
     # `v_ij` and summed them into a third, three of the largest arrays in the
     # function. Column `i` pairs the two vertices *other* than `theta_i`,
@@ -1246,8 +1256,8 @@ def _dedup_representatives(points, counts, tol):
 
     # A block of one point is its own representative and a block of none
     # contributes nothing, so neither reaches the clustering kernel at all.
-    # On a multiplicity map those are the large majority of blocks -- 88% at
-    # the reference configuration -- and skipping them is the single biggest
+    # On a multiplicity map those are the large majority -- 88% of blocks on a
+    # typical multiplicity map -- and skipping them is the single biggest
     # reduction in what the kernel has to hold.
     singles = np.flatnonzero(counts == 1)
     if singles.size:
@@ -1652,9 +1662,11 @@ class Mesh:
         Image-plane positions of every image of each source-plane point.
 
         :meth:`seeds` supplies a Newton seed per candidate leaf, accurate to
-        ``min_img_sep`` by construction; Levenberg-Marquardt refines each seed to a
-        root of the lens equation, unconverged roots are discarded, and the
-        survivors are deduplicated at ``min_img_sep``.
+        ``min_img_sep`` by construction. Under ``method="rootfind"``,
+        Levenberg-Marquardt refines each seed to a root of the lens equation,
+        unconverged roots are discarded, and the survivors are deduplicated at
+        ``min_img_sep``; under ``method="dedup"`` the seeds themselves are
+        deduplicated directly -- see the ``method`` parameter below.
 
         Parameters
         ----------
@@ -1675,8 +1687,9 @@ class Mesh:
         batch_size: Optional[int]
             Chunk size over source points. Bounds peak memory for the whole
             pipeline, not just :meth:`query` -- the root finder holds ``(K, 2)``
-            states and the dedup a ``(B, M, M)`` adjacency. Results are identical
-            for every value.
+            states and the dedup a ``(B_c, c, c)`` intermediate per distinct
+            candidate count ``c`` (see :func:`_dedup_representatives`). Results
+            are identical for every value.
         method: str
             ``"rootfind"`` (default) refines every seed with
             Levenberg-Marquardt and returns machine-precision image positions.
@@ -1825,11 +1838,15 @@ class Mesh:
             *Unit: arcsec*
 
         batch_size: Optional[int]
-            Chunk size over pixels, forwarded to :meth:`forward_raytrace`. This
-            matters more here than anywhere else in the module: the default
-            ``None`` root-finds every pixel of the map in one batch.
+            Chunk size over pixels, forwarded to :meth:`Mesh._image_chunks`.
+            This matters more here than anywhere else in the module: under
+            ``method="rootfind"`` the default ``None`` root-finds every pixel
+            of the map in one batch; under ``method="dedup"`` there is no
+            root finder to feed, and it instead bounds the spatial-query
+            intermediate.
         residual_tol, lm_kwargs
-            Forwarded to :meth:`forward_raytrace`.
+            Forwarded to the root finder, as in :meth:`forward_raytrace`.
+            Ignored under ``method="dedup"``, which never calls it.
 
         Returns
         -------
