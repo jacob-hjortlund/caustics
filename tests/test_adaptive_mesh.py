@@ -6,6 +6,7 @@ import pytest
 from caustics.backend_obj import backend
 from caustics.cosmology import FlatLambdaCDM
 from caustics.lenses import SIE, Point
+from caustics.lenses import adaptive
 from caustics.lenses.adaptive import (
     LeafStatus,
     BuildStats,
@@ -16,7 +17,6 @@ from caustics.lenses.adaptive import (
     _dedup_representatives,
     _depth_floor,
     _edge_quarter_keys,
-    _find_unbalanced,
     _initial_triangles,
     _invalidate_nonfinite_origins,
     _Lattice,
@@ -856,30 +856,55 @@ def test_edge_quarter_keys_are_lattice_points_of_both_quarters():
     assert (0, 4) in got and (0, 12) in got  # edge (2,0)
 
 
-def test_find_unbalanced_matches_the_six_quarter_key_reference():
-    """The edge-at-a-time scan must select exactly the rows the batch form did.
+def test_find_unbalanced_matches_the_six_quarter_key_reference_during_the_cascade(
+    monkeypatch,
+):
+    """The edge-at-a-time scan must select exactly the rows the batch form did,
+    checked where a violation can actually occur.
 
     `_find_unbalanced` no longer builds the whole `(cand, 6)` key array -- it
     tests the six quarter points one at a time to keep the temporary
     `(cand,)`-shaped. That is a reassociation of the same disjunction, so
     `_edge_quarter_keys`, which is unchanged and separately tested, is the
     reference it must reproduce row for row.
+
+    An earlier version of this test ran `_find_unbalanced` against a *completed*
+    `_refine` result. A completed refinement is balanced by construction --
+    that is exactly what `test_mesh_is_edge_balanced_after_refinement` asserts
+    -- so every frontier level it inspected had zero candidates, zero
+    violators, and `got == want` trivially as empty-to-empty. A rewrite that
+    silently *misses* violators -- the dangerous direction, since it yields an
+    unbalanced mesh rather than an error -- would pass that just as well as a
+    correct one.
+
+    This version instead intercepts every call `_refine`'s own balance cascade
+    makes while it is actively running, which is where non-empty violator sets
+    exist, and requires that at least one such non-empty comparison happened.
     """
-    ref, lat, calls, max_level = refine_with(localised_fold, min_img_sep=0.02)
-    checked = 0
-    for frontier in range(2, max_level + 1):
-        got = _find_unbalanced(
-            ref.store, ref.cache, lat, ref.active, max_level, frontier
+    real_find_unbalanced = adaptive._find_unbalanced
+    seen_nonempty = False
+
+    def shim(store, cache, lattice, active, max_level, frontier_level):
+        nonlocal seen_nonempty
+        got = real_find_unbalanced(
+            store, cache, lattice, active, max_level, frontier_level
         )
-        bound = min(frontier - 2, max_level - 2)
-        cand = np.flatnonzero(ref.store.valid & (ref.store.level <= bound))
-        if cand.size == 0:
-            continue
-        checked += 1
-        keys = _edge_quarter_keys(lat, ref.cache.ij[ref.store.v[cand]])
-        want = cand[ref.active.contains(keys).any(axis=1)]
-        assert got.tolist() == want.tolist(), f"frontier_level={frontier}"
-    assert checked > 0, "no frontier level produced candidates to compare"
+        bound = min(frontier_level - 2, max_level - 2)
+        cand = np.flatnonzero(store.valid & (store.level <= bound))
+        if cand.size:
+            keys = _edge_quarter_keys(lattice, cache.ij[store.v[cand]])
+            want = cand[active.contains(keys).any(axis=1)]
+        else:
+            want = cand
+        assert got.tolist() == want.tolist(), f"frontier_level={frontier_level}"
+        if want.size > 0:
+            seen_nonempty = True
+        return got
+
+    monkeypatch.setattr(adaptive, "_find_unbalanced", shim)
+    refine_with(localised_fold, min_img_sep=0.02)
+
+    assert seen_nonempty, "shim never observed a non-empty violator set"
 
 
 def test_leaf_store_add_accepts_per_row_level_and_status():
@@ -2338,6 +2363,29 @@ def test_multiplicity_map_has_the_requested_shape_and_extent():
     assert to_np(m).shape == (5, 7), "shape is (ny, nx), imshow-ready"
     # Outer pixel edges, not first/last centres: `extent` is what `imshow` wants.
     assert np.allclose(extent, (-0.7, 0.7, -0.5, 0.5))
+
+
+def test_multiplicity_map_handles_a_degenerate_axis_under_both_methods():
+    """``nx=0`` or ``ny=0`` must return an empty ``(ny, nx)`` map, not raise.
+
+    Regression test for a `_image_chunks` bug: its batch step was
+    ``n if batch_size is None else max(1, int(batch_size))``, so with ``n ==
+    0`` (an empty pixel grid) and the default ``batch_size=None``, ``step``
+    came out ``0`` and ``range(0, 0, 0)`` raised ``ValueError: range() arg 3
+    must not be zero``. ``forward_raytrace`` never hits this because of its
+    own ``n == 0`` early return before it ever calls `_image_chunks`;
+    `multiplicity_map` calls `_image_chunks` directly and had no such guard.
+    At the pre-dedup baseline this could not happen because `multiplicity_map`
+    went through `forward_raytrace` and inherited its guard; the direct
+    `_image_chunks` call is what reintroduced the gap.
+    """
+    lens, mesh = sie_fixture()
+    for nx, ny in ((0, 3), (3, 0)):
+        for method in ("rootfind", "dedup"):
+            m, extent = mesh.multiplicity_map(
+                lens.raytrace, 0.2, nx=nx, ny=ny, method=method
+            )
+            assert to_np(m).shape == (ny, nx), f"nx={nx} ny={ny} method={method}"
 
 
 def test_multiplicity_map_agrees_with_forward_raytrace_pixel_by_pixel():

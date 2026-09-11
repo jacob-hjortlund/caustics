@@ -19,8 +19,9 @@ at all.
 
 The distinction matters and is not cosmetic. **Candidate count is not image
 multiplicity** -- a point on a shared edge returns both leaves, and near-critical
-leaves overlap -- so anything that needs a count has to go through the root-finding
-layer, which is what :meth:`Mesh.multiplicity_map` is.
+leaves overlap -- so anything that needs a count has to go through
+:meth:`Mesh.multiplicity_map`, which counts distinct images: converged roots
+under ``"rootfind"``, deduplicated seeds under ``"dedup"``.
 
 Non-goals, by design: no autodiff, no jit, no vmap. :meth:`Mesh.query` has
 data-dependent output shapes, so the mesh is structurally unjittable rather than
@@ -1622,8 +1623,8 @@ class Mesh:
         tol = self.min_img_sep if residual_tol is None else float(residual_tol)
         lm_kwargs = {} if lm_kwargs is None else dict(lm_kwargs)
         n = beta.shape[0]
-        step = n if batch_size is None else max(1, int(batch_size))
-        for lo in range(0, n, step):
+        step = max(1, n) if batch_size is None else max(1, int(batch_size))
+        for lo in range(0, max(n, 1), step):
             yield self._forward_chunk(
                 beta[lo : lo + step], raytrace, method, tol, lm_kwargs, want_images
             )
@@ -1688,8 +1689,11 @@ class Mesh:
             Positions from ``"dedup"`` are accurate to ``min_img_sep``, not to
             machine precision. Counts agree with ``"rootfind"`` except within
             about ``min_img_sep`` of a caustic -- measured at 12 pixels in
-            24656 on an EPL-plus-shear lens. Use ``"rootfind"`` when the
-            position itself matters, ``"dedup"`` when the count does.
+            24656 on an EPL-plus-shear lens. Unlike ``"rootfind"``, ``"dedup"``
+            counts are not guaranteed to satisfy the odd-image theorem: a
+            near-tangential pair closer than ``min_img_sep`` merges into one.
+            Use ``"rootfind"`` when the position itself matters, ``"dedup"``
+            when the count does.
         residual_tol: Optional[float]
             Source-plane tolerance on ``|raytrace(x) - beta|`` for accepting a
             root. Defaults to ``min_img_sep``.
@@ -1847,8 +1851,9 @@ class Mesh:
         ``method="dedup"`` there is no solver, and the cost is the spatial
         query alone.
 
-        Multiplicity here is the count of *distinct converged roots*, which is why
-        it needed :meth:`forward_raytrace` rather than :meth:`query`: candidate
+        Multiplicity here is the count of *distinct images* -- converged roots
+        under ``"rootfind"``, deduplicated seeds under ``"dedup"`` -- which is why
+        it goes through :meth:`forward_raytrace` rather than :meth:`query`: candidate
         count is not multiplicity, since a query on a shared edge returns both
         leaves and near-critical leaves overlap.
         """
