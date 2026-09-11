@@ -1152,6 +1152,34 @@ def test_closure_adds_no_new_vertices():
     assert set(np.unique(leaves)) <= set(range(n_pre))
 
 
+def test_closure_re_emits_every_origin_vertex():
+    """Every closure pattern re-emits all three of its origin's vertices.
+
+    `build_adaptive_mesh` unions the closed leaves' slots with the pre-closure
+    leaves' slots to decide which vertices to keep. That second term is
+    redundant *if* this holds for all four patterns -- count 0 emits `v`
+    itself, count 1 emits `(v_i, v_j, m_i)` and `(v_i, m_i, v_k)`, count 2 the
+    corner `(v_c, m_b, m_a)` plus two triangles spanning `v_a` and `v_b`, and
+    count 3 is the red split, whose children include all three. Dropping the
+    term without this test would be an unchecked proof.
+    """
+    for fn, kw in (
+        (localised_fold, dict(min_img_sep=0.02)),
+        (lambda p: np.stack([p[:, 0], p[:, 1] ** 2], axis=-1), dict(min_img_sep=0.05)),
+    ):
+        ref, lat, *_ = refine_with(fn, **kw)
+        v, level, cls, status = ref.store.compact()
+        order = _canonical_order(lat, ref.cache, v)
+        v, level, status = v[order], level[order], status[order]
+        leaves, origin, _, _ = _close(lat, ref.cache, ref.active, v, level, status)
+        # Not merely "the sets agree": each origin's own three slots must appear
+        # among the leaves that origin produced, which is the property the
+        # union relies on.
+        for row in range(v.shape[0]):
+            emitted = set(leaves[origin == row].reshape(-1).tolist())
+            assert set(v[row].tolist()) <= emitted, f"origin {row} lost a vertex"
+
+
 def test_close_reaches_the_count_equals_3_branch_via_a_gaussian_bump():
     """`_close`'s ``count == 3`` branch, which no other fixture reaches.
 

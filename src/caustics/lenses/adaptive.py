@@ -883,10 +883,20 @@ def _close(lattice, cache, active, v, level, status):
     # |det| == 1. So no edge of a max_level leaf can ever have matching endpoint
     # parity, `exact` is False on every edge, and the count == 0 pass-through
     # above is that leaf's only route through -- not an artifact of this fixture.
-    exact = ((v_ij[:, [1, 2, 0]] + v_ij[:, [2, 0, 1]]) % 2 == 0).all(axis=-1)
+    # Edge at a time: the batch form gathered two `(L0, 3, 2)` copies of
+    # `v_ij` and summed them into a third, three of the largest arrays in the
+    # function. Column `i` pairs the two vertices *other* than `theta_i`,
+    # matching `_midpoint_ij`'s convention that `m_i` is opposite `theta_i`.
+    exact = np.empty((v.shape[0], 3), dtype=bool)
+    for i in range(3):
+        j, k = (i + 1) % 3, (i + 2) % 3
+        exact[:, i] = ((v_ij[:, j] + v_ij[:, k]) % 2 == 0).all(axis=-1)
     # `m` is already `cache.lookup(mid_keys)`; asking by slot skips a second
     # searchsorted over the same keys.
     hanging = exact & active.contains_slots(m)  # (L0, 3)
+    # `v_ij` and the midpoint coordinates are dead from here: the pattern
+    # tables below work in slots, and `geom` re-gathers from the cache.
+    del v_ij, mid_ij, mid_keys
     count = hanging.sum(axis=1)
 
     n_children = np.choose(count, [1, 2, 3, 4])
@@ -2018,7 +2028,12 @@ def build_adaptive_mesh(
 
     # Compaction: sorting by lattice key makes vertex order a function of the
     # geometry alone and gives row-major locality for query-time gathers.
-    used = np.unique(np.concatenate([leaf_v.reshape(-1), pre_v.reshape(-1)]))
+    # `leaf_v` alone: every closure pattern re-emits all three of its origin's
+    # vertices, so `pre_v`'s slots are a subset of `leaf_v`'s and unioning them
+    # sorted 2.6 million redundant entries. Guarded by
+    # `test_closure_re_emits_every_origin_vertex`, which is what makes this a
+    # checked property rather than an argument.
+    used = np.unique(leaf_v.reshape(-1))
     used = used[np.argsort(lattice.key(ref.cache.ij[used]), kind="stable")]
     remap = np.zeros(len(ref.cache), dtype=np.int64)
     remap[used] = np.arange(used.size, dtype=np.int64)
