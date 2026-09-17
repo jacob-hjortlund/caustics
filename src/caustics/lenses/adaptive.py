@@ -539,21 +539,33 @@ def _make_raytrace_np(raytrace, device):
     return call
 
 
+def _trace_keys(lattice, ij, raytrace_np, batch_size):
+    """
+    Raytrace lattice points as one logical batch, chunked only for memory.
+
+    Split out of :func:`_evaluate` so the ``max_level`` midpoint pass can reuse
+    the chunking without touching the vertex cache: those points are consumed by
+    the parity test and never read again, and caching them would grow the cache
+    by roughly ``1.5x`` the ``max_level`` leaf count for nothing.
+
+    Takes ``ij`` rather than keys so :func:`_evaluate` does not convert twice.
+    """
+    xy = lattice.xy(ij)
+    if batch_size is None or xy.shape[0] <= batch_size:
+        return raytrace_np(xy)
+    n_chunks = int(ceil(xy.shape[0] / batch_size))
+    return np.concatenate(
+        [raytrace_np(chunk) for chunk in np.array_split(xy, n_chunks)]
+    )
+
+
 def _evaluate(cache, lattice, keys, raytrace_np, batch_size):
     """Evaluate every not-yet-cached key, in one logical batch per call."""
     todo = cache.missing(keys)
     if todo.size == 0:
         return
     ij = lattice.ij_from_key(todo)
-    xy = lattice.xy(ij)
-    if batch_size is None or xy.shape[0] <= batch_size:
-        beta = raytrace_np(xy)
-    else:
-        n_chunks = int(ceil(xy.shape[0] / batch_size))
-        beta = np.concatenate(
-            [raytrace_np(chunk) for chunk in np.array_split(xy, n_chunks)]
-        )
-    cache.insert(todo, ij, beta)
+    cache.insert(todo, ij, _trace_keys(lattice, ij, raytrace_np, batch_size))
 
 
 def _edge_quarter_keys(lattice, ij):
