@@ -1573,6 +1573,48 @@ def test_invalid_leaves_are_kept_but_excluded_from_the_index():
     assert not indexed & set(np.flatnonzero(status == LeafStatus.INVALID).tolist())
 
 
+def test_parity_condemned_leaves_are_excluded_from_the_index():
+    """The coverage hole this feature deliberately opens.
+
+    The cored SIE fixture (`sie_fixture`) is finite everywhere, so
+    `n_nonfinite_vertices == 0` isolates parity as the only cause of invalidity
+    here -- without that guard this test would pass just as well on the
+    pre-existing non-finite path.
+    """
+    lens, mesh = sie_fixture()
+    s = mesh.stats
+    assert s.n_nonfinite_vertices == 0, "fixture must isolate the parity cause"
+    assert s.n_parity_invalid > 0
+    assert s.n_parity_invalid <= s.n_invalid
+
+    status = backend.to_numpy(mesh.leaf_status)
+    level = backend.to_numpy(mesh.leaf_level)
+    invalid = np.flatnonzero(status == LeafStatus.INVALID)
+    assert invalid.size > 0
+    assert (level[invalid] == s.max_level).all()
+    indexed = set(backend.to_numpy(mesh._cell_leaves).tolist())
+    assert not indexed & set(invalid.tolist())
+
+
+def test_parity_invalid_partitions_the_max_level_leaves():
+    """Exact conservation, so the count cannot drift without being noticed.
+
+    SIZE_FLOOR arises only at max_level, and with no non-finite vertices the
+    only other max_level outcome is a parity condemnation. So the two must
+    together account for every pre-closure leaf at that level.
+    """
+    lens, mesh = sie_fixture()
+    s = mesh.stats
+    assert s.n_nonfinite_vertices == 0
+    assert s.n_parity_invalid + s.n_size_floor == s.leaves_by_level[s.max_level]
+    # Disjoint from the split counter: one sizes the descent, the other the hole.
+    assert s.n_parity_splits > 0 and s.n_parity_invalid > 0
+    assert (
+        s.n_converged + s.n_size_floor + s.n_forced + s.n_invalid
+        == s.n_leaves_pre_closure
+    )
+
+
 def test_query_seeds_an_inner_image_that_runs_into_the_lens_centre():
     """The coverage the old terminate-on-non-finite policy destroyed.
 

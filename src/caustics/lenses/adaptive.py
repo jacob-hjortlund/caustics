@@ -72,11 +72,15 @@ class LeafStatus(IntEnum):
     a caller auditing coverage must be able to tell them apart. Closure triangles
     have no status of their own; they inherit their origin's.
 
-    ``INVALID`` is not a refinement outcome the criterion can reach: a non-finite
-    triangle is split unconditionally, so ``INVALID`` arises only at ``max_level``,
-    where no split is left, plus the freeze-time propagation in
-    :func:`_invalidate_nonfinite_origins`. That bounds the coverage hole around a
-    singularity by the ``max_level`` leaf size rather than by ``fov / init_res``.
+    ``INVALID`` has three sources, all of them at ``max_level`` or later. A
+    non-finite triangle is split unconditionally, so it can only come to rest at
+    ``max_level``, where no split is left. A ``max_level`` triangle whose four
+    hypothetical children do not share ``sign(det Q_k)`` straddles a fold at a
+    scale the mesh cannot resolve, and is condemned rather than answering
+    queries with a non-injective affine model. And
+    :func:`_invalidate_nonfinite_origins` propagates invalidity at freeze time.
+    All three bound the coverage hole by the ``max_level`` leaf size rather than
+    by ``fov / init_res``.
     """
 
     CONVERGED = 0
@@ -689,13 +693,23 @@ def _refine(
     criterion vectorized, then partitions into converged and to-split. No
     Python-level recursion over individual triangles, no per-triangle ``raytrace``.
 
-    At ``max_level`` nothing splits, so there is no cascade, so no force-split, so
-    no leaf ever needs its midpoints -- and closure needs none either, because a
-    hanging node is a *vertex* of the finer neighbour. The evaluation set therefore
-    collapses to the vertices, saving the single largest batch in the build. The
-    non-finite check still runs there, on the vertices alone; without it a leaf with
-    a ``NaN`` vertex would enter the spatial index and swallow every query in its
-    cell.
+    At ``max_level`` nothing splits, so there is no cascade, so no force-split.
+    The midpoints are still evaluated, but for the parity test alone: a triangle
+    whose four hypothetical children disagree on ``sign(det Q_k)`` contains a
+    fold at a scale no further split can resolve, so it is marked ``INVALID``
+    and kept out of the spatial index. Those midpoints are traced once,
+    deduplicated on their lattice keys, consumed, and dropped -- they are the
+    only points with an odd coordinate, so they can never collide with the
+    cache, and nothing downstream reads them.
+
+    That pass is the single largest batch in the build. For a mesh refining
+    uniformly to ``max_level`` on an ``N x N`` cell grid it adds the
+    ``3 * N**2 + 2 * N`` edge midpoints to the ``(N + 1)**2`` vertices, which
+    together are exactly the ``(2 * N + 1)**2`` points of the widened lattice --
+    so a full-depth build now evaluates every lattice point exactly once, where
+    it used to evaluate only the even sublattice. Roughly ``4x`` the
+    ``raytrace`` calls in that worst case, and less on a genuinely adaptive
+    mesh. ``counters["max_level_midpoints"]`` is the measured cost.
 
     **Non-finite triangles split unconditionally.** A non-finite sample point is
     maximal ignorance about a triangle, so it triggers refinement like every other
@@ -1055,6 +1069,13 @@ class BuildStats:
     A triangle failing both parity and deviation is counted in ``n_parity_splits``;
     ``n_deviation_splits`` counts only among parity-passers.
 
+    ``n_parity_splits`` counts parity failures that caused a **split**, at
+    levels ``0`` through ``max_level - 1``. ``n_parity_invalid`` counts parity
+    failures that caused a **condemnation**, at ``max_level`` only, over leaves
+    whose vertices were all finite. The two are disjoint, and
+    ``n_parity_invalid <= n_invalid`` -- the difference being non-finite
+    vertices plus whatever :func:`_invalidate_nonfinite_origins` adds at freeze.
+
     ``n_nonfinite_splits`` is disjoint from both: a triangle with a non-finite
     sample point never reaches the criterion at all, and splitting it is a decision
     made in the absence of evidence rather than because of it. It is also the cost
@@ -1073,6 +1094,7 @@ class BuildStats:
     n_invalid: int
     n_converged_at_level_0: int
     n_parity_splits: int
+    n_parity_invalid: int
     n_deviation_splits: int
     n_nonfinite_splits: int
     leaves_by_level: Tuple[int, ...]
@@ -1363,12 +1385,24 @@ class Mesh:
     structural rather than an invariant kept in sync.
 
     ``INVALID`` leaves remain in ``leaves``, ``leaf_status`` and the conformity
-    relation but are never registered in the spatial index, so :meth:`query` cannot
-    return them. That is a genuine coverage hole in the lens plane -- but a
-    ``min_img_sep``-scale one, not an ``init_res``-scale one: a non-finite triangle
-    refines rather than terminating, so it can only come to rest at ``max_level``.
-    ``stats.n_invalid`` sizes the hole and ``stats.n_nonfinite_splits`` the descent
-    that shrank it.
+    relation but are never registered in the spatial index, so :meth:`query`
+    cannot return them. That is a genuine coverage hole in the lens plane --
+    but a ``min_img_sep``-scale one, not an ``init_res``-scale one, since both
+    causes can only come to rest at ``max_level``.
+
+    The hole has two parts. Around a singularity it is a ring, because a
+    non-finite triangle refines rather than terminating. Along every critical
+    curve it is a band one ``max_level`` leaf thick -- bounded by the caller's
+    requested ``min_img_sep`` since the build refines internally to half it --
+    because a leaf whose four hypothetical children disagree on
+    ``sign(det Q_k)`` contains a fold the mesh cannot resolve: its affine model
+    is non-injective there, so it would report containment for source points
+    with zero or two preimages and make :meth:`multiplicity_map` count them
+    wrong. Reporting no coverage is the conservative answer, and it is
+    deliberate -- correctness over completeness exactly where images merge.
+    ``stats.n_invalid`` sizes the whole hole, ``stats.n_parity_invalid`` the
+    critical-curve band, and ``stats.n_nonfinite_splits`` the descent that
+    shrank the ring.
 
     ``min_img_sep`` is stored because it is the mesh's own defining tolerance, in
     both of its build roles and again as the dedup radius in
@@ -2190,6 +2224,7 @@ def build_adaptive_mesh(
         n_invalid=int((pre_status == LeafStatus.INVALID).sum()),
         n_converged_at_level_0=int(ref.counters["converged_level0"]),
         n_parity_splits=int(ref.counters["parity_splits"]),
+        n_parity_invalid=int(ref.counters["parity_invalid"]),
         n_deviation_splits=int(ref.counters["deviation_splits"]),
         n_nonfinite_splits=int(ref.counters["nonfinite_splits"]),
         leaves_by_level=tuple(
