@@ -648,6 +648,56 @@ def test_midpoints_are_exact_integers_and_opposite_their_vertex():
     assert np.array_equal(m[0], np.array([[2, 2], [0, 2], [2, 0]]))
 
 
+def test_midpoints_are_exact_at_max_level_on_the_widened_lattice():
+    """The reason the lattice is one level finer than max_level.
+
+    With the lattice at max_level a triangle's edges are one unit long and
+    `_midpoint_ij`'s floor division collapses each "midpoint" onto one of that
+    edge's own endpoints. One level finer, every edge vector is even at every
+    level up to and including max_level, so the midpoints are genuine lattice
+    points -- and they are exactly the points with an odd coordinate, which is
+    what guarantees they can never collide with a cached vertex.
+    """
+    M, G, COMPOSE, PINV0, ROOT_CLASS = child_matrix_tables()
+    max_level = 3
+    lat = _Lattice(4.0, 0.0, 0.0, 2, max_level + 1)
+    ij, cls = _initial_triangles(2, lat.level, ROOT_CLASS)
+    # Descend to max_level by taking child C_4 (the middle child) each time.
+    for _ in range(max_level):
+        ij = _midpoint_ij(ij)
+    assert (ij % 2 == 0).all(), "max_level vertices are even"
+
+    mid = _midpoint_ij(ij)
+    # Exact: the floor division threw nothing away.
+    assert (
+        (ij[:, [1, 2, 0]] + ij[:, [2, 0, 1]]) % 2 == 0
+    ).all(), "edge endpoint sums must be even for the midpoint to be exact"
+    # Every midpoint has an odd coordinate, so it is not a vertex of any level.
+    assert (mid % 2 == 1).any(axis=-1).all()
+
+
+def test_widening_the_lattice_does_not_move_any_vertex():
+    """Bit-identical coordinates, not merely close ones.
+
+    `scale' = fov / (2n)` equals `fl(fov / n) / 2` exactly, because binary
+    floating point is scale-invariant under powers of two, and `(2 * ij) *
+    scale'` then rounds the same exact real as `ij * scale`. If this ever fails,
+    the widened lattice has perturbed the frozen mesh's geometry and every
+    downstream bit-exactness argument in the module is void.
+    """
+    fov, init_res, max_level = 4.0, 4, 3
+    narrow = _Lattice(fov, 0.0, 0.0, init_res, max_level)
+    wide = _Lattice(fov, 0.0, 0.0, init_res, max_level + 1)
+    assert wide.n == 2 * narrow.n
+    assert wide.level == max_level + 1
+
+    ij = np.stack(
+        np.meshgrid(np.arange(narrow.n + 1), np.arange(narrow.n + 1), indexing="ij"),
+        axis=-1,
+    ).reshape(-1, 2)
+    assert np.array_equal(narrow.xy(ij), wide.xy(2 * ij))
+
+
 def test_red_split_is_triangle_major_and_advances_the_class():
     M, G, COMPOSE, PINV0, ROOT_CLASS = child_matrix_tables()
     v = np.array([[0, 1, 2], [3, 4, 5]], dtype=np.int64)
@@ -702,7 +752,7 @@ def refine_with(fn, fov=4.0, init_res=4, min_img_sep=0.5, max_depth=25):
     M, G, COMPOSE, PINV0, ROOT_CLASS = child_matrix_tables()
     tables = (M, G, COMPOSE, PINV0, ROOT_CLASS)
     max_level = min(max_depth, _depth_floor(fov, init_res, min_img_sep))
-    lat = _Lattice(fov, 0.0, 0.0, init_res, max_level)
+    lat = _Lattice(fov, 0.0, 0.0, init_res, max_level + 1)
     raytrace, calls = make_counting_raytrace(fn)
     ref = _refine(
         _make_raytrace_np(raytrace, None),
@@ -755,7 +805,8 @@ def test_refine_terminates_at_max_level_on_a_kappa_one_sheet():
     # because its vertices are all already cached -- hence max_level batches,
     # not max_level + 1. Every lattice point is evaluated exactly once.
     assert calls["batches"] == max_level
-    assert calls["points"] == (lat.n + 1) ** 2
+    # Even sublattice only: the max_level midpoint pass arrives in a later commit.
+    assert calls["points"] == (lat.n // 2 + 1) ** 2
 
 
 def sis_raytrace(p, b=1.0):
@@ -1081,19 +1132,16 @@ def undirected_edges(lat, cache, leaves):
     return np.sort(e, axis=-1).reshape(-1, 2)
 
 
-def gated_hanging_nodes(lat, cache, active, slots):
-    """Hanging-node mask, applying the same exactness gate ``_close`` applies.
+def hanging_nodes(lat, cache, active, slots):
+    """Hanging-node mask, the same predicate ``_close`` itself applies.
 
-    Without the gate a max_level triangle's edges are one lattice unit long, so
-    ``_midpoint_ij``'s floor division collapses each "midpoint" onto one of that
-    same edge's own endpoints -- a real, trivially active mesh vertex -- and
-    every max_level leaf reads as having three hanging nodes. Any test that asks
-    "does a hanging node exist here" must gate, or it is measuring that artifact.
+    No exactness gate: the lattice is one level finer than max_level, so
+    `_midpoint_ij` is exact at every level and this names true midpoints
+    everywhere. A max_level midpoint has an odd coordinate and is never cached,
+    so `contains` reads it as absent -- which is correct, not an artifact.
     """
-    ij = cache.ij[slots]
-    mid_keys = lat.key(_midpoint_ij(ij))
-    exact = ((ij[:, [1, 2, 0]] + ij[:, [2, 0, 1]]) % 2 == 0).all(axis=-1)
-    return exact & active.contains(mid_keys)
+    mid_keys = lat.key(_midpoint_ij(cache.ij[slots]))
+    return active.contains(mid_keys)
 
 
 def closed_mesh(fn, **kw):
@@ -1158,8 +1206,8 @@ def test_closure_leaves_no_hanging_node():
     ref, lat, v, pre_lvl, pre_st, leaves, origin, lvl, st, n_pre = closed_mesh(
         localised_fold, min_img_sep=0.05
     )
-    assert gated_hanging_nodes(lat, ref.cache, ref.active, v).any(), "nothing to close"
-    assert not gated_hanging_nodes(lat, ref.cache, ref.active, leaves).any()
+    assert hanging_nodes(lat, ref.cache, ref.active, v).any(), "nothing to close"
+    assert not hanging_nodes(lat, ref.cache, ref.active, leaves).any()
 
 
 def test_pre_closure_mesh_is_not_already_conforming():
@@ -1172,16 +1220,15 @@ def test_pre_closure_mesh_is_not_already_conforming():
     ``(M, B)`` -- never ``(A, B)``, since no fine triangle has both endpoints. So
     a mesh riddled with hanging nodes has the same ``{1, 2}`` multiplicity
     profile as a conforming one, and hanging nodes are indistinguishable from
-    domain-boundary edges by counting alone. This is the same predicate
-    :func:`_close` itself uses to classify each leaf, **including its exactness
-    gate**. The gate is not optional here: ungated, a max_level triangle's
-    collapsed pseudo-midpoints are trivially active, so ``.any()`` would be
-    satisfied by that artifact alone and this guard would pass whether or not a
-    genuine hanging node existed anywhere in the mesh.
+    domain-boundary edges by counting alone.
+    This is the same predicate :func:`_close` itself uses to classify each leaf.
+    On the widened lattice it needs no exactness gate: `_midpoint_ij` is exact
+    at every level, so a True here is a genuine hanging node and never the
+    collapsed-pseudo-midpoint artifact the narrow lattice produced.
     """
     ref, lat, calls, max_level = refine_with(localised_fold, min_img_sep=0.05)
     v, level, cls, status = ref.store.compact()
-    assert gated_hanging_nodes(
+    assert hanging_nodes(
         lat, ref.cache, ref.active, v
     ).any(), "fixture has no hanging nodes"
 

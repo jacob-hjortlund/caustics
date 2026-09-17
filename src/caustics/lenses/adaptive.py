@@ -108,12 +108,15 @@ def _validate_build_args(fov, init_res, min_img_sep, max_depth) -> None:
     if max_depth < 0:
         raise ValueError(f"max_depth must be non-negative, got {max_depth}")
     max_level = min(max_depth, _depth_floor(fov, init_res, min_img_sep))
-    n = init_res * (1 << max_level)
+    # One level finer than max_level: see `_Lattice`. The guard has to size the
+    # lattice actually built, not the finest triangle level.
+    n = init_res * (1 << (max_level + 1))
     if (n + 1) ** 2 >= _MAX_KEY:
         raise ValueError(
             f"lattice too fine to key in int64: init_res={init_res} at level "
-            f"{max_level} needs {n + 1} points per axis. Raise min_img_sep, "
-            f"lower max_depth, or lower init_res."
+            f"{max_level} needs a lattice of {n + 1} points per axis, one level "
+            f"finer than max_level so that max_level edge midpoints are lattice "
+            f"points. Raise min_img_sep, lower max_depth, or lower init_res."
         )
 
 
@@ -126,10 +129,28 @@ class _Lattice:
     function of the integer pair, so two triangles sharing a vertex compute
     bit-identical coordinates. That is the root of the exact-negation property that
     stops a query falling through the seam between adjacent leaves.
+
+    The lattice is built one level finer than ``max_level``, so a triangle's
+    edge vectors are multiples of ``1 << (max_level + 1 - d)`` at level ``d``
+    -- at least 2 for every ``d <= max_level``. That makes :func:`_midpoint_ij`
+    exact at *every* level, ``max_level`` included, which is what lets the
+    parity test run there.
+
+    It also partitions the lattice. Every point the vertex cache holds -- a
+    vertex at any level, or a midpoint below ``max_level`` -- has **even**
+    coordinates; a ``max_level`` midpoint always has at least one **odd**
+    coordinate. So the ``max_level`` midpoint pass can never re-trace a cached
+    point, and a ``max_level`` midpoint can never be a triangle vertex.
+
+    Widening does not move anything. ``fov / (2n)`` is exactly ``fl(fov / n) / 2``
+    and ``(2 * ij) * (scale / 2)`` rounds the same exact real as ``ij * scale``,
+    so every pre-existing point keeps a bit-identical position. Keys scale
+    uniformly, so :func:`_canonical_order` is unchanged too.
     """
 
-    def __init__(self, fov, x0, y0, init_res, max_level):
-        self.n = int(init_res) * (1 << int(max_level))
+    def __init__(self, fov, x0, y0, init_res, lattice_level):
+        self.level = int(lattice_level)
+        self.n = int(init_res) * (1 << self.level)
         self.stride = self.n + 1
         self.scale = float(fov) / self.n
         self.lo = np.array([x0 - fov / 2.0, y0 - fov / 2.0], dtype=np.float64)
@@ -424,7 +445,7 @@ class _LeafStore:
         return self.v[keep], self.level[keep], self.cls[keep], self.status[keep]
 
 
-def _initial_triangles(init_res, max_level, root_class):
+def _initial_triangles(init_res, lattice_level, root_class):
     """
     Level-0 triangles: two per cell, split on the ``(0,0)-(1,1)`` diagonal.
 
@@ -439,7 +460,7 @@ def _initial_triangles(init_res, max_level, root_class):
     cls: ndarray
         ``(2 * init_res**2,)`` int64 orientation classes.
     """
-    step = 1 << int(max_level)
+    step = 1 << int(lattice_level)
     i, j = np.meshgrid(np.arange(init_res), np.arange(init_res), indexing="ij")
     base = np.stack((i.ravel(), j.ravel()), axis=-1).astype(np.int64) * step
     blocks, classes = [], []
@@ -454,8 +475,9 @@ def _midpoint_ij(ij):
     """
     Edge midpoints ``m1, m2, m3``, with ``m_i`` opposite ``theta_i``.
 
-    Exact integer averaging: at any level below ``max_level`` the coordinate sums
-    are even by construction.
+    Exact integer averaging: the lattice is one level finer than ``max_level``
+    (see :class:`_Lattice`), so the coordinate sums are even at every level up
+    to and including ``max_level``.
     """
     return np.stack(
         (
@@ -594,9 +616,12 @@ def _find_unbalanced(store, cache, lattice, active, max_level, frontier_level):
     """
     # ``frontier_level <= max_level`` holds for every call `_refine` makes, so
     # the first term always binds and the second is unreachable defensive code
-    # today. Keep the min(): it is what makes the integrality precondition of
-    # the quarter-point arithmetic below -- edge vectors divisible by four -- a
-    # property of this function rather than of its caller.
+    # today. Keep the min(): `max_level - 2` is the level above which no
+    # neighbour can be two levels finer, since `max_level` is the finest level
+    # there is. (It used to double as an integrality requirement for the
+    # quarter-point arithmetic below; on the widened lattice quarter points stay
+    # lattice points down to `max_level - 1`, so that role is gone and only the
+    # balance argument remains.)
     bound = min(frontier_level - 2, max_level - 2)
     cand = np.flatnonzero(store.valid & (store.level <= bound))
     if cand.size == 0:
@@ -675,7 +700,7 @@ def _refine(
         "cascade_rounds": 0,
     }
 
-    active_ij, active_cls = _initial_triangles(init_res, max_level, ROOT_CLASS)
+    active_ij, active_cls = _initial_triangles(init_res, lattice.level, ROOT_CLASS)
     deferred = np.empty(0, dtype=np.int64)
 
     for level in range(max_level + 1):
@@ -874,37 +899,19 @@ def _close(lattice, cache, active, v, level, status):
     mid_ij = _midpoint_ij(v_ij)
     mid_keys = lattice.key(mid_ij)
     m = cache.lookup(mid_keys)
-    # A max_level leaf's edges are one lattice unit long, so their true midpoints
-    # are not lattice points at all -- `_midpoint_ij`'s floor division silently
-    # collapses onto one of that same edge's own (trivially active) endpoints
-    # instead. Gating on exact reconstruction sends those leaves through as
-    # count == 0, matching `_refine`'s invariant that no leaf at max_level has a
-    # hanging node; below max_level the sums are always even by construction (see
-    # `_midpoint_ij`), so the gate has no effect there.
+    # No exactness gate. The lattice is one level finer than max_level, so
+    # `_midpoint_ij` is exact at every level and `mid_keys` always names the
+    # true midpoint. At max_level that midpoint has an odd coordinate, is traced
+    # transiently by `_refine` and never cached, so `lookup` returns -1 and
+    # `contains_slots` reads it as False. Even were it cached it could not be
+    # *active*: an active slot is by definition a triangle vertex, and every
+    # triangle vertex has even coordinates. So no max_level leaf has a hanging
+    # node -- the invariant `_refine` relies on -- and the count == 0
+    # pass-through below is still every max_level leaf's only route through.
     #
-    # That covers the gate being a no-op *below* max_level; the other half is that
-    # it always *fires* -- is never merely usually True -- *at* max_level, i.e.
-    # `exact` is exactly equivalent to `level < max_level`. Proof: at max_level
-    # every leaf is a unimodular lattice triangle, |det(edge matrix)| == 1. If any
-    # edge's two endpoints shared parity in both coordinates, that edge vector
-    # would be all-even; using it as one column of an edge matrix built from the
-    # triangle's other two edges would then force the determinant to be even (or,
-    # were a second edge also all-even, divisible by four) -- both impossible when
-    # |det| == 1. So no edge of a max_level leaf can ever have matching endpoint
-    # parity, `exact` is False on every edge, and the count == 0 pass-through
-    # above is that leaf's only route through -- not an artifact of this fixture.
-    #
-    # Edge at a time: the batch form gathered two `(L0, 3, 2)` copies of
-    # `v_ij` and summed them into a third, three of the largest arrays in the
-    # function. Column `i` pairs the two vertices *other* than `theta_i`,
-    # matching `_midpoint_ij`'s convention that `m_i` is opposite `theta_i`.
-    exact = np.empty((v.shape[0], 3), dtype=bool)
-    for i in range(3):
-        j, k = (i + 1) % 3, (i + 2) % 3
-        exact[:, i] = ((v_ij[:, j] + v_ij[:, k]) % 2 == 0).all(axis=-1)
     # `m` is already `cache.lookup(mid_keys)`; asking by slot skips a second
     # searchsorted over the same keys.
-    hanging = exact & active.contains_slots(m)  # (L0, 3)
+    hanging = active.contains_slots(m)  # (L0, 3)
     # `v_ij` and the midpoint coordinates are dead from here: the pattern
     # tables below work in slots, and `geom` re-gathers from the cache.
     del v_ij, mid_ij, mid_keys
@@ -2017,7 +2024,7 @@ def build_adaptive_mesh(
         )
 
     tables = child_matrix_tables()
-    lattice = _Lattice(fov, x0, y0, init_res, max_level)
+    lattice = _Lattice(fov, x0, y0, init_res, max_level + 1)
     raytrace_np = _make_raytrace_np(raytrace, device)
     ref = _refine(
         raytrace_np,
