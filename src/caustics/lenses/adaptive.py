@@ -42,8 +42,10 @@ from .func.adaptive import (
     CHILD_VERTEX_INDICES,
     ROOT_SHAPES,
     child_matrix_tables,
+    child_shape_matrices,
     contains,
     evaluate_criterion,
+    parity_from_children,
     sanitize_bary,
     shape_matrix,
     triangle_weights,
@@ -705,9 +707,11 @@ def _refine(
     counters = {
         "converged_level0": 0,
         "parity_splits": 0,
+        "parity_invalid": 0,
         "deviation_splits": 0,
         "sigma_zero": 0,
         "nonfinite_splits": 0,
+        "max_level_midpoints": 0,
         "forced": 0,
         "cascade_rounds": 0,
     }
@@ -731,8 +735,39 @@ def _refine(
         finite_v = np.isfinite(beta_v).all(axis=(1, 2))
 
         if level == max_level:
-            store.add(v[~finite_v], level, active_cls[~finite_v], LeafStatus.INVALID)
-            store.add(v[finite_v], level, active_cls[finite_v], LeafStatus.SIZE_FLOOR)
+            # Parity at the size floor. No split is left, so a triangle
+            # straddling a fold cannot be resolved -- it is condemned instead,
+            # which keeps it out of the spatial index. Only the midpoints are
+            # new: the vertices are already cached, and a max_level midpoint is
+            # the only kind of point with an odd coordinate, so this pass can
+            # never re-trace a cached one. They are consumed here and dropped;
+            # nothing downstream reads them, and `_close` finds no hanging node
+            # at max_level either way.
+            #
+            # The deviation half of the criterion deliberately does NOT run
+            # here: the size floor is what bounds curvature at max_level, and a
+            # second condemnation reason would blow a much larger hole.
+            rows = np.flatnonzero(finite_v)
+            # All-False start, so a non-finite vertex is condemned without a
+            # branch of its own and `~parity_ok` is the whole condemnation mask.
+            parity_ok = np.zeros(active_ij.shape[0], dtype=bool)
+            if rows.size:
+                keys = lattice.key(_midpoint_ij(active_ij[rows])).reshape(-1)
+                # Flattened before `np.unique` rather than leaning on NumPy 2's
+                # shape-preserving `return_inverse`, so the reshape below is
+                # explicit and this does not depend on the NumPy major version.
+                uniq, inv = np.unique(keys, return_inverse=True)
+                beta_m = _trace_keys(
+                    lattice, lattice.ij_from_key(uniq), raytrace_np, batch_size
+                )[inv].reshape(-1, 3, 2)
+                parity_ok[rows] = parity_from_children(
+                    child_shape_matrices(beta_v[rows], beta_m)
+                )
+                counters["max_level_midpoints"] = int(uniq.size)
+            counters["parity_invalid"] = int(finite_v.sum() - parity_ok.sum())
+            bad = ~parity_ok
+            store.add(v[bad], level, active_cls[bad], LeafStatus.INVALID)
+            store.add(v[~bad], level, active_cls[~bad], LeafStatus.SIZE_FLOOR)
             break
 
         m = cache.lookup(lattice.key(mid_ij))

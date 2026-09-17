@@ -786,7 +786,7 @@ def test_refine_never_evaluates_a_point_twice():
     ref, lat, calls, max_level = refine_with(
         lambda p: np.stack([p[:, 0], p[:, 1] ** 2], axis=-1), min_img_sep=0.05
     )
-    assert calls["points"] == len(ref.cache)
+    assert calls["points"] == len(ref.cache) + ref.counters["max_level_midpoints"]
     assert len(np.unique(lat.key(ref.cache.ij))) == len(ref.cache)
 
 
@@ -829,12 +829,21 @@ def test_refine_terminates_at_max_level_on_a_kappa_one_sheet():
     assert np.isfinite(ref.cache.beta).all()
     # This fixture genuinely reaches max_level, so it is the one that pins the
     # loop's batch structure on the full-descent path: one raytrace batch per
-    # level that needs new points, and the max_level iteration needs none
-    # because its vertices are all already cached -- hence max_level batches,
-    # not max_level + 1. Every lattice point is evaluated exactly once.
-    assert calls["batches"] == max_level
-    # Even sublattice only: the max_level midpoint pass arrives in a later commit.
-    assert calls["points"] == (lat.n // 2 + 1) ** 2
+    # level that needs new points, and the max_level iteration needs one more
+    # of its own for the midpoints -- hence max_level + 1 batches.
+    assert calls["batches"] == max_level + 1
+    # Every point of the widened lattice, exactly once. Even-even points are
+    # triangle vertices; single-odd points are horizontal or vertical edge
+    # midpoints; double-odd points are cell centres, which are the diagonal
+    # edge's midpoint. The three cases are exhaustive and disjoint, so a fixture
+    # that refines uniformly to max_level covers the lattice exactly. Checked by
+    # hand for the helper's defaults: max_level == 2, N == 16, 289 vertices +
+    # 800 midpoints == 33**2 == 1089.
+    assert calls["points"] == (lat.n + 1) ** 2
+    # kappa == 1 maps everything to a point, so all four child determinants are
+    # exactly zero -- a constant sign, hence no parity *change*. Spec 4.6: this
+    # passes rather than being condemned.
+    assert ref.counters["parity_invalid"] == 0
 
 
 def sis_raytrace(p, b=1.0):
@@ -928,10 +937,85 @@ def test_refine_marks_nonfinite_vertices_invalid_even_at_max_level():
     # Without this, a run producing zero SIZE_FLOOR rows would make the loop
     # below vacuously true.
     assert (status == LeafStatus.SIZE_FLOOR).any()
+    # Every vertex sits on an integer coordinate and the NaN half-plane starts
+    # at x > 0.5, so no all-finite-vertex triangle here has a NaN midpoint, and
+    # the map is the identity where it is finite, so parity never changes.
+    # INVALID is therefore non-finiteness alone -- which is what the loop below
+    # is entitled to assume.
+    assert ref.counters["parity_invalid"] == 0
     for row in np.flatnonzero(status == LeafStatus.SIZE_FLOOR):
         assert np.isfinite(ref.cache.beta[v[row]]).all()
     for row in np.flatnonzero(status == LeafStatus.INVALID):
         assert not np.isfinite(ref.cache.beta[v[row]]).all()
+
+
+def test_max_level_leaves_are_condemned_exactly_when_parity_changes():
+    """Independent oracle: recompute parity from each max_level leaf's own
+    geometry and require the assigned status to agree row for row.
+
+    `localised_fold`'s Jacobian 0.6 + 2y changes sign at y = -0.3, so the band of
+    max_level leaves straddling that line is condemned and the rest are not --
+    measured at 256 of 512 for this tolerance. Both arms are asserted non-empty,
+    so the row-for-row equality cannot pass vacuously on an all-True or all-False
+    mask.
+
+    The oracle builds its midpoints with `lat.xy(_midpoint_ij(...))` rather than
+    averaging vertex positions. The two differ in the last ulp, which is enough
+    to flip the sign of a near-zero child determinant right at the fold -- and
+    then this test would be measuring float rounding rather than the branch it
+    is aimed at. Midpoint *construction* is pinned separately by
+    `test_midpoints_are_exact_at_max_level_on_the_widened_lattice`.
+    """
+    ref, lat, calls, max_level = refine_with(localised_fold, min_img_sep=0.05)
+    v, level, cls, status = ref.store.compact()
+    sel = np.flatnonzero(level == max_level)
+    assert sel.size > 0, "fixture must reach max_level"
+
+    ij = ref.cache.ij[v[sel]]
+    beta_v = ref.cache.beta[v[sel]]
+    beta_m = localised_fold(lat.xy(_midpoint_ij(ij)).reshape(-1, 2)).reshape(-1, 3, 2)
+    want_ok = parity_from_children(child_shape_matrices(beta_v, beta_m))
+
+    got_invalid = status[sel] == LeafStatus.INVALID
+    assert got_invalid.any(), "fixture must condemn something"
+    assert (~got_invalid).any(), "fixture must spare something"
+    assert np.array_equal(got_invalid, ~want_ok)
+    assert (status[sel][~got_invalid] == LeafStatus.SIZE_FLOOR).all()
+    assert ref.counters["parity_invalid"] == int(got_invalid.sum())
+    # Condemnation happens only at the size floor; nothing coarser is touched.
+    assert (level[status == LeafStatus.INVALID] == max_level).all()
+
+
+def test_max_level_condemns_a_nonfinite_midpoint_with_finite_vertices():
+    """A midpoint the criterion cannot evaluate fails parity closed.
+
+    `min_img_sep` forces max_level == 0, so the level-0 triangles *are* the
+    max_level triangles. Vertices land on integer arcsec coordinates and
+    midpoints on half-integers, so a NaN band of half-width 0.1 around x == 0.5
+    hits midpoints only and leaves every vertex finite -- isolating the path
+    where parity, not the `finite_v` check, is what condemns.
+
+    Exactly the eight triangles of the x in [0, 1] cell column are hit: both
+    root shapes place a midpoint at x == 0.5, there are four cells in that
+    column, and two triangles per cell.
+    """
+
+    def broken(p):
+        out = p.copy()
+        out[np.abs(p[:, 0] - 0.5) < 0.1] = np.nan
+        return out
+
+    ref, lat, calls, max_level = refine_with(broken, min_img_sep=2.0)
+    assert max_level == 0
+    v, level, cls, status = ref.store.compact()
+    invalid = np.flatnonzero(status == LeafStatus.INVALID)
+    assert invalid.size == 8
+    assert ref.counters["parity_invalid"] == 8
+    for row in invalid:
+        assert np.isfinite(
+            ref.cache.beta[v[row]]
+        ).all(), "condemned by its midpoint, so its vertices must be finite"
+    assert (status == LeafStatus.SIZE_FLOOR).any()
 
 
 def test_refine_makes_one_batch_per_level_and_exits_early_when_affine():
@@ -941,18 +1025,6 @@ def test_refine_makes_one_batch_per_level_and_exits_early_when_affine():
     and the loop exits through the empty-``active`` break without ever reaching
     ``max_level``. This pins the level-synchronous one-batch-per-level structure
     on the early-exit path.
-
-    This deliberately does NOT claim to test the ``max_level`` midpoint-batch
-    skip, tempting though a batch count is: at ``max_level`` a triangle's edges
-    are one lattice unit, so ``_midpoint_ij``'s floor division collapses its
-    midpoints onto lattice points that are *already cached*. Requesting them
-    would add no ``raytrace`` call at all, which makes the skip invisible to
-    ``calls`` -- verified numerically: all 512 max-level triangles yield 288
-    distinct floored midpoints, none outside the finest lattice. The skip's
-    observable behaviour is its *labelling* -- SIZE_FLOOR and INVALID without
-    running the criterion -- and that is covered by
-    ``test_refine_terminates_at_max_level_on_a_kappa_one_sheet`` and
-    ``test_refine_marks_nonfinite_vertices_invalid_even_at_max_level``.
     """
     ref, lat, calls, max_level = refine_with(lambda p: p * 1.0, min_img_sep=0.5)
     v, level, cls, status = ref.store.compact()
@@ -1138,10 +1210,18 @@ def test_forced_and_invalid_statuses_are_mutually_consistent():
     # the ordinary path would break it.
     for row in np.flatnonzero(status == LeafStatus.FORCED):
         assert np.isfinite(ref.cache.beta[v[row]]).all()
-    # Conversely, no INVALID leaf may have all-finite vertices: the label is
-    # only ever applied because some point of the triangle failed the check.
+    # Conversely, INVALID no longer implies a non-finite vertex: spec 4.2 also
+    # condemns a max_level leaf whose four hypothetical children disagree on
+    # sign(det Q_k) even though every one of its vertices is finite. So both
+    # arms are expected here, not just the non-finite one -- this fixture's
+    # fold (from `localised_fold`) exercises the parity arm alongside the
+    # halfplane's non-finite arm.
     inv_beta = ref.cache.beta[v[status == LeafStatus.INVALID]]
-    assert not np.isfinite(inv_beta).all(axis=(1, 2)).any()
+    all_finite = np.isfinite(inv_beta).all(axis=(1, 2))
+    assert all_finite.any(), "fixture should exercise the parity-only condemnation too"
+    assert (
+        ~all_finite
+    ).any(), "fixture should exercise the non-finite condemnation too"
     # INVALID is unreachable below max_level, which is what makes the
     # unconditional FORCED above exact rather than lucky.
     assert (level[status == LeafStatus.INVALID] == max_level).all()
@@ -1151,7 +1231,7 @@ def test_cascade_still_evaluates_every_point_exactly_once():
     ref, lat, calls, max_level = refine_with(
         localised_fold, fov=4.0, init_res=4, min_img_sep=0.05
     )
-    assert calls["points"] == len(ref.cache)
+    assert calls["points"] == len(ref.cache) + ref.counters["max_level_midpoints"]
 
 
 def undirected_edges(lat, cache, leaves):
@@ -2290,8 +2370,13 @@ def sie_fixture(device=None):
     )
     if device is not None:
         lens = lens.to(device)
+    # The parity-condemned band at max_level is ~2 * min_img_sep wide in the lens
+    # plane. At min_img_sep=1e-2 that band spans r in [0.0154, 0.0336]" and
+    # swallows this lens's central image, which sits at r~0.0150" -- dropping a
+    # multiplicity-map pixel from 3 images to 2. Halving it to 0.5e-2 halves the
+    # band to r in [0.0196, 0.0295]", clear of the central image.
     mesh = build_adaptive_mesh(
-        lens.raytrace, fov=5.0, init_res=32, min_img_sep=1e-2, device=device
+        lens.raytrace, fov=5.0, init_res=32, min_img_sep=0.5e-2, device=device
     )
     return lens, mesh
 
