@@ -1392,9 +1392,9 @@ class Mesh:
 
     The hole has two parts. Around a singularity it is a ring, because a
     non-finite triangle refines rather than terminating. Along every critical
-    curve it is a band one ``max_level`` leaf thick -- bounded by the caller's
-    requested ``min_img_sep`` since the build refines internally to half it --
-    because a leaf whose four hypothetical children disagree on
+    curve it is a band about twice a ``max_level`` leaf thick -- bounded by the
+    caller's requested ``min_img_sep`` since the build refines internally to
+    half it -- because a leaf whose four hypothetical children disagree on
     ``sign(det Q_k)`` contains a fold the mesh cannot resolve: its affine model
     is non-injective there, so it would report containment for source points
     with zero or two preimages and make :meth:`multiplicity_map` count them
