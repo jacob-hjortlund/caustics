@@ -1170,7 +1170,7 @@ def test_cascade_produces_forced_children():
 
 
 def test_forced_and_invalid_statuses_are_mutually_consistent():
-    """FORCED leaves are finite; INVALID leaves are not.
+    """FORCED leaves are finite; INVALID leaves are a mix of finite and not.
 
     Each status is asserted independently. A single ``.any()`` over the union of
     the two would be satisfied by FORCED alone -- which ``localised_fold``
@@ -1613,6 +1613,42 @@ def test_parity_invalid_partitions_the_max_level_leaves():
         s.n_converged + s.n_size_floor + s.n_forced + s.n_invalid
         == s.n_leaves_pre_closure
     )
+
+
+def test_parity_band_is_bounded_by_a_small_multiple_of_min_img_sep():
+    """The single claim spec section 4.8's internal halving exists to deliver.
+
+    Nothing else in the suite checks that halving ``min_img_sep`` before the
+    build actually bounds the parity-condemned band by anything related to
+    what the caller asked for. This test was added after a whole-branch
+    review found the documented factor wrong: the band is about three
+    ``max_level`` leaves thick, not two, so it is only bounded at roughly
+    ``1.5x`` the requested ``min_img_sep``, not ``1x``. That review measured
+    this same fixture at requested separations from ``2.5e-3`` to ``2e-2`` and
+    found the band-to-request ratio running from 0.91 to 1.04 -- ``1.5x``
+    holds with real margin across that whole range, while ``1x`` is falsified
+    at its finer end.
+
+    Band width is measured the way those numbers were produced: INVALID leaf
+    centroids within 0.05 arcsec of the lens centre, max radius minus min
+    radius.
+    """
+    requested_min_img_sep = 1e-2  # the value sie_fixture's own build call uses
+    lens, mesh = sie_fixture()
+    status = backend.to_numpy(mesh.leaf_status)
+    leaves = backend.to_numpy(mesh.leaves)
+    vl = backend.to_numpy(mesh.vertices_lens)
+
+    invalid = np.flatnonzero(status == LeafStatus.INVALID)
+    assert invalid.size > 0, "fixture must condemn leaves to measure a band"
+    centroids = vl[leaves[invalid]].mean(axis=1)
+    radius = np.linalg.norm(centroids, axis=-1)
+    near_centre = radius < 0.05
+    assert near_centre.any(), "fixture must condemn leaves near the lens centre"
+
+    core_radius = radius[near_centre]
+    band_width = core_radius.max() - core_radius.min()
+    assert band_width <= 1.5 * requested_min_img_sep
 
 
 def test_query_seeds_an_inner_image_that_runs_into_the_lens_centre():

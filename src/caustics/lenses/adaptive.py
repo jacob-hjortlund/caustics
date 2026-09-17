@@ -1392,17 +1392,31 @@ class Mesh:
 
     The hole has two parts. Around a singularity it is a ring, because a
     non-finite triangle refines rather than terminating. Along every critical
-    curve it is a band about twice a ``max_level`` leaf thick -- bounded by the
-    caller's requested ``min_img_sep`` since the build refines internally to
-    half it -- because a leaf whose four hypothetical children disagree on
-    ``sign(det Q_k)`` contains a fold the mesh cannot resolve: its affine model
-    is non-injective there, so it would report containment for source points
-    with zero or two preimages and make :meth:`multiplicity_map` count them
-    wrong. Reporting no coverage is the conservative answer, and it is
-    deliberate -- correctness over completeness exactly where images merge.
-    ``stats.n_invalid`` sizes the whole hole, ``stats.n_parity_invalid`` the
-    critical-curve band, and ``stats.n_nonfinite_splits`` the descent that
-    shrank the ring.
+    curve it is a band about three ``max_level`` leaves thick, not the one leaf
+    a naive fold would need: measured on the SIE fixture, 94.4% of condemned
+    leaves genuinely straddle a ``det J`` sign change -- about one leaf thick,
+    as that simple model predicts -- while the remaining 5.6% sit in the
+    unresolved core band, where the discrete child-determinant parity flips on
+    curvature rather than on a real fold, and it is that remainder which
+    widens one leaf to three. Consequently the band is only roughly ``1.5x``
+    the caller's requested ``min_img_sep`` even though the build refines
+    internally to half it, and that is not a hard guarantee: at fine
+    tolerances the band has been measured slightly exceeding the request,
+    since ``l_max_final / min_img_sep`` lands anywhere in ``(0.5, 1.0]``
+    depending on where the integer depth ceiling falls. A leaf whose four
+    hypothetical children disagree on ``sign(det Q_k)`` contains a fold the
+    mesh cannot resolve: its affine model is non-injective there, so it would
+    report containment for source points with zero or two preimages and make
+    :meth:`multiplicity_map` count them wrong. Reporting no coverage is the
+    conservative answer, and it is deliberate -- correctness over completeness
+    exactly where images merge. But that coverage hole is not merely a region
+    that returns nothing: it is a region where counts come back plausible and
+    low, since neither :meth:`query` nor :meth:`multiplicity_map` has any
+    channel to report "no coverage here" -- a caller who needs reliable counts
+    must choose ``min_img_sep`` fine enough that the band cannot swallow
+    images it cares about. ``stats.n_invalid`` sizes the whole hole,
+    ``stats.n_parity_invalid`` the critical-curve band, and
+    ``stats.n_nonfinite_splits`` the descent that shrank the ring.
 
     ``min_img_sep`` is stored because it is the mesh's own defining tolerance, in
     both of its build roles and again as the dedup radius in
@@ -1802,11 +1816,17 @@ class Mesh:
             Positions from ``"dedup"`` are accurate to ``min_img_sep``, not to
             machine precision. Counts agree with ``"rootfind"`` except within
             about ``min_img_sep`` of a caustic -- measured at 12 pixels in
-            24656 on an EPL-plus-shear lens. Unlike ``"rootfind"``, ``"dedup"``
-            counts are not guaranteed to satisfy the odd-image theorem: a
-            near-tangential pair closer than ``min_img_sep`` merges into one.
-            Use ``"rootfind"`` when the position itself matters, ``"dedup"``
-            when the count does.
+            24656 on an EPL-plus-shear lens. Neither method's counts are
+            guaranteed to satisfy the odd-image theorem any longer:
+            ``"dedup"`` can merge a near-tangential pair closer than
+            ``min_img_sep`` into one, and ``"rootfind"`` can miss an image
+            outright whose seed fell in a parity-condemned leaf and so was
+            never in the index to seed the root finder in the first place.
+            Measured on the SIE fixture, a 25x25 source grid, ``"rootfind"``:
+            even image counts -- impossible for this non-singular lens --
+            turn up at 42 of 625 pixels at ``min_img_sep=0.04``, 2 at ``0.02``,
+            and 0 at ``0.01``. Use ``"rootfind"`` when the position itself
+            matters, ``"dedup"`` when the count does.
         residual_tol: Optional[float]
             Source-plane tolerance on ``|raytrace(x) - beta|`` for accepting a
             root. Defaults to ``min_img_sep``.
@@ -1973,6 +1993,15 @@ class Mesh:
         it goes through :meth:`forward_raytrace` rather than :meth:`query`: candidate
         count is not multiplicity, since a query on a shared edge returns both
         leaves and near-critical leaves overlap.
+
+        Every pixel inherits :meth:`forward_raytrace`'s odd-image-theorem
+        caveat, and this is the consumer where it bites silently: a pixel
+        whose caustic-crossing images fell in a parity-condemned band comes
+        back with a plausible, merely low, count, and nothing in the returned
+        array flags which pixels those are. A caller who needs the map's
+        counts to be trustworthy, not just plausible, should choose
+        ``min_img_sep`` fine enough that the band cannot reach the multiplicity
+        structure they care about.
         """
         _check_method(method)
         if not pixelscale > 0:
@@ -2069,14 +2098,23 @@ def build_adaptive_mesh(
         curvature scale in the lens; ``stats.n_converged_at_level_0`` is the check.
     min_img_sep: float
         Requested lens-plane tolerance. The parity-condemned band at
-        ``max_level`` is about twice a leaf's size, so the build refines to
-        ``min_img_sep / 2`` internally -- that halved value is what actually
-        bounds the band by the separation requested here, and it is the value
-        stored on the returned :class:`Mesh`, not the value passed in.
+        ``max_level`` is about three leaves wide, so the build refines to
+        ``min_img_sep / 2`` internally -- that halving keeps the band to
+        roughly ``1.5x`` the separation requested here, not a hard bound
+        (measured slightly over it at the finest tolerances). The halved value
+        is the one stored on the returned :class:`Mesh`, not the value passed
+        in.
 
         The halved value plays the tolerance's original two roles: the size
         floor ``l_max <= min_img_sep / 2`` and the step-7 threshold. No converged
         leaf hides an image pair separated by more than ``min_img_sep / 8``.
+
+        That halving is not free: it costs roughly ``3x`` the raytrace points
+        a build spends relative to refining straight to the request, measured
+        at 2.9x-3.0x on the SIE fixture and up to ``4x`` in the uniform
+        full-depth worst case where the ``max_level`` midpoint pass touches
+        every remaining lattice point. Leaf count grows by roughly the same
+        halving, about ``2x``.
 
         *Unit: arcsec*
 
@@ -2099,8 +2137,14 @@ def build_adaptive_mesh(
         **not** ``_VertexCache.beta``, which retains the source-plane image of
         every point ever evaluated for the whole build: a converged leaf's
         midpoints cannot be pruned, since the balance cascade may force-split
-        that leaf later and need them. A caller setting this to bound peak
-        memory should budget for the whole vertex cache, not just one level.
+        that leaf later and need them. A caller bounding peak memory should
+        still budget for the whole vertex cache, but that is no longer the
+        whole story: the single largest ``raytrace`` call in the build is now
+        the ``max_level`` midpoint pass (see :func:`_refine`), and those
+        midpoints are traced, deduplicated and dropped without ever entering
+        the cache -- a deliberately transient peak that this argument still
+        bounds, but that the cache-budgeting advice above does not account
+        for.
     index_cells: Optional[int]
         Spatial-index cells along the longer axis of the source-plane bounding box.
 
@@ -2108,15 +2152,17 @@ def build_adaptive_mesh(
     -------
     Mesh
     """
-    # The parity-condemned band at max_level is about twice a leaf's size, so
-    # refining to the caller's requested separation would let the band itself
-    # exceed it. Halved once, here, before any use, so every computation below
-    # -- validation, the depth floor, max_level, l_max_final and its
-    # depth-limited warning, the refine call, the cancellation-floor check, and
-    # the value stored on the returned Mesh -- sees this one halved value and
-    # never the caller's original. `requested_min_img_sep` is kept alongside
-    # purely so the messages below can name what the caller actually passed,
-    # rather than quoting them a number they never supplied.
+    # The parity-condemned band at max_level is about three leaves wide, so
+    # refining straight to the caller's requested separation would leave the
+    # band several leaves wider than it. Halved once, here, before any use, so
+    # every computation below -- validation, the depth floor, max_level,
+    # l_max_final and its depth-limited warning, the refine call, the
+    # cancellation-floor check, and the value stored on the returned Mesh --
+    # sees this one halved value and never the caller's original. That halving
+    # keeps the band to roughly 1.5x the requested separation, not a hard
+    # bound. `requested_min_img_sep` is kept alongside purely so the messages
+    # below can name what the caller actually passed, rather than quoting them
+    # a number they never supplied.
     requested_min_img_sep = min_img_sep
     min_img_sep = min_img_sep / 2
     _validate_build_args(fov, init_res, min_img_sep, max_depth, requested_min_img_sep)
