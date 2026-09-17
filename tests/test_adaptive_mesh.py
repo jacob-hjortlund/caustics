@@ -1540,6 +1540,24 @@ def test_depth_limit_warns_and_names_the_required_max_depth():
     assert mesh.stats.d_floor > 2
 
 
+def test_depth_limited_warning_names_the_caller_requested_min_img_sep():
+    """The message must quote what the caller passed, never the halved value.
+
+    `build_adaptive_mesh` halves `min_img_sep` internally (the parity-condemned
+    band at `max_level` is about twice a leaf's size), and that halving also
+    raises `d_floor` by exactly one level on every build -- so a caller who
+    never saw this warning before may now see it, and is owed a number they
+    recognise. 0.0002 is what is passed here; 0.0001 is the halved value the
+    build actually uses, which must appear only labelled, never as a bare
+    ``min_img_sep=0.0001``.
+    """
+    with pytest.warns(UserWarning, match=r"min_img_sep=0\.0002 arcsec") as record:
+        build(lambda p: p, min_img_sep=2e-4, max_depth=1)
+    assert not any(
+        "min_img_sep=0.0001" in str(w.message) for w in record
+    ), "must not quote the halved value as if it were what the caller passed"
+
+
 def test_invalid_leaves_are_kept_but_excluded_from_the_index():
     def broken(p):
         out = localised_fold(p)

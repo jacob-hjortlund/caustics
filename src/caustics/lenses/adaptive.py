@@ -99,14 +99,26 @@ def _depth_floor(fov, init_res, min_img_sep) -> int:
     return int(ceil(log2(l_max0 / min_img_sep)))
 
 
-def _validate_build_args(fov, init_res, min_img_sep, max_depth) -> None:
-    """Reject impossible parameters, including a lattice that would overflow int64."""
+def _validate_build_args(
+    fov, init_res, min_img_sep, max_depth, requested_min_img_sep=None
+) -> None:
+    """
+    Reject impossible parameters, including a lattice that would overflow int64.
+
+    ``min_img_sep`` is the value every check and the depth computation use.
+    ``requested_min_img_sep`` names only the positivity message, so a caller who
+    halved it (``build_adaptive_mesh``) is told the number they actually
+    supplied rather than the halved one. Defaults to ``min_img_sep`` for a
+    direct call, where the two coincide.
+    """
+    if requested_min_img_sep is None:
+        requested_min_img_sep = min_img_sep
     if not fov > 0:
         raise ValueError(f"fov must be positive, got {fov}")
     if init_res < 1:
         raise ValueError(f"init_res must be at least 1, got {init_res}")
     if not min_img_sep > 0:
-        raise ValueError(f"min_img_sep must be positive, got {min_img_sep}")
+        raise ValueError(f"min_img_sep must be positive, got {requested_min_img_sep}")
     if max_depth < 0:
         raise ValueError(f"max_depth must be non-negative, got {max_depth}")
     max_level = min(max_depth, _depth_floor(fov, init_res, min_img_sep))
@@ -2068,9 +2080,12 @@ def build_adaptive_mesh(
     # -- validation, the depth floor, max_level, l_max_final and its
     # depth-limited warning, the refine call, the cancellation-floor check, and
     # the value stored on the returned Mesh -- sees this one halved value and
-    # never the caller's original.
+    # never the caller's original. `requested_min_img_sep` is kept alongside
+    # purely so the messages below can name what the caller actually passed,
+    # rather than quoting them a number they never supplied.
+    requested_min_img_sep = min_img_sep
     min_img_sep = min_img_sep / 2
-    _validate_build_args(fov, init_res, min_img_sep, max_depth)
+    _validate_build_args(fov, init_res, min_img_sep, max_depth, requested_min_img_sep)
     d_floor = _depth_floor(fov, init_res, min_img_sep)
     max_level = min(int(max_depth), d_floor)
     l_max_final = float(np.sqrt(2.0) * fov / (init_res * 2**max_level))
@@ -2078,7 +2093,8 @@ def build_adaptive_mesh(
         warn(
             f"Adaptive mesh is depth-limited: max_depth={max_depth} is below "
             f"d_floor={d_floor}, the depth required to reach "
-            f"min_img_sep={min_img_sep:g} arcsec. Refinement stops at level "
+            f"min_img_sep={requested_min_img_sep:g} arcsec (refined internally to "
+            f"{min_img_sep:g}). Refinement stops at level "
             f"{max_level}, where the maximum leaf edge is {l_max_final:.3g} arcsec. "
             f"Set max_depth >= {d_floor} to restore the size-floor guarantee, or "
             f"raise init_res / min_img_sep."
@@ -2104,7 +2120,8 @@ def build_adaptive_mesh(
         warn(
             f"raytrace returned {raytrace_np.info['dtype']}, whose cancellation "
             f"floor sqrt(8*eps*fov) = {cancellation_floor:.3g} arcsec exceeds "
-            f"min_img_sep={min_img_sep:g}. Below that scale the midpoint deviation "
+            f"min_img_sep={requested_min_img_sep:g} (refined internally to "
+            f"{min_img_sep:g}). Below that scale the midpoint deviation "
             "cancels to zero, which the criterion reads as 'affine' and converges. "
             "Supply a raytrace that preserves float64."
         )
