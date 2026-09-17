@@ -27,6 +27,8 @@ __all__ = (
     "sigma_min_2x2",
     "midpoint_deviation",
     "converged_from_deviation",
+    "child_shape_matrices",
+    "parity_from_children",
     "evaluate_criterion",
     "triangle_weights",
     "contains",
@@ -290,15 +292,77 @@ def converged_from_deviation(r, s, min_img_sep):
     return (r < (s * min_img_sep)[:, None]).all(axis=1)
 
 
+def child_shape_matrices(beta_v, beta_m):
+    """
+    Source-plane edge matrices ``Q_k`` of the four red-split children.
+
+    Split out of :func:`evaluate_criterion` so the parity test can be applied on
+    its own at ``max_level``, where there is no split left to decide and the
+    deviation half of the criterion does not run.
+
+    Parameters
+    ----------
+    beta_v: ndarray
+        Source-plane vertices, shape ``(n, 3, 2)``.
+
+        *Unit: arcsec*
+
+    beta_m: ndarray
+        Source-plane midpoints ``m1, m2, m3``, shape ``(n, 3, 2)``.
+
+        *Unit: arcsec*
+
+    Returns
+    -------
+    ndarray
+        Shape ``(n, 4, 2, 2)``, child index in :data:`CHILD_VERTEX_INDICES`
+        order.
+    """
+    stacked = np.concatenate([beta_v, beta_m], axis=1)  # (n, 6, 2)
+    idx = np.asarray(CHILD_VERTEX_INDICES)  # (4, 3)
+    q1 = stacked[:, idx[:, 0], :]
+    q2 = stacked[:, idx[:, 1], :]
+    q3 = stacked[:, idx[:, 2], :]
+    return np.stack((q2 - q1, q3 - q1), axis=-1)  # (n, 4, 2, 2)
+
+
+def parity_from_children(Q):
+    """
+    True where ``sign(det Q_k)`` is constant over the four children.
+
+    The parity test needs no lens-plane ``P`` at all: ``sign(det A_k) =
+    sign(det Q_k) * sign(det P_k)``, and all four children share the parent's
+    ``sign(det P_k)`` because every ``det M_k == +1``, so constancy of
+    ``sign(det A_k)`` over ``k`` is equivalent to constancy of
+    ``sign(det Q_k)``. That is what makes this usable at ``max_level``, where
+    no child is ever built and no ``P`` is ever formed.
+
+    A ``NaN`` never equals itself, so a non-finite child lands in the failing
+    branch. An exact zero gives sign 0, which differs from ``+-1`` and also
+    fails -- unless *every* child is zero, which is a constant sign and passes.
+
+    Parameters
+    ----------
+    Q: ndarray
+        Child edge matrices from :func:`child_shape_matrices`, shape
+        ``(n, 4, 2, 2)``.
+
+    Returns
+    -------
+    ndarray
+        Shape ``(n,)`` bool.
+    """
+    det_q = Q[..., 0, 0] * Q[..., 1, 1] - Q[..., 0, 1] * Q[..., 1, 0]
+    sign_q = np.sign(det_q)
+    return (sign_q == sign_q[:, :1]).all(axis=1)
+
+
 def evaluate_criterion(beta_v, beta_m, classes, level, h0, min_img_sep, pinv0, compose):
     """
     Steps 3 to 7 of the refinement criterion, vectorized over triangles.
 
-    Step 4 (parity) catches folds; step 7 (deviation) catches curvature. Neither
-    alone is sufficient. The parity test needs no ``P`` at all: ``sign(det A_k) =
-    sign(det Q_k) * sign(det P_k)`` and all four children share the parent's
-    ``sign(det P_k)`` because every ``det M_k == +1``, so constancy of
-    ``sign(det A_k)`` over ``k`` is equivalent to constancy of ``sign(det Q_k)``.
+    Step 4 (parity) is :func:`parity_from_children`; step 7 (deviation) catches
+    curvature. Neither alone is sufficient.
 
     Parameters
     ----------
@@ -342,18 +406,8 @@ def evaluate_criterion(beta_v, beta_m, classes, level, h0, min_img_sep, pinv0, c
         expected near a critical curve; it forces the split, and the size floor
         terminates the descent.
     """
-    stacked = np.concatenate([beta_v, beta_m], axis=1)  # (n, 6, 2)
-    idx = np.asarray(CHILD_VERTEX_INDICES)  # (4, 3)
-    q1 = stacked[:, idx[:, 0], :]
-    q2 = stacked[:, idx[:, 1], :]
-    q3 = stacked[:, idx[:, 2], :]
-    Q = np.stack((q2 - q1, q3 - q1), axis=-1)  # (n, 4, 2, 2)
-
-    det_q = Q[..., 0, 0] * Q[..., 1, 1] - Q[..., 0, 1] * Q[..., 1, 0]
-    sign_q = np.sign(det_q)
-    # A NaN never equals itself, so a non-finite child lands in the split branch.
-    # An exact zero gives sign 0, which differs from +-1 and also splits.
-    parity_ok = (sign_q == sign_q[:, :1]).all(axis=1)
+    Q = child_shape_matrices(beta_v, beta_m)
+    parity_ok = parity_from_children(Q)
 
     A = Q @ pinv0[compose[classes]]  # (n, 4, 2, 2), up to the common 2**(d+1)/h0
     s = sigma_min_2x2(A).min(axis=1) * (2.0 ** (level + 1)) / h0

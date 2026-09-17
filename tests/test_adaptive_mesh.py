@@ -36,10 +36,12 @@ from caustics.lenses.func.adaptive import (
     ROOT_SHAPES,
     affine_from_triangles,
     child_matrix_tables,
+    child_shape_matrices,
     contains,
     converged_from_deviation,
     evaluate_criterion,
     midpoint_deviation,
+    parity_from_children,
     sanitize_bary,
     shape_matrix,
     sigma_min_2x2,
@@ -258,6 +260,61 @@ def test_criterion_reports_nonfinite_as_split():
         v, bad, classes, 0, h0, 1e-3, PINV0, COMPOSE
     )
     assert not keep[0]
+
+
+def test_child_shape_matrices_match_shape_matrix_of_each_child():
+    """Q_k must be exactly the edge matrix of child k, bit for bit.
+
+    Both forms subtract the same operands in the same order, so this is an
+    equality check and not an allclose: a reassociation that changed rounding
+    would change the sign of a near-degenerate det and silently move the parity
+    verdict, which is the whole thing this kernel decides.
+    """
+    rng = np.random.default_rng(0)
+    beta_v = rng.normal(size=(5, 3, 2))
+    beta_m = rng.normal(size=(5, 3, 2))
+    Q = child_shape_matrices(beta_v, beta_m)
+    assert Q.shape == (5, 4, 2, 2)
+    six = np.concatenate([beta_v, beta_m], axis=1)
+    for k, idx in enumerate(CHILD_VERTEX_INDICES):
+        assert np.array_equal(Q[:, k], shape_matrix(six[:, list(idx)]))
+
+
+def test_parity_from_children_accepts_a_constant_sign():
+    Q = np.tile(np.eye(2), (2, 4, 1, 1))
+    assert parity_from_children(Q).tolist() == [True, True]
+
+
+def test_parity_from_children_rejects_a_sign_change():
+    Q = np.tile(np.eye(2), (1, 4, 1, 1))
+    Q[0, 2] = np.array([[0.0, 1.0], [1.0, 0.0]])  # det -1 among three det +1
+    assert parity_from_children(Q).tolist() == [False]
+
+
+def test_parity_from_children_fails_closed_on_a_nonfinite_child():
+    """sign(NaN) is NaN and NaN != NaN, so the constancy test is False.
+
+    This is what lets `_refine` condemn a max_level triangle with a non-finite
+    midpoint without a branch of its own. See spec section 3.3.
+    """
+    Q = np.tile(np.eye(2), (1, 4, 1, 1))
+    Q[0, 1, 0, 0] = np.nan
+    assert parity_from_children(Q).tolist() == [False]
+
+
+def test_parity_from_children_condemns_a_lone_degenerate_child():
+    Q = np.tile(np.eye(2), (1, 4, 1, 1))
+    Q[0, 3] = 0.0  # sign 0 differs from +1
+    assert parity_from_children(Q).tolist() == [False]
+
+
+def test_parity_from_children_passes_an_entirely_degenerate_triangle():
+    """All four dets exactly zero is a constant sign, so there is no parity
+    *change* and the triangle passes. Spec section 4.6: condemning this case
+    would be the deviation test in disguise, which is out of scope. A kappa == 1
+    sheet is the fixture that reaches it.
+    """
+    assert parity_from_children(np.zeros((1, 4, 2, 2))).tolist() == [True]
 
 
 def test_midpoint_deviation_pairs_midpoint_with_opposite_edge():
