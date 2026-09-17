@@ -2022,9 +2022,15 @@ def build_adaptive_mesh(
         scale is invisible to it. ``init_res`` must already resolve the smallest
         curvature scale in the lens; ``stats.n_converged_at_level_0`` is the check.
     min_img_sep: float
-        Lens-plane tolerance, in two roles: the size floor ``l_max <= min_img_sep``
-        and the step-7 threshold. No converged leaf hides an image pair separated by
-        more than ``min_img_sep / 4``.
+        Requested lens-plane tolerance. The parity-condemned band at
+        ``max_level`` is about twice a leaf's size, so the build refines to
+        ``min_img_sep / 2`` internally -- that halved value is what actually
+        bounds the band by the separation requested here, and it is the value
+        stored on the returned :class:`Mesh`, not the value passed in.
+
+        The halved value plays the tolerance's original two roles: the size
+        floor ``l_max <= min_img_sep / 2`` and the step-7 threshold. No converged
+        leaf hides an image pair separated by more than ``min_img_sep / 8``.
 
         *Unit: arcsec*
 
@@ -2056,6 +2062,14 @@ def build_adaptive_mesh(
     -------
     Mesh
     """
+    # The parity-condemned band at max_level is about twice a leaf's size, so
+    # refining to the caller's requested separation would let the band itself
+    # exceed it. Halved once, here, before any use, so every computation below
+    # -- validation, the depth floor, max_level, l_max_final and its
+    # depth-limited warning, the refine call, the cancellation-floor check, and
+    # the value stored on the returned Mesh -- sees this one halved value and
+    # never the caller's original.
+    min_img_sep = min_img_sep / 2
     _validate_build_args(fov, init_res, min_img_sep, max_depth)
     d_floor = _depth_floor(fov, init_res, min_img_sep)
     max_level = min(int(max_depth), d_floor)

@@ -2243,7 +2243,11 @@ def test_mesh_stores_min_img_sep():
         s=1e-6,
     )
     mesh = build_adaptive_mesh(lens.raytrace, fov=4.0, init_res=8, min_img_sep=0.05)
-    assert mesh.min_img_sep == 0.05
+    # The build halves min_img_sep internally (the parity-condemned band at
+    # max_level is about twice a leaf's size), and stores that halved value --
+    # not the value passed in -- since the halved value is what the size floor
+    # and the dedup radius actually are.
+    assert mesh.min_img_sep == 0.025
 
 
 def test_dedup_collapses_points_closer_than_the_tolerance():
@@ -2370,13 +2374,8 @@ def sie_fixture(device=None):
     )
     if device is not None:
         lens = lens.to(device)
-    # The parity-condemned band at max_level is ~2 * min_img_sep wide in the lens
-    # plane. At min_img_sep=1e-2 that band spans r in [0.0154, 0.0336]" and
-    # swallows this lens's central image, which sits at r~0.0150" -- dropping a
-    # multiplicity-map pixel from 3 images to 2. Halving it to 0.5e-2 halves the
-    # band to r in [0.0196, 0.0295]", clear of the central image.
     mesh = build_adaptive_mesh(
-        lens.raytrace, fov=5.0, init_res=32, min_img_sep=0.5e-2, device=device
+        lens.raytrace, fov=5.0, init_res=32, min_img_sep=1e-2, device=device
     )
     return lens, mesh
 
