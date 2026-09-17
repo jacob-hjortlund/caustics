@@ -591,8 +591,8 @@ def _find_unbalanced(store, cache, lattice, active, max_level, frontier_level):
     Two independent level bounds apply. ``level <= frontier_level - 2`` is an
     optimization: only triangles at least two levels coarser than the frontier can
     have been invalidated by it, so the scan skips most of the store.
-    ``level <= max_level - 2`` is an integrality requirement: below it the quarter
-    points are not lattice points and no finer neighbour can exist.
+    ``level <= max_level - 2`` is the bound above which no neighbour can be two
+    levels finer, since ``max_level`` is the finest level there is.
 
     Parameters
     ----------
