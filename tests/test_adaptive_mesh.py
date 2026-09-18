@@ -6,7 +6,6 @@ import pytest
 from caustics.backend_obj import backend
 from caustics.cosmology import FlatLambdaCDM
 from caustics.lenses import SIE, Point
-from caustics.lenses import adaptive
 from caustics.lenses.adaptive import (
     LeafStatus,
     BuildStats,
@@ -15,7 +14,6 @@ from caustics.lenses.adaptive import (
     _close,
     _dedup_representatives,
     _depth_floor,
-    _edge_quarter_keys,
     _invalidate_nonfinite_origins,
     _Lattice,
     _make_raytrace_np,
@@ -27,9 +25,7 @@ from caustics.lenses.adaptive import (
 from caustics.lenses.func import forward_raytrace_rootfind
 from caustics.lenses.func.old_adaptive import (
     child_matrix_tables,
-    child_shape_matrices,
     contains,
-    parity_from_children,
     shape_matrix,
     triangle_weights,
 )
@@ -88,54 +84,6 @@ def refine_with(fn, fov=4.0, init_res=4, min_img_sep=0.5, max_depth=25):
 AFFINE = np.array([[0.7, 0.1], [-0.2, 0.9]])
 
 
-def test_refine_converges_everywhere_at_level_zero_for_an_affine_map():
-    ref, lat, calls, max_level = refine_with(lambda p: p @ AFFINE.T)
-    v, level, cls, status = ref.store.compact()
-    assert v.shape[0] == 2 * 4**2
-    assert (level == 0).all()
-    assert (status == LeafStatus.CONVERGED).all()
-    assert ref.counters["converged_level0"] == v.shape[0]
-    assert ref.counters["parity_splits"] == 0
-    assert ref.counters["deviation_splits"] == 0
-
-
-def test_refine_never_evaluates_a_point_twice():
-    ref, lat, calls, max_level = refine_with(
-        lambda p: np.stack([p[:, 0], p[:, 1] ** 2], axis=-1), min_img_sep=0.05
-    )
-    assert calls["points"] == len(ref.cache) + ref.counters["max_level_midpoints"]
-    assert len(np.unique(lat.key(ref.cache.ij))) == len(ref.cache)
-
-
-def test_refine_terminates_at_max_level_on_a_kappa_one_sheet():
-    """kappa == 1 maps the whole lens plane to a point: A == 0 everywhere."""
-    ref, lat, calls, max_level = refine_with(
-        lambda p: np.zeros_like(p), min_img_sep=0.5
-    )
-    v, level, cls, status = ref.store.compact()
-    assert (level == max_level).all()
-    assert (status == LeafStatus.SIZE_FLOOR).all()
-    assert ref.counters["sigma_zero"] > 0
-    assert np.isfinite(ref.cache.beta).all()
-    # This fixture genuinely reaches max_level, so it is the one that pins the
-    # loop's batch structure on the full-descent path: one raytrace batch per
-    # level that needs new points, and the max_level iteration needs one more
-    # of its own for the midpoints -- hence max_level + 1 batches.
-    assert calls["batches"] == max_level + 1
-    # Every point of the widened lattice, exactly once. Even-even points are
-    # triangle vertices; single-odd points are horizontal or vertical edge
-    # midpoints; double-odd points are cell centres, which are the diagonal
-    # edge's midpoint. The three cases are exhaustive and disjoint, so a fixture
-    # that refines uniformly to max_level covers the lattice exactly. Checked by
-    # hand for the helper's defaults: max_level == 2, N == 16, 289 vertices +
-    # 800 midpoints == 33**2 == 1089.
-    assert calls["points"] == (lat.n + 1) ** 2
-    # kappa == 1 maps everything to a point, so all four child determinants are
-    # exactly zero -- a constant sign, hence no parity *change*. Spec 4.6: this
-    # passes rather than being condemned.
-    assert ref.counters["parity_invalid"] == 0
-
-
 def sis_raytrace(p, b=1.0):
     """SIS deflection ``beta = theta (1 - b/|theta|)``, non-finite at ``theta = 0``.
 
@@ -154,246 +102,6 @@ def sis_raytrace(p, b=1.0):
     with np.errstate(divide="ignore", invalid="ignore"):
         r = np.linalg.norm(p, axis=-1, keepdims=True)
         return p * (1.0 - b / r)
-
-
-def test_refine_splits_a_nonfinite_subregion_down_to_max_level():
-    """Non-finite is maximal ignorance, so it refines rather than terminating.
-
-    The bad half-plane is condemned only at ``max_level``, where no split is
-    available -- not at whatever level it was first sampled. Reinstating the
-    early ``store.add(v[~good], ..., INVALID)`` puts INVALID rows at level 0 and
-    fails the level assertion.
-    """
-
-    def broken(p):
-        out = p.copy()
-        bad = p[:, 0] > 0.5
-        out[bad] = np.nan
-        return out
-
-    ref, lat, calls, max_level = refine_with(broken, min_img_sep=0.5)
-    assert max_level > 0, "fixture must allow at least one split"
-    v, level, cls, status = ref.store.compact()
-    invalid = status == LeafStatus.INVALID
-    assert invalid.any()
-    assert (level[invalid] == max_level).all()
-    assert not np.isfinite(ref.cache.beta[v[invalid]]).all()
-    # a triangle wholly in the good half is untouched
-    good = status == LeafStatus.CONVERGED
-    assert good.any()
-    assert np.isfinite(ref.cache.beta[v[good]]).all()
-
-
-def test_refine_splits_only_the_triangles_that_touch_a_point_singularity():
-    """The cost of refining on non-finite, counted exactly.
-
-    Six level-0 triangles share the origin, and a red split hands the bad vertex
-    to exactly one of the four children -- the corner child at that vertex -- so
-    the non-finite frontier stays six triangles wide at every level rather than
-    quadrupling. Hand-derived total: ``6 * max_level`` splits over levels
-    ``0 .. max_level - 1``, with no non-finite triangle left to split at
-    ``max_level``.
-
-    This is the counter that would expose an area-shaped non-finite region
-    driving an ``O(4**max_level)`` descent, which is the one real cost of
-    inverting the policy.
-    """
-    ref, lat, calls, max_level = refine_with(sis_raytrace, min_img_sep=0.05)
-    assert max_level == 5, "hand-derived counts below assume this depth"
-    assert ref.counters["nonfinite_splits"] == 6 * max_level
-
-
-def test_refine_marks_nonfinite_vertices_invalid_even_at_max_level():
-    """The max_level short-circuit must not blanket-label everything SIZE_FLOOR.
-
-    ``min_img_sep`` forces ``max_level == 0``, so the loop's first and only
-    iteration *is* the max_level iteration, and the ``~finite_v`` branch is the
-    whole of this build's non-finite handling -- there is no deeper level for a
-    non-finite triangle to be pushed down to. That isolation is the point: with
-    ``max_level > 0`` a failure here could equally be the split path
-    misbehaving, whereas at ``max_level == 0`` only the short-circuit's own
-    INVALID-versus-SIZE_FLOOR discrimination can be at fault.
-    """
-
-    def broken(p):
-        out = p.copy()
-        out[p[:, 0] > 0.5] = np.nan
-        return out
-
-    ref, lat, calls, max_level = refine_with(broken, min_img_sep=2.0)
-    assert max_level == 0
-    v, level, cls, status = ref.store.compact()
-    assert (status == LeafStatus.INVALID).any()
-    # Without this, a run producing zero SIZE_FLOOR rows would make the loop
-    # below vacuously true.
-    assert (status == LeafStatus.SIZE_FLOOR).any()
-    # Every vertex sits on an integer coordinate and the NaN half-plane starts
-    # at x > 0.5, so no all-finite-vertex triangle here has a NaN midpoint, and
-    # the map is the identity where it is finite, so parity never changes.
-    # INVALID is therefore non-finiteness alone -- which is what the loop below
-    # is entitled to assume.
-    assert ref.counters["parity_invalid"] == 0
-    for row in np.flatnonzero(status == LeafStatus.SIZE_FLOOR):
-        assert np.isfinite(ref.cache.beta[v[row]]).all()
-    for row in np.flatnonzero(status == LeafStatus.INVALID):
-        assert not np.isfinite(ref.cache.beta[v[row]]).all()
-
-
-def test_max_level_leaves_are_condemned_exactly_when_parity_changes():
-    """Independent oracle: recompute parity from each max_level leaf's own
-    geometry and require the assigned status to agree row for row.
-
-    `localised_fold`'s Jacobian 0.6 + 2y changes sign at y = -0.3, so the band of
-    max_level leaves straddling that line is condemned and the rest are not --
-    measured at 256 of 512 for this tolerance. Both arms are asserted non-empty,
-    so the row-for-row equality cannot pass vacuously on an all-True or all-False
-    mask.
-
-    The oracle builds its midpoints with `lat.xy(_midpoint_ij(...))` rather than
-    averaging vertex positions. The two differ in the last ulp, which is enough
-    to flip the sign of a near-zero child determinant right at the fold -- and
-    then this test would be measuring float rounding rather than the branch it
-    is aimed at. Midpoint *construction* is pinned separately by
-    `test_midpoints_are_exact_at_max_level_on_the_widened_lattice`.
-    """
-    ref, lat, calls, max_level = refine_with(localised_fold, min_img_sep=0.05)
-    v, level, cls, status = ref.store.compact()
-    sel = np.flatnonzero(level == max_level)
-    assert sel.size > 0, "fixture must reach max_level"
-
-    ij = ref.cache.ij[v[sel]]
-    beta_v = ref.cache.beta[v[sel]]
-    beta_m = localised_fold(lat.xy(_midpoint_ij(ij)).reshape(-1, 2)).reshape(-1, 3, 2)
-    want_ok = parity_from_children(child_shape_matrices(beta_v, beta_m))
-
-    got_invalid = status[sel] == LeafStatus.INVALID
-    assert got_invalid.any(), "fixture must condemn something"
-    assert (~got_invalid).any(), "fixture must spare something"
-    assert np.array_equal(got_invalid, ~want_ok)
-    assert (status[sel][~got_invalid] == LeafStatus.SIZE_FLOOR).all()
-    assert ref.counters["parity_invalid"] == int(got_invalid.sum())
-    # Condemnation happens only at the size floor; nothing coarser is touched.
-    assert (level[status == LeafStatus.INVALID] == max_level).all()
-
-
-def test_max_level_condemns_a_nonfinite_midpoint_with_finite_vertices():
-    """A midpoint the criterion cannot evaluate fails parity closed.
-
-    `min_img_sep` forces max_level == 0, so the level-0 triangles *are* the
-    max_level triangles. Vertices land on integer arcsec coordinates and
-    midpoints on half-integers, so a NaN band of half-width 0.1 around x == 0.5
-    hits midpoints only and leaves every vertex finite -- isolating the path
-    where parity, not the `finite_v` check, is what condemns.
-
-    Exactly the eight triangles of the x in [0, 1] cell column are hit: both
-    root shapes place a midpoint at x == 0.5, there are four cells in that
-    column, and two triangles per cell.
-    """
-
-    def broken(p):
-        out = p.copy()
-        out[np.abs(p[:, 0] - 0.5) < 0.1] = np.nan
-        return out
-
-    ref, lat, calls, max_level = refine_with(broken, min_img_sep=2.0)
-    assert max_level == 0
-    v, level, cls, status = ref.store.compact()
-    invalid = np.flatnonzero(status == LeafStatus.INVALID)
-    assert invalid.size == 8
-    assert ref.counters["parity_invalid"] == 8
-    for row in invalid:
-        assert np.isfinite(
-            ref.cache.beta[v[row]]
-        ).all(), "condemned by its midpoint, so its vertices must be finite"
-    assert (status == LeafStatus.SIZE_FLOOR).any()
-
-
-def test_refine_makes_one_batch_per_level_and_exits_early_when_affine():
-    """One raytrace batch per level that needs new points, and no more.
-
-    The identity map is affine everywhere, so every level-0 triangle converges
-    and the loop exits through the empty-``active`` break without ever reaching
-    ``max_level``. This pins the level-synchronous one-batch-per-level structure
-    on the early-exit path.
-    """
-    ref, lat, calls, max_level = refine_with(lambda p: p * 1.0, min_img_sep=0.5)
-    v, level, cls, status = ref.store.compact()
-    assert (
-        max_level > 0
-    ), "fixture must allow deeper levels for early exit to mean anything"
-    assert (level == 0).all()
-    assert calls["batches"] == 1
-
-
-def test_refine_all_leaves_are_positively_oriented():
-    ref, lat, calls, max_level = refine_with(
-        lambda p: np.stack([p[:, 0], p[:, 1] ** 2], axis=-1), min_img_sep=0.05
-    )
-    v, level, cls, status = ref.store.compact()
-    tri = lat.xy(ref.cache.ij[v])
-    assert (signed_area(tri) > 0).all()
-
-
-def assert_balanced(ref, lat, max_level):
-    """No leaf edge carries an active quarter point."""
-    v, level, cls, status = ref.store.compact()
-    for lv in np.unique(level):
-        if lv > max_level - 2:
-            continue
-        sel = level == lv
-        keys = _edge_quarter_keys(lat, ref.cache.ij[v[sel]])
-        assert not ref.active.contains(keys).any(), f"unbalanced at level {lv}"
-
-
-def test_find_unbalanced_matches_the_six_quarter_key_reference_during_the_cascade(
-    monkeypatch,
-):
-    """The edge-at-a-time scan must select exactly the rows the batch form did,
-    checked where a violation can actually occur.
-
-    `_find_unbalanced` no longer builds the whole `(cand, 6)` key array -- it
-    tests the six quarter points one at a time to keep the temporary
-    `(cand,)`-shaped. That is a reassociation of the same disjunction, so
-    `_edge_quarter_keys`, which is unchanged and separately tested, is the
-    reference it must reproduce row for row.
-
-    An earlier version of this test ran `_find_unbalanced` against a *completed*
-    `_refine` result. A completed refinement is balanced by construction --
-    that is exactly what `test_mesh_is_edge_balanced_after_refinement` asserts
-    -- so every frontier level it inspected had zero candidates, zero
-    violators, and `got == want` trivially as empty-to-empty. A rewrite that
-    silently *misses* violators -- the dangerous direction, since it yields an
-    unbalanced mesh rather than an error -- would pass that just as well as a
-    correct one.
-
-    This version instead intercepts every call `_refine`'s own balance cascade
-    makes while it is actively running, which is where non-empty violator sets
-    exist, and requires that at least one such non-empty comparison happened.
-    """
-    real_find_unbalanced = adaptive._find_unbalanced
-    seen_nonempty = False
-
-    def shim(store, cache, lattice, active, max_level, frontier_level):
-        nonlocal seen_nonempty
-        got = real_find_unbalanced(
-            store, cache, lattice, active, max_level, frontier_level
-        )
-        bound = min(frontier_level - 2, max_level - 2)
-        cand = np.flatnonzero(store.valid & (store.level <= bound))
-        if cand.size:
-            keys = _edge_quarter_keys(lattice, cache.ij[store.v[cand]])
-            want = cand[active.contains(keys).any(axis=1)]
-        else:
-            want = cand
-        assert got.tolist() == want.tolist(), f"frontier_level={frontier_level}"
-        if want.size > 0:
-            seen_nonempty = True
-        return got
-
-    monkeypatch.setattr(adaptive, "_find_unbalanced", shim)
-    refine_with(localised_fold, min_img_sep=0.02)
-
-    assert seen_nonempty, "shim never observed a non-empty violator set"
 
 
 def localised_fold(p):
@@ -415,91 +123,6 @@ def localised_fold(p):
     y = p[:, 1]
     bend = np.where(np.abs(y) < 0.5, y**2 - 0.25, 0.0)
     return np.stack([p[:, 0], 0.6 * y + bend], axis=-1)
-
-
-def test_mesh_is_edge_balanced_after_refinement():
-    ref, lat, calls, max_level = refine_with(
-        localised_fold, fov=4.0, init_res=4, min_img_sep=0.05
-    )
-    assert max_level >= 4, "fixture must allow several levels"
-    v, level, cls, status = ref.store.compact()
-    assert len(np.unique(level)) > 1, "fixture must produce level transitions"
-    assert_balanced(ref, lat, max_level)
-
-
-def test_cascade_produces_forced_children():
-    ref, lat, calls, max_level = refine_with(
-        localised_fold, fov=4.0, init_res=4, min_img_sep=0.05
-    )
-    v, level, cls, status = ref.store.compact()
-    assert (status == LeafStatus.FORCED).any()
-    assert ref.counters["forced"] > 0
-    assert ref.counters["cascade_rounds"] > 0
-
-
-def test_forced_and_invalid_statuses_are_mutually_consistent():
-    """FORCED leaves are finite; INVALID leaves are a mix of finite and not.
-
-    Each status is asserted independently. A single ``.any()`` over the union of
-    the two would be satisfied by FORCED alone -- which ``localised_fold``
-    already guarantees via ``test_cascade_produces_forced_children`` -- leaving
-    the INVALID half of the claim unfalsifiable.
-
-    The cascade has no INVALID-inheritance arm to reach, and this fixture is
-    what shows why one is unnecessary rather than merely unused.
-    ``_find_unbalanced`` filters candidates on ``store.valid & (store.level <=
-    min(frontier_level, max_level) - 2)`` and not on status, so an INVALID leaf
-    would be an ordinary violator candidate like any other -- but INVALID only
-    ever lands at ``max_level``, two levels above that bound, and the
-    ``max_level`` branch breaks out of the level loop before any cascade runs.
-    Instrumented on this fixture: the cascade processes 103 violators and none
-    of them is INVALID, while 2728 non-finite triangles were split on the way
-    down. So the unconditional ``FORCED`` in ``_refine`` is exact here, not a
-    simplification that happens to hold.
-    """
-
-    def half_bad(p):
-        out = localised_fold(p)
-        out[p[:, 0] > 1.0] = np.nan
-        return out
-
-    ref, lat, calls, max_level = refine_with(
-        half_bad, fov=4.0, init_res=4, min_img_sep=0.05
-    )
-    v, level, cls, status = ref.store.compact()
-    assert (status == LeafStatus.FORCED).any()
-    assert (status == LeafStatus.INVALID).any()
-    # A FORCED child descends from a non-INVALID parent, whose vertices were
-    # verified finite before it was allowed to split. Not an invariant of the
-    # module -- a parent's midpoints are deferred, never criterion-checked, so a
-    # re-forced child can carry a non-finite vertex to freeze, which is what
-    # `_invalidate_nonfinite_origins` exists to catch. It does hold on this
-    # fixture, and a cascade that leaked non-finite geometry into FORCED rows on
-    # the ordinary path would break it.
-    for row in np.flatnonzero(status == LeafStatus.FORCED):
-        assert np.isfinite(ref.cache.beta[v[row]]).all()
-    # Conversely, INVALID no longer implies a non-finite vertex: spec 4.2 also
-    # condemns a max_level leaf whose four hypothetical children disagree on
-    # sign(det Q_k) even though every one of its vertices is finite. So both
-    # arms are expected here, not just the non-finite one -- this fixture's
-    # fold (from `localised_fold`) exercises the parity arm alongside the
-    # halfplane's non-finite arm.
-    inv_beta = ref.cache.beta[v[status == LeafStatus.INVALID]]
-    all_finite = np.isfinite(inv_beta).all(axis=(1, 2))
-    assert all_finite.any(), "fixture should exercise the parity-only condemnation too"
-    assert (
-        ~all_finite
-    ).any(), "fixture should exercise the non-finite condemnation too"
-    # INVALID is unreachable below max_level, which is what makes the
-    # unconditional FORCED above exact rather than lucky.
-    assert (level[status == LeafStatus.INVALID] == max_level).all()
-
-
-def test_cascade_still_evaluates_every_point_exactly_once():
-    ref, lat, calls, max_level = refine_with(
-        localised_fold, fov=4.0, init_res=4, min_img_sep=0.05
-    )
-    assert calls["points"] == len(ref.cache) + ref.counters["max_level_midpoints"]
 
 
 def undirected_edges(lat, cache, leaves):

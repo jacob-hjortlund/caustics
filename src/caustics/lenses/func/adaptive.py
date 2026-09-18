@@ -68,6 +68,7 @@ __all__ = (
     "make_raytrace",
     "trace_keys",
     "evaluate",
+    "refine",
 )
 
 # ---------------------------------------------------------------------------
@@ -1451,3 +1452,298 @@ def evaluate(cache, lat, keys, raytrace_fn, batch_size) -> VertexCache:
     beta = trace_keys(lat, ij, raytrace_fn, batch_size)
     new_cache, _ = cache_insert(cache, todo, ij, beta)
     return new_cache
+
+
+# ---------------------------------------------------------------------------
+# The refinement loop
+# ---------------------------------------------------------------------------
+
+
+def refine(raytrace_fn, lat, init_res, h0, min_img_sep, max_level, tables, batch_size):
+    """
+    Level-synchronous refinement.
+
+    Processes the whole active set one level at a time: gathers all unique new
+    points for that level, calls ``raytrace`` once on the batch, applies the
+    criterion vectorized, then partitions into converged and to-split. No
+    Python-level recursion over individual triangles, no per-triangle ``raytrace``.
+
+    At ``max_level`` nothing splits, so there is no cascade, so no force-split.
+    The midpoints are still evaluated, but for the parity test alone: a triangle
+    whose four hypothetical children disagree on ``sign(det Q_k)`` contains a
+    fold at a scale no further split can resolve, so it is marked ``LEAF_INVALID``
+    and kept out of the spatial index. Those midpoints are traced once,
+    deduplicated on their lattice keys, consumed, and dropped -- they are the
+    only points with an odd coordinate, so they can never collide with the
+    cache, and nothing downstream reads them.
+
+    That pass is the single largest batch in the build. For a mesh refining
+    uniformly to ``max_level`` on an ``N x N`` cell grid it adds the
+    ``3 * N**2 + 2 * N`` edge midpoints to the ``(N + 1)**2`` vertices, which
+    together are exactly the ``(2 * N + 1)**2`` points of the widened lattice --
+    so a full-depth build now evaluates every lattice point exactly once, where
+    it used to evaluate only the even sublattice. Roughly ``4x`` the
+    ``raytrace`` calls in that worst case, and less on a genuinely adaptive
+    mesh. ``counters["max_level_midpoints"]`` is the measured cost.
+
+    **Non-finite triangles split unconditionally.** A non-finite sample point is
+    maximal ignorance about a triangle, so it triggers refinement like every other
+    unresolved condition rather than terminating it -- the criterion simply cannot
+    be evaluated there, which is why the split carries no verdict. A red split
+    hands the bad vertex to exactly one of the four children, so the other three
+    re-enter the criterion normally and the singularity ends up ringed by a band of
+    ``LEAF_NONFINITE`` leaves at the smallest allowed size instead of a hexagon of
+    ``fov / init_res``. Terminating on the spot instead would put the hole at
+    whatever level the triangle was first sampled, and ``LEAF_NONFINITE`` leaves are
+    excluded from the spatial index -- so on a singular model that hole is exactly
+    the region where the mesh is most needed. The cost is
+    ``counters["nonfinite_splits"]``: six triangles per level for a point
+    singularity, but ``O(area * 4**max_level)`` should a ``raytrace`` return
+    non-finite values over a whole region.
+
+    Parameters
+    ----------
+    raytrace_fn: Callable[[ArrayLike], ArrayLike]
+        From :func:`make_raytrace`.
+    lat: Lattice
+    init_res: int
+        Level-0 grid resolution.
+    h0: float
+        Level-0 cell size ``fov / init_res``.
+
+        *Unit: arcsec*
+    min_img_sep: float
+        Lens-plane tolerance.
+
+        *Unit: arcsec*
+    max_level: int
+        Finest allowed level.
+    tables:
+        ``(M, G, COMPOSE, PINV0, ROOT_CLASS)`` from :func:`child_matrix_tables`.
+    batch_size: Optional[int]
+        Forwarded to :func:`evaluate` and :func:`trace_keys`.
+
+    Returns
+    -------
+    cache: VertexCache
+    active: ArrayLike
+        The active-vertex set.
+    store: LeafStore
+    counters: dict[str, int]
+        ``converged_level0``: leaves converged at level 0.
+        ``parity_splits``: level ``< max_level`` triangles split on parity alone.
+        ``parity_invalid``: ``max_level`` triangles condemned by parity.
+        ``deviation_splits``: parity-clean triangles split by the deviation test.
+        ``sigma_zero``: triangles seen with ``s == 0`` (parity-ok or not).
+        ``nonfinite_splits``: level ``< max_level`` triangles split because some
+        sample was non-finite.
+        ``max_level_midpoints``: unique ``max_level`` midpoints traced for the
+        parity test.
+        ``forced``: children produced by the balance cascade.
+        ``cascade_rounds``: balance-cascade rounds run over the whole build.
+    """
+    M, G, COMPOSE, PINV0, ROOT_CLASS = tables
+    cache = empty_cache()
+    active = empty_active()
+    store = empty_store()
+    counters = {
+        "converged_level0": 0,
+        "parity_splits": 0,
+        "parity_invalid": 0,
+        "deviation_splits": 0,
+        "sigma_zero": 0,
+        "nonfinite_splits": 0,
+        "max_level_midpoints": 0,
+        "forced": 0,
+        "cascade_rounds": 0,
+    }
+
+    active_ij, active_cls = initial_triangles(init_res, lat.level, ROOT_CLASS)
+    deferred = backend.empty((0,), dtype=backend.int64)
+
+    for level in range(max_level + 1):
+        vert_keys = lattice_key(lat, active_ij)  # (n, 3)
+        need = [vert_keys.reshape(-1)]
+        if level < max_level:
+            mid_ij = midpoint_ij(active_ij)
+            need.append(lattice_key(lat, mid_ij).reshape(-1))
+            need.append(deferred)
+            deferred = backend.empty((0,), dtype=backend.int64)
+        cache = evaluate(
+            cache, lat, backend.concatenate(need, dim=0), raytrace_fn, batch_size
+        )
+
+        v = cache_lookup(cache, vert_keys)
+        active = active_add_slots(active, cache_size(cache), v.reshape(-1))
+        beta_v = cache.beta[v]
+        finite_v = backend.all(backend.isfinite(beta_v), dim=(1, 2))
+
+        if level == max_level:
+            has_converged = backend.zeros((active_ij.shape[0],), dtype=backend.bool)
+            finite_samples = backend.zeros((active_ij.shape[0],), dtype=backend.bool)
+            rows = backend.flatnonzero(finite_v)
+
+            if rows.shape[0]:
+                # Trace unique midpoints without adding them to the vertex cache.
+                # Flattened before `backend.unique` rather than leaning on a
+                # shape-preserving `return_inverse`, so the reshapes below are
+                # explicit and this does not depend on the backend's own
+                # convention.
+                keys = lattice_key(lat, midpoint_ij(active_ij[rows])).reshape(-1)
+                uniq, inv = backend.unique(keys, return_inverse=True)
+                inv = inv.reshape(-1)
+                beta_m = trace_keys(
+                    lat, lattice_ij_from_key(lat, uniq), raytrace_fn, batch_size
+                )[inv].reshape(-1, 3, 2)
+                counters["max_level_midpoints"] = int(uniq.shape[0])
+
+                # Only evaluate the criterion where all six samples are finite.
+                finite_m = backend.all(backend.isfinite(beta_m), dim=(1, 2))
+                good_rows = rows[finite_m]
+                finite_samples = backend.fill_at_indices(
+                    finite_samples, good_rows, True
+                )
+
+                if good_rows.shape[0]:
+                    keep, parity_ok, s = evaluate_criterion(
+                        beta_v[good_rows],
+                        beta_m[finite_m],
+                        active_cls[good_rows],
+                        level,
+                        h0,
+                        min_img_sep,
+                        PINV0,
+                        COMPOSE,
+                    )
+                    has_converged = backend.fill_at_indices(
+                        has_converged, good_rows, keep
+                    )
+                    counters["parity_invalid"] = int(
+                        backend.to_numpy(backend.sum(~parity_ok))
+                    )
+                    counters["sigma_zero"] += int(backend.to_numpy(backend.sum(s == 0)))
+
+            status = backend.zeros((active_ij.shape[0],), dtype=backend.int64)
+            status = status + LEAF_NONFINITE
+            status = backend.fill_at_indices(
+                status, backend.flatnonzero(finite_samples), LEAF_INVALID
+            )
+            status = backend.fill_at_indices(
+                status, backend.flatnonzero(has_converged), LEAF_CONVERGED
+            )
+
+            store, _ = store_add(store, v, level, active_cls, status)
+
+            if level == 0:
+                counters["converged_level0"] = int(
+                    backend.to_numpy(backend.sum(has_converged))
+                )
+
+            break
+
+        m = cache_lookup(cache, lattice_key(lat, mid_ij))
+        beta_m = cache.beta[m]
+        good = finite_v & backend.all(backend.isfinite(beta_m), dim=(1, 2))
+        counters["nonfinite_splits"] += int(backend.to_numpy(backend.sum(~good)))
+
+        rows = backend.flatnonzero(good)
+        keep, parity_ok, s = evaluate_criterion(
+            beta_v[rows],
+            beta_m[rows],
+            active_cls[rows],
+            level,
+            h0,
+            min_img_sep,
+            PINV0,
+            COMPOSE,
+        )
+        counters["parity_splits"] += int(backend.to_numpy(backend.sum(~parity_ok)))
+        counters["deviation_splits"] += int(
+            backend.to_numpy(backend.sum(parity_ok & ~keep))
+        )
+        counters["sigma_zero"] += int(backend.to_numpy(backend.sum(s == 0)))
+
+        # A non-finite triangle joins the criterion's failures in `pending`
+        # rather than terminating: the criterion cannot be evaluated on it, so
+        # the split is unconditional. Sorted, so which reason condemned a
+        # triangle never reaches the child ordering.
+        done = rows[keep]
+        pending = backend.sort(
+            backend.concatenate((backend.flatnonzero(~good), rows[~keep]), dim=0)
+        )
+        store, _ = store_add(store, v[done], level, active_cls[done], LEAF_CONVERGED)
+        if level == 0:
+            counters["converged_level0"] = int(done.shape[0])
+
+        child_v, child_cls = red_split(
+            v[pending], m[pending], active_cls[pending], COMPOSE
+        )
+        child_ij = cache.ij[child_v]
+        active = active_add_slots(active, cache_size(cache), child_v.reshape(-1))
+
+        # Balance cascade. The children above are already registered as active
+        # vertices, which is what makes the quarter-point test able to see them --
+        # the split must precede the cascade, not follow it.
+        frontier_level = level + 1
+        while True:
+            violators = find_unbalanced(
+                store, cache, lat, active, max_level, frontier_level
+            )
+            if violators.shape[0] == 0:
+                break
+            counters["cascade_rounds"] += 1
+            store = store_remove(store, violators)
+            vv = store.v[violators]
+            vij = cache.ij[vv]
+            vm = cache_lookup(cache, lattice_key(lat, midpoint_ij(vij)))
+            # Trip-wire for the re-forcing invariant. A violator's midpoints are
+            # normally already cached, but a forced child re-forced within the
+            # same cascade would still have its midpoints sitting in `deferred`,
+            # and a -1 slot here would silently negative-index `cache.ij` into
+            # wrong geometry rather than raising. See spec section 2.3.
+            #
+            # `raise AssertionError` rather than a bare `assert`: `python -O`
+            # strips bare asserts, and this one guards against silent geometric
+            # corruption, not just a debugging convenience. `active_add_slots`
+            # uses `raise AssertionError` for the same class of guard.
+            if not bool(backend.all(vm >= 0)):
+                raise AssertionError("cascade hit an unevaluated midpoint")
+            kid_v, kid_cls = red_split(vv, vm, store.cls[violators], COMPOSE)
+            kid_level = backend.repeat(store.level[violators] + 1, 4, axis=0)
+            # A forced child is auto-converged: steps 3-7 are skipped so the
+            # cascade cannot re-enter the split machinery from inside itself.
+            #
+            # No FORCED tag of its own: a forced child inherits its parent's
+            # status instead. A violator is bounded to `level <= max_level - 2`
+            # by `find_unbalanced`, and the only INVALID or NONFINITE leaves in
+            # the store sit at `max_level` -- the branch above adds them and
+            # breaks out of the loop before any cascade runs. So no violator is
+            # ever INVALID or NONFINITE, and every forced child inherits
+            # `LEAF_CONVERGED`, transitively, all the way down the cascade. A
+            # forced child can still reach freeze with a non-finite vertex, via
+            # a deferred midpoint the criterion never saw; closure is left to
+            # catch that.
+            kid_status = backend.repeat(store.status[violators], 4, axis=0)
+            store, _ = store_add(store, kid_v, kid_level, kid_cls, kid_status)
+            counters["forced"] += int(kid_v.shape[0])
+            kid_ij = cache.ij[kid_v]
+            active = active_add_slots(active, cache_size(cache), kid_v.reshape(-1))
+            # Forced children are produced after this level's raytrace call has
+            # gone out, and land at levels the loop will never revisit. Queue
+            # their midpoints and drain at the top of the next level, so the
+            # one-batch-per-level structure survives. A forced child cannot be
+            # re-forced within the same cascade, because the frontier only moves
+            # coarser -- so the deferral is never more than one level deep.
+            deferred = backend.concatenate(
+                (deferred, lattice_key(lat, midpoint_ij(kid_ij)).reshape(-1)), dim=0
+            )
+            # The MAXIMUM kid level, not the minimum: a kid at level L invalidates
+            # neighbours at level <= L-2, so the minimum would skip violators.
+            # The maximum strictly decreases each round, which terminates the loop.
+            frontier_level = int(backend.to_numpy(backend.max(kid_level)))
+
+        active_ij, active_cls = child_ij, child_cls
+        if active_ij.shape[0] == 0:
+            break
+
+    return cache, active, store, counters
