@@ -31,7 +31,7 @@ from caustics.lenses.adaptive import (
     build_adaptive_mesh,
 )
 from caustics.lenses.func import forward_raytrace_rootfind
-from caustics.lenses.func.adaptive import (
+from caustics.lenses.func.old_adaptive import (
     child_matrix_tables,
     child_shape_matrices,
     contains,
