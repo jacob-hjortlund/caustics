@@ -357,6 +357,43 @@ def parity_from_children(Q):
     return (sign_q == sign_q[:, :1]).all(axis=1)
 
 
+def quadratic_vertex_parity_ok(beta_v, beta_m):
+    """Check parity agreement at the quadratic interpolant's vertices.
+
+    Parameters
+    ----------
+    beta_v : ndarray, shape (n, 3, 2)
+        Mapped triangle vertices.
+    beta_m : ndarray, shape (n, 3, 2)
+        Mapped edge midpoints, each opposite its corresponding vertex.
+
+    Returns
+    -------
+    ndarray, shape (n,)
+        True when all three estimated vertex determinants are finite
+        and have the same strictly nonzero sign.
+
+    Notes
+    -----
+    Uses the existing six samples; no additional raytracing.
+    This checks the interpolant at vertices, not the entire true mapping.
+    """
+    with np.errstate(over="ignore", invalid="ignore"):
+        # At each vertex, estimate derivatives toward the next and
+        # previous vertices in cyclic order. Using differences avoids
+        # combining large absolute source-plane coordinates directly.
+        d_next = 4.0 * (beta_m[:, [2, 0, 1]] - beta_v) - (beta_v[:, [1, 2, 0]] - beta_v)
+        d_prev = 4.0 * (beta_m[:, [1, 2, 0]] - beta_v) - (beta_v[:, [2, 0, 1]] - beta_v)
+
+        det = d_next[..., 0] * d_prev[..., 1] - d_next[..., 1] * d_prev[..., 0]
+
+    # Cyclic lens-plane edge pairs have the same determinant.
+    # Its common factor can be omitted when checking sign agreement.
+    return np.isfinite(det).all(axis=1) & (
+        (det > 0).all(axis=1) | (det < 0).all(axis=1)
+    )
+
+
 def evaluate_criterion(beta_v, beta_m, classes, level, h0, min_img_sep, pinv0, compose):
     """
     Steps 3 to 7 of the refinement criterion, vectorized over triangles.
@@ -407,7 +444,7 @@ def evaluate_criterion(beta_v, beta_m, classes, level, h0, min_img_sep, pinv0, c
         terminates the descent.
     """
     Q = child_shape_matrices(beta_v, beta_m)
-    parity_ok = parity_from_children(Q)
+    parity_ok = parity_from_children(Q) & quadratic_vertex_parity_ok(beta_v, beta_m)
 
     A = Q @ pinv0[compose[classes]]  # (n, 4, 2, 2), up to the common 2**(d+1)/h0
     s = sigma_min_2x2(A).min(axis=1) * (2.0 ** (level + 1)) / h0
