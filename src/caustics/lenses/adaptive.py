@@ -38,7 +38,7 @@ import numpy as np
 
 from ..backend_obj import ArrayLike, backend
 from ..utils import batch_lm, meshgrid
-from .func.adaptive import (
+from .func.old_adaptive import (
     CHILD_VERTEX_INDICES,
     ROOT_SHAPES,
     child_matrix_tables,
