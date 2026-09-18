@@ -189,3 +189,46 @@ def test_active_add_slots_rejects_an_uncached_slot():
     active = new.empty_active()
     with pytest.raises(AssertionError, match="cannot activate an uncached vertex"):
         new.active_add_slots(active, 2, _i64([-1, 0]))
+
+
+def test_active_add_slots_does_not_mutate_its_input_on_the_no_growth_path():
+    """Regression test: torch's `fill_at_indices` mutates its argument in place
+    and returns it, so scattering straight into `active` when no growth is
+    needed would silently clobber the caller's own array under torch while
+    leaving it untouched under jax. `before` aliases the array returned by the
+    first call; the second call must not be able to reach through that alias.
+    """
+    active = new.active_add_slots(new.empty_active(), 2, _i64([0]))
+    before = active
+    after = new.active_add_slots(active, 2, _i64([1]))  # same n_slots: no growth
+    assert backend.to_numpy(before).tolist() == [True, False]
+    assert backend.to_numpy(after).tolist() == [True, True]
+
+
+def test_cache_insert_keeps_ij_and_beta_aligned_with_their_slot_across_many_merges():
+    """Coverage restored from the deleted `test_vertex_cache_survives_many_
+    small_inserts`: each key's ij/beta row must stay aligned with its own
+    slot, not just its key position, across many merge-inserts.
+
+    Descending keys force a merge at the front of ``cache.keys`` on every
+    insert, the worst case for the searchsorted-merge in :func:`cache_insert`.
+    """
+    cache = new.empty_cache()
+    probe = []
+    for k in range(40):
+        key = 1000 - k
+        cache, slot = new.cache_insert(
+            cache, _i64([key]), _i64([[key, key]]), _f64([[key, key]]) * 0.5
+        )
+        assert backend.to_numpy(slot).tolist() == [k]
+        probe.append(key)
+
+    probe = np.array(probe, dtype=np.int64)
+    assert new.cache_size(cache) == 40
+    assert backend.to_numpy(new.cache_lookup(cache, _i64(probe))).tolist() == list(
+        range(40)
+    )
+    assert np.array_equal(backend.to_numpy(cache.ij)[:, 0], probe)
+    assert np.allclose(
+        backend.to_numpy(cache.beta)[:, 0], probe.astype(np.float64) * 0.5
+    )

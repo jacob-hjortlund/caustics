@@ -919,11 +919,18 @@ def active_add_slots(active, n_slots, slots) -> ArrayLike:
     # bare asserts, and this guards against silent geometric corruption.
     if not bool(backend.all(slots >= 0)):
         raise AssertionError("cannot activate an uncached vertex")
-    extra = n_slots - active.shape[0]
-    if extra > 0:
-        active = backend.concatenate(
-            [active, backend.zeros((extra,), dtype=backend.bool)], dim=0
-        )
+    # Concatenate unconditionally, even when `extra` is 0, so this always
+    # scatters into a fresh array and never the caller's own. `torch.cat`/
+    # `jnp.concatenate` both always allocate, unlike `fill_at_indices` on its
+    # own: torch mutates its first argument in place and returns it, so
+    # scattering directly into `active` on the no-growth path would silently
+    # clobber the caller's array under torch while leaving it untouched under
+    # jax -- the exact backend-divergence `cache_insert` avoids by always
+    # writing into a fresh `backend.empty`/`backend.ones` buffer.
+    extra = max(n_slots - active.shape[0], 0)
+    active = backend.concatenate(
+        [active, backend.zeros((extra,), dtype=backend.bool)], dim=0
+    )
     return backend.fill_at_indices(active, slots, True)
 
 
