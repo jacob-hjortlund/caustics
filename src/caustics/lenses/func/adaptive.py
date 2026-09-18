@@ -11,7 +11,8 @@ verifiable.
 **Query kernels** operate on ``backend`` arrays and are used by ``Mesh.query``.
 """
 
-from typing import Tuple
+import math
+from typing import NamedTuple, Tuple
 
 from ...backend_obj import ArrayLike, backend
 
@@ -30,6 +31,15 @@ __all__ = (
     "triangle_weights",
     "contains",
     "sanitize_bary",
+    "MAX_KEY",
+    "Lattice",
+    "make_lattice",
+    "lattice_key",
+    "lattice_ij_from_key",
+    "lattice_xy",
+    "lattice_on_boundary",
+    "depth_floor",
+    "validate_build_args",
 )
 
 # ---------------------------------------------------------------------------
@@ -595,3 +605,161 @@ def sanitize_bary(w, d) -> ArrayLike:
     normed = bary / backend.unsqueeze(safe, -1)
     third = backend.ones_like(bary) / 3
     return backend.where(backend.unsqueeze(ok, -1), normed, third)
+
+
+# ---------------------------------------------------------------------------
+# Dyadic lattice and build-argument validation
+# ---------------------------------------------------------------------------
+
+MAX_KEY = 2**63 - 1
+
+
+def depth_floor(fov, init_res, min_img_sep) -> int:
+    """
+    Level at which the longest leaf edge first falls to ``min_img_sep``.
+
+    Red refinement makes every child similar to its parent with ratio 1/2, so
+    ``l_max`` is a function of level alone and the size floor is a depth computable
+    up front. ``sqrt(2) * fov / init_res`` is the level-0 hypotenuse.
+    """
+    l_max0 = math.sqrt(2.0) * fov / init_res
+    if l_max0 <= min_img_sep:
+        return 0
+    return int(math.ceil(math.log2(l_max0 / min_img_sep)))
+
+
+def validate_build_args(
+    fov, init_res, min_img_sep, max_depth, requested_min_img_sep=None
+) -> None:
+    """
+    Reject impossible parameters, including a lattice that would overflow int64.
+
+    ``min_img_sep`` is the value every check and the depth computation use.
+    ``requested_min_img_sep`` names only the positivity message, so a caller who
+    halved it (``build_adaptive_mesh``) is told the number they actually
+    supplied rather than the halved one. Defaults to ``min_img_sep`` for a
+    direct call, where the two coincide.
+    """
+    if requested_min_img_sep is None:
+        requested_min_img_sep = min_img_sep
+    if not fov > 0:
+        raise ValueError(f"fov must be positive, got {fov}")
+    if init_res < 1:
+        raise ValueError(f"init_res must be at least 1, got {init_res}")
+    if not min_img_sep > 0:
+        raise ValueError(f"min_img_sep must be positive, got {requested_min_img_sep}")
+    if max_depth < 0:
+        raise ValueError(f"max_depth must be non-negative, got {max_depth}")
+    max_level = min(max_depth, depth_floor(fov, init_res, min_img_sep))
+    # One level finer than max_level: see `Lattice`. The guard has to size the
+    # lattice actually built, not the finest triangle level.
+    n = init_res * (1 << (max_level + 1))
+    if (n + 1) ** 2 >= MAX_KEY:
+        raise ValueError(
+            f"lattice too fine to key in int64: init_res={init_res} at level "
+            f"{max_level} needs a lattice of {n + 1} points per axis, one level "
+            f"finer than max_level so that max_level edge midpoints are lattice "
+            f"points. Raise min_img_sep, lower max_depth, or lower init_res."
+        )
+
+
+class Lattice(NamedTuple):
+    """
+    Dyadic integer lattice over the square domain, at the finest allowed level.
+
+    Every mesh vertex is an integer pair, so midpoints are exact integer averages
+    -- no float hashing, no rounding tolerance. The lens-plane position is a pure
+    function of the integer pair, so two triangles sharing a vertex compute
+    bit-identical coordinates. That is the root of the exact-negation property that
+    stops a query falling through the seam between adjacent leaves.
+
+    The lattice is built one level finer than ``max_level``, so a triangle's
+    edge vectors are multiples of ``1 << (max_level + 1 - d)`` at level ``d``
+    -- at least 2 for every ``d <= max_level``. That makes :func:`_midpoint_ij`
+    exact at *every* level, ``max_level`` included, which is what lets the
+    parity test run there.
+
+    It also partitions the lattice. Every point the vertex cache holds -- a
+    vertex at any level, or a midpoint below ``max_level`` -- has **even**
+    coordinates; a ``max_level`` midpoint always has at least one **odd**
+    coordinate. So the ``max_level`` midpoint pass can never re-trace a cached
+    point, and a ``max_level`` midpoint can never be a triangle vertex.
+
+    Widening does not move anything. ``fov / (2n)`` is exactly ``fl(fov / n) / 2``
+    and ``(2 * ij) * (scale / 2)`` rounds the same exact real as ``ij * scale``,
+    so every pre-existing point keeps a bit-identical position. Keys scale
+    uniformly, so :func:`_canonical_order` is unchanged too.
+    """
+
+    level: int
+    n: int
+    stride: int
+    scale: float
+    lo: ArrayLike
+
+
+def make_lattice(fov, x0, y0, init_res, lattice_level) -> Lattice:
+    """
+    Build a :class:`Lattice` covering ``fov``, centred at ``(x0, y0)``.
+
+    Parameters
+    ----------
+    fov: float
+        Field of view.
+
+        *Unit: arcsec*
+
+    x0: float
+        Domain centre, x.
+
+        *Unit: arcsec*
+
+    y0: float
+        Domain centre, y.
+
+        *Unit: arcsec*
+
+    init_res: int
+        Level-0 grid resolution.
+    lattice_level: int
+        Level at which the lattice itself is built -- one finer than
+        ``max_level``, see :class:`Lattice`.
+
+    Returns
+    -------
+    Lattice
+    """
+    level = int(lattice_level)
+    n = int(init_res) * (1 << level)
+    stride = n + 1
+    scale = float(fov) / n
+    lo = backend.as_array([x0 - fov / 2.0, y0 - fov / 2.0], dtype=backend.float64)
+    return Lattice(level=level, n=n, stride=stride, scale=scale, lo=lo)
+
+
+def lattice_key(lat, ij):
+    """Lattice key of integer coordinates, shape ``(..., 2) -> (...)``."""
+    return ij[..., 0] * lat.stride + ij[..., 1]
+
+
+def lattice_ij_from_key(lat, key):
+    """Inverse of :func:`lattice_key`, shape ``(...) -> (..., 2)``."""
+    return backend.stack((key // lat.stride, key % lat.stride), dim=-1)
+
+
+def lattice_xy(lat, ij):
+    """Lens-plane position, shape ``(..., 2) -> (..., 2)``.
+
+    *Unit: arcsec*
+    """
+    return lat.lo + backend.to(ij, dtype=backend.float64) * lat.scale
+
+
+def lattice_on_boundary(lat, ij):
+    """True where the point lies on the edge of the domain."""
+    return (
+        (ij[..., 0] == 0)
+        | (ij[..., 0] == lat.n)
+        | (ij[..., 1] == 0)
+        | (ij[..., 1] == lat.n)
+    )

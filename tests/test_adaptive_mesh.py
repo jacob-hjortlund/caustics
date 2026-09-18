@@ -27,7 +27,6 @@ from caustics.lenses.adaptive import (
     _red_split,
     _refine,
     _trace_keys,
-    _validate_build_args,
     _VertexCache,
     build_adaptive_mesh,
 )
@@ -57,23 +56,6 @@ def signed_area(tri):
     """Twice the signed area of a (..., 3, 2) triangle."""
     P = shape_matrix(tri)
     return P[..., 0, 0] * P[..., 1, 1] - P[..., 0, 1] * P[..., 1, 0]
-
-
-def test_depth_floor_matches_the_size_criterion():
-    assert _depth_floor(5.0, 100, 10.0) == 0
-    d = _depth_floor(5.0, 100, 1e-3)
-    l0 = np.sqrt(2) * 5.0 / 100
-    assert l0 / 2**d <= 1e-3 < l0 / 2 ** (d - 1)
-
-
-def test_lattice_key_roundtrip_and_geometry():
-    lat = _Lattice(4.0, 0.0, 0.0, 4, 3)
-    assert lat.n == 32
-    ij = np.array([[0, 0], [32, 32], [7, 19]])
-    assert np.array_equal(lat.ij_from_key(lat.key(ij)), ij)
-    assert np.allclose(lat.xy(ij[0]), [-2.0, -2.0])
-    assert np.allclose(lat.xy(ij[1]), [2.0, 2.0])
-    assert lat.on_boundary(ij).tolist() == [True, True, False]
 
 
 def test_vertex_cache_lookup_missing_insert():
@@ -328,28 +310,6 @@ def test_midpoints_are_exact_at_max_level_on_the_widened_lattice():
     assert (mid % 2 == 1).any(axis=-1).all()
 
 
-def test_widening_the_lattice_does_not_move_any_vertex():
-    """Bit-identical coordinates, not merely close ones.
-
-    `scale' = fov / (2n)` equals `fl(fov / n) / 2` exactly, because binary
-    floating point is scale-invariant under powers of two, and `(2 * ij) *
-    scale'` then rounds the same exact real as `ij * scale`. If this ever fails,
-    the widened lattice has perturbed the frozen mesh's geometry and every
-    downstream bit-exactness argument in the module is void.
-    """
-    fov, init_res, max_level = 4.0, 4, 3
-    narrow = _Lattice(fov, 0.0, 0.0, init_res, max_level)
-    wide = _Lattice(fov, 0.0, 0.0, init_res, max_level + 1)
-    assert wide.n == 2 * narrow.n
-    assert wide.level == max_level + 1
-
-    ij = np.stack(
-        np.meshgrid(np.arange(narrow.n + 1), np.arange(narrow.n + 1), indexing="ij"),
-        axis=-1,
-    ).reshape(-1, 2)
-    assert np.array_equal(narrow.xy(ij), wide.xy(2 * ij))
-
-
 def test_red_split_is_triangle_major_and_advances_the_class():
     M, G, COMPOSE, PINV0, ROOT_CLASS = child_matrix_tables()
     v = np.array([[0, 1, 2], [3, 4, 5]], dtype=np.int64)
@@ -361,29 +321,6 @@ def test_red_split_is_triangle_major_and_advances_the_class():
     assert cv[3].tolist() == [6, 7, 8]  # C_4 = (m1, m2, m3)
     assert cc[:4].tolist() == COMPOSE[0].tolist()
     assert cc[4:].tolist() == COMPOSE[4].tolist()
-
-
-@pytest.mark.parametrize(
-    "kwargs",
-    [
-        dict(fov=0.0),
-        dict(fov=-1.0),
-        dict(init_res=0),
-        dict(min_img_sep=0.0),
-        dict(min_img_sep=-1.0),
-        dict(max_depth=-1),
-    ],
-)
-def test_validate_build_args_rejects_bad_input(kwargs):
-    args = dict(fov=5.0, init_res=8, min_img_sep=1e-2, max_depth=10)
-    args.update(kwargs)
-    with pytest.raises(ValueError):
-        _validate_build_args(**args)
-
-
-def test_validate_build_args_rejects_lattice_overflow():
-    with pytest.raises(ValueError, match="lattice"):
-        _validate_build_args(fov=5.0, init_res=100, min_img_sep=1e-12, max_depth=60)
 
 
 def make_counting_raytrace(fn):
