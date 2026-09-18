@@ -83,9 +83,12 @@ def test_refine_counters_match_the_oracle(
 
 def test_refine_converges_everywhere_at_level_zero_for_an_affine_map():
     _, _, store, counters = _run_new(_affine, 4.0, 2, 0.5, 3)
-    v, level, _, _ = new.store_compact(store)
+    v, level, _, status = new.store_compact(store)
     assert (backend.to_numpy(level) == 0).all()
     assert counters["converged_level0"] == 2 * 2**2
+    assert bool(backend.all(status == new.LEAF_CONVERGED))
+    assert counters["parity_splits"] == 0
+    assert counters["deviation_splits"] == 0
 
 
 def test_refine_evaluates_every_point_exactly_once():
