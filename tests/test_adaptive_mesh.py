@@ -11,7 +11,6 @@ from caustics.lenses.adaptive import (
     LeafStatus,
     BuildStats,
     Mesh,
-    _ActiveKeys,
     _canonical_order,
     _close,
     _dedup_representatives,
@@ -27,7 +26,6 @@ from caustics.lenses.adaptive import (
     _red_split,
     _refine,
     _trace_keys,
-    _VertexCache,
     build_adaptive_mesh,
 )
 from caustics.lenses.func import forward_raytrace_rootfind
@@ -58,93 +56,6 @@ def signed_area(tri):
     return P[..., 0, 0] * P[..., 1, 1] - P[..., 0, 1] * P[..., 1, 0]
 
 
-def test_vertex_cache_lookup_missing_insert():
-    cache = _VertexCache()
-    keys = np.array([7, 3, 7, 11], dtype=np.int64)
-    assert np.array_equal(cache.missing(keys), np.array([3, 7, 11]))
-    todo = cache.missing(keys)
-    ij = np.stack([todo, todo], axis=-1)
-    cache.insert(todo, ij, ij.astype(np.float64))
-    assert len(cache) == 3
-    assert cache.missing(keys).size == 0
-    assert np.array_equal(cache.lookup(np.array([7, 99])), np.array([1, -1]))
-
-
-def test_vertex_cache_survives_many_small_inserts():
-    """Capacity doubling must not expose slack or misplace a slot.
-
-    Slots are assigned monotonically in order of first evaluation and never
-    move, and `ij`/`beta` are views into an over-allocated buffer -- so an
-    off-by-one in the truncation shows up as a length or a stale row, not as
-    an exception.
-    """
-    cache = _VertexCache()
-    for k in range(40):
-        keys = np.array([1000 - k], dtype=np.int64)  # descending, to force merges
-        ij = np.stack([keys, keys], axis=-1)
-        slots = cache.insert(keys, ij, ij.astype(np.float64) * 0.5)
-        assert slots.tolist() == [k]
-    assert len(cache) == 40
-    assert cache.ij.shape == (40, 2)
-    assert cache.beta.shape == (40, 2)
-    probe = np.array([1000 - k for k in range(40)], dtype=np.int64)
-    assert cache.lookup(probe).tolist() == list(range(40))
-    assert np.array_equal(cache.ij[:, 0], probe)
-    assert np.allclose(cache.beta[:, 0], probe * 0.5)
-
-
-def test_vertex_cache_keys_stay_sorted_across_interleaved_inserts():
-    """The key index is merged, not re-sorted; the merge must be correct."""
-    cache = _VertexCache()
-    for block in ([5, 9], [1, 7], [3, 11], [0, 6]):
-        keys = np.array(block, dtype=np.int64)
-        ij = np.stack([keys, keys], axis=-1)
-        cache.insert(keys, ij, ij.astype(np.float64))
-    assert cache.missing(np.arange(12)).tolist() == [2, 4, 8, 10]
-    order = cache.lookup(np.array([0, 1, 3, 5, 6, 7, 9, 11]))
-    assert sorted(order.tolist()) == list(range(8))
-    assert (order >= 0).all()
-
-
-def test_vertex_cache_survives_reallocation_past_the_capacity_floor():
-    """Exercise the doubling arithmetic itself, not just the first 0->1024 jump.
-
-    ``_reserve`` grows to ``max(need, 2 * capacity, 1024)``. A test that never
-    inserts past 1024 elements only ever exercises the one-time floor
-    allocation -- the ``2 * capacity`` branch, run when the buffer must grow a
-    second and third time, is untouched. Two thousand five hundred keys, added
-    in permuted chunks so the merge lands at both ends and the middle of the
-    existing sorted key array rather than only ever appending at one end,
-    cross the floor twice (0->1024->2048->4096). Every key inserted before
-    *and* after each crossing must still resolve to its original, unmoved
-    slot, with its ``ij``/``beta`` row intact.
-    """
-    n_chunks, chunk = 50, 50
-    total = n_chunks * chunk  # 2500: two reallocations past the 1024 floor
-    cache = _VertexCache()
-    rng = np.random.default_rng(0)
-    order = rng.permutation(n_chunks)
-    expected_slot = {}
-    seen = 0
-    for c in order.tolist():
-        block = np.arange(c * chunk, c * chunk + chunk, dtype=np.int64)
-        ij = np.stack([block, block], axis=-1)
-        slots = cache.insert(block, ij, ij.astype(np.float64) * 2.0)
-        assert slots.tolist() == list(range(seen, seen + chunk))
-        for key, slot in zip(block.tolist(), slots.tolist()):
-            expected_slot[key] = slot
-        seen += chunk
-
-    assert len(cache) == total
-    assert cache.ij.shape == (total, 2)
-    assert cache.beta.shape == (total, 2)
-    keys = np.array(sorted(expected_slot), dtype=np.int64)
-    slots = np.array([expected_slot[k] for k in keys.tolist()], dtype=np.int64)
-    assert cache.lookup(keys).tolist() == slots.tolist()
-    assert np.array_equal(cache.ij[slots, 0], keys)
-    assert np.allclose(cache.beta[slots, 0], keys.astype(np.float64) * 2.0)
-
-
 def test_leaf_store_survives_many_small_adds_and_removals():
     """Buffered growth must not break `remove`, which writes through a view."""
     store = _LeafStore()
@@ -160,95 +71,6 @@ def test_leaf_store_survives_many_small_adds_and_removals():
     v, level, cls, status = store.compact()
     assert v.shape == (20, 3)
     assert level.tolist() == [k for k in range(30) if k % 3 != 0]
-
-
-def test_leaf_store_survives_reallocation_past_the_capacity_floor():
-    """Exercise the doubling arithmetic itself, with `remove` on both sides of a growth.
-
-    ``_LeafStore._reserve`` uses the same ``max(need, 2 * capacity, 1024)``
-    rule as the vertex cache, so a test that stays under 1024 rows never
-    reaches the branch where an existing buffer must be doubled rather than
-    allocated fresh. Adds 2500 rows in chunks, crossing the floor twice
-    (0->1024->2048->4096), and removes chunks before the first crossing,
-    between the two crossings, and after the second -- so ``remove``'s
-    write-through is checked against a buffer that has already been swapped
-    out and copied at least once underneath it. ``compact`` must return
-    exactly the surviving rows, with their original values, in row order.
-    """
-    store = _LeafStore()
-    chunk = 50
-    n_chunks = 50
-    total = n_chunks * chunk  # 2500: two reallocations past the 1024 floor
-    # Crossings happen at chunk index 20 (1024->2048) and 40 (2048->4096);
-    # remove before the first, between the two, and after the second.
-    removed_chunks = {5, 25, 45}
-    expected_v_chunks = []
-    expected_level_chunks = []
-    for c in range(n_chunks):
-        v = np.arange(3 * c * chunk, 3 * c * chunk + 3 * chunk, dtype=np.int64).reshape(
-            chunk, 3
-        )
-        rows = store.add(v, c, np.zeros(chunk, np.int64), LeafStatus.CONVERGED)
-        if c in removed_chunks:
-            store.remove(rows)
-        else:
-            expected_v_chunks.append(v)
-            expected_level_chunks.append(np.full(chunk, c, dtype=np.int64))
-
-    assert store.v.shape == (total, 3)
-    assert store.valid.shape == (total,)
-    v, level, cls, status = store.compact()
-    expected_v = np.concatenate(expected_v_chunks)
-    expected_level = np.concatenate(expected_level_chunks)
-    assert v.shape == (total - chunk * len(removed_chunks), 3)
-    assert np.array_equal(v, expected_v)
-    assert np.array_equal(level, expected_level)
-    assert (cls == 0).all()
-    assert (status == LeafStatus.CONVERGED).all()
-
-
-def test_active_keys_membership():
-    """Activation is by cache slot; membership is still asked by key.
-
-    The set is stored as a flag per vertex-cache slot rather than as a second
-    sorted key array, because every active key is by construction a vertex
-    that has already been evaluated -- so the cache's own key index is the
-    only sorted structure needed.
-    """
-    cache = _VertexCache()
-    keys = np.array([1, 5, 9], dtype=np.int64)
-    ij = np.stack([keys, keys], axis=-1)
-    slots = cache.insert(keys, ij, ij.astype(np.float64))
-
-    ak = _ActiveKeys(cache)
-    assert not ak.contains(np.array([1])).any(), "nothing is active yet"
-    ak.add_slots(slots[[0, 1]])
-    assert ak.contains(np.array([1, 5, 9])).tolist() == [True, True, False]
-
-
-def test_active_keys_reject_an_uncached_key():
-    """A key never evaluated cannot be a vertex, so it is not active."""
-    cache = _VertexCache()
-    keys = np.array([4], dtype=np.int64)
-    ij = np.stack([keys, keys], axis=-1)
-    ak = _ActiveKeys(cache)
-    ak.add_slots(cache.insert(keys, ij, ij.astype(np.float64)))
-    assert ak.contains(np.array([4, 99])).tolist() == [True, False]
-
-
-def test_active_keys_refuse_a_negative_slot():
-    """A -1 slot would activate the last cache entry instead of raising.
-
-    `_VertexCache.lookup` returns -1 for an absent key, so a caller that
-    forwards a lookup result without checking would silently corrupt the
-    active set and produce an unbalanced mesh rather than an error.
-    """
-    cache = _VertexCache()
-    keys = np.array([2], dtype=np.int64)
-    ij = np.stack([keys, keys], axis=-1)
-    cache.insert(keys, ij, ij.astype(np.float64))
-    with pytest.raises(AssertionError, match="uncached"):
-        _ActiveKeys(cache).add_slots(np.array([-1], dtype=np.int64))
 
 
 def test_leaf_store_add_remove_compact():

@@ -107,3 +107,85 @@ def test_widening_the_lattice_does_not_move_any_vertex():
         backend.to_numpy(new.lattice_xy(narrow, ij)),
         backend.to_numpy(new.lattice_xy(wide, 2 * ij)),
     )
+
+
+def _i64(x):
+    return backend.as_array(np.asarray(x, dtype=np.int64), dtype=backend.int64)
+
+
+def _f64(x):
+    return backend.as_array(np.asarray(x, dtype=np.float64), dtype=backend.float64)
+
+
+def test_cache_lookup_missing_insert():
+    cache = new.empty_cache()
+    assert backend.to_numpy(new.cache_lookup(cache, _i64([5, 9]))).tolist() == [-1, -1]
+
+    todo = new.cache_missing(cache, _i64([9, 5, 9]))
+    assert backend.to_numpy(todo).tolist() == [5, 9]
+
+    cache, slots = new.cache_insert(
+        cache, todo, _i64([[0, 5], [1, 2]]), _f64([[0.0, 1.0], [2.0, 3.0]])
+    )
+    assert backend.to_numpy(slots).tolist() == [0, 1]
+    assert backend.to_numpy(new.cache_lookup(cache, _i64([9, 5, 7]))).tolist() == [
+        1,
+        0,
+        -1,
+    ]
+    assert new.cache_size(cache) == 2
+
+
+def test_cache_keys_stay_sorted_across_interleaved_inserts():
+    rng = np.random.default_rng(7)
+    cache = new.empty_cache()
+    seen = []
+    for _ in range(12):
+        batch = rng.integers(0, 200, 9)
+        todo = new.cache_missing(cache, _i64(batch))
+        n = int(backend.to_numpy(todo).size)
+        if n == 0:
+            continue
+        cache, _ = new.cache_insert(
+            cache, todo, _i64(np.zeros((n, 2))), _f64(np.zeros((n, 2)))
+        )
+        seen.extend(backend.to_numpy(todo).tolist())
+        keys = backend.to_numpy(cache.keys)
+        assert (np.diff(keys) > 0).all(), "cache keys must stay strictly ascending"
+    assert sorted(set(seen)) == backend.to_numpy(cache.keys).tolist()
+
+
+def test_cache_slots_are_assigned_in_insertion_order():
+    cache = new.empty_cache()
+    cache, slots_a = new.cache_insert(
+        cache, _i64([10, 20]), _i64(np.zeros((2, 2))), _f64(np.zeros((2, 2)))
+    )
+    cache, slots_b = new.cache_insert(
+        cache, _i64([5, 15]), _i64(np.zeros((2, 2))), _f64(np.zeros((2, 2)))
+    )
+    assert backend.to_numpy(slots_a).tolist() == [0, 1]
+    assert backend.to_numpy(slots_b).tolist() == [2, 3]
+    # Slot order is insertion order; key order is sorted. They differ.
+    assert backend.to_numpy(cache.keys).tolist() == [5, 10, 15, 20]
+    assert backend.to_numpy(cache.slots).tolist() == [2, 0, 3, 1]
+
+
+def test_active_membership_and_negative_slots():
+    cache = new.empty_cache()
+    cache, slots = new.cache_insert(
+        cache, _i64([3, 8]), _i64(np.zeros((2, 2))), _f64(np.zeros((2, 2)))
+    )
+    active = new.empty_active()
+    active = new.active_add_slots(active, new.cache_size(cache), _i64([0]))
+    assert backend.to_numpy(
+        new.active_contains_slots(active, _i64([0, 1, -1]))
+    ).tolist() == [True, False, False]
+    assert backend.to_numpy(
+        new.active_contains(active, cache, _i64([3, 8, 99]))
+    ).tolist() == [True, False, False]
+
+
+def test_active_add_slots_rejects_an_uncached_slot():
+    active = new.empty_active()
+    with pytest.raises(AssertionError, match="cannot activate an uncached vertex"):
+        new.active_add_slots(active, 2, _i64([-1, 0]))
