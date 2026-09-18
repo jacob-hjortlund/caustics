@@ -628,3 +628,334 @@ def test_cascade_still_evaluates_every_point_exactly_once():
         _localised_fold, fov=4.0, init_res=4, min_img_sep=0.05
     )
     assert calls["points"] == new.cache_size(cache) + counters["max_level_midpoints"]
+
+
+def test_min_angle_of_an_equilateral_triangle():
+    tri = backend.as_array(
+        np.array([[[0.0, 0.0], [1.0, 0.0], [0.5, np.sqrt(3) / 2]]]),
+        dtype=backend.float64,
+    )
+    assert backend.to_numpy(new.min_angle(tri))[0] == pytest.approx(np.pi / 3)
+
+
+def test_min_angle_of_a_degenerate_triangle_is_zero_not_nan():
+    tri = backend.as_array(
+        np.array([[[0.0, 0.0], [0.0, 0.0], [0.0, 0.0]]]), dtype=backend.float64
+    )
+    assert backend.to_numpy(new.min_angle(tri))[0] == 0.0
+
+
+def test_canonical_order_is_independent_of_input_order():
+    cache, active, store, _ = _run_new(_sie_like, 4.0, 3, 0.25, 3)
+    lat = new.make_lattice(4.0, 0.0, 0.0, 3, 4)
+    v, _, _, _ = new.store_compact(store)
+
+    order = backend.to_numpy(new.canonical_order(lat, cache, v))
+    v_np = backend.to_numpy(v)
+
+    rng = np.random.default_rng(3)
+    perm = rng.permutation(v_np.shape[0])
+    v_shuf = backend.as_array(v_np[perm], dtype=backend.int64)
+    order_shuf = backend.to_numpy(new.canonical_order(lat, cache, v_shuf))
+
+    assert v_np[order].tolist() == v_np[perm][order_shuf].tolist()
+
+
+def test_closure_matches_the_oracle():
+    cache, active, store, _ = _run_new(_sie_like, 4.0, 3, 0.25, 3)
+    ref = _run_old(_sie_like, 4.0, 3, 0.25, 3)
+    lat = new.make_lattice(4.0, 0.0, 0.0, 3, 4)
+    lat_old = oracle._Lattice(4.0, 0.0, 0.0, 3, 4)
+
+    v, level, _, status = new.store_compact(store)
+    order = new.canonical_order(lat, cache, v)
+    v, level, status = v[order], level[order], status[order]
+    leaves, origin, out_level, out_status = new.close(
+        lat, cache, active, v, level, status
+    )
+
+    v_o, lvl_o, _, st_o = ref.store.compact()
+    order_o = oracle._canonical_order(lat_old, ref.cache, v_o)
+    v_o, lvl_o, st_o = v_o[order_o], lvl_o[order_o], st_o[order_o]
+    leaves_o, origin_o, lvl_out_o, st_out_o = oracle._close(
+        lat_old, ref.cache, ref.active, v_o, lvl_o, st_o
+    )
+
+    key = lambda arr, ij: np.sort(lat_old.key(ij[arr]), axis=1)  # noqa: E731
+    assert sorted(
+        map(tuple, key(backend.to_numpy(leaves), backend.to_numpy(cache.ij)).tolist())
+    ) == sorted(map(tuple, key(leaves_o, ref.cache.ij).tolist()))
+    assert backend.to_numpy(origin).tolist() == origin_o.tolist()
+    assert backend.to_numpy(out_level).tolist() == lvl_out_o.tolist()
+    assert backend.to_numpy(out_status).tolist() == st_out_o.tolist()
+
+
+def test_closure_origin_is_non_decreasing():
+    cache, active, store, _ = _run_new(_sie_like, 4.0, 3, 0.25, 3)
+    lat = new.make_lattice(4.0, 0.0, 0.0, 3, 4)
+    v, level, _, status = new.store_compact(store)
+    order = new.canonical_order(lat, cache, v)
+    _, origin, _, _ = new.close(
+        lat, cache, active, v[order], level[order], status[order]
+    )
+    o = backend.to_numpy(origin)
+    assert (
+        np.diff(o) >= 0
+    ).all(), "origin must be non-decreasing for segment reduction"
+
+
+# ---------------------------------------------------------------------------
+# Ported from tests/test_adaptive_mesh.py's closure tests, which called
+# `_canonical_order`/`_close` directly on `caustics.lenses.adaptive` (still
+# byte-identical to the frozen oracle at the time of this port).
+# `test_min_angle_of_an_equilateral_triangle` and
+# `test_canonical_order_is_independent_of_input_order` are not re-added here:
+# both names are already defined above, verbatim from the brief, covering the
+# same properties -- re-porting the legacy bodies under the same names would
+# just silently shadow the Step-1 versions rather than add coverage, since a
+# second `def` of the same name in one module replaces the first in pytest's
+# collection. Their legacy counterparts were deleted with no replacement body.
+# ---------------------------------------------------------------------------
+
+
+def _closed_mesh(fn, **kw):
+    """Backend port of the legacy ``closed_mesh`` helper."""
+    cache, active, store, counters, lat, calls, max_level = _refine_with(fn, **kw)
+    v, level, _, status = new.store_compact(store)
+    order = new.canonical_order(lat, cache, v)
+    v, level, status = v[order], level[order], status[order]
+    # Captured BEFORE closure. `close` must add no vertices, so a test checking
+    # `leaves` against the cache size has to use a bound that predates the call;
+    # reading `cache_size` afterwards would silently absorb any growth into the
+    # bound and the check could never fail.
+    n_cache_pre = new.cache_size(cache)
+    leaves, origin, out_level, out_status = new.close(
+        lat, cache, active, v, level, status
+    )
+    return (
+        cache,
+        active,
+        lat,
+        v,
+        level,
+        status,
+        leaves,
+        origin,
+        out_level,
+        out_status,
+        n_cache_pre,
+    )
+
+
+def _undirected_edges(lat, cache, leaves):
+    k = backend.to_numpy(new.lattice_key(lat, cache.ij[leaves]))  # (L, 3)
+    e = np.stack([k[:, [0, 1]], k[:, [1, 2]], k[:, [2, 0]]], axis=1)
+    return np.sort(e, axis=-1).reshape(-1, 2)
+
+
+def _hanging_nodes(lat, cache, active, slots):
+    """Hanging-node mask, the same predicate ``close`` itself applies.
+
+    No exactness gate: the lattice is one level finer than max_level, so
+    `midpoint_ij` is exact at every level and this names true midpoints
+    everywhere. A max_level midpoint has an odd coordinate and is never
+    cached, so `active_contains` reads it as absent -- which is correct, not
+    an artifact.
+    """
+    mid_keys = new.lattice_key(lat, new.midpoint_ij(cache.ij[slots]))
+    return new.active_contains(active, cache, mid_keys)
+
+
+def _gaussian_bump(p, w=0.08, amp=1.0, c=(0.13, 0.07)):
+    """Narrow Gaussian bump, curved enough to reach ``close``'s ``count == 3`` branch.
+
+    An ``init_res=8`` grid over this map is coarse enough that most triangles
+    converge quickly while a few interior ones split deep enough to leave a
+    fully-hanging (3-node) origin behind for ``close`` to red-split.
+    """
+    centre = np.asarray(c)
+    r2 = ((p - centre) ** 2).sum(axis=-1)
+    return p * 0.5 + (amp * np.exp(-r2 / (2 * w**2)))[:, None] * np.array([1.0, 0.3])
+
+
+def test_closure_makes_every_edge_appear_once_or_twice():
+    cache, active, lat, v, pre_lvl, pre_st, leaves, origin, lvl, st, n_pre = (
+        _closed_mesh(_localised_fold, min_img_sep=0.05)
+    )
+    edges = _undirected_edges(lat, cache, leaves)
+    _, counts = np.unique(edges, axis=0, return_counts=True)
+    assert set(np.unique(counts)) <= {1, 2}
+
+
+def test_closure_leaves_no_hanging_node():
+    """The property closure exists for, checked directly on the closed mesh.
+
+    Edge multiplicity cannot substitute for this: a hanging node never raises
+    any edge's count (the coarse triangle contributes ``(A, B)`` once, the finer
+    neighbours contribute only ``(A, M)`` and ``(M, B)``), so a closure that
+    left hanging nodes behind would still show multiplicities inside ``{1, 2}``.
+    Multiplicity catches over-generation; this catches under-closure.
+    """
+    cache, active, lat, v, pre_lvl, pre_st, leaves, origin, lvl, st, n_pre = (
+        _closed_mesh(_localised_fold, min_img_sep=0.05)
+    )
+    assert bool(backend.any(_hanging_nodes(lat, cache, active, v))), "nothing to close"
+    assert not bool(backend.any(_hanging_nodes(lat, cache, active, leaves)))
+
+
+def test_pre_closure_mesh_is_not_already_conforming():
+    """Guard against a fixture where closure has nothing to do.
+
+    Tested with the hanging-node predicate directly rather than via
+    undirected-edge multiplicity, because a hanging node does not raise any
+    edge's count: a coarse triangle contributes its edge ``(A, B)`` exactly once
+    while the finer neighbours contribute the half-edges ``(A, M)`` and
+    ``(M, B)`` -- never ``(A, B)``, since no fine triangle has both endpoints. So
+    a mesh riddled with hanging nodes has the same ``{1, 2}`` multiplicity
+    profile as a conforming one, and hanging nodes are indistinguishable from
+    domain-boundary edges by counting alone.
+    This is the same predicate :func:`close` itself uses to classify each leaf.
+    On the widened lattice it needs no exactness gate: `midpoint_ij` is exact
+    at every level, so a True here is a genuine hanging node and never the
+    collapsed-pseudo-midpoint artifact the narrow lattice produced.
+    """
+    cache, active, store, counters, lat, calls, max_level = _refine_with(
+        _localised_fold, min_img_sep=0.05
+    )
+    v, level, _, status = new.store_compact(store)
+    assert bool(
+        backend.any(_hanging_nodes(lat, cache, active, v))
+    ), "fixture has no hanging nodes"
+
+
+def test_closure_preserves_orientation_and_inherits_level_and_status():
+    cache, active, lat, v, pre_lvl, pre_st, leaves, origin, lvl, st, n_pre = (
+        _closed_mesh(_localised_fold, min_img_sep=0.05)
+    )
+    tri = new.lattice_xy(lat, cache.ij[leaves])
+    assert bool(backend.all(_signed_area(tri) > 0))
+    assert backend.to_numpy(lvl).tolist() == backend.to_numpy(pre_lvl[origin]).tolist()
+    assert backend.to_numpy(st).tolist() == backend.to_numpy(pre_st[origin]).tolist()
+    assert lvl.shape == (leaves.shape[0],) and st.shape == (leaves.shape[0],)
+
+
+def test_leaf_origin_groups_are_contiguous_and_tile_their_origin():
+    cache, active, lat, v, pre_lvl, pre_st, leaves, origin, lvl, st, n_pre = (
+        _closed_mesh(_localised_fold, min_img_sep=0.05)
+    )
+    origin_np = backend.to_numpy(origin)
+    assert (np.diff(origin_np) >= 0).all(), "origin must be non-decreasing"
+    child_area = backend.to_numpy(_signed_area(new.lattice_xy(lat, cache.ij[leaves])))
+    origin_area = backend.to_numpy(_signed_area(new.lattice_xy(lat, cache.ij[v])))
+    summed = np.zeros_like(origin_area)
+    np.add.at(summed, origin_np, child_area)
+    assert np.allclose(summed, origin_area, rtol=1e-12)
+
+
+def test_unclosed_leaf_is_its_own_origin_geometry():
+    cache, active, lat, v, pre_lvl, pre_st, leaves, origin, lvl, st, n_pre = (
+        _closed_mesh(_localised_fold, min_img_sep=0.05)
+    )
+    origin_np = backend.to_numpy(origin)
+    _, counts = np.unique(origin_np, return_counts=True)
+    solo = np.flatnonzero(counts == 1)
+    assert solo.size > 0
+    v_np = backend.to_numpy(v)
+    leaves_np = backend.to_numpy(leaves)
+    for o in solo[:20]:
+        row = np.flatnonzero(origin_np == o)[0]
+        assert np.array_equal(leaves_np[row], v_np[o])
+
+
+def test_closure_adds_no_new_vertices():
+    """Bound taken before closure, so the assertion can actually fail.
+
+    Reading ``cache_size`` after ``close`` returns would fold any vertices it
+    inserted into the bound itself, making the check unfalsifiable -- it
+    passed against a known-buggy ``close`` for exactly that reason.
+    """
+    cache, active, lat, v, pre_lvl, pre_st, leaves, origin, lvl, st, n_pre = (
+        _closed_mesh(_localised_fold, min_img_sep=0.05)
+    )
+    leaves_np = backend.to_numpy(leaves)
+    assert leaves_np.max() < n_pre
+    assert set(np.unique(leaves_np)) <= set(range(n_pre))
+
+
+def test_closure_re_emits_every_origin_vertex():
+    """Every closure pattern re-emits all three of its origin's vertices.
+
+    `build_adaptive_mesh` unions the closed leaves' slots with the pre-closure
+    leaves' slots to decide which vertices to keep. That second term is
+    redundant *if* this holds for all four patterns -- count 0 emits `v`
+    itself, count 1 emits `(v_i, v_j, m_i)` and `(v_i, m_i, v_k)`, count 2 the
+    corner `(v_c, m_b, m_a)` plus two triangles spanning `v_a` and `v_b`, and
+    count 3 is the red split, whose children include all three. Dropping the
+    term without this test would be an unchecked proof.
+    """
+    for fn, kw in (
+        (_localised_fold, dict(min_img_sep=0.02)),
+        (lambda p: np.stack([p[:, 0], p[:, 1] ** 2], axis=-1), dict(min_img_sep=0.05)),
+        (_gaussian_bump, dict(fov=4.0, init_res=8, min_img_sep=0.02)),
+    ):
+        cache, active, store, counters, lat, calls, max_level = _refine_with(fn, **kw)
+        v, level, _, status = new.store_compact(store)
+        order = new.canonical_order(lat, cache, v)
+        v, level, status = v[order], level[order], status[order]
+        leaves, origin, _, _ = new.close(lat, cache, active, v, level, status)
+        v_np = backend.to_numpy(v)
+        leaves_np = backend.to_numpy(leaves)
+        origin_np = backend.to_numpy(origin)
+        # Not merely "the sets agree": each origin's own three slots must appear
+        # among the leaves that origin produced, which is the property the
+        # union relies on.
+        for row in range(v_np.shape[0]):
+            emitted = set(leaves_np[origin_np == row].reshape(-1).tolist())
+            assert set(v_np[row].tolist()) <= emitted, f"origin {row} lost a vertex"
+
+
+def test_close_reaches_the_count_equals_3_branch_via_a_gaussian_bump():
+    """``close``'s ``count == 3`` branch, which no other fixture reaches.
+
+    That branch re-derives the red split with a raw ``concatenate`` + fancy-index
+    gather rather than calling ``red_split``, so ``red_split``'s own tests give
+    it zero coverage. A narrow Gaussian bump gives an ``init_res=8`` grid coarse
+    enough that most triangles converge quickly while a few interior ones split
+    deep enough to leave a fully-hanging (3-node) origin behind for ``close`` to
+    red-split.
+
+    STALE-TEST UPDATE: the legacy docstring recorded ``n_closure_by_pattern ==
+    (244, 42, 6)``. That is no longer what the frozen oracle itself produces on
+    this exact fixture -- unrelated to the b6dc3eb status rename this file's
+    other STALE-TEST UPDATEs describe, since this test never inspects status.
+    Verified by calling `oracle._refine`/`oracle._canonical_order`/
+    `oracle._close` directly (the same frozen functions `_run_old` wraps) on
+    `_gaussian_bump` with these exact arguments: 2408 pre-closure leaves, 2752
+    post-closure leaves, pattern ``(248, 39, 6)``, reproduced twice for
+    determinism. The six-triangle count-3 branch this test exists to reach is
+    unaffected.
+    """
+    cache, active, lat, v, pre_lvl, pre_st, leaves, origin, lvl, st, n_pre = (
+        _closed_mesh(_gaussian_bump, fov=4.0, init_res=8, min_img_sep=0.02)
+    )
+    origin_np = backend.to_numpy(origin)
+    group_sizes = np.bincount(origin_np, minlength=v.shape[0])
+    pattern = (
+        int((group_sizes == 2).sum()),
+        int((group_sizes == 3).sum()),
+        int((group_sizes == 4).sum()),
+    )
+    assert pattern[2] > 0, f"fixture must reach the count == 3 branch, got {pattern}"
+    assert pattern == (248, 39, 6), f"measured n_closure_by_pattern={pattern}"
+
+    tri = new.lattice_xy(lat, cache.ij[leaves])
+    assert bool(
+        backend.all(_signed_area(tri) > 0)
+    ), "every leaf must be positively oriented"
+
+    origin_area = backend.to_numpy(_signed_area(new.lattice_xy(lat, cache.ij[v])))
+    summed = np.zeros_like(origin_area)
+    np.add.at(summed, origin_np, backend.to_numpy(_signed_area(tri)))
+    assert np.allclose(
+        summed, origin_area, rtol=1e-12
+    ), "origin-group areas must tile their origin exactly"
