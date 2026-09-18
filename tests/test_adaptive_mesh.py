@@ -16,13 +16,11 @@ from caustics.lenses.adaptive import (
     _dedup_representatives,
     _depth_floor,
     _edge_quarter_keys,
-    _initial_triangles,
     _invalidate_nonfinite_origins,
     _Lattice,
     _make_raytrace_np,
     _midpoint_ij,
     _min_angle,
-    _red_split,
     _refine,
     _trace_keys,
     build_adaptive_mesh,
@@ -53,65 +51,6 @@ def signed_area(tri):
     """Twice the signed area of a (..., 3, 2) triangle."""
     P = shape_matrix(tri)
     return P[..., 0, 0] * P[..., 1, 1] - P[..., 0, 1] * P[..., 1, 0]
-
-
-def test_initial_triangles_tile_the_square_and_are_positively_oriented():
-    M, G, COMPOSE, PINV0, ROOT_CLASS = child_matrix_tables()
-    init_res, max_level = 4, 2
-    ij, cls = _initial_triangles(init_res, max_level, ROOT_CLASS)
-    assert ij.shape == (2 * init_res**2, 3, 2)
-    area = signed_area(ij.astype(np.float64))
-    assert (area > 0).all()
-    step = 1 << max_level
-    assert np.isclose(area.sum() / 2, (init_res * step) ** 2)
-    assert set(np.unique(cls)) == {int(ROOT_CLASS[0]), int(ROOT_CLASS[1])}
-
-
-def test_midpoints_are_exact_integers_and_opposite_their_vertex():
-    ij = np.array([[[0, 0], [4, 0], [0, 4]]], dtype=np.int64)
-    m = _midpoint_ij(ij)
-    assert np.array_equal(m[0], np.array([[2, 2], [0, 2], [2, 0]]))
-
-
-def test_midpoints_are_exact_at_max_level_on_the_widened_lattice():
-    """The reason the lattice is one level finer than max_level.
-
-    With the lattice at max_level a triangle's edges are one unit long and
-    `_midpoint_ij`'s floor division collapses each "midpoint" onto one of that
-    edge's own endpoints. One level finer, every edge vector is even at every
-    level up to and including max_level, so the midpoints are genuine lattice
-    points -- and they are exactly the points with an odd coordinate, which is
-    what guarantees they can never collide with a cached vertex.
-    """
-    M, G, COMPOSE, PINV0, ROOT_CLASS = child_matrix_tables()
-    max_level = 3
-    lat = _Lattice(4.0, 0.0, 0.0, 2, max_level + 1)
-    ij, cls = _initial_triangles(2, lat.level, ROOT_CLASS)
-    # Descend to max_level by taking child C_4 (the middle child) each time.
-    for _ in range(max_level):
-        ij = _midpoint_ij(ij)
-    assert (ij % 2 == 0).all(), "max_level vertices are even"
-
-    mid = _midpoint_ij(ij)
-    # Exact: the floor division threw nothing away.
-    assert (
-        (ij[:, [1, 2, 0]] + ij[:, [2, 0, 1]]) % 2 == 0
-    ).all(), "edge endpoint sums must be even for the midpoint to be exact"
-    # Every midpoint has an odd coordinate, so it is not a vertex of any level.
-    assert (mid % 2 == 1).any(axis=-1).all()
-
-
-def test_red_split_is_triangle_major_and_advances_the_class():
-    M, G, COMPOSE, PINV0, ROOT_CLASS = child_matrix_tables()
-    v = np.array([[0, 1, 2], [3, 4, 5]], dtype=np.int64)
-    m = np.array([[6, 7, 8], [9, 10, 11]], dtype=np.int64)
-    cls = np.array([0, 4], dtype=np.int64)
-    cv, cc = _red_split(v, m, cls, COMPOSE)
-    assert cv.shape == (8, 3) and cc.shape == (8,)
-    assert cv[0].tolist() == [0, 8, 7]  # C_1 = (theta1, m3, m2)
-    assert cv[3].tolist() == [6, 7, 8]  # C_4 = (m1, m2, m3)
-    assert cc[:4].tolist() == COMPOSE[0].tolist()
-    assert cc[4:].tolist() == COMPOSE[4].tolist()
 
 
 def make_counting_raytrace(fn):
@@ -432,15 +371,6 @@ def assert_balanced(ref, lat, max_level):
         sel = level == lv
         keys = _edge_quarter_keys(lat, ref.cache.ij[v[sel]])
         assert not ref.active.contains(keys).any(), f"unbalanced at level {lv}"
-
-
-def test_edge_quarter_keys_are_lattice_points_of_both_quarters():
-    lat = _Lattice(4.0, 0.0, 0.0, 1, 4)  # n = 16
-    ij = np.array([[[0, 0], [16, 0], [0, 16]]], dtype=np.int64)
-    keys = _edge_quarter_keys(lat, ij)
-    got = {tuple(p) for p in lat.ij_from_key(keys[0])}
-    assert (4, 0) in got and (12, 0) in got  # edge (0,1)
-    assert (0, 4) in got and (0, 12) in got  # edge (2,0)
 
 
 def test_find_unbalanced_matches_the_six_quarter_key_reference_during_the_cascade(

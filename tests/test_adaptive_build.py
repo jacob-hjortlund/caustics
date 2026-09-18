@@ -312,3 +312,123 @@ def test_store_remove_does_not_mutate_its_input():
     assert backend.to_numpy(before).tolist() == [True, True]
     assert backend.to_numpy(store.valid).tolist() == [True, True]
     assert backend.to_numpy(after.valid).tolist() == [False, True]
+
+
+def test_initial_triangles_match_the_oracle():
+    _, _, _, _, root_class = new.child_matrix_tables()
+    ij, cls = new.initial_triangles(3, 2, root_class)
+    want_ij, want_cls = oracle._initial_triangles(3, 2, oracle.child_matrix_tables()[4])
+    assert backend.to_numpy(ij).tolist() == want_ij.tolist()
+    assert backend.to_numpy(cls).tolist() == want_cls.tolist()
+
+
+def test_midpoint_ij_matches_the_oracle_and_is_exact():
+    ij = np.array([[[0, 0], [4, 0], [0, 4]], [[2, 2], [6, 2], [2, 6]]], dtype=np.int64)
+    got = backend.to_numpy(new.midpoint_ij(_i64(ij)))
+    assert got.tolist() == oracle._midpoint_ij(ij).tolist()
+    # opposite-vertex convention: m_i bisects the edge opposite theta_i
+    assert got[0, 0].tolist() == [2, 2]
+
+
+def test_red_split_matches_the_oracle():
+    _, _, compose, _, _ = new.child_matrix_tables()
+    v = _i64([[0, 1, 2], [3, 4, 5]])
+    m = _i64([[6, 7, 8], [9, 10, 11]])
+    cls = _i64([0, 3])
+    child_v, child_cls = new.red_split(v, m, cls, compose)
+    want_v, want_cls = oracle._red_split(
+        np.array([[0, 1, 2], [3, 4, 5]]),
+        np.array([[6, 7, 8], [9, 10, 11]]),
+        np.array([0, 3]),
+        oracle.child_matrix_tables()[2],
+    )
+    assert backend.to_numpy(child_v).tolist() == want_v.tolist()
+    assert backend.to_numpy(child_cls).tolist() == want_cls.tolist()
+
+
+def test_edge_quarter_keys_match_the_oracle():
+    lat = new.make_lattice(4.0, 0.0, 0.0, 2, 3)
+    old = oracle._Lattice(4.0, 0.0, 0.0, 2, 3)
+    ij = np.array([[[0, 0], [8, 0], [0, 8]]], dtype=np.int64)
+    got = backend.to_numpy(new.edge_quarter_keys(lat, _i64(ij)))
+    assert got.tolist() == oracle._edge_quarter_keys(old, ij).tolist()
+
+
+def test_initial_triangles_tile_the_square_and_are_positively_oriented():
+    """Ported from `test_adaptive_mesh.py`: geometric properties that the
+    oracle-comparison test above does not check -- full square coverage and
+    a consistent positive orientation -- rather than element-wise equality
+    with the oracle.
+    """
+    _, _, _, _, root_class = new.child_matrix_tables()
+    init_res, max_level = 4, 2
+    ij, cls = new.initial_triangles(init_res, max_level, root_class)
+    assert ij.shape == (2 * init_res**2, 3, 2)
+    P = new.shape_matrix(backend.to(ij, dtype=backend.float64))
+    area = P[..., 0, 0] * P[..., 1, 1] - P[..., 0, 1] * P[..., 1, 0]
+    assert bool(backend.all(area > 0))
+    step = 1 << max_level
+    assert np.isclose(float(backend.sum(area)) / 2, (init_res * step) ** 2)
+    assert set(backend.to_numpy(cls).tolist()) == set(
+        backend.to_numpy(root_class).tolist()
+    )
+
+
+def test_midpoints_are_exact_integers_and_opposite_their_vertex():
+    ij = np.array([[[0, 0], [4, 0], [0, 4]]], dtype=np.int64)
+    m = new.midpoint_ij(_i64(ij))
+    assert backend.to_numpy(m)[0].tolist() == [[2, 2], [0, 2], [2, 0]]
+
+
+def test_midpoints_are_exact_at_max_level_on_the_widened_lattice():
+    """The reason the lattice is one level finer than max_level.
+
+    With the lattice at max_level a triangle's edges are one unit long and
+    `midpoint_ij`'s floor division collapses each "midpoint" onto one of that
+    edge's own endpoints. One level finer, every edge vector is even at every
+    level up to and including max_level, so the midpoints are genuine lattice
+    points -- and they are exactly the points with an odd coordinate, which is
+    what guarantees they can never collide with a cached vertex.
+    """
+    _, _, _, _, root_class = new.child_matrix_tables()
+    max_level = 3
+    lat = new.make_lattice(4.0, 0.0, 0.0, 2, max_level + 1)
+    ij, cls = new.initial_triangles(2, lat.level, root_class)
+    # Descend to max_level by taking child C_4 (the middle child) each time.
+    for _ in range(max_level):
+        ij = new.midpoint_ij(ij)
+    assert bool(backend.all(ij % 2 == 0)), "max_level vertices are even"
+
+    mid = new.midpoint_ij(ij)
+    # Exact: the floor division threw nothing away.
+    assert bool(
+        backend.all((ij[:, [1, 2, 0]] + ij[:, [2, 0, 1]]) % 2 == 0)
+    ), "edge endpoint sums must be even for the midpoint to be exact"
+    # Every midpoint has an odd coordinate, so it is not a vertex of any level.
+    assert bool(backend.all(backend.any(mid % 2 == 1, dim=-1)))
+
+
+def test_red_split_is_triangle_major_and_advances_the_class():
+    _, _, compose, _, _ = new.child_matrix_tables()
+    v = _i64([[0, 1, 2], [3, 4, 5]])
+    m = _i64([[6, 7, 8], [9, 10, 11]])
+    cls = _i64([0, 4])
+    cv, cc = new.red_split(v, m, cls, compose)
+    assert cv.shape == (8, 3) and cc.shape == (8,)
+    cv_np = backend.to_numpy(cv)
+    cc_np = backend.to_numpy(cc)
+    compose_np = backend.to_numpy(compose)
+    assert cv_np[0].tolist() == [0, 8, 7]  # C_1 = (theta1, m3, m2)
+    assert cv_np[3].tolist() == [6, 7, 8]  # C_4 = (m1, m2, m3)
+    assert cc_np[:4].tolist() == compose_np[0].tolist()
+    assert cc_np[4:].tolist() == compose_np[4].tolist()
+
+
+def test_edge_quarter_keys_are_lattice_points_of_both_quarters():
+    lat = new.make_lattice(4.0, 0.0, 0.0, 1, 4)  # n = 16
+    ij = np.array([[[0, 0], [16, 0], [0, 16]]], dtype=np.int64)
+    keys = new.edge_quarter_keys(lat, _i64(ij))
+    ij_from_key = backend.to_numpy(new.lattice_ij_from_key(lat, keys[0]))
+    got = {tuple(p) for p in ij_from_key}
+    assert (4, 0) in got and (12, 0) in got  # edge (0,1)
+    assert (0, 4) in got and (0, 12) in got  # edge (2,0)

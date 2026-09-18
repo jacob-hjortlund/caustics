@@ -60,6 +60,11 @@ __all__ = (
     "store_add",
     "store_remove",
     "store_compact",
+    "initial_triangles",
+    "midpoint_ij",
+    "red_split",
+    "edge_quarter_keys",
+    "find_unbalanced",
 )
 
 # ---------------------------------------------------------------------------
@@ -79,6 +84,11 @@ ROOT_SHAPES = (
     ((0, 0), (1, 1), (0, 1)),
     ((0, 0), (1, 0), (1, 1)),
 )
+
+# `CHILD_VERTEX_INDICES` as a single backend int64 array, built once, so
+# `red_split` can gather all four children with one fancy-indexing op rather
+# than three separate per-axis index lists.
+_CHILD_VERTEX_INDEX_TABLE = backend.as_array(CHILD_VERTEX_INDICES, dtype=backend.int64)
 
 
 def shape_matrix(tri):
@@ -1087,3 +1097,203 @@ def store_compact(store) -> Tuple[ArrayLike, ArrayLike, ArrayLike, ArrayLike]:
     """The surviving rows of ``v``, ``level``, ``cls`` and ``status``."""
     keep = backend.flatnonzero(store.valid)
     return store.v[keep], store.level[keep], store.cls[keep], store.status[keep]
+
+
+# ---------------------------------------------------------------------------
+# Triangle helpers and 2:1 balance detection
+# ---------------------------------------------------------------------------
+
+
+def initial_triangles(
+    init_res, lattice_level, root_class
+) -> Tuple[ArrayLike, ArrayLike]:
+    """
+    Level-0 triangles: two per cell, split on the ``(0,0)-(1,1)`` diagonal.
+
+    Both are emitted positively oriented. ``func/base.py`` builds its pair with
+    *opposite* handedness; this fixes that so orientation is globally consistent
+    and downstream degree or winding-number arguments stay available.
+
+    Built with a ``backend.meshgrid(..., indexing="ij")`` cell grid, flattened
+    in the same row-major order ``numpy`` uses -- the oracle test compares the
+    result element by element, so a transposed ordering fails loudly rather
+    than quietly.
+
+    Parameters
+    ----------
+    init_res: int
+        Level-0 grid resolution.
+    lattice_level: int
+        Level the lattice is built at -- one finer than ``max_level``, see
+        :class:`Lattice`.
+    root_class: ArrayLike
+        ``ROOT_CLASS`` from :func:`child_matrix_tables`, shape ``(2,)``.
+
+    Returns
+    -------
+    ij: ArrayLike
+        ``(2 * init_res**2, 3, 2)`` int64 lattice coordinates.
+    cls: ArrayLike
+        ``(2 * init_res**2,)`` int64 orientation classes.
+    """
+    step = 1 << int(lattice_level)
+    axis = backend.arange(init_res, dtype=backend.int64)
+    i, j = backend.meshgrid(axis, axis, indexing="ij")
+    base = backend.stack((i.reshape(-1), j.reshape(-1)), dim=-1) * step  # (r**2, 2)
+    blocks, classes = [], []
+    for s, shape in enumerate(ROOT_SHAPES):
+        offs = backend.as_array(shape, dtype=backend.int64) * step  # (3, 2)
+        blocks.append(base[:, None, :] + offs[None, :, :])
+        classes.append(
+            backend.zeros((base.shape[0],), dtype=backend.int64) + root_class[s]
+        )
+    return backend.concatenate(blocks, dim=0), backend.concatenate(classes, dim=0)
+
+
+def midpoint_ij(ij) -> ArrayLike:
+    """
+    Edge midpoints ``m1, m2, m3``, with ``m_i`` opposite ``theta_i``.
+
+    Exact integer averaging via integer ``//``: the lattice is one level finer
+    than ``max_level`` (see :class:`Lattice`), so the coordinate sums are even
+    at every level up to and including ``max_level``.
+
+    Parameters
+    ----------
+    ij: ArrayLike
+        Triangle vertex coordinates, shape ``(n, 3, 2)`` int64.
+
+    Returns
+    -------
+    ArrayLike
+        Shape ``(n, 3, 2)`` int64.
+    """
+    return backend.stack(
+        (
+            (ij[:, 1] + ij[:, 2]) // 2,
+            (ij[:, 2] + ij[:, 0]) // 2,
+            (ij[:, 0] + ij[:, 1]) // 2,
+        ),
+        dim=1,
+    )
+
+
+def red_split(v, m, cls, compose) -> Tuple[ArrayLike, ArrayLike]:
+    """
+    Split into the four canonical children, triangle-major.
+
+    Parameters
+    ----------
+    v: ArrayLike
+        Triangle vertex slots, shape ``(n, 3)`` int64.
+    m: ArrayLike
+        Edge-midpoint slots ``m1, m2, m3``, shape ``(n, 3)`` int64.
+    cls: ArrayLike
+        Orientation class of each triangle, shape ``(n,)`` int64.
+    compose: ArrayLike
+        ``COMPOSE`` from :func:`child_matrix_tables`, shape ``(6, 4)``.
+
+    Returns
+    -------
+    child_v: ArrayLike
+        ``(4n, 3)`` vertex slots, ordered as all four children of triangle 0,
+        then triangle 1, and so on.
+    child_cls: ArrayLike
+        ``(4n,)`` orientation classes, in the same order.
+    """
+    six = backend.concatenate([v, m], dim=1)  # (n, 6)
+    child_v = six[:, _CHILD_VERTEX_INDEX_TABLE].reshape(-1, 3)
+    child_cls = compose[cls].reshape(-1)
+    return child_v, child_cls
+
+
+def edge_quarter_keys(lat, ij) -> ArrayLike:
+    """
+    Keys of both quarter points on each of the three edges.
+
+    A neighbour across an edge that is two or more levels finer has one of
+    these as a vertex, so six hash lookups decide balance for a triangle --
+    no edge-to-triangle adjacency table and no ancestry walk. Both quarter
+    points are checked because the neighbour across an edge can itself be
+    non-uniform.
+
+    The caller must only pass triangles at level ``<= max_level - 2``, where
+    the edge vectors are divisible by four and the quarter points are lattice
+    points.
+
+    Parameters
+    ----------
+    lat: Lattice
+        Used to key the quarter points.
+    ij: ArrayLike
+        Lattice coordinates, shape ``(n, 3, 2)`` int64.
+
+    Returns
+    -------
+    ArrayLike
+        Shape ``(n, 6)`` int64.
+    """
+    a = ij[:, [0, 1, 2], :]
+    b = ij[:, [1, 2, 0], :]
+    delta = (b - a) // 4
+    return backend.concatenate(
+        (lattice_key(lat, a + delta), lattice_key(lat, b - delta)), dim=1
+    )
+
+
+def find_unbalanced(store, cache, lat, active, max_level, frontier_level) -> ArrayLike:
+    """
+    Rows of ``store`` carrying an active quarter point on some edge.
+
+    Two independent level bounds apply. ``level <= frontier_level - 2`` is an
+    optimization: only triangles at least two levels coarser than the
+    frontier can have been invalidated by it, so the scan skips most of the
+    store. ``level <= max_level - 2`` is the bound above which no neighbour
+    can be two levels finer, since ``max_level`` is the finest level there is.
+
+    Parameters
+    ----------
+    store: LeafStore
+        Terminal triangles; only rows with ``valid`` set are scanned.
+    cache: VertexCache
+        Supplies the lattice coordinates of each row's vertices.
+    lat: Lattice
+        Used to key the quarter points.
+    active: ArrayLike
+        Pre-existing active-vertex set; membership decides a violation.
+    max_level: int
+        Finest allowed level.
+    frontier_level: int
+        Level of the finest triangles created in the current round.
+
+    Returns
+    -------
+    ArrayLike
+        Int64 indices into ``store``'s rows.
+    """
+    # `frontier_level <= max_level` holds for every call the level loop
+    # makes, so the first term always binds and the second is unreachable
+    # defensive code today. Keep the min(): `max_level - 2` is the level
+    # above which no neighbour can be two levels finer, since `max_level` is
+    # the finest level there is. (It used to double as an integrality
+    # requirement for the quarter-point arithmetic below; on the widened
+    # lattice quarter points stay lattice points down to `max_level - 1`, so
+    # that role is gone and only the balance argument remains.)
+    bound = min(frontier_level - 2, max_level - 2)
+    cand = backend.flatnonzero(store.valid & (store.level <= bound))
+    if cand.shape[0] == 0:
+        return cand
+    ij = cache.ij[store.v[cand]]  # (n, 3, 2)
+    # One edge at a time, accumulating into a single `(n,)` mask, rather than
+    # building the whole `(cand, 6)` key array the way `edge_quarter_keys`
+    # does: the batched form held 153 MB at a million leaves -- the largest
+    # transient in the level loop. The disjunction is over the same six keys
+    # `edge_quarter_keys` returns; only the association changes.
+    hit = backend.zeros((cand.shape[0],), dtype=backend.bool)
+    for e in range(3):
+        a = ij[:, e, :]
+        b = ij[:, (e + 1) % 3, :]
+        delta = (b - a) // 4
+        for quarter in (a + delta, b - delta):
+            hit = hit | active_contains(active, cache, lattice_key(lat, quarter))
+    return cand[hit]
