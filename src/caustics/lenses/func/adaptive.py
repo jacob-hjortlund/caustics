@@ -50,6 +50,16 @@ __all__ = (
     "active_add_slots",
     "active_contains_slots",
     "active_contains",
+    "LEAF_CONVERGED",
+    "LEAF_SIZE_FLOOR",
+    "LEAF_FORCED",
+    "LEAF_INVALID",
+    "LEAF_NONFINITE",
+    "LeafStore",
+    "empty_store",
+    "store_add",
+    "store_remove",
+    "store_compact",
 )
 
 # ---------------------------------------------------------------------------
@@ -951,3 +961,129 @@ def active_contains(active, cache, keys) -> ArrayLike:
     and :func:`active_contains_slots` reads that as False.
     """
     return active_contains_slots(active, cache_lookup(cache, keys))
+
+
+# ---------------------------------------------------------------------------
+# Leaf store
+# ---------------------------------------------------------------------------
+
+# Why a terminal leaf stopped refining. Plain ints, not an ``IntEnum``:
+# ``status`` lives in a ``backend.int64`` array and is compared, scattered
+# and broadcast through backend ops the whole way, which a NumPy-flavoured
+# enum would fight at every one of those call sites for no benefit.
+#
+# ``LEAF_FORCED`` is distinct from ``LEAF_CONVERGED`` because a forced child
+# carries no criterion evidence at all -- that is exactly what auto-converging
+# decides -- so a caller auditing coverage must be able to tell them apart.
+# Closure triangles have no status of their own; they inherit their origin's.
+#
+# ``LEAF_INVALID`` has three sources, all of them at ``max_level`` or later. A
+# non-finite triangle is split unconditionally, so it can only come to rest at
+# ``max_level``, where no split is left. A ``max_level`` triangle whose four
+# hypothetical children do not share ``sign(det Q_k)`` straddles a fold at a
+# scale the mesh cannot resolve, and is condemned rather than answering
+# queries with a non-injective affine model. And nonfinite-origin propagation
+# at freeze time is the third source. All three bound the coverage hole by
+# the ``max_level`` leaf size rather than by ``fov / init_res``.
+LEAF_CONVERGED = 0
+LEAF_SIZE_FLOOR = 1
+LEAF_FORCED = 2
+LEAF_INVALID = 3
+LEAF_NONFINITE = 4
+
+
+class LeafStore(NamedTuple):
+    """
+    Terminal triangles, keyed by row index with a validity flag.
+
+    Not append-only: a triangle marked converged at level ``d`` can be
+    removed and replaced by descendants several levels later, when a distant
+    refinement cascades back to it. Hence the flag and the single compaction
+    at the end (:func:`store_compact`), rather than streaming into a flat
+    array as we go.
+
+    ``v`` holds the three vertex-cache slots of each leaf, shape ``(N, 3)``.
+    ``level``, ``cls``, ``status`` and ``valid`` are per-row, shape ``(N,)``.
+    ``status`` is ``backend.int64`` -- see the ``LEAF_*`` constants above.
+    """
+
+    v: ArrayLike
+    level: ArrayLike
+    cls: ArrayLike
+    status: ArrayLike
+    valid: ArrayLike
+
+
+def empty_store(device=None) -> LeafStore:
+    """An empty :class:`LeafStore`."""
+    return LeafStore(
+        v=backend.empty((0, 3), dtype=backend.int64, device=device),
+        level=backend.empty((0,), dtype=backend.int64, device=device),
+        cls=backend.empty((0,), dtype=backend.int64, device=device),
+        status=backend.empty((0,), dtype=backend.int64, device=device),
+        valid=backend.empty((0,), dtype=backend.bool, device=device),
+    )
+
+
+def _broadcast_row_field(value, n_rows) -> ArrayLike:
+    """A per-row array as-is, or a Python scalar broadcast to ``n_rows``."""
+    if hasattr(value, "shape"):
+        return value
+    return backend.zeros((n_rows,), dtype=backend.int64) + value
+
+
+def store_add(store, v, level, cls, status) -> Tuple[LeafStore, ArrayLike]:
+    """
+    Append triangles, returning their row indices.
+
+    ``level``, ``cls`` and ``status`` may each be a Python scalar or a
+    per-row array; a scalar is broadcast to the row count before
+    concatenating.
+
+    Returns
+    -------
+    LeafStore
+        The updated store.
+    ArrayLike
+        The row indices assigned to ``v``, in the order given.
+    """
+    start = store.v.shape[0]
+    k = v.shape[0]
+    rows = backend.arange(start, start + k, dtype=backend.int64)
+
+    new_store = LeafStore(
+        v=backend.concatenate([store.v, v], dim=0),
+        level=backend.concatenate([store.level, _broadcast_row_field(level, k)], dim=0),
+        cls=backend.concatenate([store.cls, _broadcast_row_field(cls, k)], dim=0),
+        status=backend.concatenate(
+            [store.status, _broadcast_row_field(status, k)], dim=0
+        ),
+        valid=backend.concatenate(
+            [store.valid, backend.ones((k,), dtype=backend.bool)], dim=0
+        ),
+    )
+    return new_store, rows
+
+
+def store_remove(store, rows) -> LeafStore:
+    """
+    Mark rows invalid, returning a NEW store; ``store`` itself is untouched.
+
+    Scatters into a copy of ``store.valid`` rather than ``store.valid``
+    itself: ``backend.fill_at_indices`` mutates its first argument in place
+    and returns it under torch, so writing straight into ``store.valid``
+    would silently clobber the input store's own array under torch while
+    leaving it (and every alias of it a caller might still hold) untouched
+    under jax -- the same backend divergence :func:`cache_insert` and
+    :func:`active_add_slots` avoid by always writing into a fresh buffer.
+    """
+    valid = backend.fill_at_indices(backend.copy(store.valid), rows, False)
+    return LeafStore(
+        v=store.v, level=store.level, cls=store.cls, status=store.status, valid=valid
+    )
+
+
+def store_compact(store) -> Tuple[ArrayLike, ArrayLike, ArrayLike, ArrayLike]:
+    """The surviving rows of ``v``, ``level``, ``cls`` and ``status``."""
+    keep = backend.flatnonzero(store.valid)
+    return store.v[keep], store.level[keep], store.cls[keep], store.status[keep]

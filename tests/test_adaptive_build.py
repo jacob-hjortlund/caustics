@@ -232,3 +232,83 @@ def test_cache_insert_keeps_ij_and_beta_aligned_with_their_slot_across_many_merg
     assert np.allclose(
         backend.to_numpy(cache.beta)[:, 0], probe.astype(np.float64) * 0.5
     )
+
+
+def test_store_add_remove_compact():
+    store = new.empty_store()
+    store, rows = new.store_add(
+        store, _i64([[0, 1, 2], [3, 4, 5]]), 1, _i64([0, 1]), new.LEAF_CONVERGED
+    )
+    assert backend.to_numpy(rows).tolist() == [0, 1]
+
+    store, rows2 = new.store_add(
+        store, _i64([[6, 7, 8]]), 2, _i64([2]), new.LEAF_FORCED
+    )
+    assert backend.to_numpy(rows2).tolist() == [2]
+
+    store = new.store_remove(store, _i64([0]))
+    v, level, cls, status = new.store_compact(store)
+    assert backend.to_numpy(v).tolist() == [[3, 4, 5], [6, 7, 8]]
+    assert backend.to_numpy(level).tolist() == [1, 2]
+    assert backend.to_numpy(status).tolist() == [new.LEAF_CONVERGED, new.LEAF_FORCED]
+
+
+def test_store_add_accepts_per_row_level_and_status():
+    store = new.empty_store()
+    store, _ = new.store_add(
+        store,
+        _i64([[0, 1, 2], [3, 4, 5]]),
+        _i64([1, 4]),
+        _i64([0, 1]),
+        _i64([new.LEAF_CONVERGED, new.LEAF_INVALID]),
+    )
+    _, level, _, status = new.store_compact(store)
+    assert backend.to_numpy(level).tolist() == [1, 4]
+    assert backend.to_numpy(status).tolist() == [new.LEAF_CONVERGED, new.LEAF_INVALID]
+
+
+def test_store_survives_many_small_adds_and_removals():
+    rng = np.random.default_rng(11)
+    store = new.empty_store()
+    alive = []
+    for i in range(40):
+        k = int(rng.integers(1, 5))
+        v = np.arange(3 * k).reshape(k, 3) + 100 * i
+        store, rows = new.store_add(store, _i64(v), i, _i64(np.zeros(k)), 0)
+        alive.extend(zip(backend.to_numpy(rows).tolist(), v.tolist()))
+        if len(alive) > 3 and i % 3 == 0:
+            drop = alive.pop(0)
+            store = new.store_remove(store, _i64([drop[0]]))
+    v_out, _, _, _ = new.store_compact(store)
+    assert backend.to_numpy(v_out).tolist() == [rec[1] for rec in alive]
+
+
+def test_leaf_status_constants_are_distinct_plain_ints():
+    values = [
+        new.LEAF_CONVERGED,
+        new.LEAF_SIZE_FLOOR,
+        new.LEAF_FORCED,
+        new.LEAF_INVALID,
+        new.LEAF_NONFINITE,
+    ]
+    assert values == [0, 1, 2, 3, 4]
+    assert all(type(v) is int for v in values)
+
+
+def test_store_remove_does_not_mutate_its_input():
+    """Regression test: torch's `fill_at_indices` mutates its argument in
+    place and returns it, so scattering straight into `store.valid` would
+    silently clobber the caller's own array under torch while leaving it
+    untouched under jax. `before` aliases the array the input store holds;
+    removing rows from the returned store must not be able to reach through
+    that alias.
+    """
+    store = new.empty_store()
+    store, _ = new.store_add(
+        store, _i64([[0, 1, 2], [3, 4, 5]]), 0, _i64([0, 0]), new.LEAF_CONVERGED
+    )
+    before = store.valid
+    after = new.store_remove(store, _i64([0]))
+    assert backend.to_numpy(before).tolist() == [True, True]
+    assert backend.to_numpy(store.valid).tolist() == [True, True]
+    assert backend.to_numpy(after.valid).tolist() == [False, True]

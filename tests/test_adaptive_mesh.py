@@ -19,7 +19,6 @@ from caustics.lenses.adaptive import (
     _initial_triangles,
     _invalidate_nonfinite_origins,
     _Lattice,
-    _LeafStore,
     _make_raytrace_np,
     _midpoint_ij,
     _min_angle,
@@ -54,36 +53,6 @@ def signed_area(tri):
     """Twice the signed area of a (..., 3, 2) triangle."""
     P = shape_matrix(tri)
     return P[..., 0, 0] * P[..., 1, 1] - P[..., 0, 1] * P[..., 1, 0]
-
-
-def test_leaf_store_survives_many_small_adds_and_removals():
-    """Buffered growth must not break `remove`, which writes through a view."""
-    store = _LeafStore()
-    for k in range(30):
-        rows = store.add(
-            np.arange(3 * k, 3 * k + 3).reshape(1, 3),
-            k,
-            np.zeros(1, np.int64),
-            LeafStatus.CONVERGED,
-        )
-        if k % 3 == 0:
-            store.remove(rows)
-    v, level, cls, status = store.compact()
-    assert v.shape == (20, 3)
-    assert level.tolist() == [k for k in range(30) if k % 3 != 0]
-
-
-def test_leaf_store_add_remove_compact():
-    store = _LeafStore()
-    rows = store.add(
-        np.arange(6).reshape(2, 3), 0, np.zeros(2, np.int64), LeafStatus.CONVERGED
-    )
-    store.add(np.arange(3).reshape(1, 3), 1, np.zeros(1, np.int64), LeafStatus.FORCED)
-    store.remove(rows[:1])
-    v, level, cls, status = store.compact()
-    assert v.shape == (2, 3)
-    assert level.tolist() == [0, 1]
-    assert status.tolist() == [LeafStatus.CONVERGED, LeafStatus.FORCED]
 
 
 def test_initial_triangles_tile_the_square_and_are_positively_oriented():
@@ -523,19 +492,6 @@ def test_find_unbalanced_matches_the_six_quarter_key_reference_during_the_cascad
     refine_with(localised_fold, min_img_sep=0.02)
 
     assert seen_nonempty, "shim never observed a non-empty violator set"
-
-
-def test_leaf_store_add_accepts_per_row_level_and_status():
-    store = _LeafStore()
-    store.add(
-        np.arange(6).reshape(2, 3),
-        np.array([1, 3]),
-        np.zeros(2, np.int64),
-        np.array([LeafStatus.FORCED, LeafStatus.INVALID]),
-    )
-    v, level, cls, status = store.compact()
-    assert level.tolist() == [1, 3]
-    assert status.tolist() == [LeafStatus.FORCED, LeafStatus.INVALID]
 
 
 def localised_fold(p):
