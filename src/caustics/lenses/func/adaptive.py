@@ -3,18 +3,15 @@ Pure kernels for the adaptive lens-plane mesh.
 
 This module has two clearly separated halves.
 
-**Host-side build kernels** operate on ``numpy`` float64 arrays. The mesh build is
-a host-side algorithm whose only array-API contact is the ``raytrace`` callback, so
-these deliberately do not use ``backend``. Keeping them in one numerical world is
-what makes the ``NaN`` semantics of :func:`sigma_min_2x2` and
-:func:`converged_from_deviation` verifiable.
+**Host-side build kernels** operate on ``backend`` float64 arrays during the
+host-side mesh build. Keeping them in one numerical world is what makes the
+``NaN`` semantics of :func:`sigma_min_2x2` and :func:`converged_from_deviation`
+verifiable.
 
 **Query kernels** operate on ``backend`` arrays and are used by ``Mesh.query``.
 """
 
 from typing import Tuple
-
-import numpy as np
 
 from ...backend_obj import ArrayLike, backend
 
@@ -36,7 +33,7 @@ __all__ = (
 )
 
 # ---------------------------------------------------------------------------
-# Host-side build kernels (numpy, float64)
+# Host-side build kernels (backend, float64)
 # ---------------------------------------------------------------------------
 
 # Indices into the stacked six-point array [theta1, theta2, theta3, m1, m2, m3]
@@ -72,8 +69,8 @@ def shape_matrix(tri):
 
         *Unit: arcsec*
     """
-    return np.stack(
-        (tri[..., 1, :] - tri[..., 0, :], tri[..., 2, :] - tri[..., 0, :]), axis=-1
+    return backend.stack(
+        (tri[..., 1, :] - tri[..., 0, :], tri[..., 2, :] - tri[..., 0, :]), dim=-1
     )
 
 
@@ -101,27 +98,30 @@ def affine_from_triangles(p, q):
     ndarray
         Shape ``(..., 2, 2)``.
     """
-    return shape_matrix(q) @ np.linalg.inv(shape_matrix(p))
+    return shape_matrix(q) @ backend.linalg.inv(shape_matrix(p))
 
 
 def _derive_child_matrices():
     """Recover ``M_k`` from the child ordering, where ``P_k = (1/2) P M_k``."""
-    parent = np.array([[0.0, 0.0], [3.0, 2.0], [-1.0, 5.0]])
+    parent = backend.as_array(
+        [[0.0, 0.0], [3.0, 2.0], [-1.0, 5.0]], dtype=backend.float64
+    )
     t1, t2, t3 = parent
-    six = np.stack([t1, t2, t3, (t2 + t3) / 2, (t3 + t1) / 2, (t1 + t2) / 2])
+    six = backend.stack([t1, t2, t3, (t2 + t3) / 2, (t3 + t1) / 2, (t1 + t2) / 2])
     P = shape_matrix(parent)
-    M = np.empty((4, 2, 2), dtype=np.int64)
-    for k, idx in enumerate(CHILD_VERTEX_INDICES):
-        Pk = shape_matrix(six[list(idx)])
-        exact = 2.0 * np.linalg.solve(P, Pk)
-        M[k] = np.rint(exact).astype(np.int64)
-        if not np.allclose(exact, M[k], atol=1e-9):
+    rows = []
+    for idx in CHILD_VERTEX_INDICES:
+        Pk = shape_matrix(six[list(idx), :])
+        exact = 2.0 * (backend.linalg.inv(P) @ Pk)
+        rounded = backend.round(exact)
+        if not bool(backend.allclose(exact, rounded, atol=1e-9)):
             raise AssertionError("child matrices are not integral")
-    return M
+        rows.append(backend.long(rounded))
+    return backend.stack(rows)
 
 
 def child_matrix_tables() -> (
-    Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]
+    Tuple[ArrayLike, ArrayLike, ArrayLike, ArrayLike, ArrayLike]
 ):
     """
     Fixed tables for red refinement.
@@ -148,30 +148,44 @@ def child_matrix_tables() -> (
         ``(2,)`` int64 class index of each entry of :data:`ROOT_SHAPES`.
     """
     M = _derive_child_matrices()
-    eye = np.eye(2, dtype=np.int64)
-    G = np.stack([eye, M[1], M[2], -eye, -M[1], -M[2]])
+    eye = backend.eye(2, dtype=backend.int64)
+    G = backend.stack([eye, M[1], M[2], -eye, -M[1], -M[2]])
 
-    lookup = {G[c].tobytes(): c for c in range(6)}
-    COMPOSE = np.empty((6, 4), dtype=np.int64)
+    lookup = {tuple(backend.to_numpy(G[c]).reshape(-1).tolist()): c for c in range(6)}
+    compose_rows = []
     for c in range(6):
+        row = []
         for k in range(4):
-            product = (G[c] @ M[k]).astype(np.int64)
-            if product.tobytes() not in lookup:
+            product = G[c] @ M[k]
+            key = tuple(backend.to_numpy(product).reshape(-1).tolist())
+            if key not in lookup:
                 raise AssertionError("child matrix group is not closed")
-            COMPOSE[c, k] = lookup[product.tobytes()]
+            row.append(lookup[key])
+        compose_rows.append(row)
+    COMPOSE = backend.as_array(compose_rows, dtype=backend.int64)
 
-    R = shape_matrix(np.asarray(ROOT_SHAPES[0], dtype=np.float64))
-    PINV0 = np.stack([np.linalg.inv(R @ G[c].astype(np.float64)) for c in range(6)])
+    R = shape_matrix(backend.as_array(ROOT_SHAPES[0], dtype=backend.float64))
+    PINV0 = backend.stack(
+        [
+            backend.linalg.inv(R @ backend.to(G[c], dtype=backend.float64))
+            for c in range(6)
+        ]
+    )
 
-    ROOT_CLASS = np.empty(2, dtype=np.int64)
+    root_class_values = []
     for s, shape in enumerate(ROOT_SHAPES):
-        target = shape_matrix(np.asarray(shape, dtype=np.float64))
+        target = shape_matrix(backend.as_array(shape, dtype=backend.float64))
+        match = None
         for c in range(6):
-            if np.allclose(R @ G[c].astype(np.float64), target):
-                ROOT_CLASS[s] = c
+            if bool(
+                backend.allclose(R @ backend.to(G[c], dtype=backend.float64), target)
+            ):
+                match = c
                 break
-        else:  # pragma: no cover - guarded by test_group_tables_close_...
+        if match is None:  # pragma: no cover - guarded by test_group_tables_close_...
             raise AssertionError(f"root shape {s} is not in the orbit of R")
+        root_class_values.append(match)
+    ROOT_CLASS = backend.as_array(root_class_values, dtype=backend.int64)
     return M, G, COMPOSE, PINV0, ROOT_CLASS
 
 
@@ -198,7 +212,7 @@ def sigma_min_2x2(A):
 
     The ``sigma_max == 0`` branch is exact, not a tolerance: ``sigma_max == 0`` iff
     ``A == 0``, whose smallest singular value is exactly zero. Do not replace it
-    with ``max(sigma_min, eps)`` -- both ``np.maximum`` and ``torch.clamp``
+    with ``max(sigma_min, eps)`` -- both ``backend.maximum`` and ``backend.clamp``
     propagate ``NaN``, so a floor would fail open.
 
     Parameters
@@ -212,13 +226,15 @@ def sigma_min_2x2(A):
         Shape ``(...)``. Exactly ``0.0`` where ``A == 0``; ``NaN`` where ``A`` is
         non-finite, so that step 7 fails closed.
     """
-    F = (A**2).sum(axis=(-2, -1))
-    D = np.abs(A[..., 0, 0] * A[..., 1, 1] - A[..., 0, 1] * A[..., 1, 0])
-    sigma_max = (np.sqrt(F + 2 * D) + np.sqrt(np.clip(F - 2 * D, 0.0, None))) / 2
+    F = backend.sum(A**2, dim=(-2, -1))
+    D = backend.abs(A[..., 0, 0] * A[..., 1, 1] - A[..., 0, 1] * A[..., 1, 0])
+    sigma_max = (
+        backend.sqrt(F + 2 * D) + backend.sqrt(backend.clamp(F - 2 * D, 0.0, None))
+    ) / 2
     zero = sigma_max == 0
     # Double `where` keeps the division away from 0/0 without masking a NaN input:
     # a NaN sigma_max fails the `== 0` test, so NaN reaches the output.
-    return np.where(zero, 0.0, D / np.where(zero, 1.0, sigma_max))
+    return backend.where(zero, 0.0, D / backend.where(zero, 1.0, sigma_max))
 
 
 def midpoint_deviation(beta_v, beta_m):
@@ -249,7 +265,7 @@ def midpoint_deviation(beta_v, beta_m):
         *Unit: arcsec*
     """
     predicted = 0.5 * (beta_v[:, [1, 2, 0], :] + beta_v[:, [2, 0, 1], :])
-    return np.linalg.norm(predicted - beta_m, axis=-1)
+    return backend.norm(predicted - beta_m, dim=-1)
 
 
 def converged_from_deviation(r, s, min_img_sep):
@@ -289,7 +305,7 @@ def converged_from_deviation(r, s, min_img_sep):
     ndarray
         Shape ``(n,)`` bool.
     """
-    return (r < (s * min_img_sep)[:, None]).all(axis=1)
+    return backend.all(r < (s * min_img_sep)[:, None], dim=1)
 
 
 def child_shape_matrices(beta_v, beta_m):
@@ -318,12 +334,12 @@ def child_shape_matrices(beta_v, beta_m):
         Shape ``(n, 4, 2, 2)``, child index in :data:`CHILD_VERTEX_INDICES`
         order.
     """
-    stacked = np.concatenate([beta_v, beta_m], axis=1)  # (n, 6, 2)
-    idx = np.asarray(CHILD_VERTEX_INDICES)  # (4, 3)
-    q1 = stacked[:, idx[:, 0], :]
-    q2 = stacked[:, idx[:, 1], :]
-    q3 = stacked[:, idx[:, 2], :]
-    return np.stack((q2 - q1, q3 - q1), axis=-1)  # (n, 4, 2, 2)
+    stacked = backend.concatenate([beta_v, beta_m], dim=1)  # (n, 6, 2)
+    idx0, idx1, idx2 = zip(*CHILD_VERTEX_INDICES)  # each length 4
+    q1 = stacked[:, list(idx0), :]
+    q2 = stacked[:, list(idx1), :]
+    q3 = stacked[:, list(idx2), :]
+    return backend.stack((q2 - q1, q3 - q1), dim=-1)  # (n, 4, 2, 2)
 
 
 def parity_from_children(Q):
@@ -353,8 +369,8 @@ def parity_from_children(Q):
         Shape ``(n,)`` bool.
     """
     det_q = Q[..., 0, 0] * Q[..., 1, 1] - Q[..., 0, 1] * Q[..., 1, 0]
-    sign_q = np.sign(det_q)
-    return (sign_q == sign_q[:, :1]).all(axis=1)
+    sign_q = backend.sign(det_q)
+    return backend.all(sign_q == sign_q[:, :1], dim=1)
 
 
 def quadratic_vertex_parity_ok(beta_v, beta_m):
@@ -378,19 +394,18 @@ def quadratic_vertex_parity_ok(beta_v, beta_m):
     Uses the existing six samples; no additional raytracing.
     This checks the interpolant at vertices, not the entire true mapping.
     """
-    with np.errstate(over="ignore", invalid="ignore"):
-        # At each vertex, estimate derivatives toward the next and
-        # previous vertices in cyclic order. Using differences avoids
-        # combining large absolute source-plane coordinates directly.
-        d_next = 4.0 * (beta_m[:, [2, 0, 1]] - beta_v) - (beta_v[:, [1, 2, 0]] - beta_v)
-        d_prev = 4.0 * (beta_m[:, [1, 2, 0]] - beta_v) - (beta_v[:, [2, 0, 1]] - beta_v)
+    # At each vertex, estimate derivatives toward the next and
+    # previous vertices in cyclic order. Using differences avoids
+    # combining large absolute source-plane coordinates directly.
+    d_next = 4.0 * (beta_m[:, [2, 0, 1]] - beta_v) - (beta_v[:, [1, 2, 0]] - beta_v)
+    d_prev = 4.0 * (beta_m[:, [1, 2, 0]] - beta_v) - (beta_v[:, [2, 0, 1]] - beta_v)
 
-        det = d_next[..., 0] * d_prev[..., 1] - d_next[..., 1] * d_prev[..., 0]
+    det = d_next[..., 0] * d_prev[..., 1] - d_next[..., 1] * d_prev[..., 0]
 
     # Cyclic lens-plane edge pairs have the same determinant.
     # Its common factor can be omitted when checking sign agreement.
-    return np.isfinite(det).all(axis=1) & (
-        (det > 0).all(axis=1) | (det < 0).all(axis=1)
+    return backend.all(backend.isfinite(det), dim=1) & (
+        backend.all(det > 0, dim=1) | backend.all(det < 0, dim=1)
     )
 
 
@@ -447,7 +462,7 @@ def evaluate_criterion(beta_v, beta_m, classes, level, h0, min_img_sep, pinv0, c
     parity_ok = parity_from_children(Q) & quadratic_vertex_parity_ok(beta_v, beta_m)
 
     A = Q @ pinv0[compose[classes]]  # (n, 4, 2, 2), up to the common 2**(d+1)/h0
-    s = sigma_min_2x2(A).min(axis=1) * (2.0 ** (level + 1)) / h0
+    s = backend.min(sigma_min_2x2(A), dim=1) * (2.0 ** (level + 1)) / h0
 
     r = midpoint_deviation(beta_v, beta_m)
     keep = parity_ok & converged_from_deviation(r, s, min_img_sep)
