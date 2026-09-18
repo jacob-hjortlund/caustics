@@ -432,3 +432,59 @@ def test_edge_quarter_keys_are_lattice_points_of_both_quarters():
     got = {tuple(p) for p in ij_from_key}
     assert (4, 0) in got and (12, 0) in got  # edge (0,1)
     assert (0, 4) in got and (0, 12) in got  # edge (2,0)
+
+
+def test_make_raytrace_forces_float64_and_records_the_callback_dtype():
+    seen = {}
+
+    def rt(x, y):
+        seen["dtype"] = x.dtype
+        return 2.0 * x, 3.0 * y
+
+    fn = make = new.make_raytrace(rt, None)
+    out = fn(_f64([[1.0, 2.0], [3.0, 4.0]]))
+    assert seen["dtype"] == backend.float64
+    assert backend.to_numpy(out).tolist() == [[2.0, 6.0], [6.0, 12.0]]
+    assert make.info["dtype"] == backend.float64
+
+
+def test_make_raytrace_rejects_a_non_tuple_return():
+    fn = new.make_raytrace(lambda x, y: x, None)
+    with pytest.raises(ValueError, match="2-tuple"):
+        fn(_f64([[1.0, 2.0]]))
+
+
+def test_make_raytrace_rejects_a_shape_changing_callback():
+    fn = new.make_raytrace(lambda x, y: (x[:1], y[:1]), None)
+    with pytest.raises(ValueError, match="shape-preserving"):
+        fn(_f64([[1.0, 2.0], [3.0, 4.0]]))
+
+
+def test_trace_keys_is_bit_identical_under_chunking():
+    lat = new.make_lattice(4.0, 0.0, 0.0, 4, 3)
+    fn = new.make_raytrace(lambda x, y: (x * x - y, y * y + x), None)
+    ij = _i64(
+        np.stack(np.meshgrid(np.arange(9), np.arange(9), indexing="ij"), -1).reshape(
+            -1, 2
+        )
+    )
+    whole = backend.to_numpy(new.trace_keys(lat, ij, fn, None))
+    for size in (1, 7, 33):
+        assert (backend.to_numpy(new.trace_keys(lat, ij, fn, size)) == whole).all()
+
+
+def test_evaluate_only_traces_uncached_points():
+    calls = {"n": 0}
+
+    def rt(x, y):
+        calls["n"] += int(x.shape[0])
+        return x, y
+
+    lat = new.make_lattice(4.0, 0.0, 0.0, 2, 2)
+    fn = new.make_raytrace(rt, None)
+    cache = new.empty_cache()
+    keys = _i64([3, 7, 3, 11])
+    cache = new.evaluate(cache, lat, keys, fn, None)
+    assert calls["n"] == 3
+    cache = new.evaluate(cache, lat, keys, fn, None)
+    assert calls["n"] == 3, "already-cached points must not be re-traced"

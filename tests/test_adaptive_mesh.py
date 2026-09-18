@@ -22,7 +22,6 @@ from caustics.lenses.adaptive import (
     _midpoint_ij,
     _min_angle,
     _refine,
-    _trace_keys,
     build_adaptive_mesh,
 )
 from caustics.lenses.func import forward_raytrace_rootfind
@@ -106,33 +105,6 @@ def test_refine_never_evaluates_a_point_twice():
     )
     assert calls["points"] == len(ref.cache) + ref.counters["max_level_midpoints"]
     assert len(np.unique(lat.key(ref.cache.ij))) == len(ref.cache)
-
-
-def test_trace_keys_is_bit_identical_under_chunking():
-    """Chunking is a memory device and must not change a single bit.
-
-    `raytrace_batch_size` bounds the size of each raytrace call, never the
-    answer. A reassociation here would make a mesh's geometry depend on the
-    caller's memory budget.
-    """
-    lat = _Lattice(4.0, 0.0, 0.0, 4, 3)
-    ij = np.stack(
-        np.meshgrid(np.arange(9), np.arange(7), indexing="ij"), axis=-1
-    ).reshape(-1, 2)
-
-    def fn(p):
-        return np.stack([p[:, 0] ** 2, np.sin(p[:, 1])], axis=-1)
-
-    rt_whole, calls_whole = make_counting_raytrace(fn)
-    rt_chunk, calls_chunk = make_counting_raytrace(fn)
-    whole = _trace_keys(lat, ij, _make_raytrace_np(rt_whole, None), None)
-    chunked = _trace_keys(lat, ij, _make_raytrace_np(rt_chunk, None), 7)
-
-    assert np.array_equal(whole, chunked)
-    assert whole.shape == (63, 2)
-    assert calls_whole["batches"] == 1
-    assert calls_chunk["batches"] == 9  # ceil(63 / 7)
-    assert calls_chunk["points"] == 63
 
 
 def test_refine_terminates_at_max_level_on_a_kappa_one_sheet():
