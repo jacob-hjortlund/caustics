@@ -42,10 +42,8 @@ from .func.adaptive import (
     CHILD_VERTEX_INDICES,
     ROOT_SHAPES,
     child_matrix_tables,
-    child_shape_matrices,
     contains,
     evaluate_criterion,
-    parity_from_children,
     sanitize_bary,
     shape_matrix,
     triangle_weights,
@@ -87,6 +85,7 @@ class LeafStatus(IntEnum):
     SIZE_FLOOR = 1
     FORCED = 2
     INVALID = 3
+    NONFINITE = 4
 
 
 def _depth_floor(fov, init_res, min_img_sep) -> int:
@@ -761,40 +760,97 @@ def _refine(
         finite_v = np.isfinite(beta_v).all(axis=(1, 2))
 
         if level == max_level:
-            # Parity at the size floor. No split is left, so a triangle
-            # straddling a fold cannot be resolved -- it is condemned instead,
-            # which keeps it out of the spatial index. Only the midpoints are
-            # new: the vertices are already cached, and a max_level midpoint is
-            # the only kind of point with an odd coordinate, so this pass can
-            # never re-trace a cached one. They are consumed here and dropped;
-            # nothing downstream reads them, and `_close` finds no hanging node
-            # at max_level either way.
-            #
-            # The deviation half of the criterion deliberately does NOT run
-            # here: the size floor is what bounds curvature at max_level, and a
-            # second condemnation reason would blow a much larger hole.
+            has_converged = np.zeros(active_ij.shape[0], dtype=bool)
+            finite_samples = np.zeros(active_ij.shape[0], dtype=bool)
             rows = np.flatnonzero(finite_v)
-            # All-False start, so a non-finite vertex is condemned without a
-            # branch of its own and `~parity_ok` is the whole condemnation mask.
-            parity_ok = np.zeros(active_ij.shape[0], dtype=bool)
+
             if rows.size:
+                # Trace unique midpoints without adding them to the vertex cache.
                 keys = lattice.key(_midpoint_ij(active_ij[rows])).reshape(-1)
-                # Flattened before `np.unique` rather than leaning on NumPy 2's
-                # shape-preserving `return_inverse`, so the reshape below is
-                # explicit and this does not depend on the NumPy major version.
                 uniq, inv = np.unique(keys, return_inverse=True)
                 beta_m = _trace_keys(
                     lattice, lattice.ij_from_key(uniq), raytrace_np, batch_size
                 )[inv].reshape(-1, 3, 2)
-                parity_ok[rows] = parity_from_children(
-                    child_shape_matrices(beta_v[rows], beta_m)
-                )
                 counters["max_level_midpoints"] = int(uniq.size)
-            counters["parity_invalid"] = int(finite_v.sum() - parity_ok.sum())
-            bad = ~parity_ok
-            store.add(v[bad], level, active_cls[bad], LeafStatus.INVALID)
-            store.add(v[~bad], level, active_cls[~bad], LeafStatus.SIZE_FLOOR)
+
+                # Only evaluate the criterion where all six samples are finite.
+                finite_m = np.isfinite(beta_m).all(axis=(1, 2))
+                good_rows = rows[finite_m]
+                finite_samples[good_rows] = True
+
+                if good_rows.size:
+                    keep, parity_ok, s = evaluate_criterion(
+                        beta_v[good_rows],
+                        beta_m[finite_m],
+                        active_cls[good_rows],
+                        level,
+                        h0,
+                        min_img_sep,
+                        PINV0,
+                        COMPOSE,
+                    )
+                    has_converged[good_rows] = keep
+                    counters["parity_invalid"] = int((~parity_ok).sum())
+                    counters["sigma_zero"] += int((s == 0).sum())
+
+            # store.add(
+            #     v[has_converged],
+            #     level,
+            #     active_cls[has_converged],
+            #     LeafStatus.CONVERGED,
+            # )
+            # store.add(
+            #     v[~has_converged],
+            #     level,
+            #     active_cls[~has_converged],
+            #     LeafStatus.INVALID,
+            # )
+            status = np.full(active_ij.shape[0], LeafStatus.NONFINITE, dtype=np.int8)
+            status[finite_samples] = LeafStatus.INVALID
+            status[has_converged] = LeafStatus.CONVERGED
+
+            store.add(v, level, active_cls, status)
+
+            if level == 0:
+                counters["converged_level0"] = int(has_converged.sum())
+
             break
+
+        # if level == max_level:
+        #     # Parity at the size floor. No split is left, so a triangle
+        #     # straddling a fold cannot be resolved -- it is condemned instead,
+        #     # which keeps it out of the spatial index. Only the midpoints are
+        #     # new: the vertices are already cached, and a max_level midpoint is
+        #     # the only kind of point with an odd coordinate, so this pass can
+        #     # never re-trace a cached one. They are consumed here and dropped;
+        #     # nothing downstream reads them, and `_close` finds no hanging node
+        #     # at max_level either way.
+        #     #
+        #     # The deviation half of the criterion deliberately does NOT run
+        #     # here: the size floor is what bounds curvature at max_level, and a
+        #     # second condemnation reason would blow a much larger hole.
+        #     rows = np.flatnonzero(finite_v)
+        #     # All-False start, so a non-finite vertex is condemned without a
+        #     # branch of its own and `~parity_ok` is the whole condemnation mask.
+        #     parity_ok = np.zeros(active_ij.shape[0], dtype=bool)
+        #     if rows.size:
+        #         keys = lattice.key(_midpoint_ij(active_ij[rows])).reshape(-1)
+        #         # Flattened before `np.unique` rather than leaning on NumPy 2's
+        #         # shape-preserving `return_inverse`, so the reshape below is
+        #         # explicit and this does not depend on the NumPy major version.
+        #         uniq, inv = np.unique(keys, return_inverse=True)
+        #         beta_m = _trace_keys(
+        #             lattice, lattice.ij_from_key(uniq), raytrace_np, batch_size
+        #         )[inv].reshape(-1, 3, 2)
+        #         parity_ok[rows] = parity_from_children(
+        #             child_shape_matrices(beta_v[rows], beta_m)
+        #         )
+        #         counters["max_level_midpoints"] = int(uniq.size)
+        #     counters["parity_invalid"] = int(finite_v.sum() - parity_ok.sum())
+        #     bad = ~parity_ok
+        #     store.add(v[bad], level, active_cls[bad], LeafStatus.INVALID)
+        #     store.add(v[~bad], level, active_cls[~bad], LeafStatus.SIZE_FLOOR)
+        #     break
 
         m = cache.lookup(lattice.key(mid_ij))
         beta_m = cache.beta[m]
@@ -872,7 +928,9 @@ def _refine(
             # still reach freeze with a non-finite vertex, via a deferred
             # midpoint the criterion never saw; that is what
             # `_invalidate_nonfinite_origins` is for.
-            store.add(kid_v, kid_level, kid_cls, LeafStatus.FORCED)
+            # store.add(kid_v, kid_level, kid_cls, LeafStatus.FORCED)
+            kid_status = np.repeat(store.status[violators], 4)
+            store.add(kid_v, kid_level, kid_cls, kid_status)
             counters["forced"] += int(kid_v.shape[0])
             kid_ij = cache.ij[kid_v]
             active.add_slots(kid_v.reshape(-1))
@@ -1147,7 +1205,8 @@ def _invalidate_nonfinite_origins(vs, leaves, origin, pre_status):
     leaf_finite = np.isfinite(vs[leaves]).all(axis=(1, 2))
     origin_bad = np.zeros(pre_status.shape[0], dtype=bool)
     np.logical_or.at(origin_bad, origin, ~leaf_finite)
-    return np.where(origin_bad, np.int8(LeafStatus.INVALID), pre_status)
+    return np.where(origin_bad, np.int8(LeafStatus.NONFINITE), pre_status)
+    # return np.where(origin_bad, np.int8(LeafStatus.INVALID), pre_status)
 
 
 def _build_index(vs, leaves, valid_rows, index_cells):
@@ -2254,7 +2313,10 @@ def build_adaptive_mesh(
     with np.errstate(invalid="ignore"):
         P = shape_matrix(vs[leaves_np])
         leaf_area2 = P[:, 0, 0] * P[:, 1, 1] - P[:, 0, 1] * P[:, 1, 0]
-    valid_rows = np.flatnonzero(leaf_status != LeafStatus.INVALID)
+    # valid_rows = np.flatnonzero(leaf_status != LeafStatus.INVALID)
+    valid_rows = np.flatnonzero(
+        (leaf_status != LeafStatus.INVALID) & (leaf_status != LeafStatus.NONFINITE)
+    )
     index = _build_index(vs, leaves_np, valid_rows, index_cells)
 
     group_sizes = np.bincount(origin, minlength=pre_v.shape[0])
