@@ -98,6 +98,15 @@ class Backend:
         self.arange = self._arange_torch
         self.cumsum = self._cumsum_torch
         self.linspace = self._linspace_torch
+        self.sort = self._sort_torch
+        self.argsort = self._argsort_torch
+        self.unique = self._unique_torch
+        self.bincount = self._bincount_torch
+        self.flatnonzero = self._flatnonzero_torch
+        self.sign = self._sign_torch
+        self.lexsort = self._lexsort_torch
+        self.all = self._all_torch
+        self.any = self._any_torch
 
     def setup_jax(self):
         self.jax = importlib.import_module("jax")
@@ -160,6 +169,15 @@ class Backend:
         self.arange = self._arange_jax
         self.cumsum = self._cumsum_jax
         self.linspace = self._linspace_jax
+        self.sort = self._sort_jax
+        self.argsort = self._argsort_jax
+        self.unique = self._unique_jax
+        self.bincount = self._bincount_jax
+        self.flatnonzero = self._flatnonzero_jax
+        self.sign = self._sign_jax
+        self.lexsort = self._lexsort_jax
+        self.all = self._all_jax
+        self.any = self._any_jax
 
         self.key = self.jax.random.key(
             np.random.randint(0, 2**31 - 1)
@@ -607,6 +625,77 @@ class Backend:
     def _chunk_jax(self, array, chunks, dim=0):
         return self.module.array_split(array, chunks, axis=dim)
 
+    def _sort_torch(self, array, dim=-1):
+        return self.module.sort(array, dim=dim, stable=True).values
+
+    def _sort_jax(self, array, dim=-1):
+        return self.module.sort(array, axis=dim, stable=True)
+
+    def _argsort_torch(self, array, dim=-1):
+        return self.module.argsort(array, dim=dim, stable=True)
+
+    def _argsort_jax(self, array, dim=-1):
+        return self.module.argsort(array, axis=dim, stable=True)
+
+    def _unique_torch(self, array, return_inverse=False):
+        if return_inverse:
+            values, inverse = self.module.unique(
+                array, sorted=True, return_inverse=True
+            )
+            return values, inverse.reshape(-1)
+        return self.module.unique(array, sorted=True)
+
+    def _unique_jax(self, array, return_inverse=False):
+        if return_inverse:
+            values, inverse = self.module.unique(array, return_inverse=True)
+            return values, inverse.reshape(-1)
+        return self.module.unique(array)
+
+    def _bincount_torch(self, array, minlength=0):
+        return self.module.bincount(array, minlength=minlength)
+
+    def _bincount_jax(self, array, minlength=0):
+        return self.module.bincount(array, length=minlength)
+
+    def _flatnonzero_torch(self, array):
+        return self.module.nonzero(array, as_tuple=False).reshape(-1)
+
+    def _flatnonzero_jax(self, array):
+        return self.module.flatnonzero(array)
+
+    def _sign_torch(self, array):
+        return self.module.sign(array)
+
+    def _sign_jax(self, array):
+        return self.module.sign(array)
+
+    def _lexsort_torch(self, keys):
+        # numpy convention: keys[-1] is the primary sort key. Stable sorts
+        # applied first-to-last leave the last key most significant.
+        order = self.module.arange(keys[0].shape[0], device=keys[0].device)
+        for key in keys:
+            order = order[self.module.argsort(key[order], stable=True)]
+        return order
+
+    def _lexsort_jax(self, keys):
+        return self.module.lexsort(tuple(keys))
+
+    def _all_torch(self, array, dim=None):
+        return (
+            self.module.all(array) if dim is None else self.module.all(array, dim=dim)
+        )
+
+    def _all_jax(self, array, dim=None):
+        return self.module.all(array, axis=dim)
+
+    def _any_torch(self, array, dim=None):
+        return (
+            self.module.any(array) if dim is None else self.module.any(array, dim=dim)
+        )
+
+    def _any_jax(self, array, dim=None):
+        return self.module.any(array, axis=dim)
+
     def _jit_torch(self, func, **kwargs):
         return func
 
@@ -634,11 +723,8 @@ class Backend:
     def searchsorted(self, array, value):
         return self.module.searchsorted(array, value)
 
-    def any(self, array):
-        return self.module.any(array)
-
-    def all(self, array):
-        return self.module.all(array)
+    def finfo(self, dtype):
+        return self.module.finfo(dtype)
 
     def log(self, array):
         return self.module.log(array)
@@ -802,6 +888,14 @@ class Backend:
     @property
     def float64(self):
         return self.module.float64
+
+    @property
+    def int64(self):
+        return self.module.int64
+
+    @property
+    def int8(self):
+        return self.module.int8
 
     @property
     def pi(self):
