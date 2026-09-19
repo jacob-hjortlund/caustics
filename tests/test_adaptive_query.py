@@ -535,3 +535,270 @@ def test_criterion_is_blind_to_structure_below_the_sampling_scale():
     assert coarse_counters["deviation_splits"] == 0
     assert fine_counters["converged_level0"] < fine_pre_closure
     assert fine_counters["deviation_splits"] > 0
+
+
+def test_seeds_lie_inside_their_lens_triangle(mesh, beta):
+    idx, _, bary = new.mesh_query(mesh, beta)
+    seeds = new.mesh_seeds(mesh, idx, bary)
+    tri = backend.to_numpy(mesh.vertices_lens)[
+        backend.to_numpy(mesh.leaves)[backend.to_numpy(idx)]
+    ]
+    s = backend.to_numpy(seeds)
+    assert s.shape == (backend.to_numpy(idx).size, 2)
+    lo, hi = tri.min(axis=1), tri.max(axis=1)
+    assert (s >= lo - 1e-12).all() and (s <= hi + 1e-12).all()
+
+
+def test_seeds_match_the_oracle(mesh, beta):
+    old_mesh = oracle.build_adaptive_mesh(_sie_like, **BUILD)
+    idx, _, bary = new.mesh_query(mesh, beta)
+    idx_o, _, bary_o = old_mesh.query(beta)
+    assert np.allclose(
+        backend.to_numpy(new.mesh_seeds(mesh, idx, bary)),
+        backend.to_numpy(old_mesh.seeds(leaf_indices=idx_o, bary=bary_o)),
+    )
+
+
+def _pts(x):
+    return backend.as_array(np.asarray(x, dtype=np.float64), dtype=backend.float64)
+
+
+def test_dedup_collapses_points_closer_than_the_tolerance():
+    pts = _pts([[0.0, 0.0], [0.05, 0.0], [1.0, 0.0]])
+    keep = backend.to_numpy(new.dedup_representatives(pts, np.array([3]), 0.1))
+    assert keep.tolist() == [True, False, True]
+
+
+def test_dedup_keeps_points_separated_by_exactly_the_tolerance():
+    pts = _pts([[0.0, 0.0], [0.1, 0.0]])
+    keep = backend.to_numpy(new.dedup_representatives(pts, np.array([2]), 0.1))
+    assert keep.tolist() == [True, True]
+
+
+def test_dedup_counts_connected_components_not_greedy_clusters():
+    # three collinear points spaced 0.9 * tol: one component, one representative
+    pts = _pts([[0.0, 0.0], [0.09, 0.0], [0.18, 0.0]])
+    keep = backend.to_numpy(new.dedup_representatives(pts, np.array([3]), 0.1))
+    assert keep.tolist() == [True, False, False]
+
+
+def test_dedup_never_merges_across_blocks():
+    pts = _pts([[0.0, 0.0], [0.0, 0.0]])
+    keep = backend.to_numpy(new.dedup_representatives(pts, np.array([1, 1]), 0.1))
+    assert keep.tolist() == [True, True]
+
+
+def test_dedup_handles_empty_and_singleton_blocks():
+    pts = _pts([[0.0, 0.0], [0.01, 0.0], [5.0, 5.0]])
+    keep = backend.to_numpy(new.dedup_representatives(pts, np.array([0, 2, 0, 1]), 0.1))
+    assert keep.tolist() == [True, False, True]
+
+
+def test_dedup_matches_the_oracle_on_randomised_blocks():
+    rng = np.random.default_rng(31)
+    counts = rng.integers(0, 5, 20)
+    pts = rng.normal(size=(int(counts.sum()), 2)) * 0.1
+    p = _pts(pts)
+    assert (
+        backend.to_numpy(new.dedup_representatives(p, counts, 0.05))
+        == backend.to_numpy(oracle._dedup_representatives(p, counts, 0.05))
+    ).all()
+
+
+# ---------------------------------------------------------------------------
+# Ported from tests/test_adaptive_mesh.py (Task 14, step 5): mesh_seeds and
+# dedup_representatives/dedup_block_group exercised through fixtures and
+# regression cases the tests above (added directly from the Task 14 brief)
+# do not reach -- a folded, multi-level mesh's own triangles (not just their
+# bounding boxes), point-order invariance across explicit permutations, and
+# the bucketed-vs-per-block equivalence check. Deleted from the legacy file
+# after porting.
+#
+# Four names collide with the tests above by coincidence: the oracle's
+# dual-mode `Mesh.seeds`/`Mesh.query` and the legacy suite both predate
+# `mesh_seeds`'s single-mode contract, so a handful of test names describe
+# the same idea independently on both sides. Each collision is RENAMED here
+# to name what actually distinguishes it, rather than silently shadowing the
+# same-named test above (a duplicate `def` means the first never runs):
+#   test_seeds_lie_inside_their_lens_triangle
+#       -> test_seeds_lie_inside_their_lens_triangle_on_a_folded_mesh
+#   test_dedup_collapses_points_closer_than_the_tolerance
+#       -> test_dedup_collapses_a_near_coincident_pair_and_keeps_the_lone_point
+#   test_dedup_counts_connected_components_not_greedy_clusters
+#       -> test_dedup_counts_connected_components_regardless_of_point_order
+#   test_dedup_never_merges_across_blocks
+#       -> test_dedup_keeps_identical_points_in_different_blocks_distinct
+# ---------------------------------------------------------------------------
+
+
+def _cross2(u, v):
+    """Scalar cross product of 2-D vectors.
+
+    ``np.cross`` on 2-vectors is deprecated in NumPy 2.0 and emits a
+    ``DeprecationWarning`` per call. This is the same value, computed
+    component-wise, and is bit-identical to the ``np.cross`` result.
+    """
+    return u[..., 0] * v[..., 1] - u[..., 1] * v[..., 0]
+
+
+def test_seeds_lie_inside_their_lens_triangle_on_a_folded_mesh():
+    """RENAMED from ``test_seeds_lie_inside_their_lens_triangle``: this checks
+    the stronger inside-the-triangle sign condition on a folded, multi-level
+    mesh, distinct from the bounding-box check the same-named test above
+    (added verbatim from the Task 14 brief) performs on the module-level
+    ``mesh``/``beta`` fixtures.
+
+    ADAPTED: the oracle's ``Mesh.seeds`` accepted ``beta`` (query-and-seed) or
+    ``leaf_indices``/``bary`` (gather-only) behind a ``_check_call`` guard, so
+    the legacy test compared the two modes against each other and also
+    checked the CSR ``offsets`` the ``beta`` mode returned. ``mesh_seeds`` has
+    only the gather-only form, so that comparison has no counterpart and is
+    dropped; ``triangles_lens(leaf_indices=idx)`` (also dropped) is replaced
+    by the same manual ``vertices_lens[leaves[idx]]`` gather ``mesh_seeds``
+    itself performs.
+    """
+    mesh, _ = build(localised_fold, min_img_sep=0.05)
+    beta = RNG.uniform(-1.5, 1.5, size=(50, 2))
+    idx, _, bary = new.mesh_query(mesh, beta)
+    seed = backend.to_numpy(new.mesh_seeds(mesh, idx, bary))
+    assert seed.shape[0] > 0, "fixture returned no candidates"
+    idx_np = backend.to_numpy(idx)
+    leaves = backend.to_numpy(mesh.leaves)
+    vl = backend.to_numpy(mesh.vertices_lens)
+    tri = vl[leaves[idx_np]]
+    for k in range(len(seed)):
+        w = np.array(
+            [
+                _cross2(tri[k, (i + 1) % 3] - seed[k], tri[k, (i + 2) % 3] - seed[k])
+                for i in range(3)
+            ]
+        )
+        assert (w >= -1e-9).all() or (w <= 1e-9).all()
+
+
+def test_dedup_collapses_a_near_coincident_pair_and_keeps_the_lone_point():
+    """RENAMED from ``test_dedup_collapses_points_closer_than_the_tolerance``:
+    a different magnitude (0.001 spacing at tol 0.01) and assertion style
+    (explicit "the distant point must survive" check) from the same-named
+    test above (added verbatim from the Task 14 brief)."""
+    points = _pts([[0.0, 0.0], [0.0, 0.001], [1.0, 0.0]])
+    keep = backend.to_numpy(new.dedup_representatives(points, np.array([3]), 0.01))
+    assert keep.sum() == 2, "the coincident pair must collapse to one image"
+    assert keep[2], "the distant point must survive"
+
+
+def test_dedup_keeps_points_separated_by_the_tolerance():
+    """Separation *of* min_img_sep means distinct, matching the build contract.
+
+    The size floor is ``l_max <= min_img_sep`` and step 7 hides no pair separated
+    by more than ``min_img_sep / 4``, so the boundary belongs to the distinct
+    side. Adjacency is ``d < tol``, not ``<=``.
+    """
+    points = _pts([[0.0, 0.0], [0.01, 0.0]])
+    keep = backend.to_numpy(new.dedup_representatives(points, np.array([2]), 0.01))
+    assert keep.sum() == 2
+
+
+def test_dedup_counts_connected_components_regardless_of_point_order():
+    """RENAMED from ``test_dedup_counts_connected_components_not_greedy_clusters``:
+    this checks invariance across four explicit permutations, distinct from
+    the single-order check in the same-named test above (added verbatim from
+    the Task 14 brief).
+
+    Three collinear points spaced ``0.9 * tol`` apart form one connected
+    component. Greedy returns 2 for the order below and 1 for ``[1, 0, 2]`` --
+    the answer would depend on the order ``mesh_query`` happened to emit
+    candidates in, which is not something a multiplicity map may depend on.
+    """
+    p = np.array([[0.0, 0.0], [0.009, 0.0], [0.018, 0.0]])
+    counts = np.array([3])
+    base = backend.to_numpy(new.dedup_representatives(_pts(p), counts, 0.01)).sum()
+    assert base == 1, f"one chained component expected, got {base}"
+    for order in ([1, 0, 2], [2, 1, 0], [0, 2, 1], [2, 0, 1]):
+        got = backend.to_numpy(
+            new.dedup_representatives(_pts(p[order]), counts, 0.01)
+        ).sum()
+        assert got == base, f"order {order} gave {got}, not {base}"
+
+
+def test_dedup_keeps_identical_points_in_different_blocks_distinct():
+    """RENAMED from ``test_dedup_never_merges_across_blocks`` to avoid
+    shadowing the same-named test above (added verbatim from the Task 14
+    brief); both exercise the same contract on equivalent input.
+
+    Two source points whose images coincide must not collapse into one. The
+    padded ``(B, M, M)`` formulation makes cross-block bleed the natural bug
+    here, and it would silently halve a multiplicity map.
+    """
+    points = _pts([[0.0, 0.0], [0.0, 0.0]])
+    keep = backend.to_numpy(new.dedup_representatives(points, np.array([1, 1]), 0.01))
+    assert keep.sum() == 2, "identical points in different blocks are distinct"
+
+
+def test_dedup_handles_ragged_blocks_and_empty_blocks():
+    """Padding must not invent images in a block that found none."""
+    points = _pts([[0.0, 0.0], [5.0, 5.0], [5.0, 5.0005]])
+    keep = backend.to_numpy(
+        new.dedup_representatives(points, np.array([1, 0, 2]), 0.01)
+    )
+    assert keep.tolist() == [True, True, False]
+
+
+def test_dedup_is_unchanged_by_bucketing_on_randomised_blocks():
+    """The bucketed kernel must agree with a per-block reference exactly.
+
+    Blocks are grouped by count and run at their own M rather than padded to
+    the global maximum, so the risk is a scatter that puts one block's answer
+    on another block's rows. Running each block *alone* through the same
+    function is the independent reference: a single-block call has nothing to
+    mis-scatter.
+
+    What this does NOT check: both sides call the same clustering kernel
+    (:func:`~caustics.lenses.func.adaptive.dedup_block_group` via
+    :func:`~caustics.lenses.func.adaptive.dedup_representatives`), so a bug
+    inside that kernel itself -- a wrong sentinel, a wrong iteration bound --
+    reproduces identically on both sides and is invisible to this comparison.
+    """
+    rng = np.random.default_rng(20260910)
+    # The all-empty vector is explicit: 20 random draws from this seed never
+    # produce one, and it is the case that reaches the `total == 0` early exit.
+    cases = [np.zeros(4, dtype=np.int64)]
+    cases += [rng.integers(0, 6, size=rng.integers(1, 12)) for _ in range(20)]
+    for counts in cases:
+        pts = rng.normal(scale=0.01, size=(int(counts.sum()), 2)).reshape(-1, 2)
+        got = backend.to_numpy(new.dedup_representatives(_pts(pts), counts, 0.01))
+        starts = np.cumsum(counts) - counts
+        want = np.concatenate(
+            [
+                backend.to_numpy(
+                    new.dedup_representatives(_pts(pts[s : s + c]), np.array([c]), 0.01)
+                )
+                for s, c in zip(starts, counts)
+            ]
+            + [np.zeros(0, dtype=bool)]
+        )
+        assert got.tolist() == want.tolist(), f"counts={counts.tolist()}"
+
+
+def test_dedup_keeps_exactly_one_point_per_singleton_block():
+    """Blocks of one bypass the clustering kernel; they must still be kept."""
+    points = _pts([[0.0, 0.0], [1.0, 1.0], [2.0, 2.0]])
+    keep = backend.to_numpy(
+        new.dedup_representatives(points, np.array([1, 1, 1]), 0.01)
+    )
+    assert keep.tolist() == [True, True, True]
+
+
+def test_dedup_mixes_singleton_and_clustered_blocks_in_order():
+    """The bypass and the kernel write into one output; order must survive.
+
+    Block 0 is a singleton, block 1 collapses to one image, block 2 is a
+    singleton again. A scatter that appends the bypassed blocks after the
+    clustered ones would pass every count-based assertion and still return the
+    representatives in the wrong rows.
+    """
+    points = _pts([[9.0, 9.0], [0.0, 0.0], [0.0, 0.001], [5.0, 5.0]])
+    keep = backend.to_numpy(
+        new.dedup_representatives(points, np.array([1, 2, 1]), 0.01)
+    )
+    assert keep.tolist() == [True, True, False, True]

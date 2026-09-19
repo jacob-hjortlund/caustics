@@ -8,7 +8,6 @@ from caustics.lenses.adaptive import (
     LeafStatus,
     BuildStats,
     Mesh,
-    _dedup_representatives,
     build_adaptive_mesh,
 )
 from caustics.lenses.func import forward_raytrace_rootfind
@@ -46,9 +45,6 @@ def make_counting_raytrace(fn):
     return raytrace, calls
 
 
-AFFINE = np.array([[0.7, 0.1], [-0.2, 0.9]])
-
-
 def localised_fold(p):
     """Affine away from a narrow band, curved and fold-bearing inside it.
 
@@ -74,70 +70,6 @@ def build(fn, fov=4.0, init_res=4, min_img_sep=0.25, **kw):
     raytrace, calls = make_counting_raytrace(fn)
     mesh = build_adaptive_mesh(raytrace, fov, init_res, min_img_sep, **kw)
     return mesh, calls
-
-
-def test_geometry_wrappers_match_a_manual_gather():
-    mesh, _ = build(localised_fold, min_img_sep=0.05)
-    beta = RNG.uniform(-1.5, 1.5, size=(30, 2))
-    idx, off, bary = mesh.query(beta)
-    for name, verts in (
-        ("triangles_lens", mesh.vertices_lens),
-        ("triangles_source", mesh.vertices_source),
-    ):
-        via_beta, offsets = getattr(mesh, name)(beta)
-        via_idx = getattr(mesh, name)(leaf_indices=idx)
-        manual = verts[mesh.leaves[idx]]
-        assert np.array_equal(backend.to_numpy(via_beta), backend.to_numpy(manual))
-        assert np.array_equal(backend.to_numpy(via_idx), backend.to_numpy(manual))
-        assert np.array_equal(backend.to_numpy(offsets), backend.to_numpy(off))
-
-
-def cross2(u, v):
-    """Scalar cross product of 2-D vectors.
-
-    ``np.cross`` on 2-vectors is deprecated in NumPy 2.0 and emits a
-    ``DeprecationWarning`` per call -- 141 of them across this file's runs, and
-    a hard failure under ``-W error::DeprecationWarning``. This is the same
-    value, computed the way :func:`signed_area` above already does it, and is
-    bit-identical to the ``np.cross`` result.
-    """
-    return u[..., 0] * v[..., 1] - u[..., 1] * v[..., 0]
-
-
-def test_seeds_lie_inside_their_lens_triangle():
-    mesh, _ = build(localised_fold, min_img_sep=0.05)
-    beta = RNG.uniform(-1.5, 1.5, size=(50, 2))
-    idx, off, bary = mesh.query(beta)
-    seed, offsets = mesh.seeds(beta)
-    direct = mesh.seeds(leaf_indices=idx, bary=bary)
-    assert np.allclose(backend.to_numpy(seed), backend.to_numpy(direct))
-    assert np.array_equal(backend.to_numpy(offsets), backend.to_numpy(off))
-    tri = backend.to_numpy(mesh.triangles_lens(leaf_indices=idx))
-    s = backend.to_numpy(seed)
-    for k in range(len(s)):
-        w = np.array(
-            [
-                cross2(tri[k, (i + 1) % 3] - s[k], tri[k, (i + 2) % 3] - s[k])
-                for i in range(3)
-            ]
-        )
-        assert (w >= -1e-9).all() or (w <= 1e-9).all()
-
-
-@pytest.mark.parametrize("name", ["triangles_lens", "triangles_source", "seeds"])
-def test_wrappers_reject_ambiguous_arguments(name):
-    mesh, _ = build(lambda p: p @ AFFINE.T)
-    fn = getattr(mesh, name)
-    with pytest.raises(ValueError):
-        fn()
-    with pytest.raises(ValueError):
-        fn(np.zeros((1, 2)), leaf_indices=backend.as_array([0]))
-
-
-def test_seeds_requires_bary_with_leaf_indices():
-    mesh, _ = build(lambda p: p @ AFFINE.T)
-    with pytest.raises(ValueError, match="bary"):
-        mesh.seeds(leaf_indices=backend.as_array([0]))
 
 
 def test_public_symbols_are_re_exported():
@@ -301,115 +233,6 @@ def test_build_and_query_run_on_the_configured_device(device):
     assert off_np[2] == off_np[1], "the far exterior point must hit nothing"
     assert bary_np.shape[0] == off_np[-1], "bary rows must match the CSR total"
     assert np.isfinite(bary_np).all()
-
-
-def test_dedup_collapses_points_closer_than_the_tolerance():
-    points = as_arr([[0.0, 0.0], [0.0, 0.001], [1.0, 0.0]])
-    keep = to_np(_dedup_representatives(points, np.array([3]), 0.01))
-    assert keep.sum() == 2, "the coincident pair must collapse to one image"
-    assert keep[2], "the distant point must survive"
-
-
-def test_dedup_keeps_points_separated_by_the_tolerance():
-    """Separation *of* min_img_sep means distinct, matching the build contract.
-
-    The size floor is ``l_max <= min_img_sep`` and step 7 hides no pair separated
-    by more than ``min_img_sep / 4``, so the boundary belongs to the distinct
-    side. Adjacency is ``d < tol``, not ``<=``.
-    """
-    points = as_arr([[0.0, 0.0], [0.01, 0.0]])
-    keep = to_np(_dedup_representatives(points, np.array([2]), 0.01))
-    assert keep.sum() == 2
-
-
-def test_dedup_counts_connected_components_not_greedy_clusters():
-    """Order independence, which greedy clustering does not have.
-
-    Three collinear points spaced ``0.9 * tol`` apart form one connected
-    component. Greedy returns 2 for the order below and 1 for ``[1, 0, 2]`` --
-    the answer would depend on the order ``query`` happened to emit candidates
-    in, which is not something a multiplicity map may depend on.
-    """
-    p = np.array([[0.0, 0.0], [0.009, 0.0], [0.018, 0.0]])
-    counts = np.array([3])
-    base = to_np(_dedup_representatives(as_arr(p), counts, 0.01)).sum()
-    assert base == 1, f"one chained component expected, got {base}"
-    for order in ([1, 0, 2], [2, 1, 0], [0, 2, 1], [2, 0, 1]):
-        got = to_np(_dedup_representatives(as_arr(p[order]), counts, 0.01)).sum()
-        assert got == base, f"order {order} gave {got}, not {base}"
-
-
-def test_dedup_never_merges_across_blocks():
-    """Two source points whose images coincide must not collapse into one.
-
-    The padded ``(B, M, M)`` formulation makes cross-block bleed the natural bug
-    here, and it would silently halve a multiplicity map.
-    """
-    points = as_arr([[0.0, 0.0], [0.0, 0.0]])
-    keep = to_np(_dedup_representatives(points, np.array([1, 1]), 0.01))
-    assert keep.sum() == 2, "identical points in different blocks are distinct"
-
-
-def test_dedup_handles_ragged_blocks_and_empty_blocks():
-    """Padding must not invent images in a block that found none."""
-    points = as_arr([[0.0, 0.0], [5.0, 5.0], [5.0, 5.0005]])
-    keep = to_np(_dedup_representatives(points, np.array([1, 0, 2]), 0.01))
-    assert keep.tolist() == [True, True, False]
-
-
-def test_dedup_is_unchanged_by_bucketing_on_randomised_blocks():
-    """The bucketed kernel must agree with a per-block reference exactly.
-
-    Blocks are grouped by count and run at their own M rather than padded to
-    the global maximum, so the risk is a scatter that puts one block's answer
-    on another block's rows. Running each block *alone* through the same
-    function is the independent reference: a single-block call has nothing to
-    mis-scatter.
-
-    What this does NOT check: both sides call the same clustering kernel
-    (:func:`_dedup_block_group` via :func:`_dedup_representatives`), so a bug
-    inside that kernel itself -- a wrong sentinel, a wrong iteration bound --
-    reproduces identically on both sides and is invisible to this comparison.
-    """
-    rng = np.random.default_rng(20260910)
-    # The all-empty vector is explicit: 20 random draws from this seed never
-    # produce one, and it is the case that reaches the `total == 0` early exit.
-    cases = [np.zeros(4, dtype=np.int64)]
-    cases += [rng.integers(0, 6, size=rng.integers(1, 12)) for _ in range(20)]
-    for counts in cases:
-        pts = rng.normal(scale=0.01, size=(int(counts.sum()), 2)).reshape(-1, 2)
-        got = to_np(_dedup_representatives(as_arr(pts), counts, 0.01))
-        starts = np.cumsum(counts) - counts
-        want = np.concatenate(
-            [
-                to_np(
-                    _dedup_representatives(as_arr(pts[s : s + c]), np.array([c]), 0.01)
-                )
-                for s, c in zip(starts, counts)
-            ]
-            + [np.zeros(0, dtype=bool)]
-        )
-        assert got.tolist() == want.tolist(), f"counts={counts.tolist()}"
-
-
-def test_dedup_keeps_exactly_one_point_per_singleton_block():
-    """Blocks of one bypass the clustering kernel; they must still be kept."""
-    points = as_arr([[0.0, 0.0], [1.0, 1.0], [2.0, 2.0]])
-    keep = to_np(_dedup_representatives(points, np.array([1, 1, 1]), 0.01))
-    assert keep.tolist() == [True, True, True]
-
-
-def test_dedup_mixes_singleton_and_clustered_blocks_in_order():
-    """The bypass and the kernel write into one output; order must survive.
-
-    Block 0 is a singleton, block 1 collapses to one image, block 2 is a
-    singleton again. A scatter that appends the bypassed blocks after the
-    clustered ones would pass every count-based assertion and still return the
-    representatives in the wrong rows.
-    """
-    points = as_arr([[9.0, 9.0], [0.0, 0.0], [0.0, 0.001], [5.0, 5.0]])
-    keep = to_np(_dedup_representatives(points, np.array([1, 2, 1]), 0.01))
-    assert keep.tolist() == [True, True, False, True]
 
 
 def sie_fixture(device=None):

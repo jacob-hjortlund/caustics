@@ -79,6 +79,9 @@ __all__ = (
     "AdaptiveMesh",
     "build_adaptive_mesh",
     "mesh_query",
+    "mesh_seeds",
+    "dedup_block_group",
+    "dedup_representatives",
 )
 
 # ---------------------------------------------------------------------------
@@ -2659,3 +2662,206 @@ def mesh_query(mesh, beta, batch_size=None) -> Tuple[ArrayLike, ArrayLike, Array
         offsets,
         backend.concatenate(bary_parts, dim=0),
     )
+
+
+def mesh_seeds(mesh, leaf_indices, bary) -> ArrayLike:
+    """
+    Lens-plane preimage of hit leaves under each leaf's own affine map, shape ``(K, 2)``.
+
+    A ``bary``-weighted gather of ``vertices_lens``: the pure contraction
+    ``sum(tri * bary[..., None], axis=1)`` where ``tri = vertices_lens[leaves[
+    leaf_indices]]``. That map is exactly the one step 7's refinement criterion
+    bounds, so the result is a Newton seed accurate to ``min_img_sep`` by
+    construction. Because ``bary`` is guaranteed to lie in the simplex (see
+    :func:`sanitize_bary`), the seed always lies inside its leaf.
+
+    There is no ``beta`` mode here, unlike the oracle's ``Mesh.seeds``, and no
+    guard rejecting an ambiguous call: a caller wanting query-then-seed
+    composes :func:`mesh_query` and this function directly --
+    ``leaf_indices, _, bary = mesh_query(mesh, beta)`` then
+    ``mesh_seeds(mesh, leaf_indices, bary)`` -- rather than this function
+    accepting both forms behind a runtime check.
+
+    Parameters
+    ----------
+    mesh: AdaptiveMesh
+        The frozen mesh ``leaf_indices`` indexes into.
+    leaf_indices: ArrayLike
+        ``(K,)`` indices into ``mesh.leaves``, e.g. from :func:`mesh_query`.
+    bary: ArrayLike
+        ``(K, 3)`` barycentric coordinates within each indexed leaf, e.g. from
+        :func:`mesh_query`. The caller is responsible for ensuring it lies in
+        the simplex; :func:`mesh_query` already guarantees this.
+
+    Returns
+    -------
+    ArrayLike
+        ``(K, 2)`` lens-plane seed positions.
+
+        *Unit: arcsec*
+    """
+    tri = mesh.vertices_lens[mesh.leaves[leaf_indices]]
+    return backend.sum(tri * backend.unsqueeze(bary, -1), dim=1)
+
+
+def dedup_block_group(points, rows, n_blocks, m, tol) -> ArrayLike:
+    """
+    Connected-component representatives for blocks of exactly ``m`` points.
+
+    Every slot is real, so this carries none of the padding machinery a
+    ragged formulation needs: no validity mask, no clipped gather, and the
+    "no label" sentinel is ``m`` rather than a global maximum. Grouping the
+    caller's blocks by count and calling this once per distinct count is what
+    keeps the ``(n_blocks, m, m)`` intermediate proportional to
+    ``sum_c B_c * c**2`` instead of ``B * max(c)**2``.
+
+    Parameters
+    ----------
+    points: ArrayLike
+        The caller's full point array, shape ``(K, 2)``.
+
+        *Unit: arcsec*
+    rows: ArrayLike
+        ``(n_blocks * m,)`` int64 indices into ``points``, block-major. A
+        host-side sequence is accepted too; see :func:`dedup_representatives`.
+    n_blocks, m: int
+        Block count and the common per-block point count.
+    tol: float
+        Separation below which two points are the same image.
+
+        *Unit: arcsec*
+
+    Returns
+    -------
+    ArrayLike
+        ``(n_blocks * m,)`` bool, in the order of ``rows``.
+    """
+    device = backend.device(points)
+    int64 = backend.int64
+    p = points[backend.as_array(rows, dtype=int64, device=device)]
+    p = p.reshape(n_blocks, m, 2)
+
+    delta = backend.unsqueeze(p, 2) - backend.unsqueeze(p, 1)
+    # Squared distances against a squared tolerance: no sqrt, and the
+    # comparison is exact on the diagonal, so every point is its own
+    # neighbour and the label update below is a true minimum over the closed
+    # neighbourhood.
+    adjacent = backend.long(backend.sum(delta * delta, dim=-1) < tol * tol)
+
+    # Min-label propagation. `m` is the sentinel for "no label": it exceeds
+    # every real slot index, so it never wins a minimum against a neighbour.
+    index = backend.unsqueeze(backend.arange(m, dtype=int64, device=device), 0)
+    labels = index + backend.zeros((n_blocks, m), dtype=int64, device=device)
+    for _ in range(m):
+        neighbour = adjacent * backend.unsqueeze(labels, 1) + (1 - adjacent) * m
+        updated = backend.min(neighbour, dim=2)
+        if bool(backend.to_numpy(backend.all(updated == labels))):
+            break
+        labels = updated
+
+    # Each component now carries the lowest slot index it contains, and that
+    # slot is its own label -- so the fixed points are exactly one per
+    # component.
+    return (labels == index).reshape(-1)
+
+
+def dedup_representatives(points, counts, tol) -> ArrayLike:
+    """
+    One representative per cluster of near-coincident points, within each block.
+
+    Clusters are the **connected components** of the ``distance < tol`` graph,
+    not the greedy clusters :func:`~caustics.lenses.func.base.remove_duplicate_points`
+    produces. The difference is order dependence: for three collinear points
+    spaced ``0.9 * tol`` apart, greedy returns two representatives in one input
+    order and one in another, so the image count would depend on the order
+    :func:`mesh_query` happened to emit candidates in. Components are a
+    function of the point set alone, which is what makes a multiplicity map
+    reproducible.
+
+    Adjacency is strict ``<``, so a pair separated by exactly ``tol`` stays
+    distinct. That matches the build contract, where ``min_img_sep`` is a size
+    floor the mesh resolves *to* rather than a scale it merges away.
+
+    Vectorized by grouping blocks that share a count and running each group at
+    its own width, because a greedy loop is one Python iteration per point --
+    fine for the handful of images of a single source, hopeless for the
+    ``nx * ny`` blocks of a multiplicity map. Blocks of zero or one point never
+    reach the kernel; their answer is already known. The cost is a
+    ``(B_c, c, c)`` intermediate per distinct count ``c``, which is why callers
+    may still want to chunk over query points when a single block is enormous.
+
+    Block-major order is restored by an inverse permutation rather than a
+    scatter: every row belongs to exactly one group, so concatenating the
+    groups' row indices gives a permutation of ``range(K)``, and ``argsort`` of
+    a permutation *is* its inverse -- computed by sorting, never by an indexed
+    assignment. That matters because torch keeps the last write on duplicate
+    indices and jax accumulates, so a scatter would mean two different things
+    on the two backends; a gather (indexing by the inverse permutation) means
+    the same thing on both.
+
+    Parameters
+    ----------
+    points: ArrayLike
+        Shape ``(K, 2)``, laid out block-major: block ``b`` occupies the
+        ``counts[b]`` rows following those of blocks ``0 .. b - 1``.
+
+        *Unit: arcsec*
+    counts: ArrayLike
+        Shape ``(B,)`` int, with ``counts.sum() == K``. A host-side sequence
+        is accepted directly and coerced on entry -- that is the array-like
+        input the no-``numpy``-import rule permits, not an exception to it.
+        Zero-length blocks are allowed.
+    tol: float
+        Separation below which two points are the same image.
+
+        *Unit: arcsec*
+
+    Returns
+    -------
+    ArrayLike
+        ``(K,)`` bool, True on exactly one point per cluster.
+    """
+    device = backend.device(points)
+    counts = backend.as_array(counts, dtype=backend.int64, device=device)
+    total = int(backend.to_numpy(backend.sum(counts)))
+    if total == 0:
+        return backend.zeros((0,), dtype=backend.bool, device=device)
+
+    starts = backend.cumsum(counts, dim=0) - counts
+    row_groups, keep_groups = [], []
+
+    # A block of one point is its own representative and a block of none
+    # contributes nothing, so neither reaches the clustering kernel at all.
+    # On a multiplicity map those are the large majority, and skipping them is
+    # the single biggest reduction in what the kernel has to hold.
+    singles = backend.flatnonzero(counts == 1)
+    if singles.shape[0] > 0:
+        row_groups.append(starts[singles])
+        keep_groups.append(
+            backend.ones((singles.shape[0],), dtype=backend.bool, device=device)
+        )
+
+    # The rest are grouped by *equal* count so each group runs at its own M.
+    # Padding every block to the global maximum is what made the intermediate
+    # `B * max(c)**2` and put a fine multiplicity map out of memory. The
+    # distinct counts themselves are pulled to the host: there are at most a
+    # handful of them (multiplicities are small integers), and each drives a
+    # Python-level `dedup_block_group` call with its own static shape anyway.
+    distinct = backend.to_numpy(backend.unique(counts[counts > 1])).tolist()
+    for m in distinct:
+        blocks = backend.flatnonzero(counts == m)
+        rows = (
+            backend.unsqueeze(starts[blocks], 1)
+            + backend.unsqueeze(
+                backend.arange(m, dtype=backend.int64, device=device), 0
+            )
+        ).reshape(-1)
+        row_groups.append(rows)
+        keep_groups.append(dedup_block_group(points, rows, blocks.shape[0], m, tol))
+
+    # Every row belongs to exactly one group, so `perm` is a permutation of
+    # `range(total)` and its `argsort` is exactly its inverse.
+    perm = backend.concatenate(row_groups, dim=0)
+    inverse = backend.argsort(perm)
+    stacked = backend.concatenate(keep_groups, dim=0)
+    return stacked[inverse]
