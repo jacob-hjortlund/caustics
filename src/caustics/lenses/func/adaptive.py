@@ -72,6 +72,9 @@ __all__ = (
     "canonical_order",
     "min_angle",
     "close",
+    "invalidate_nonfinite_origins",
+    "MeshIndex",
+    "build_index",
 )
 
 # ---------------------------------------------------------------------------
@@ -1947,3 +1950,217 @@ def close(
             leaves = backend.fill_at_indices(leaves, o + t, kids[:, t, :])
 
     return leaves, origin, level[origin], status[origin]
+
+
+# ---------------------------------------------------------------------------
+# Freeze-time invalidation and the spatial index
+# ---------------------------------------------------------------------------
+
+
+def invalidate_nonfinite_origins(vs, leaves, origin, pre_status) -> ArrayLike:
+    """
+    Re-check finiteness at freeze and propagate invalidity through the origin.
+
+    A ``LEAF_FORCED`` leaf inherits its vertices from a parent whose
+    midpoints were never finiteness-tested, and a closure triangle can pick
+    up a midpoint no criterion ever saw, so a non-finite vertex can reach
+    freeze on a leaf not already marked invalid. Without this it would enter
+    the spatial index and swallow every query in its cell.
+
+    Invalidity is propagated UP to the origin and then back DOWN to every one
+    of its leaves, rather than applied to the bad leaf alone: the
+    termination-reason counts are pre-closure, so marking only the leaf would
+    leave them disagreeing with the pre-closure leaf count. It is also the
+    conservative direction -- if one triangle of a region has a bad vertex,
+    the region is not trustworthy.
+
+    The oracle (``old_adaptive._invalidate_nonfinite_origins``) computes the
+    per-origin flag with ``np.logical_or.at(origin_bad, origin, ~leaf_finite)``,
+    an OR-scatter over possibly-repeated ``origin`` indices. That scatter has
+    no backend-agnostic form: torch's index assignment keeps the LAST write on
+    a repeated index, while jax's analogous ``.at[]`` update ACCUMULATES --
+    neither reproduces an OR-reduction on both backends. Counting bad leaves
+    per origin with ``bincount`` and testing ``> 0`` sidesteps the scatter
+    entirely: it *is* an OR-reduction over duplicates, and it is a primitive
+    both backends already agree on. ``minlength=n_origins`` is an exact upper
+    bound here -- every ``origin`` value is a valid index into ``pre_status``
+    by construction -- so, unlike a general ``bincount`` call, it is safe on
+    jax too (see :func:`build_index` for the same argument in more detail).
+
+    Parameters
+    ----------
+    vs: ArrayLike
+        Vertex-cache positions, shape ``(V, 2)``.
+
+        *Unit: arcsec*
+    leaves: ArrayLike
+        Pre-closure or closure leaf vertex slots, shape ``(L, 3)``, int64 into
+        ``vs``.
+    origin: ArrayLike
+        Shape ``(L,)``, int64 index into ``pre_status``. Need not be sorted.
+    pre_status: ArrayLike
+        Shape ``(N,)``, one status per origin.
+
+    Returns
+    -------
+    ArrayLike
+        ``pre_status`` with every origin owning a non-finite leaf set to
+        ``LEAF_NONFINITE``.
+    """
+    n_origins = pre_status.shape[0]
+    leaf_finite = backend.all(backend.isfinite(vs[leaves]), dim=(1, 2))
+    bad_rows = backend.flatnonzero(~leaf_finite)
+    origin_bad = backend.bincount(origin[bad_rows], minlength=n_origins) > 0
+    return backend.where(origin_bad, LEAF_NONFINITE, pre_status)
+
+
+class MeshIndex(NamedTuple):
+    """
+    Uniform-grid CSR index over source-plane leaf bounding boxes.
+
+    One cell lookup per query is complete: ``beta`` lies in the triangle,
+    which lies in its AABB, which is covered by the cells the leaf registered
+    in, so ``beta``'s own cell always contains any leaf containing ``beta``.
+    No neighbour search is needed. Per-cell lists are stored ascending, which
+    gives ``query`` its sorted CSR blocks with no sort at query time.
+
+    ``lo``/``hi`` are the source-plane bounding box of every indexed leaf's
+    vertices and ``cell`` is the per-axis cell size, all shape ``(2,)``.
+    ``cell_offsets`` (shape ``(nx * ny + 1,)``) and ``cell_leaves`` are the
+    CSR arrays: cell ``c``'s leaves are
+    ``cell_leaves[cell_offsets[c]:cell_offsets[c + 1]]``, ascending.
+    """
+
+    lo: ArrayLike
+    hi: ArrayLike
+    cell: ArrayLike
+    nx: int
+    ny: int
+    cell_offsets: ArrayLike
+    cell_leaves: ArrayLike
+
+
+def build_index(vs, leaves, valid_rows, index_cells) -> MeshIndex:
+    """
+    Build the uniform-grid CSR spatial index over ``valid_rows``' AABBs.
+
+    Deliberately float64 regardless of the mesh's own dtype: build-side and
+    query-side cell arithmetic (``Mesh.query``'s ``(chunk - lo) / cell``) must
+    agree by construction, and forcing this to the mesh's own dtype would let
+    the two sides round independently right at cell boundaries -- worse, not
+    cleaner.
+
+    Parameters
+    ----------
+    vs: ArrayLike
+        Vertex-cache positions, shape ``(V, 2)``.
+
+        *Unit: arcsec*
+    leaves: ArrayLike
+        All leaf vertex slots, shape ``(L, 3)``, int64 into ``vs``.
+    valid_rows: ArrayLike
+        Ascending row indices of ``leaves`` to index, shape ``(K,)``.
+    index_cells: int or None
+        Target cell count along the larger span axis. ``None`` sizes cells
+        from the mean leaf density instead.
+
+    Returns
+    -------
+    MeshIndex
+    """
+    # `vs` is already float64 unless the caller asked for a float32 mesh, and
+    # this gather is the largest single array in the function -- `backend.to`
+    # skips the copy when the dtype already matches (as does `Tensor.to`; a
+    # jax array is immutable regardless), so casting unconditionally does not
+    # double it for nothing.
+    tri = backend.to(vs[leaves[valid_rows]], dtype=backend.float64)
+    if tri.shape[0] == 0:
+        return MeshIndex(
+            lo=backend.zeros((2,), dtype=backend.float64),
+            hi=backend.ones((2,), dtype=backend.float64),
+            cell=backend.ones((2,), dtype=backend.float64),
+            nx=1,
+            ny=1,
+            cell_offsets=backend.zeros((2,), dtype=backend.int64),
+            cell_leaves=backend.empty((0,), dtype=backend.int64),
+        )
+    flat = tri.reshape(-1, 2)
+    lo, hi = backend.min(flat, dim=0), backend.max(flat, dim=0)
+    span = backend.where(hi > lo, hi - lo, 1.0)  # a degenerate axis becomes one cell
+
+    # `nx`, `ny` and the cell size are grid *shape*, not mesh data, and every
+    # other host-side kernel in this module already drops to a Python scalar
+    # for exactly this (see `depth_floor`, `make_lattice`). One `to_numpy`
+    # call here, not a separate one for each of the handful of scalars it
+    # takes to get there.
+    span_np = backend.to_numpy(span)
+    if index_cells is None:
+        c = float(math.sqrt(span_np[0] * span_np[1] / tri.shape[0]))
+    else:
+        c = float(span_np.max()) / int(index_cells)
+    c = max(c, float(backend.finfo(backend.float64).tiny))
+    nx = max(1, int(math.ceil(span_np[0] / c)))
+    ny = max(1, int(math.ceil(span_np[1] / c)))
+    cell = span / backend.as_array([nx, ny], dtype=backend.float64)
+
+    upper = backend.as_array([nx - 1, ny - 1], dtype=backend.int64)
+    # `backend.clamp` requires min and max to both be Tensors when either one
+    # is, on torch (a bare Python `0` alongside the array `upper` raises); a
+    # zeros array makes both bounds a Tensor on both backends.
+    lower = backend.zeros((2,), dtype=backend.int64)
+    i0 = backend.clamp(
+        backend.long((backend.min(tri, dim=1) - lo) / cell), lower, upper
+    )
+    i1 = backend.clamp(
+        backend.long((backend.max(tri, dim=1) - lo) / cell), lower, upper
+    )
+    tall = i1[:, 1] - i0[:, 1] + 1
+    counts = (i1[:, 0] - i0[:, 0] + 1) * tall
+    owner = backend.repeat(
+        backend.arange(counts.shape[0], dtype=backend.int64), counts, axis=0
+    )
+    total_pairs = int(backend.to_numpy(backend.sum(counts)))
+    within = backend.arange(total_pairs, dtype=backend.int64) - backend.repeat(
+        backend.cumsum(counts, dim=0) - counts, counts, axis=0
+    )
+    cell_id = (i0[owner, 0] + within // tall[owner]) * ny + (
+        i0[owner, 1] + within % tall[owner]
+    )
+    # A stable sort on `cell_id` alone, not a lexsort on `(leaf_id, cell_id)`.
+    # `owner` is non-decreasing by construction and `valid_rows` is ascending,
+    # so `leaf_id = valid_rows[owner]` is already sorted in generation order
+    # and a stable sort reproduces the lexsort's tie-breaking exactly. Ties in
+    # the pair cannot occur at all: within one leaf the cell rectangle is
+    # enumerated bijectively, so a leaf never registers in a cell twice.
+    order = backend.argsort(cell_id)
+    # `leaf_id` is deferred past the sort. It is only needed to fill
+    # `cell_leaves`, and materialising it beforehand costs another array as
+    # long as the (cell, leaf) pair list -- in the function that already
+    # dominates the build's peak memory.
+    cell_leaves = valid_rows[owner[order]]
+    # Counting the pairs per cell is the same thing as `searchsorted` over a
+    # sorted key array, by the definition of a CSR offset -- and `bincount`
+    # runs on the *unsorted* ids, so the sorted copy `cell_id[order]` and a
+    # `nx * ny + 1`-long probe array are both never built. `minlength=nx*ny`
+    # is an exact upper bound: `i0`/`i1` are clamped to
+    # `[0, nx - 1] x [0, ny - 1]` by construction, so `cell_id < nx * ny`
+    # always -- which is what makes it safe on jax too, where `minlength`
+    # maps to a hard cap (`length=`) that silently drops anything at or past
+    # it, rather than torch's floor that grows to fit.
+    counts_per_cell = backend.long(backend.bincount(cell_id, minlength=nx * ny))
+    cell_offsets = backend.concatenate(
+        [
+            backend.zeros((1,), dtype=backend.int64),
+            backend.cumsum(counts_per_cell, dim=0),
+        ],
+        dim=0,
+    )
+    return MeshIndex(
+        lo=lo,
+        hi=hi,
+        cell=cell,
+        nx=nx,
+        ny=ny,
+        cell_offsets=cell_offsets,
+        cell_leaves=cell_leaves,
+    )

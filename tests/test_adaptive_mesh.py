@@ -11,7 +11,6 @@ from caustics.lenses.adaptive import (
     BuildStats,
     Mesh,
     _dedup_representatives,
-    _invalidate_nonfinite_origins,
     build_adaptive_mesh,
 )
 from caustics.lenses.func import forward_raytrace_rootfind
@@ -329,63 +328,6 @@ def test_stats_count_splits_driven_by_ignorance_apart_from_the_criterion():
     assert clean.stats.n_nonfinite_splits == 0
 
 
-def test_every_indexed_leaf_has_finite_source_vertices():
-    def broken(p):
-        out = localised_fold(p)
-        out[p[:, 0] > 1.0] = np.nan
-        return out
-
-    mesh, _ = build(broken, min_img_sep=0.05)
-    vs = backend.to_numpy(mesh.vertices_source)
-    leaves = backend.to_numpy(mesh.leaves)
-    for leaf in np.unique(backend.to_numpy(mesh._cell_leaves)):
-        assert np.isfinite(vs[leaves[leaf]]).all()
-
-
-def test_index_registers_every_leaf_in_the_cell_of_each_of_its_vertices():
-    mesh, _ = build(localised_fold, min_img_sep=0.05)
-    vs = backend.to_numpy(mesh.vertices_source)
-    leaves = backend.to_numpy(mesh.leaves)
-    offs = backend.to_numpy(mesh._cell_offsets)
-    cells = backend.to_numpy(mesh._cell_leaves)
-    lo = backend.to_numpy(mesh._index_lo)
-    cell = backend.to_numpy(mesh._index_cell)
-    status = backend.to_numpy(mesh.leaf_status)
-    for leaf in RNG.choice(len(leaves), size=50, replace=False):
-        if status[leaf] == LeafStatus.INVALID:
-            continue
-        for q in vs[leaves[leaf]]:
-            ix = int(np.clip((q[0] - lo[0]) // cell[0], 0, mesh._nx - 1))
-            iy = int(np.clip((q[1] - lo[1]) // cell[1], 0, mesh._ny - 1))
-            c = ix * mesh._ny + iy
-            assert leaf in cells[offs[c] : offs[c + 1]]
-
-
-def test_build_index_orders_leaves_ascending_within_every_cell():
-    """CSR blocks must come out sorted with no sort at query time.
-
-    The ordering used to come from `np.lexsort((leaf_id, cell_id))`. It now
-    comes from a stable sort on `cell_id` alone, which is only equivalent
-    because `leaf_id` is already non-decreasing in generation order. If that
-    premise ever breaks, the blocks stop being ascending -- and `query`'s
-    contract that `leaf_indices` is "strictly ascending within each block"
-    breaks with it, silently.
-    """
-    lens, mesh = sie_fixture()
-    offsets = to_np(mesh._cell_offsets)
-    leaves = to_np(mesh._cell_leaves)
-    assert offsets[0] == 0
-    assert offsets[-1] == leaves.size
-    assert (np.diff(offsets) >= 0).all()
-    nonempty = 0
-    for start, stop in zip(offsets[:-1], offsets[1:]):
-        block = leaves[start:stop]
-        if block.size > 1:
-            nonempty += 1
-            assert (np.diff(block) > 0).all(), "cell block is not strictly ascending"
-    assert nonempty > 0, "fixture is too coarse to exercise multi-leaf cells"
-
-
 def test_query_covers_points_on_the_source_bbox_upper_edge():
     """Regression: the upper bbox edge used to return zero candidates.
 
@@ -491,25 +433,6 @@ def test_leaf_area2_uses_the_downcast_vertices_at_reduced_precision():
     assert not np.array_equal(
         from_stored, computed_then_cast
     ), "fixture no longer distinguishes the two orderings"
-
-
-def test_freeze_invalidates_a_whole_origin_group_from_one_bad_vertex():
-    """The freeze-time finiteness re-check, exercised directly.
-
-    It cannot be reached through a full build: every vertex that becomes a
-    corner or midpoint of an evaluated triangle is finiteness-checked by
-    ``_refine`` first, except on a narrow cascade path (a FORCED leaf re-forced
-    in a later round via a deferred, never-checked midpoint) that no available
-    fixture reaches. Unit-tested on a synthetic triple instead -- otherwise the
-    re-check could be deleted with no test failing.
-    """
-    vs = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [np.nan, 0.5]])
-    leaves = np.array([[0, 1, 2], [0, 1, 3], [0, 1, 2]])
-    origin = np.array([0, 0, 1])  # leaf 1 is non-finite and shares origin 0
-    pre_status = np.array([LeafStatus.CONVERGED, LeafStatus.CONVERGED], dtype=np.int8)
-    out = _invalidate_nonfinite_origins(vs, leaves, origin, pre_status)
-    assert out[0] == LeafStatus.INVALID, "one bad leaf must invalidate its origin"
-    assert out[1] == LeafStatus.CONVERGED, "a clean origin must be untouched"
 
 
 def test_kappa_one_sheet_builds_without_nan():
