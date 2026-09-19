@@ -7,11 +7,6 @@ from caustics.backend_obj import backend
 from caustics.cosmology import FlatLambdaCDM
 from caustics.lenses import SIE, Point
 from caustics.lenses import old_adaptive as oracle
-from caustics.lenses.adaptive import (
-    LeafStatus,
-    _invalidate_nonfinite_origins,
-    build_adaptive_mesh,
-)
 from caustics.lenses.func import adaptive as new
 
 
@@ -95,12 +90,11 @@ def test_build_index_leaves_are_ascending_within_every_cell():
 
 
 # ---------------------------------------------------------------------------
-# Ported from test_adaptive_mesh.py: black-box checks against the legacy
-# (pre-refactor) full build pipeline in `caustics.lenses.adaptive`. These do
-# not yet exercise `caustics.lenses.func.adaptive` -- `build_adaptive_mesh`
-# is only assembled on the backend in a later task -- but they belong here
-# thematically, with the freeze/index tests above rather than the general
-# mesh-build suite.
+# Ported from test_adaptive_mesh.py: black-box checks against the full build
+# pipeline, exercising `caustics.lenses.func.adaptive`'s backend-native
+# `build_adaptive_mesh` via the `new_build`/`new_sie_fixture` helpers below.
+# They stay here, thematically with the freeze/index tests above, rather
+# than in the general mesh-build suite.
 # ---------------------------------------------------------------------------
 
 RNG = np.random.default_rng(20260904)
@@ -145,43 +139,16 @@ def localised_fold(p):
     return np.stack([p[:, 0], 0.6 * y + bend], axis=-1)
 
 
-def build(fn, fov=4.0, init_res=4, min_img_sep=0.25, **kw):
-    raytrace, calls = make_counting_raytrace(fn)
-    mesh = build_adaptive_mesh(raytrace, fov, init_res, min_img_sep, **kw)
-    return mesh, calls
-
-
-def sie_fixture(device=None):
-    lens = SIE(
-        name="sie",
-        cosmology=FlatLambdaCDM(name="cosmo"),
-        z_l=0.5,
-        z_s=1.5,
-        x0=0.0,
-        y0=0.0,
-        q=0.4,
-        phi=np.pi / 5,
-        Rein=1.0,
-        s=1e-3,
-    )
-    if device is not None:
-        lens = lens.to(device)
-    mesh = build_adaptive_mesh(
-        lens.raytrace, fov=5.0, init_res=32, min_img_sep=1e-2, device=device
-    )
-    return lens, mesh
-
-
 def test_every_indexed_leaf_has_finite_source_vertices():
     def broken(p):
         out = localised_fold(p)
         out[p[:, 0] > 1.0] = np.nan
         return out
 
-    mesh, _ = build(broken, min_img_sep=0.05)
+    mesh, _ = new_build(broken, min_img_sep=0.05)
     vs = backend.to_numpy(mesh.vertices_source)
     leaves = backend.to_numpy(mesh.leaves)
-    for leaf in np.unique(backend.to_numpy(mesh._cell_leaves)):
+    for leaf in np.unique(backend.to_numpy(mesh.index.cell_leaves)):
         assert np.isfinite(vs[leaves[leaf]]).all()
 
 
@@ -197,21 +164,21 @@ def test_every_indexed_leaf_has_finite_source_vertices():
     strict=False,
 )
 def test_index_registers_every_leaf_in_the_cell_of_each_of_its_vertices():
-    mesh, _ = build(localised_fold, min_img_sep=0.05)
+    mesh, _ = new_build(localised_fold, min_img_sep=0.05)
     vs = backend.to_numpy(mesh.vertices_source)
     leaves = backend.to_numpy(mesh.leaves)
-    offs = backend.to_numpy(mesh._cell_offsets)
-    cells = backend.to_numpy(mesh._cell_leaves)
-    lo = backend.to_numpy(mesh._index_lo)
-    cell = backend.to_numpy(mesh._index_cell)
+    offs = backend.to_numpy(mesh.index.cell_offsets)
+    cells = backend.to_numpy(mesh.index.cell_leaves)
+    lo = backend.to_numpy(mesh.index.lo)
+    cell = backend.to_numpy(mesh.index.cell)
     status = backend.to_numpy(mesh.leaf_status)
     for leaf in RNG.choice(len(leaves), size=50, replace=False):
-        if status[leaf] == LeafStatus.INVALID:
+        if status[leaf] == new.LEAF_INVALID:
             continue
         for q in vs[leaves[leaf]]:
-            ix = int(np.clip((q[0] - lo[0]) // cell[0], 0, mesh._nx - 1))
-            iy = int(np.clip((q[1] - lo[1]) // cell[1], 0, mesh._ny - 1))
-            c = ix * mesh._ny + iy
+            ix = int(np.clip((q[0] - lo[0]) // cell[0], 0, mesh.index.nx - 1))
+            iy = int(np.clip((q[1] - lo[1]) // cell[1], 0, mesh.index.ny - 1))
+            c = ix * mesh.index.ny + iy
             assert leaf in cells[offs[c] : offs[c + 1]]
 
 
@@ -225,9 +192,9 @@ def test_build_index_orders_leaves_ascending_within_every_cell():
     contract that `leaf_indices` is "strictly ascending within each block"
     breaks with it, silently.
     """
-    lens, mesh = sie_fixture()
-    offsets = to_np(mesh._cell_offsets)
-    leaves = to_np(mesh._cell_leaves)
+    lens, mesh = new_sie_fixture()
+    offsets = to_np(mesh.index.cell_offsets)
+    leaves = to_np(mesh.index.cell_leaves)
     assert offsets[0] == 0
     assert offsets[-1] == leaves.size
     assert (np.diff(offsets) >= 0).all()
@@ -253,16 +220,20 @@ def test_freeze_invalidates_a_whole_origin_group_from_one_bad_vertex():
     vs = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [np.nan, 0.5]])
     leaves = np.array([[0, 1, 2], [0, 1, 3], [0, 1, 2]])
     origin = np.array([0, 0, 1])  # leaf 1 is non-finite and shares origin 0
-    pre_status = np.array([LeafStatus.CONVERGED, LeafStatus.CONVERGED], dtype=np.int8)
-    out = _invalidate_nonfinite_origins(vs, leaves, origin, pre_status)
+    pre_status = np.array([new.LEAF_CONVERGED, new.LEAF_CONVERGED])
+    out = backend.to_numpy(
+        new.invalidate_nonfinite_origins(
+            _f64(vs), _i64(leaves), _i64(origin), _i64(pre_status)
+        )
+    )
     # UPDATED from `LeafStatus.INVALID`: b6dc3eb split the old INVALID status
     # into finite-only INVALID vs non-finite NONFINITE. The frozen oracle
     # (`old_adaptive._invalidate_nonfinite_origins`) returns
     # `np.where(origin_bad, np.int8(LeafStatus.NONFINITE), pre_status)`, and
     # running it directly on these exact inputs gives `out == [4, 0]`, i.e.
     # NONFINITE for the bad origin -- confirmed against the oracle, not guessed.
-    assert out[0] == LeafStatus.NONFINITE, "one bad leaf must invalidate its origin"
-    assert out[1] == LeafStatus.CONVERGED, "a clean origin must be untouched"
+    assert out[0] == new.LEAF_NONFINITE, "one bad leaf must invalidate its origin"
+    assert out[1] == new.LEAF_CONVERGED, "a clean origin must be untouched"
 
 
 # ---------------------------------------------------------------------------

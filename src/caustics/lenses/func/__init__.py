@@ -93,6 +93,17 @@ from .adaptive import (
     shape_matrix,
     sigma_min_2x2,
     triangle_weights,
+    build_adaptive_mesh,
+    mesh_query,
+    mesh_seeds,
+    mesh_forward_raytrace,
+    AdaptiveMesh,
+    MeshIndex,
+    LEAF_CONVERGED,
+    LEAF_SIZE_FLOOR,
+    LEAF_FORCED,
+    LEAF_INVALID,
+    LEAF_NONFINITE,
 )
 
 __all__ = (
@@ -171,4 +182,15 @@ __all__ = (
     "shape_matrix",
     "sigma_min_2x2",
     "triangle_weights",
+    "build_adaptive_mesh",
+    "mesh_query",
+    "mesh_seeds",
+    "mesh_forward_raytrace",
+    "AdaptiveMesh",
+    "MeshIndex",
+    "LEAF_CONVERGED",
+    "LEAF_SIZE_FLOOR",
+    "LEAF_FORCED",
+    "LEAF_INVALID",
+    "LEAF_NONFINITE",
 )

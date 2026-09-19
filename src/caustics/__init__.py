@@ -23,11 +23,8 @@ from .lenses import (
     TNFW,
     Multipole,
     EnclosedMass,
-    build_adaptive_mesh,
-    Mesh,
-    LeafStatus,
-    BuildStats,
 )
+from .lenses.func import build_adaptive_mesh
 from .light import (
     Source,
     Pixelated,
@@ -73,9 +70,6 @@ __all__ = [
     "Multipole",
     "EnclosedMass",
     "build_adaptive_mesh",
-    "Mesh",
-    "LeafStatus",
-    "BuildStats",
     "Source",
     "Pixelated",
     "PixelatedTime",

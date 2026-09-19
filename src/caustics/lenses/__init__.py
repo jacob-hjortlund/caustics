@@ -16,7 +16,6 @@ from .tnfw import TNFW
 from .multiplane import Multiplane
 from .multipole import Multipole
 from .enclosed_mass import EnclosedMass
-from .adaptive import build_adaptive_mesh, Mesh, LeafStatus, BuildStats
 
 __all__ = [
     "ThinLens",
@@ -38,8 +37,4 @@ __all__ = [
     "TNFW",
     "Multipole",
     "EnclosedMass",
-    "build_adaptive_mesh",
-    "Mesh",
-    "LeafStatus",
-    "BuildStats",
 ]
