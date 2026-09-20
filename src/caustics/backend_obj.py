@@ -655,16 +655,19 @@ class Backend:
         return self.module.bincount(array, minlength=minlength)
 
     def _bincount_jax(self, array, minlength=0):
-        return self.module.bincount(array, length=minlength)
+        return self.module.bincount(array, minlength=minlength)
 
     def _flatnonzero_torch(self, array):
-        return self.module.nonzero(array, as_tuple=False).reshape(-1)
+        return self.module.nonzero(array.reshape(-1), as_tuple=False).reshape(-1)
 
     def _flatnonzero_jax(self, array):
         return self.module.flatnonzero(array)
 
     def _sign_torch(self, array):
-        return self.module.sign(array)
+        result = self.module.sign(array)
+        if array.dtype.is_floating_point:
+            result = self.module.where(self.module.isnan(array), array, result)
+        return result
 
     def _sign_jax(self, array):
         return self.module.sign(array)

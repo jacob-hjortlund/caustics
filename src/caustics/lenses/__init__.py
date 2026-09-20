@@ -16,6 +16,14 @@ from .tnfw import TNFW
 from .multiplane import Multiplane
 from .multipole import Multipole
 from .enclosed_mass import EnclosedMass
+from .func import (
+    build_adaptive_mesh,
+    mesh_query,
+    mesh_seeds,
+    mesh_forward_raytrace,
+    AdaptiveMesh,
+    MeshIndex,
+)
 
 __all__ = [
     "ThinLens",
@@ -37,4 +45,10 @@ __all__ = [
     "TNFW",
     "Multipole",
     "EnclosedMass",
+    "build_adaptive_mesh",
+    "mesh_query",
+    "mesh_seeds",
+    "mesh_forward_raytrace",
+    "AdaptiveMesh",
+    "MeshIndex",
 ]

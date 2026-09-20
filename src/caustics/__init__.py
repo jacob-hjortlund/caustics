@@ -24,7 +24,14 @@ from .lenses import (
     Multipole,
     EnclosedMass,
 )
-from .lenses.func import build_adaptive_mesh
+from .lenses.func import (
+    build_adaptive_mesh,
+    mesh_query,
+    mesh_seeds,
+    mesh_forward_raytrace,
+    AdaptiveMesh,
+    MeshIndex,
+)
 from .light import (
     Source,
     Pixelated,
@@ -70,6 +77,11 @@ __all__ = [
     "Multipole",
     "EnclosedMass",
     "build_adaptive_mesh",
+    "mesh_query",
+    "mesh_seeds",
+    "mesh_forward_raytrace",
+    "AdaptiveMesh",
+    "MeshIndex",
     "Source",
     "Pixelated",
     "PixelatedTime",

@@ -1371,6 +1371,7 @@ def make_raytrace(raytrace, device) -> Callable[[ArrayLike], ArrayLike]:
     info = {"done": False, "dtype": backend.float64}
 
     def call(xy):
+        build_device = backend.device(xy)
         x = backend.as_array(xy[:, 0], dtype=backend.float64, device=device)
         y = backend.as_array(xy[:, 1], dtype=backend.float64, device=device)
         out = raytrace(x, y)
@@ -1389,7 +1390,11 @@ def make_raytrace(raytrace, device) -> Callable[[ArrayLike], ArrayLike]:
                 f"for {tuple(x.shape)} inputs; it must be shape-preserving on "
                 "1-D input"
             )
-        return backend.to(backend.stack((bx, by), dim=-1), dtype=backend.float64)
+        return backend.to(
+            backend.stack((bx, by), dim=-1),
+            dtype=backend.float64,
+            device=build_device,
+        )
 
     call.info = info  # type: ignore[attr-defined]
     return call
@@ -1998,8 +2003,8 @@ def invalidate_nonfinite_origins(vs, leaves, origin, pre_status) -> ArrayLike:
     entirely: it *is* an OR-reduction over duplicates, and it is a primitive
     both backends already agree on. ``minlength=n_origins`` is an exact upper
     bound here -- every ``origin`` value is a valid index into ``pre_status``
-    by construction -- so, unlike a general ``bincount`` call, it is safe on
-    jax too (see :func:`build_index` for the same argument in more detail).
+    by construction. ``minlength`` is a lower bound on both backends, while
+    the construction here also guarantees the result has exactly that length.
 
     Parameters
     ----------
@@ -2158,9 +2163,7 @@ def build_index(vs, leaves, valid_rows, index_cells) -> MeshIndex:
     # `nx * ny + 1`-long probe array are both never built. `minlength=nx*ny`
     # is an exact upper bound: `i0`/`i1` are clamped to
     # `[0, nx - 1] x [0, ny - 1]` by construction, so `cell_id < nx * ny`
-    # always -- which is what makes it safe on jax too, where `minlength`
-    # maps to a hard cap (`length=`) that silently drops anything at or past
-    # it, rather than torch's floor that grows to fit.
+    # always, so the minimum-length result is exactly `nx * ny` entries.
     counts_per_cell = backend.long(backend.bincount(cell_id, minlength=nx * ny))
     cell_offsets = backend.concatenate(
         [
@@ -2332,9 +2335,9 @@ def build_adaptive_mesh(
         curvature scale in the lens.
     min_img_sep: float
         Requested lens-plane tolerance. The parity-condemned band at
-        ``max_level`` is about three leaves wide, so the build refines to
-        ``min_img_sep / 2`` internally -- that halving keeps the band to
-        roughly ``1.5x`` the separation requested here, not a hard bound. The
+        ``max_level`` is model-dependent, so the build refines to
+        ``min_img_sep / 2`` internally to narrow it; this is not a universal
+        numerical bound on the band width. The
         halved value is the one stored on the returned :class:`AdaptiveMesh`,
         not the value passed in.
 
@@ -2365,15 +2368,14 @@ def build_adaptive_mesh(
     -------
     AdaptiveMesh
     """
-    # The parity-condemned band at max_level is about three leaves wide, so
-    # refining straight to the caller's requested separation would leave the
-    # band several leaves wider than it. Halved once, here, before any use, so
+    # The parity-condemned band at max_level is model-dependent. Refining to
+    # half the requested separation narrows it, without implying a universal
+    # bound on its width. Halved once, here, before any use, so
     # every computation below -- validation, the depth floor, max_level,
     # l_max_final and its depth-limited warning, the refine call, the
     # cancellation-floor check, and the value stored on the returned mesh --
-    # sees this one halved value and never the caller's original. That halving
-    # keeps the band to roughly 1.5x the requested separation, not a hard
-    # bound. `requested_min_img_sep` is kept alongside purely so the messages
+    # sees this one halved value and never the caller's original.
+    # `requested_min_img_sep` is kept alongside purely so the messages
     # below can name what the caller actually passed, rather than quoting them
     # a number they never supplied.
     requested_min_img_sep = min_img_sep
@@ -3032,7 +3034,9 @@ def mesh_forward_raytrace(
         pipeline, not just :func:`mesh_query` -- the root finder holds
         ``(K, 2)`` states and the dedup a ``(B_c, c, c)`` intermediate per
         distinct candidate count ``c`` (see :func:`dedup_representatives`).
-        Results are identical for every value.
+        Image counts are invariant to this chunking. Levenberg-Marquardt's
+        shared damping schedule can shift root positions within solver
+        accuracy when the batch partition changes.
     method: str
         ``"rootfind"`` (default) refines every seed with
         Levenberg-Marquardt and returns machine-precision image positions.

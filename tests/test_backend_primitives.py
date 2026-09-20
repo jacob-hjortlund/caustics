@@ -4,7 +4,7 @@ import pytest
 from caustics.backend_obj import backend
 
 
-def test_sort_is_ascending_and_stable():
+def test_sort_is_ascending():
     x = backend.as_array(np.array([3, 1, 2, 1], dtype=np.int64))
     assert backend.to_numpy(backend.sort(x)).tolist() == [1, 1, 2, 3]
 
@@ -26,16 +26,19 @@ def test_unique_without_inverse_returns_values_only():
     assert backend.to_numpy(backend.unique(x)).tolist() == [1, 2, 3]
 
 
-def test_bincount_honours_the_minimum_length():
-    x = backend.as_array(np.array([3, 1, 2, 1], dtype=np.int64))
-    assert backend.to_numpy(backend.bincount(x, minlength=6)).tolist() == [
-        0,
-        2,
-        1,
-        1,
-        0,
-        0,
-    ]
+@pytest.mark.parametrize(
+    "minlength, expected",
+    [
+        (None, [1, 0, 2]),
+        (1, [1, 0, 2]),
+        (3, [1, 0, 2]),
+        (5, [1, 0, 2, 0, 0]),
+    ],
+)
+def test_bincount_honours_the_minimum_length(minlength, expected):
+    x = backend.as_array(np.array([0, 2, 2], dtype=np.int64))
+    got = backend.bincount(x) if minlength is None else backend.bincount(x, minlength)
+    assert backend.to_numpy(got).tolist() == expected
 
 
 def test_bincount_of_an_empty_array_is_all_zeros():
@@ -48,9 +51,38 @@ def test_flatnonzero_returns_ascending_indices():
     assert backend.to_numpy(backend.flatnonzero(x > 1)).tolist() == [0, 2]
 
 
+@pytest.mark.parametrize(
+    "values, expected",
+    [
+        ([[0, 1], [1, 0]], [1, 2]),
+        (1, [0]),
+        (0, []),
+    ],
+)
+def test_flatnonzero_flattens_inputs_before_finding_indices(values, expected):
+    x = backend.as_array(np.asarray(values, dtype=np.int64), dtype=backend.int64)
+    assert backend.to_numpy(backend.flatnonzero(x)).tolist() == expected
+
+
 def test_sign_matches_numpy():
     x = backend.as_array(np.array([-2.0, 0.0, 3.0]))
     assert backend.to_numpy(backend.sign(x)).tolist() == [-1.0, 0.0, 1.0]
+
+
+def test_sign_preserves_nan_like_numpy():
+    x = backend.as_array(np.array([np.nan, -2.0, 0.0, 3.0]))
+    assert np.array_equal(
+        backend.to_numpy(backend.sign(x)),
+        np.sign(np.array([np.nan, -2.0, 0.0, 3.0])),
+        equal_nan=True,
+    )
+
+
+def test_sign_preserves_integer_dtype_and_values():
+    x = backend.as_array(np.array([-2, 0, 3], dtype=np.int64), dtype=backend.int64)
+    got = backend.sign(x)
+    assert got.dtype == backend.int64
+    assert backend.to_numpy(got).tolist() == [-1, 0, 1]
 
 
 def test_lexsort_matches_numpy_with_the_last_key_primary():

@@ -4,10 +4,17 @@ import numpy as np
 import pytest
 
 from caustics.backend_obj import backend
-from caustics.lenses.func import old_adaptive as oracle
 from caustics.lenses.func import adaptive as new
 
 RNG = np.random.default_rng(20260918)
+
+
+@pytest.fixture
+def oracle_module():
+    return pytest.importorskip(
+        "caustics.lenses.func.old_adaptive",
+        reason="optional frozen differential oracle",
+    )
 
 
 def _arr(x):
@@ -47,32 +54,32 @@ def _six_points(tri):
     return tri, mid
 
 
-def test_shape_matrix_matches_the_oracle():
+def test_shape_matrix_matches_the_oracle(oracle_module):
     tri = RNG.normal(size=(32, 3, 2))
     assert np.allclose(
-        backend.to_numpy(new.shape_matrix(_arr(tri))), oracle.shape_matrix(tri)
+        backend.to_numpy(new.shape_matrix(_arr(tri))), oracle_module.shape_matrix(tri)
     )
 
 
-def test_affine_from_triangles_matches_the_oracle():
+def test_affine_from_triangles_matches_the_oracle(oracle_module):
     p, q = RNG.normal(size=(16, 3, 2)), RNG.normal(size=(16, 3, 2))
     assert np.allclose(
         backend.to_numpy(new.affine_from_triangles(_arr(p), _arr(q))),
-        oracle.affine_from_triangles(p, q),
+        oracle_module.affine_from_triangles(p, q),
     )
 
 
-def test_child_matrix_tables_match_the_oracle():
+def test_child_matrix_tables_match_the_oracle(oracle_module):
     got = new.child_matrix_tables()
-    want = oracle.child_matrix_tables()
+    want = oracle_module.child_matrix_tables()
     for g, w in zip(got, want):
         assert np.allclose(backend.to_numpy(g), w)
 
 
-def test_sigma_min_matches_the_oracle():
+def test_sigma_min_matches_the_oracle(oracle_module):
     A = RNG.normal(size=(64, 2, 2))
     assert np.allclose(
-        backend.to_numpy(new.sigma_min_2x2(_arr(A))), oracle.sigma_min_2x2(A)
+        backend.to_numpy(new.sigma_min_2x2(_arr(A))), oracle_module.sigma_min_2x2(A)
     )
 
 
@@ -95,33 +102,33 @@ def test_converged_from_deviation_fails_closed_on_nan():
     assert not bool(backend.to_numpy(new.converged_from_deviation(r, s, 1.0))[0])
 
 
-def test_midpoint_deviation_matches_the_oracle():
+def test_midpoint_deviation_matches_the_oracle(oracle_module):
     beta_v, beta_m = _samples()
     assert np.allclose(
         backend.to_numpy(new.midpoint_deviation(_arr(beta_v), _arr(beta_m))),
-        oracle.midpoint_deviation(beta_v, beta_m),
+        oracle_module.midpoint_deviation(beta_v, beta_m),
     )
 
 
-def test_child_shape_matrices_match_the_oracle():
+def test_child_shape_matrices_match_the_oracle(oracle_module):
     beta_v, beta_m = _samples()
     assert np.allclose(
         backend.to_numpy(new.child_shape_matrices(_arr(beta_v), _arr(beta_m))),
-        oracle.child_shape_matrices(beta_v, beta_m),
+        oracle_module.child_shape_matrices(beta_v, beta_m),
     )
 
 
-def test_parity_from_children_matches_the_oracle():
+def test_parity_from_children_matches_the_oracle(oracle_module):
     beta_v, beta_m = _samples()
-    Q = oracle.child_shape_matrices(beta_v, beta_m)
+    Q = oracle_module.child_shape_matrices(beta_v, beta_m)
     assert (
         backend.to_numpy(new.parity_from_children(_arr(Q)))
-        == oracle.parity_from_children(Q)
+        == oracle_module.parity_from_children(Q)
     ).all()
 
 
 def test_parity_from_children_fails_closed_on_a_nonfinite_child():
-    """sign(NaN) is NaN and NaN != NaN, so the constancy test is False.
+    """A NaN determinant stays NaN, so sign constancy fails closed.
 
     This is what lets `_refine` condemn a max_level triangle with a non-finite
     midpoint without a branch of its own. See spec section 3.3.
@@ -131,20 +138,20 @@ def test_parity_from_children_fails_closed_on_a_nonfinite_child():
     assert not bool(backend.to_numpy(new.parity_from_children(_arr(Q)))[0])
 
 
-def test_quadratic_vertex_parity_matches_the_oracle():
+def test_quadratic_vertex_parity_matches_the_oracle(oracle_module):
     beta_v, beta_m = _samples()
     assert (
         backend.to_numpy(new.quadratic_vertex_parity_ok(_arr(beta_v), _arr(beta_m)))
-        == oracle.quadratic_vertex_parity_ok(beta_v, beta_m)
+        == oracle_module.quadratic_vertex_parity_ok(beta_v, beta_m)
     ).all()
 
 
 @pytest.mark.parametrize("level", [0, 2, 5])
-def test_evaluate_criterion_matches_the_oracle(level):
+def test_evaluate_criterion_matches_the_oracle(oracle_module, level):
     beta_v, beta_m = _samples()
     classes = RNG.integers(0, 6, beta_v.shape[0])
-    _, _, compose, pinv0, _ = oracle.child_matrix_tables()
-    want = oracle.evaluate_criterion(
+    _, _, compose, pinv0, _ = oracle_module.child_matrix_tables()
+    want = oracle_module.evaluate_criterion(
         beta_v, beta_m, classes, level, 0.5, 0.01, pinv0, compose
     )
     got = new.evaluate_criterion(
@@ -164,6 +171,11 @@ def test_evaluate_criterion_matches_the_oracle(level):
 
 def test_group_tables_close_and_have_order_six():
     M, G, COMPOSE, PINV0, ROOT_CLASS = new.child_matrix_tables()
+    assert M.dtype == backend.int64
+    assert G.dtype == backend.int64
+    assert COMPOSE.dtype == backend.int64
+    assert PINV0.dtype == backend.float64
+    assert ROOT_CLASS.dtype == backend.int64
     M, G, COMPOSE, ROOT_CLASS = (
         backend.to_numpy(M),
         backend.to_numpy(G),
@@ -435,6 +447,20 @@ def test_parity_from_children_passes_an_entirely_degenerate_triangle():
     """
     Q = np.zeros((1, 4, 2, 2))
     assert backend.to_numpy(new.parity_from_children(_arr(Q))).tolist() == [True]
+
+
+@pytest.mark.parametrize(
+    "determinants",
+    [
+        [np.nan, np.nan, np.nan, np.nan],
+        [np.nan, 0.0, 0.0, 0.0],
+    ],
+)
+def test_parity_from_children_rejects_nan_determinants(determinants):
+    Q = np.zeros((1, 4, 2, 2))
+    Q[0, :, 0, 0] = determinants
+    Q[0, :, 1, 1] = 1.0
+    assert backend.to_numpy(new.parity_from_children(_arr(Q))).tolist() == [False]
 
 
 def test_midpoint_deviation_pairs_midpoint_with_opposite_edge():

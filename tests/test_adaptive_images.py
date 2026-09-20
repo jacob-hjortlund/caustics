@@ -4,11 +4,17 @@ import pytest
 from caustics.backend_obj import backend
 from caustics.cosmology import FlatLambdaCDM
 from caustics.lenses import SIE, Point
-from caustics.lenses import old_adaptive as oracle
 from caustics.lenses.func import adaptive as new
 from caustics.lenses.func import forward_raytrace_rootfind
 
 RNG = np.random.default_rng(20260904)
+
+
+@pytest.fixture
+def oracle_module():
+    return pytest.importorskip(
+        "caustics.lenses.old_adaptive", reason="optional frozen differential oracle"
+    )
 
 
 def _sie_like(x, y):
@@ -28,8 +34,8 @@ def _beta(points):
     return backend.as_array(np.asarray(points, dtype=np.float64), dtype=backend.float64)
 
 
-def test_forward_raytrace_matches_the_oracle(mesh):
-    old_mesh = oracle.build_adaptive_mesh(_sie_like, **BUILD)
+def test_forward_raytrace_matches_the_oracle(mesh, oracle_module):
+    old_mesh = oracle_module.build_adaptive_mesh(_sie_like, **BUILD)
     beta = _beta([[0.05, 0.02], [0.4, -0.3], [1.9, 1.7]])
 
     img, counts = new.mesh_forward_raytrace(mesh, beta, _sie_like)
@@ -97,10 +103,10 @@ def test_dedup_positions_are_within_min_img_sep_of_the_refined_roots(mesh):
     beta = _beta([[0.4, -0.3]])
     a, ca = new.mesh_forward_raytrace(mesh, beta, _sie_like, method="rootfind")
     b, cb = new.mesh_forward_raytrace(mesh, beta, _sie_like, method="dedup")
-    if backend.to_numpy(ca).tolist() == backend.to_numpy(cb).tolist():
-        pa = np.sort(backend.to_numpy(a), axis=0)
-        pb = np.sort(backend.to_numpy(b), axis=0)
-        assert np.abs(pa - pb).max() <= mesh.min_img_sep
+    assert backend.to_numpy(ca).tolist() == backend.to_numpy(cb).tolist()
+    pa = np.sort(backend.to_numpy(a), axis=0)
+    pb = np.sort(backend.to_numpy(b), axis=0)
+    assert np.abs(pa - pb).max() <= mesh.min_img_sep
 
 
 # ---------------------------------------------------------------------------
@@ -177,12 +183,10 @@ def test_sie_candidates_recover_forward_raytrace_images(device):
         expected = dedup(
             np.stack([backend.to_numpy(ex), backend.to_numpy(ey)], axis=-1), 1e-2
         )
-        # The coverage contract below goes vacuous if `dedup` ever returned an
-        # empty `expected`: `.all()` over an empty array is True.
-        assert expected.shape[0] > 0, f"{sp}: forward_raytrace found no images"
         # Excludes any image inside the lens's own softening radius -- see
         # the docstring above; the mesh deliberately has no coverage there.
         coverable = expected[np.linalg.norm(expected, axis=-1) >= 1e-3]
+        assert coverable.shape[0] > 0, f"{sp}: no coverable reference images"
         idx, offsets, bary = new.mesh_query(mesh, backend.as_array(np.asarray([sp])))
         seed = backend.to_numpy(new.mesh_seeds(mesh, idx, bary))
         assert seed.shape[0] >= coverable.shape[0], "candidates must cover the images"

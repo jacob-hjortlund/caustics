@@ -3,10 +3,12 @@ import importlib
 import pytest
 
 import caustics
+import caustics.lenses as lenses
 from caustics.lenses import func
 
 
-def test_new_symbols_are_re_exported():
+@pytest.mark.parametrize("package", [caustics, lenses, func])
+def test_new_symbols_are_re_exported_at_every_package_level(package):
     for name in (
         "build_adaptive_mesh",
         "mesh_query",
@@ -15,19 +17,15 @@ def test_new_symbols_are_re_exported():
         "AdaptiveMesh",
         "MeshIndex",
     ):
-        assert hasattr(func, name), name
-        assert name in func.__all__, name
+        assert getattr(package, name) is getattr(func, name), name
+        assert name in package.__all__, name
 
 
-def test_build_adaptive_mesh_is_reachable_from_the_package_root():
-    assert hasattr(caustics, "build_adaptive_mesh")
-    assert "build_adaptive_mesh" in caustics.__all__
-
-
-def test_dropped_symbols_are_gone():
+@pytest.mark.parametrize("package", [caustics, lenses, func])
+def test_dropped_symbols_are_gone(package):
     for name in ("Mesh", "LeafStatus", "BuildStats"):
-        assert not hasattr(caustics, name), name
-        assert name not in caustics.__all__, name
+        assert not hasattr(package, name), name
+        assert name not in package.__all__, name
 
 
 def test_the_old_module_no_longer_exists():

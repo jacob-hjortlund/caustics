@@ -6,8 +6,14 @@ import pytest
 from caustics.backend_obj import backend
 from caustics.cosmology import FlatLambdaCDM
 from caustics.lenses import SIE, Point
-from caustics.lenses import old_adaptive as oracle
 from caustics.lenses.func import adaptive as new
+
+
+@pytest.fixture
+def oracle_module():
+    return pytest.importorskip(
+        "caustics.lenses.old_adaptive", reason="optional frozen differential oracle"
+    )
 
 
 def _f64(x):
@@ -32,7 +38,7 @@ def test_invalidate_propagates_one_bad_vertex_to_the_whole_origin_group():
     assert got.tolist() == [new.LEAF_NONFINITE, new.LEAF_CONVERGED]
 
 
-def test_invalidate_matches_the_oracle_on_duplicate_origins():
+def test_invalidate_matches_the_oracle_on_duplicate_origins(oracle_module):
     rng = np.random.default_rng(5)
     vs = rng.normal(size=(30, 2))
     vs[7] = np.inf
@@ -45,21 +51,21 @@ def test_invalidate_matches_the_oracle_on_duplicate_origins():
             _f64(vs), _i64(leaves), _i64(origin), _i64(pre_status)
         )
     )
-    want = oracle._invalidate_nonfinite_origins(
+    want = oracle_module._invalidate_nonfinite_origins(
         vs, leaves, origin, pre_status.astype(np.int8)
     )
     # The oracle marks NONFINITE; only the constant's spelling differs.
     assert got.tolist() == want.astype(np.int64).tolist()
 
 
-def test_build_index_matches_the_oracle():
+def test_build_index_matches_the_oracle(oracle_module):
     rng = np.random.default_rng(9)
     vs = rng.normal(size=(60, 2)) * 2.0
     leaves = rng.integers(0, 60, (40, 3))
     valid = np.arange(0, 40, 2)
 
     got = new.build_index(_f64(vs), _i64(leaves), _i64(valid), None)
-    want = oracle._build_index(vs, leaves, valid, None)
+    want = oracle_module._build_index(vs, leaves, valid, None)
 
     assert np.allclose(backend.to_numpy(got.lo), want[0])
     assert np.allclose(backend.to_numpy(got.cell), want[1])
@@ -84,9 +90,13 @@ def test_build_index_leaves_are_ascending_within_every_cell():
     idx = new.build_index(_f64(vs), _i64(leaves), _i64(np.arange(60)), 6)
     offsets = backend.to_numpy(idx.cell_offsets)
     cell_leaves = backend.to_numpy(idx.cell_leaves)
+    exercised = 0
     for a, b in zip(offsets[:-1], offsets[1:]):
         block = cell_leaves[a:b]
-        assert (np.diff(block) > 0).all() if block.size > 1 else True
+        if block.size > 1:
+            exercised += 1
+            assert (np.diff(block) > 0).all()
+    assert exercised > 0, "fixture must exercise a cell containing multiple leaves"
 
 
 # ---------------------------------------------------------------------------
@@ -253,9 +263,9 @@ def _affine(x, y):
 BUILD = dict(fov=4.0, init_res=3, min_img_sep=0.5, max_depth=3)
 
 
-def test_build_matches_the_oracle_mesh():
+def test_build_matches_the_oracle_mesh(oracle_module):
     got = new.build_adaptive_mesh(_sie_like, **BUILD)
-    want = oracle.build_adaptive_mesh(_sie_like, **BUILD)
+    want = oracle_module.build_adaptive_mesh(_sie_like, **BUILD)
 
     assert np.allclose(
         backend.to_numpy(got.vertices_lens), backend.to_numpy(want.vertices_lens)

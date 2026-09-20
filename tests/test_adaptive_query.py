@@ -4,8 +4,14 @@ import numpy as np
 import pytest
 
 from caustics.backend_obj import backend
-from caustics.lenses import old_adaptive as oracle
 from caustics.lenses.func import adaptive as new
+
+
+@pytest.fixture
+def oracle_module():
+    return pytest.importorskip(
+        "caustics.lenses.old_adaptive", reason="optional frozen differential oracle"
+    )
 
 
 def _sie_like(x, y):
@@ -27,8 +33,8 @@ def beta():
     return backend.as_array(rng.uniform(-1.5, 1.5, (64, 2)), dtype=backend.float64)
 
 
-def test_query_matches_the_oracle(mesh, beta):
-    old_mesh = oracle.build_adaptive_mesh(_sie_like, **BUILD)
+def test_query_matches_the_oracle(mesh, beta, oracle_module):
+    old_mesh = oracle_module.build_adaptive_mesh(_sie_like, **BUILD)
     idx, offsets, bary = new.mesh_query(mesh, beta)
     idx_o, off_o, bary_o = old_mesh.query(beta)
 
@@ -181,18 +187,14 @@ def test_query_seeds_an_inner_image_that_runs_into_the_lens_centre():
     sits 5x deeper inside the old hexagon than its half-width, so the old policy
     returns only the outer seed, 2.0 arcsec away.
 
-    ADAPTED: ``mesh_seeds`` is Task 14's interface and does not exist yet.
-    ``Mesh.seeds`` is exactly a ``bary``-weighted gather of
-    ``vertices_lens[leaves[idx]]`` (see ``old_adaptive.Mesh._seed``), so the
-    seed is reconstructed here directly from ``mesh_query``'s own output,
-    the same pattern ``test_query_finds_the_affine_preimage`` below already
-    uses.
+    Compose the public ``mesh_query`` and ``mesh_seeds`` interfaces so this
+    regression exercises the same seeding path used by forward raytracing.
     """
     mesh, _ = build(sis_raytrace, min_img_sep=0.05)
     idx, offsets, bary = query_np(mesh, np.array([[0.8, 0.0]]))
-    vl = backend.to_numpy(mesh.vertices_lens)
-    leaves = backend.to_numpy(mesh.leaves)
-    seed = np.einsum("kj,kjd->kd", bary, vl[leaves[idx]])
+    seed = backend.to_numpy(
+        new.mesh_seeds(mesh, backend.as_array(idx), backend.as_array(bary))
+    )
     assert offsets.shape[0] == 2 and seed.shape[0] > 0
     for image in ([-0.2, 0.0], [1.8, 0.0]):
         gap = np.linalg.norm(seed - np.asarray(image), axis=1).min()
@@ -549,8 +551,8 @@ def test_seeds_lie_inside_their_lens_triangle(mesh, beta):
     assert (s >= lo - 1e-12).all() and (s <= hi + 1e-12).all()
 
 
-def test_seeds_match_the_oracle(mesh, beta):
-    old_mesh = oracle.build_adaptive_mesh(_sie_like, **BUILD)
+def test_seeds_match_the_oracle(mesh, beta, oracle_module):
+    old_mesh = oracle_module.build_adaptive_mesh(_sie_like, **BUILD)
     idx, _, bary = new.mesh_query(mesh, beta)
     idx_o, _, bary_o = old_mesh.query(beta)
     assert np.allclose(
@@ -594,14 +596,14 @@ def test_dedup_handles_empty_and_singleton_blocks():
     assert keep.tolist() == [True, False, True]
 
 
-def test_dedup_matches_the_oracle_on_randomised_blocks():
+def test_dedup_matches_the_oracle_on_randomised_blocks(oracle_module):
     rng = np.random.default_rng(31)
     counts = rng.integers(0, 5, 20)
     pts = rng.normal(size=(int(counts.sum()), 2)) * 0.1
     p = _pts(pts)
     assert (
         backend.to_numpy(new.dedup_representatives(p, counts, 0.05))
-        == backend.to_numpy(oracle._dedup_representatives(p, counts, 0.05))
+        == backend.to_numpy(oracle_module._dedup_representatives(p, counts, 0.05))
     ).all()
 
 

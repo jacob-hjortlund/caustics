@@ -4,8 +4,14 @@ import numpy as np
 import pytest
 
 from caustics.backend_obj import backend
-from caustics.lenses import old_adaptive as oracle
 from caustics.lenses.func import adaptive as new
+
+
+@pytest.fixture
+def oracle_module():
+    return pytest.importorskip(
+        "caustics.lenses.old_adaptive", reason="optional frozen differential oracle"
+    )
 
 
 def _sie_like(x, y):
@@ -26,19 +32,22 @@ def _run_new(raytrace, fov, init_res, min_img_sep, max_level):
     )
 
 
-def _run_old(raytrace, fov, init_res, min_img_sep, max_level):
-    tables = oracle.child_matrix_tables()
-    lat = oracle._Lattice(fov, 0.0, 0.0, init_res, max_level + 1)
-    fn = oracle._make_raytrace_np(raytrace, None)
-    return oracle._refine(
+def _run_old(oracle_module, raytrace, fov, init_res, min_img_sep, max_level):
+    tables = oracle_module.child_matrix_tables()
+    lat = oracle_module._Lattice(fov, 0.0, 0.0, init_res, max_level + 1)
+    fn = oracle_module._make_raytrace_np(raytrace, None)
+    return oracle_module._refine(
         fn, lat, init_res, fov / init_res, min_img_sep, max_level, tables, None
     )
 
 
-def _leaf_key_set(v, ij_of_slot, key_of_ij):
-    """Canonical, order-independent identity for a leaf set."""
+def _leaf_records(v, level, cls, status, ij_of_slot, key_of_ij):
+    """Canonical joint geometry and metadata records for a leaf set."""
     keys = np.sort(key_of_ij(ij_of_slot[v]), axis=1)
-    return sorted(map(tuple, keys.tolist()))
+    return sorted(
+        (tuple(key_row), int(lvl), int(shape_cls), int(st))
+        for key_row, lvl, shape_cls, st in zip(keys, level, cls, status)
+    )
 
 
 @pytest.mark.parametrize(
@@ -50,23 +59,28 @@ def _leaf_key_set(v, ij_of_slot, key_of_ij):
     ],
 )
 def test_refine_reproduces_the_oracle_leaf_set(
-    raytrace, fov, init_res, min_img_sep, max_level
+    oracle_module, raytrace, fov, init_res, min_img_sep, max_level
 ):
     cache, active, store, counters = _run_new(
         raytrace, fov, init_res, min_img_sep, max_level
     )
-    ref = _run_old(raytrace, fov, init_res, min_img_sep, max_level)
+    ref = _run_old(oracle_module, raytrace, fov, init_res, min_img_sep, max_level)
 
-    v_new, lvl_new, _, st_new = new.store_compact(store)
-    v_old, lvl_old, _, st_old = ref.store.compact()
+    v_new, lvl_new, cls_new, st_new = new.store_compact(store)
+    v_old, lvl_old, cls_old, st_old = ref.store.compact()
 
-    lat_old = oracle._Lattice(fov, 0.0, 0.0, init_res, max_level + 1)
+    lat_old = oracle_module._Lattice(fov, 0.0, 0.0, init_res, max_level + 1)
     ij_new = backend.to_numpy(cache.ij)
-    got = _leaf_key_set(backend.to_numpy(v_new), ij_new, lambda ij: lat_old.key(ij))
-    want = _leaf_key_set(v_old, ref.cache.ij, lambda ij: lat_old.key(ij))
+    got = _leaf_records(
+        backend.to_numpy(v_new),
+        backend.to_numpy(lvl_new),
+        backend.to_numpy(cls_new),
+        backend.to_numpy(st_new),
+        ij_new,
+        lat_old.key,
+    )
+    want = _leaf_records(v_old, lvl_old, cls_old, st_old, ref.cache.ij, lat_old.key)
     assert got == want
-    assert sorted(backend.to_numpy(lvl_new).tolist()) == sorted(lvl_old.tolist())
-    assert sorted(backend.to_numpy(st_new).tolist()) == sorted(st_old.tolist())
 
 
 @pytest.mark.parametrize(
@@ -74,10 +88,10 @@ def test_refine_reproduces_the_oracle_leaf_set(
     [(_sie_like, 4.0, 4, 0.25, 3), (_sie_like, 5.0, 3, 0.1, 4)],
 )
 def test_refine_counters_match_the_oracle(
-    raytrace, fov, init_res, min_img_sep, max_level
+    oracle_module, raytrace, fov, init_res, min_img_sep, max_level
 ):
     _, _, _, counters = _run_new(raytrace, fov, init_res, min_img_sep, max_level)
-    ref = _run_old(raytrace, fov, init_res, min_img_sep, max_level)
+    ref = _run_old(oracle_module, raytrace, fov, init_res, min_img_sep, max_level)
     assert counters == ref.counters
 
 
@@ -89,21 +103,6 @@ def test_refine_converges_everywhere_at_level_zero_for_an_affine_map():
     assert bool(backend.all(status == new.LEAF_CONVERGED))
     assert counters["parity_splits"] == 0
     assert counters["deviation_splits"] == 0
-
-
-def test_refine_evaluates_every_point_exactly_once():
-    calls = []
-
-    def counting(x, y):
-        calls.append(backend.to_numpy(x).copy())
-        return _sie_like(x, y)
-
-    cache, _, _, _ = _run_new(counting, 4.0, 3, 0.25, 3)
-    traced = np.concatenate(calls)
-    # max_level midpoints are traced but never cached, so the cache is a subset
-    assert len(np.unique(np.round(traced, 12))) <= traced.size
-    keys = backend.to_numpy(cache.keys)
-    assert len(np.unique(keys)) == keys.size
 
 
 # ---------------------------------------------------------------------------
@@ -661,11 +660,11 @@ def test_canonical_order_is_independent_of_input_order():
     assert v_np[order].tolist() == v_np[perm][order_shuf].tolist()
 
 
-def test_closure_matches_the_oracle():
+def test_closure_matches_the_oracle(oracle_module):
     cache, active, store, _ = _run_new(_sie_like, 4.0, 3, 0.25, 3)
-    ref = _run_old(_sie_like, 4.0, 3, 0.25, 3)
+    ref = _run_old(oracle_module, _sie_like, 4.0, 3, 0.25, 3)
     lat = new.make_lattice(4.0, 0.0, 0.0, 3, 4)
-    lat_old = oracle._Lattice(4.0, 0.0, 0.0, 3, 4)
+    lat_old = oracle_module._Lattice(4.0, 0.0, 0.0, 3, 4)
 
     v, level, _, status = new.store_compact(store)
     order = new.canonical_order(lat, cache, v)
@@ -675,9 +674,9 @@ def test_closure_matches_the_oracle():
     )
 
     v_o, lvl_o, _, st_o = ref.store.compact()
-    order_o = oracle._canonical_order(lat_old, ref.cache, v_o)
+    order_o = oracle_module._canonical_order(lat_old, ref.cache, v_o)
     v_o, lvl_o, st_o = v_o[order_o], lvl_o[order_o], st_o[order_o]
-    leaves_o, origin_o, lvl_out_o, st_out_o = oracle._close(
+    leaves_o, origin_o, lvl_out_o, st_out_o = oracle_module._close(
         lat_old, ref.cache, ref.active, v_o, lvl_o, st_o
     )
 

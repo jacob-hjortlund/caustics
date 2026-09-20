@@ -2,13 +2,19 @@ import numpy as np
 import pytest
 
 from caustics.backend_obj import backend
-from caustics.lenses import old_adaptive as oracle
 from caustics.lenses.func import adaptive as new
 
 
-def test_lattice_key_round_trips_and_matches_the_oracle():
+@pytest.fixture
+def oracle_module():
+    return pytest.importorskip(
+        "caustics.lenses.old_adaptive", reason="optional frozen differential oracle"
+    )
+
+
+def test_lattice_key_round_trips_and_matches_the_oracle(oracle_module):
     lat = new.make_lattice(4.0, 0.0, 0.0, 2, 3)
-    old = oracle._Lattice(4.0, 0.0, 0.0, 2, 3)
+    old = oracle_module._Lattice(4.0, 0.0, 0.0, 2, 3)
     ij = np.array([[0, 0], [1, 3], [16, 16], [5, 11]], dtype=np.int64)
     ij_b = backend.as_array(ij, dtype=backend.int64)
 
@@ -18,9 +24,9 @@ def test_lattice_key_round_trips_and_matches_the_oracle():
     assert np.allclose(backend.to_numpy(new.lattice_xy(lat, ij_b)), old.xy(ij))
 
 
-def test_lattice_on_boundary_matches_the_oracle():
+def test_lattice_on_boundary_matches_the_oracle(oracle_module):
     lat = new.make_lattice(4.0, 0.0, 0.0, 2, 2)
-    old = oracle._Lattice(4.0, 0.0, 0.0, 2, 2)
+    old = oracle_module._Lattice(4.0, 0.0, 0.0, 2, 2)
     ij = np.array([[0, 4], [8, 1], [3, 3], [8, 8]], dtype=np.int64)
     got = backend.to_numpy(
         new.lattice_on_boundary(lat, backend.as_array(ij, dtype=backend.int64))
@@ -31,8 +37,8 @@ def test_lattice_on_boundary_matches_the_oracle():
 @pytest.mark.parametrize(
     "fov,init_res,min_img_sep", [(5.0, 4, 0.1), (1.0, 1, 2.0), (10.0, 8, 0.001)]
 )
-def test_depth_floor_matches_the_oracle(fov, init_res, min_img_sep):
-    assert new.depth_floor(fov, init_res, min_img_sep) == oracle._depth_floor(
+def test_depth_floor_matches_the_oracle(oracle_module, fov, init_res, min_img_sep):
+    assert new.depth_floor(fov, init_res, min_img_sep) == oracle_module._depth_floor(
         fov, init_res, min_img_sep
     )
 
@@ -314,44 +320,46 @@ def test_store_remove_does_not_mutate_its_input():
     assert backend.to_numpy(after.valid).tolist() == [False, True]
 
 
-def test_initial_triangles_match_the_oracle():
+def test_initial_triangles_match_the_oracle(oracle_module):
     _, _, _, _, root_class = new.child_matrix_tables()
     ij, cls = new.initial_triangles(3, 2, root_class)
-    want_ij, want_cls = oracle._initial_triangles(3, 2, oracle.child_matrix_tables()[4])
+    want_ij, want_cls = oracle_module._initial_triangles(
+        3, 2, oracle_module.child_matrix_tables()[4]
+    )
     assert backend.to_numpy(ij).tolist() == want_ij.tolist()
     assert backend.to_numpy(cls).tolist() == want_cls.tolist()
 
 
-def test_midpoint_ij_matches_the_oracle_and_is_exact():
+def test_midpoint_ij_matches_the_oracle_and_is_exact(oracle_module):
     ij = np.array([[[0, 0], [4, 0], [0, 4]], [[2, 2], [6, 2], [2, 6]]], dtype=np.int64)
     got = backend.to_numpy(new.midpoint_ij(_i64(ij)))
-    assert got.tolist() == oracle._midpoint_ij(ij).tolist()
+    assert got.tolist() == oracle_module._midpoint_ij(ij).tolist()
     # opposite-vertex convention: m_i bisects the edge opposite theta_i
     assert got[0, 0].tolist() == [2, 2]
 
 
-def test_red_split_matches_the_oracle():
+def test_red_split_matches_the_oracle(oracle_module):
     _, _, compose, _, _ = new.child_matrix_tables()
     v = _i64([[0, 1, 2], [3, 4, 5]])
     m = _i64([[6, 7, 8], [9, 10, 11]])
     cls = _i64([0, 3])
     child_v, child_cls = new.red_split(v, m, cls, compose)
-    want_v, want_cls = oracle._red_split(
+    want_v, want_cls = oracle_module._red_split(
         np.array([[0, 1, 2], [3, 4, 5]]),
         np.array([[6, 7, 8], [9, 10, 11]]),
         np.array([0, 3]),
-        oracle.child_matrix_tables()[2],
+        oracle_module.child_matrix_tables()[2],
     )
     assert backend.to_numpy(child_v).tolist() == want_v.tolist()
     assert backend.to_numpy(child_cls).tolist() == want_cls.tolist()
 
 
-def test_edge_quarter_keys_match_the_oracle():
+def test_edge_quarter_keys_match_the_oracle(oracle_module):
     lat = new.make_lattice(4.0, 0.0, 0.0, 2, 3)
-    old = oracle._Lattice(4.0, 0.0, 0.0, 2, 3)
+    old = oracle_module._Lattice(4.0, 0.0, 0.0, 2, 3)
     ij = np.array([[[0, 0], [8, 0], [0, 8]]], dtype=np.int64)
     got = backend.to_numpy(new.edge_quarter_keys(lat, _i64(ij)))
-    assert got.tolist() == oracle._edge_quarter_keys(old, ij).tolist()
+    assert got.tolist() == oracle_module._edge_quarter_keys(old, ij).tolist()
 
 
 def test_initial_triangles_tile_the_square_and_are_positively_oriented():
@@ -446,6 +454,40 @@ def test_make_raytrace_forces_float64_and_records_the_callback_dtype():
     assert seen["dtype"] == backend.float64
     assert backend.to_numpy(out).tolist() == [[2.0, 6.0], [6.0, 12.0]]
     assert make.info["dtype"] == backend.float64
+
+
+def test_make_raytrace_returns_to_the_input_device(monkeypatch):
+    xy = _f64([[1.0, 2.0]])
+    input_device = backend.device(xy)
+    calls = []
+    seen = {}
+    original_to = backend.to
+
+    def recording_to(array, *args, **kwargs):
+        calls.append(kwargs.copy())
+        return original_to(array, *args, **kwargs)
+
+    def rt(x, y):
+        seen["device"] = backend.device(x)
+        return x, y
+
+    monkeypatch.setattr(backend, "to", recording_to)
+    out = new.make_raytrace(rt, input_device)(xy)
+    assert seen["device"] == input_device
+    assert backend.device(out) == input_device
+    assert calls[-1]["device"] == input_device
+
+
+def test_make_raytrace_records_float32_callback_dtype_but_returns_float64():
+    def rt(x, y):
+        return backend.to(x, dtype=backend.float32), backend.to(
+            y, dtype=backend.float32
+        )
+
+    fn = new.make_raytrace(rt, None)
+    out = fn(_f64([[1.0, 2.0]]))
+    assert fn.info["dtype"] == backend.float32
+    assert out.dtype == backend.float64
 
 
 def test_make_raytrace_rejects_a_non_tuple_return():
