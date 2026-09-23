@@ -57,10 +57,11 @@ __all__ = (
     "active_contains_slots",
     "active_contains",
     "LEAF_CONVERGED",
-    "LEAF_SIZE_FLOOR",
-    "LEAF_FORCED",
-    "LEAF_INVALID",
-    "LEAF_NONFINITE",
+    "LEAF_CONVERGENCE_FAILED",
+    "LEAF_APPROX_PARITY_UNRESOLVED",
+    "LEAF_JACOBIAN_PARITY_UNRESOLVED",
+    "LEAF_RAYTRACE_NONFINITE",
+    "LEAF_JACOBIAN_NONFINITE",
     "LeafStore",
     "empty_store",
     "store_add",
@@ -473,7 +474,81 @@ def quadratic_vertex_parity_ok(beta_v, beta_m):
     )
 
 
-def evaluate_criterion(beta_v, beta_m, classes, level, h0, min_img_sep, pinv0, compose):
+def jacobian_parity_ok(jacobian_fn, theta_v, theta_m, *, return_details=False):
+    """Check Jacobian parity at triangle vertices and edge midpoints.
+
+    Parameters
+    ----------
+    jacobian_fn : callable
+        jacobian_fn(x, y) returns an array of shape (K, 2, 2).
+    theta_v, theta_m : backend arrays
+        Shape (N, 3, 2), containing the selected triangles' lens-plane
+        vertices and edge midpoints.
+    return_details : bool
+        If True, return (parity_ok, jacobian_nonfinite).
+
+    Returns
+    -------
+    parity_ok : Boolean array, shape (N,)
+        True when all six Jacobians have finite, nonzero determinants
+        with the same sign.
+    jacobian_nonfinite : Boolean array, shape (N,), optional
+        True when any Jacobian is nonfinite or has zero determinant.
+    """
+    if theta_v.shape != theta_m.shape or theta_v.shape[1:] != (3, 2):
+        raise ValueError("theta_v and theta_m must both have shape (N, 3, 2)")
+
+    n = theta_v.shape[0]
+    if n == 0:
+        empty = backend.zeros((0,), dtype=backend.bool, device=backend.device(theta_v))
+        return (empty, empty) if return_details else empty
+
+    theta = backend.concatenate((theta_v, theta_m), dim=1).reshape(-1, 2)
+
+    J = jacobian_fn(theta[:, 0], theta[:, 1])
+    if J.shape != (6 * n, 2, 2):
+        raise ValueError("jacobian_fn must return shape (6 * N, 2, 2)")
+
+    finite_J = backend.all(backend.isfinite(J), dim=(-2, -1))
+
+    # Keep nonfinite matrices out of subsequent arithmetic.
+    # Their failure flags are retained through finite_J.
+    identity = backend.to(backend.eye(2), dtype=J.dtype, device=backend.device(J))
+    safe_J = backend.where(finite_J[:, None, None], J, identity)
+
+    # Positive row scaling preserves determinant sign while avoiding
+    # overflow/underflow caused by the overall matrix scale.
+    row_scale = backend.max(backend.abs(safe_J), dim=-1)
+    scaled = safe_J / backend.where(row_scale > 0, row_scale, 1.0)[..., None]
+
+    det = scaled[:, 0, 0] * scaled[:, 1, 1] - scaled[:, 0, 1] * scaled[:, 1, 0]
+
+    usable = finite_J & backend.isfinite(det) & (det != 0)
+    jacobian_nonfinite = ~backend.all(usable.reshape(n, 6), dim=1)
+
+    det = det.reshape(n, 6)
+    same_sign = backend.all(det > 0, dim=1) | backend.all(det < 0, dim=1)
+    parity_ok = ~jacobian_nonfinite & same_sign
+
+    if return_details:
+        return parity_ok, jacobian_nonfinite
+    return parity_ok
+
+
+def evaluate_criterion(
+    jacobian_fn,
+    theta_v,
+    theta_m,
+    beta_v,
+    beta_m,
+    classes,
+    level,
+    h0,
+    min_img_sep,
+    pinv0,
+    compose,
+    force_jacobian=False,
+):
     """
     Steps 3 to 7 of the refinement criterion, vectorized over triangles.
 
@@ -522,15 +597,58 @@ def evaluate_criterion(beta_v, beta_m, classes, level, h0, min_img_sep, pinv0, c
         expected near a critical curve; it forces the split, and the size floor
         terminates the descent.
     """
-    Q = child_shape_matrices(beta_v, beta_m)
-    parity_ok = parity_from_children(Q) & quadratic_vertex_parity_ok(beta_v, beta_m)
 
-    A = Q @ pinv0[compose[classes]]  # (n, 4, 2, 2), up to the common 2**(d+1)/h0
+    Q = child_shape_matrices(beta_v, beta_m)
+    child_ok = parity_from_children(Q)
+
+    A = Q @ pinv0[compose[classes]]
     s = backend.min(sigma_min_2x2(A), dim=1) * (2.0 ** (level + 1)) / h0
 
     r = midpoint_deviation(beta_v, beta_m)
-    keep = parity_ok & converged_from_deviation(r, s, min_img_sep)
-    return keep, parity_ok, s
+    deviation_ok = converged_from_deviation(r, s, min_img_sep)
+
+    finite_samples = backend.all(backend.isfinite(beta_v), dim=(1, 2)) & backend.all(
+        backend.isfinite(beta_m), dim=(1, 2)
+    )
+
+    # Initial status from mapping samples and the approximate tests.
+    status = (
+        (backend.long(~child_ok) * LEAF_APPROX_PARITY_UNRESOLVED)
+        | (backend.long(finite_samples & ~deviation_ok) * LEAF_CONVERGENCE_FAILED)
+        | (backend.long(~finite_samples) * LEAF_RAYTRACE_NONFINITE)
+    )
+
+    # Normally check Jacobians only for candidates that would otherwise
+    # converge. At max_level, check every finite triangle.
+    candidate = status == LEAF_CONVERGED
+    rows = backend.flatnonzero(finite_samples & (candidate | force_jacobian))
+
+    jacobian_ok, jacobian_nonfinite = jacobian_parity_ok(
+        jacobian_fn,
+        theta_v[rows],
+        theta_m[rows],
+        return_details=True,
+    )
+
+    jacobian_status = (
+        backend.long(~jacobian_ok & ~jacobian_nonfinite)
+        * LEAF_JACOBIAN_PARITY_UNRESOLVED
+    ) | (backend.long(jacobian_nonfinite) * LEAF_JACOBIAN_NONFINITE)
+
+    # Preserve existing failures; Jacobians can add failures but cannot
+    # rescue a failed child-parity or deviation test.
+    status = backend.fill_at_indices(status, rows, status[rows] | jacobian_status)
+
+    # Used by refinement counters. Unchecked rows retain the child result;
+    # checked rows must pass both child parity and Jacobian parity.
+    parity_ok = backend.fill_at_indices(
+        backend.copy(child_ok),
+        rows,
+        child_ok[rows] & jacobian_ok,
+    )
+
+    keep = status == LEAF_CONVERGED
+    return keep, parity_ok, s, status
 
 
 # ---------------------------------------------------------------------------
@@ -1001,29 +1119,16 @@ def active_contains(active, cache, keys) -> ArrayLike:
 # Leaf store
 # ---------------------------------------------------------------------------
 
-# Why a terminal leaf stopped refining. Plain ints, not an ``IntEnum``:
-# ``status`` lives in a ``backend.int64`` array and is compared, scattered
-# and broadcast through backend ops the whole way, which a NumPy-flavoured
-# enum would fight at every one of those call sites for no benefit.
-#
-# ``LEAF_FORCED`` is distinct from ``LEAF_CONVERGED`` because a forced child
-# carries no criterion evidence at all -- that is exactly what auto-converging
-# decides -- so a caller auditing coverage must be able to tell them apart.
-# Closure triangles have no status of their own; they inherit their origin's.
-#
-# ``LEAF_INVALID`` has three sources, all of them at ``max_level`` or later. A
-# non-finite triangle is split unconditionally, so it can only come to rest at
-# ``max_level``, where no split is left. A ``max_level`` triangle whose four
-# hypothetical children do not share ``sign(det Q_k)`` straddles a fold at a
-# scale the mesh cannot resolve, and is condemned rather than answering
-# queries with a non-injective affine model. And nonfinite-origin propagation
-# at freeze time is the third source. All three bound the coverage hole by
-# the ``max_level`` leaf size rather than by ``fov / init_res``.
+
+# Failure flags stored in backend.int64 arrays.
+# Zero means no recorded failure; multiple failures combine with bitwise OR.
+# Balance-cascade children and closure triangles inherit their origin's status.
 LEAF_CONVERGED = 0
-LEAF_SIZE_FLOOR = 1
-LEAF_FORCED = 2
-LEAF_INVALID = 3
-LEAF_NONFINITE = 4
+LEAF_CONVERGENCE_FAILED = 1 << 0
+LEAF_APPROX_PARITY_UNRESOLVED = 1 << 1
+LEAF_JACOBIAN_PARITY_UNRESOLVED = 1 << 2
+LEAF_RAYTRACE_NONFINITE = 1 << 3
+LEAF_JACOBIAN_NONFINITE = 1 << 4
 
 
 class LeafStore(NamedTuple):
@@ -1484,7 +1589,17 @@ def evaluate(cache, lat, keys, raytrace_fn, batch_size) -> VertexCache:
 # ---------------------------------------------------------------------------
 
 
-def refine(raytrace_fn, lat, init_res, h0, min_img_sep, max_level, tables, batch_size):
+def refine(
+    raytrace_fn,
+    jacobian_fn,
+    lat,
+    init_res,
+    h0,
+    min_img_sep,
+    max_level,
+    tables,
+    batch_size,
+):
     """
     Level-synchronous refinement.
 
@@ -1604,8 +1719,12 @@ def refine(raytrace_fn, lat, init_res, h0, min_img_sep, max_level, tables, batch
         finite_v = backend.all(backend.isfinite(beta_v), dim=(1, 2))
 
         if level == max_level:
-            has_converged = backend.zeros((active_ij.shape[0],), dtype=backend.bool)
-            finite_samples = backend.zeros((active_ij.shape[0],), dtype=backend.bool)
+            # has_converged = backend.zeros((active_ij.shape[0],), dtype=backend.bool)
+            # finite_samples = backend.zeros((active_ij.shape[0],), dtype=backend.bool)
+            status = (
+                backend.zeros((active_ij.shape[0],), dtype=backend.int64)
+                + LEAF_RAYTRACE_NONFINITE
+            )
             rows = backend.flatnonzero(finite_v)
 
             if rows.shape[0]:
@@ -1625,12 +1744,16 @@ def refine(raytrace_fn, lat, init_res, h0, min_img_sep, max_level, tables, batch
                 # Only evaluate the criterion where all six samples are finite.
                 finite_m = backend.all(backend.isfinite(beta_m), dim=(1, 2))
                 good_rows = rows[finite_m]
-                finite_samples = backend.fill_at_indices(
-                    finite_samples, good_rows, True
-                )
 
                 if good_rows.shape[0]:
-                    keep, parity_ok, s = evaluate_criterion(
+
+                    theta_v = lattice_xy(lat, active_ij[good_rows])
+                    theta_m = lattice_xy(lat, midpoint_ij(active_ij[good_rows]))
+
+                    keep, parity_ok, s, criterion_status = evaluate_criterion(
+                        jacobian_fn,
+                        theta_v,
+                        theta_m,
                         beta_v[good_rows],
                         beta_m[finite_m],
                         active_cls[good_rows],
@@ -1639,23 +1762,18 @@ def refine(raytrace_fn, lat, init_res, h0, min_img_sep, max_level, tables, batch
                         min_img_sep,
                         PINV0,
                         COMPOSE,
+                        force_jacobian=True,
                     )
-                    has_converged = backend.fill_at_indices(
-                        has_converged, good_rows, keep
+
+                    status = backend.fill_at_indices(
+                        status, good_rows, criterion_status
                     )
                     counters["parity_invalid"] = int(
                         backend.to_numpy(backend.sum(~parity_ok))
                     )
                     counters["sigma_zero"] += int(backend.to_numpy(backend.sum(s == 0)))
 
-            status = backend.zeros((active_ij.shape[0],), dtype=backend.int64)
-            status = status + LEAF_NONFINITE
-            status = backend.fill_at_indices(
-                status, backend.flatnonzero(finite_samples), LEAF_INVALID
-            )
-            status = backend.fill_at_indices(
-                status, backend.flatnonzero(has_converged), LEAF_CONVERGED
-            )
+            has_converged = status == LEAF_CONVERGED
 
             store, _ = store_add(store, v, level, active_cls, status)
 
@@ -1672,7 +1790,14 @@ def refine(raytrace_fn, lat, init_res, h0, min_img_sep, max_level, tables, batch
         counters["nonfinite_splits"] += int(backend.to_numpy(backend.sum(~good)))
 
         rows = backend.flatnonzero(good)
-        keep, parity_ok, s = evaluate_criterion(
+
+        theta_v = lattice_xy(lat, active_ij[rows])
+        theta_m = lattice_xy(lat, mid_ij[rows])
+
+        keep, parity_ok, s, _status = evaluate_criterion(
+            jacobian_fn,
+            theta_v,
+            theta_m,
             beta_v[rows],
             beta_m[rows],
             active_cls[rows],
@@ -2030,7 +2155,7 @@ def invalidate_nonfinite_origins(vs, leaves, origin, pre_status) -> ArrayLike:
     leaf_finite = backend.all(backend.isfinite(vs[leaves]), dim=(1, 2))
     bad_rows = backend.flatnonzero(~leaf_finite)
     origin_bad = backend.bincount(origin[bad_rows], minlength=n_origins) > 0
-    return backend.where(origin_bad, LEAF_NONFINITE, pre_status)
+    return pre_status | (backend.long(origin_bad) * LEAF_RAYTRACE_NONFINITE)
 
 
 class MeshIndex(NamedTuple):
@@ -2292,7 +2417,7 @@ class AdaptiveMesh(NamedTuple):
 
 
 def build_adaptive_mesh(
-    raytrace,
+    lens,
     fov,
     init_res,
     min_img_sep,
@@ -2368,6 +2493,10 @@ def build_adaptive_mesh(
     -------
     AdaptiveMesh
     """
+
+    raytrace = lens.raytrace
+    jacobian = lens.jacobian_lens_equation
+
     # The parity-condemned band at max_level is model-dependent. Refining to
     # half the requested separation narrows it, without implying a universal
     # bound on its width. Halved once, here, before any use, so
@@ -2400,6 +2529,7 @@ def build_adaptive_mesh(
     raytrace_fn = make_raytrace(raytrace, device)
     cache, active, store, _counters = refine(
         raytrace_fn,
+        jacobian,
         lat,
         init_res,
         fov / init_res,
@@ -2481,9 +2611,7 @@ def build_adaptive_mesh(
 
     P = shape_matrix(vs[leaves])
     leaf_area2 = P[:, 0, 0] * P[:, 1, 1] - P[:, 0, 1] * P[:, 1, 0]
-    valid_rows = backend.flatnonzero(
-        (leaf_status != LEAF_INVALID) & (leaf_status != LEAF_NONFINITE)
-    )
+    valid_rows = backend.flatnonzero(leaf_status == LEAF_CONVERGED)
     index = build_index(vs, leaves, valid_rows, index_cells)
 
     def to_device(array):
