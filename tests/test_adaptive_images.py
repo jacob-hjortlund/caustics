@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
@@ -22,20 +24,68 @@ def _sie_like(x, y):
     return x - 1.2 * x / r, y - 1.2 * y / r
 
 
+def _sie_like_jacobian(x, y):
+    r = (x * x + y * y + 0.05) ** 0.5
+    k = 1.2 / r**3
+    xx, yy, xy = 1.0 - 1.2 / r + k * x * x, 1.0 - 1.2 / r + k * y * y, k * x * y
+    return backend.stack(
+        (backend.stack((xx, xy), dim=-1), backend.stack((xy, yy), dim=-1)), dim=-2
+    )
+
+
+SIE_LIKE = SimpleNamespace(
+    raytrace=_sie_like, jacobian_lens_equation=_sie_like_jacobian
+)
 BUILD = dict(fov=6.0, init_res=4, min_img_sep=0.1, max_depth=6)
 
 
 @pytest.fixture(scope="module")
 def mesh():
-    return new.build_adaptive_mesh(_sie_like, **BUILD)
+    return new.build_adaptive_mesh(SIE_LIKE, **BUILD)
 
 
 def _beta(points):
     return backend.as_array(np.asarray(points, dtype=np.float64), dtype=backend.float64)
 
 
+def _oracle_mesh(oracle_module, mesh):
+    """The oracle's `Mesh`, frozen from exactly this mesh's arrays.
+
+    Building the oracle's own mesh instead would compare the two refinement
+    criteria as well as image finding, and across `_sie_like`'s fold the
+    criteria deliberately differ. The oracle never reads its ``dtype`` field
+    here, so the numpy dtype it expects there is only for form's sake.
+    """
+    index = mesh.index
+    return oracle_module.Mesh(
+        vertices_lens=mesh.vertices_lens,
+        vertices_source=mesh.vertices_source,
+        leaves=mesh.leaves,
+        leaf_area2=mesh.leaf_area2,
+        leaf_origin=mesh.leaf_origin,
+        leaf_status=mesh.leaf_status,
+        leaf_level=mesh.leaf_level,
+        origin_leaves=mesh.origin_leaves,
+        index=(
+            index.lo,
+            index.cell,
+            index.nx,
+            index.ny,
+            index.cell_offsets,
+            index.cell_leaves,
+            index.hi,
+        ),
+        stats=None,
+        d_floor=mesh.d_floor,
+        max_level=mesh.max_level,
+        min_img_sep=mesh.min_img_sep,
+        dtype=np.float64,
+        device=mesh.device,
+    )
+
+
 def test_forward_raytrace_matches_the_oracle(mesh, oracle_module):
-    old_mesh = oracle_module.build_adaptive_mesh(_sie_like, **BUILD)
+    old_mesh = _oracle_mesh(oracle_module, mesh)
     beta = _beta([[0.05, 0.02], [0.4, -0.3], [1.9, 1.7]])
 
     img, counts = new.mesh_forward_raytrace(mesh, beta, _sie_like)
@@ -111,9 +161,10 @@ def test_dedup_positions_are_within_min_img_sep_of_the_refined_roots(mesh):
 
 # ---------------------------------------------------------------------------
 # Ported from tests/test_adaptive_mesh.py (Task 15) -- see the task-15 report
-# for the oracle derivation behind the two `coverable`-filtered assertions
-# below, and for the three renames forced by a name collision with the
-# Step-1 tests above.
+# for the three renames forced by a name collision with the Step-1 tests
+# above. The two SIE coverage tests below once excluded the central image,
+# which the oracle's criterion left uncovered; each docstring says why they
+# no longer need to.
 # ---------------------------------------------------------------------------
 
 
@@ -133,33 +184,27 @@ def dedup(points, tol):
 def test_sie_candidates_recover_forward_raytrace_images(device):
     """Spec test 26, split into the two contracts this module actually owns.
 
-    1. **Coverage** -- every image ``forward_raytrace`` finds outside the
-       lens's own softening radius has a candidate seed within
-       ``min_img_sep``. That is exactly what :func:`mesh_seeds` promises: the
-       hit leaf's own affine map is the one step 7 bounds, so the seed is
-       accurate to ``min_img_sep`` by construction. Measured across the
-       covered images at these three source points, the worst distance is
+    1. **Coverage** -- every image ``forward_raytrace`` finds has a candidate
+       seed within ``min_img_sep``. That is exactly what :func:`mesh_seeds`
+       promises: the hit leaf's own affine map is the one step 7 bounds, so
+       the seed is accurate to ``min_img_sep`` by construction. Measured
+       across the images at these three source points, the worst distance is
        1.1e-3 against a 1e-2 tolerance -- roughly ten times better than the
        guarantee.
     2. **No spurious images** -- every candidate the root-finder converges on
        is a genuine image.
 
-    This deliberately does **not** assert that the refined set has the same
-    cardinality as ``forward_raytrace``'s. For ``sp = [0.2, 0.2]`` and
-    ``sp = [0.05, -0.05]`` this SIE has a central image at radius ~7.0e-4 and
-    ~6.7e-5 respectively, *inside* its own softening radius ``s = 1e-3``,
-    where the Jacobian is nearly degenerate. Oracle-verified directly against
-    ``old_adaptive.py`` (and independently reproduced by this module's own
-    ``build_adaptive_mesh``): the single lens-plane leaf containing that
-    image is ``LEAF_INVALID`` -- a fold the criterion cannot resolve there,
-    exactly the coverage hole ``AdaptiveMesh`` documents as deliberate -- so
-    the mesh supplies no seed anywhere near it (nearest candidate ~0.52 and
-    ~0.78 away for the two points respectively) while every other image is
-    covered. A cardinality assertion over every analytic image would
-    therefore spuriously fail on the one image the mesh was never going to
-    cover, not on a genuine regression -- so Contract 1 below is scoped to
-    the images the mesh can promise to cover (outside the softening radius),
-    and still fails loudly if coverage is ever lost among *those*.
+    Coverage includes the central image. For ``sp = [0.2, 0.2]`` and
+    ``sp = [0.05, -0.05]`` this SIE has one at radius ~7.0e-4 and ~6.7e-5
+    respectively, *inside* its own softening radius ``s = 1e-3``, where the
+    Jacobian is large but -- the radial critical curve running at r ~ 0.025 --
+    of one sign. The frozen oracle's quadratic-vertex parity check read the
+    core's curvature as a fold and condemned the leaves holding those images,
+    leaving no seed within 0.52 and 0.78 arcsec of them, so this test used to
+    exclude everything inside the softening radius. The Jacobian test finds
+    no sign change there, the leaves converge, and the two central images now
+    have seeds 8.4e-4 and 1.1e-4 away -- so Contract 1 covers every image, and
+    fails loudly should the core ever be condemned again.
     """
     lens = SIE(
         name="sie",
@@ -174,7 +219,7 @@ def test_sie_candidates_recover_forward_raytrace_images(device):
         s=1e-3,
     ).to(device)
     mesh = new.build_adaptive_mesh(
-        lens.raytrace, fov=5.0, init_res=32, min_img_sep=1e-2, device=device
+        lens, fov=5.0, init_res=32, min_img_sep=1e-2, device=device
     )
     for sp in ([0.2, 0.2], [0.05, -0.05], [1.4, 1.1]):
         sx = backend.as_array(sp[0], device=device)
@@ -183,13 +228,10 @@ def test_sie_candidates_recover_forward_raytrace_images(device):
         expected = dedup(
             np.stack([backend.to_numpy(ex), backend.to_numpy(ey)], axis=-1), 1e-2
         )
-        # Excludes any image inside the lens's own softening radius -- see
-        # the docstring above; the mesh deliberately has no coverage there.
-        coverable = expected[np.linalg.norm(expected, axis=-1) >= 1e-3]
-        assert coverable.shape[0] > 0, f"{sp}: no coverable reference images"
+        assert expected.shape[0] > 0, f"{sp}: no reference images"
         idx, offsets, bary = new.mesh_query(mesh, backend.as_array(np.asarray([sp])))
         seed = backend.to_numpy(new.mesh_seeds(mesh, idx, bary))
-        assert seed.shape[0] >= coverable.shape[0], "candidates must cover the images"
+        assert seed.shape[0] >= expected.shape[0], "candidates must cover the images"
         refined = forward_raytrace_rootfind(
             backend.as_array(seed[:, 0], device=device),
             backend.as_array(seed[:, 1], device=device),
@@ -207,9 +249,9 @@ def test_sie_candidates_recover_forward_raytrace_images(device):
             axis=-1,
         )
         got = dedup(refined[residual < 1e-3], 1e-2)
-        # Contract 1: coverage. Every coverable image has a seed within
-        # min_img_sep.
-        nearest = np.linalg.norm(coverable[:, None, :] - seed[None, :, :], axis=-1).min(
+        # Contract 1: coverage. Every image, the central one included, has a
+        # seed within min_img_sep.
+        nearest = np.linalg.norm(expected[:, None, :] - seed[None, :, :], axis=-1).min(
             axis=1
         )
         assert (
@@ -234,9 +276,7 @@ def test_point_mass_recovers_the_analytic_image_pair():
         Rein=1.0,
         s=1e-6,
     )
-    mesh = new.build_adaptive_mesh(
-        lens.raytrace, fov=8.0, init_res=64, min_img_sep=1e-2
-    )
+    mesh = new.build_adaptive_mesh(lens, fov=8.0, init_res=64, min_img_sep=1e-2)
     b = 0.4
     idx, offsets, bary = new.mesh_query(mesh, backend.as_array(np.array([[b, 0.0]])))
     seed = backend.to_numpy(new.mesh_seeds(mesh, idx, bary))
@@ -269,7 +309,7 @@ def test_build_and_query_run_on_the_configured_device(device):
         s=1e-3,
     ).to(device)
     mesh = new.build_adaptive_mesh(
-        lens.raytrace, fov=4.0, init_res=8, min_img_sep=0.1, device=device
+        lens, fov=4.0, init_res=8, min_img_sep=0.1, device=device
     )
     idx, off, bary = new.mesh_query(
         mesh, backend.as_array(np.array([[0.1, 0.1], [3.0, 3.0]]))
@@ -303,7 +343,7 @@ def sie_fixture(device=None):
     if device is not None:
         lens = lens.to(device)
     mesh = new.build_adaptive_mesh(
-        lens.raytrace, fov=5.0, init_res=32, min_img_sep=1e-2, device=device
+        lens, fov=5.0, init_res=32, min_img_sep=1e-2, device=device
     )
     return lens, mesh
 
@@ -335,15 +375,14 @@ def test_forward_raytrace_finds_no_spurious_sie_images():
 def test_forward_raytrace_covers_every_sie_image():
     """The converse contract: no image is dropped by the filters or the dedup.
 
-    Scoped to images outside the lens's own softening radius ``s = 1e-3``:
-    for both source points below, the SIE's central image sits inside that
-    core (radius 7.0e-4 and 6.7e-5 respectively), on a lens-plane leaf the
-    build marks ``LEAF_INVALID`` -- oracle-verified, and independently
-    reproduced by this module's own ``build_adaptive_mesh`` -- so
-    ``mesh_query`` never returns a candidate for it and no downstream filter
-    or dedup step is responsible for its absence (see
+    Every image, including the central one inside the softening radius
+    ``s = 1e-3`` (radius 7.0e-4 and 6.7e-5 for the two source points below).
+    The frozen oracle's criterion condemned the core leaves holding it, so
+    this test used to be scoped to the images outside that radius; under the
+    Jacobian test those leaves converge (see
     ``test_sie_candidates_recover_forward_raytrace_images`` for the full
-    derivation). Every other image is covered to within 1.1e-3.
+    derivation), and all five images of each source come back. Measured,
+    every image is covered to within 4.4e-5.
     """
     lens, mesh = sie_fixture()
     for sp in ([0.2, 0.2], [0.05, -0.05]):
@@ -355,9 +394,7 @@ def test_forward_raytrace_covers_every_sie_image():
         ex, ey = lens.forward_raytrace(backend.as_array(sp[0]), backend.as_array(sp[1]))
         expected = dedup(np.stack([to_np(ex), to_np(ey)], axis=-1), 1e-2)
         assert expected.shape[0] > 0, f"{sp}: reference found no images"
-        # Excludes the one image inside the softening core; see the docstring.
-        coverable = expected[np.linalg.norm(expected, axis=-1) >= 1e-3]
-        nearest = np.linalg.norm(coverable[:, None, :] - images[None, :, :], axis=-1)
+        nearest = np.linalg.norm(expected[:, None, :] - images[None, :, :], axis=-1)
         worst = nearest.min(axis=1).max()
         assert worst < 1e-2, f"{sp}: uncovered image, worst distance {worst:.3e}"
 
@@ -379,9 +416,7 @@ def test_forward_raytrace_recovers_the_analytic_point_mass_pair():
         Rein=1.0,
         s=1e-6,
     )
-    mesh = new.build_adaptive_mesh(
-        lens.raytrace, fov=8.0, init_res=64, min_img_sep=1e-2
-    )
+    mesh = new.build_adaptive_mesh(lens, fov=8.0, init_res=64, min_img_sep=1e-2)
     b = 0.4
     images, counts = new.mesh_forward_raytrace(mesh, _beta([[b, 0.0]]), lens.raytrace)
     images = to_np(images)
@@ -508,13 +543,16 @@ def test_dedup_positions_are_within_min_img_sep_of_the_refined_roots_across_a_ba
 
     Not to a source-plane residual: `min_img_sep` bounds the seed's distance
     from the image in the lens plane, and the source-plane residual is that
-    distance times the local Jacobian. On a SIZE_FLOOR leaf, which stopped
-    because it hit the floor rather than because the deviation test passed,
-    there is no source-plane bound at all -- measured residuals there reach
-    7e-2 against a min_img_sep of 1e-2. Comparing against the root finder's
-    own answer is what the documented contract actually claims.
+    distance times the local Jacobian, which is large inside the SIE's core.
+    Measured on these four sources, seeds within 2e-3 of the lens centre --
+    which now converge, see
+    ``test_sie_candidates_recover_forward_raytrace_images`` -- reach
+    source-plane residuals of 0.16, against 1.6e-3 for every seed outside the
+    core. Comparing against the root finder's own answer is what the
+    documented contract actually claims.
 
-    Measured worst case on this fixture: 3.7e-3 against min_img_sep = 1e-2.
+    Measured worst case on this fixture: 1.6e-3, against the mesh's own
+    ``min_img_sep`` of 5e-3 -- half the 1e-2 the build was asked for.
     """
     lens, mesh = sie_fixture()
     beta = _beta([[0.02, 0.01], [0.05, 0.02], [-0.03, 0.04], [0.3, 0.2]])

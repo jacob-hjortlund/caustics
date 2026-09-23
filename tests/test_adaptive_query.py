@@ -1,4 +1,5 @@
 import warnings
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -19,12 +20,24 @@ def _sie_like(x, y):
     return x - 1.2 * x / r, y - 1.2 * y / r
 
 
+def _sie_like_jacobian(x, y):
+    r = (x * x + y * y + 0.05) ** 0.5
+    k = 1.2 / r**3
+    xx, yy, xy = 1.0 - 1.2 / r + k * x * x, 1.0 - 1.2 / r + k * y * y, k * x * y
+    return backend.stack(
+        (backend.stack((xx, xy), dim=-1), backend.stack((xy, yy), dim=-1)), dim=-2
+    )
+
+
+SIE_LIKE = SimpleNamespace(
+    raytrace=_sie_like, jacobian_lens_equation=_sie_like_jacobian
+)
 BUILD = dict(fov=4.0, init_res=3, min_img_sep=0.5, max_depth=3)
 
 
 @pytest.fixture(scope="module")
 def mesh():
-    return new.build_adaptive_mesh(_sie_like, **BUILD)
+    return new.build_adaptive_mesh(SIE_LIKE, **BUILD)
 
 
 @pytest.fixture(scope="module")
@@ -33,8 +46,44 @@ def beta():
     return backend.as_array(rng.uniform(-1.5, 1.5, (64, 2)), dtype=backend.float64)
 
 
+def _oracle_mesh(oracle_module, mesh):
+    """The oracle's `Mesh`, frozen from exactly this mesh's arrays.
+
+    Building the oracle's own mesh instead would compare the two refinement
+    criteria as well as the query kernels, and across `_sie_like`'s fold the
+    criteria deliberately differ. The oracle's query never reads its ``dtype``
+    field, so the numpy dtype it expects there is only for form's sake.
+    """
+    index = mesh.index
+    return oracle_module.Mesh(
+        vertices_lens=mesh.vertices_lens,
+        vertices_source=mesh.vertices_source,
+        leaves=mesh.leaves,
+        leaf_area2=mesh.leaf_area2,
+        leaf_origin=mesh.leaf_origin,
+        leaf_status=mesh.leaf_status,
+        leaf_level=mesh.leaf_level,
+        origin_leaves=mesh.origin_leaves,
+        index=(
+            index.lo,
+            index.cell,
+            index.nx,
+            index.ny,
+            index.cell_offsets,
+            index.cell_leaves,
+            index.hi,
+        ),
+        stats=None,
+        d_floor=mesh.d_floor,
+        max_level=mesh.max_level,
+        min_img_sep=mesh.min_img_sep,
+        dtype=np.float64,
+        device=mesh.device,
+    )
+
+
 def test_query_matches_the_oracle(mesh, beta, oracle_module):
-    old_mesh = oracle_module.build_adaptive_mesh(_sie_like, **BUILD)
+    old_mesh = _oracle_mesh(oracle_module, mesh)
     idx, offsets, bary = new.mesh_query(mesh, beta)
     idx_o, off_o, bary_o = old_mesh.query(beta)
 
@@ -120,8 +169,13 @@ RNG = np.random.default_rng(20260904)
 AFFINE = np.array([[0.7, 0.1], [-0.2, 0.9]])
 
 
-def make_counting_raytrace(fn):
-    """Wrap a numpy (N,2)->(N,2) map as a backend raytrace, counting evaluations."""
+def make_counting_lens(fn, jac):
+    """Wrap numpy maps as a lens, counting raytrace evaluations.
+
+    ``fn`` is a ``(N, 2) -> (N, 2)`` lens map and ``jac`` its Jacobian,
+    ``(N, 2) -> (N, 2, 2)``; the stand-in exposes the two methods
+    `build_adaptive_mesh` reads, ``raytrace`` and ``jacobian_lens_equation``.
+    """
     calls = {"points": 0, "batches": 0}
 
     def raytrace(x, y):
@@ -131,7 +185,14 @@ def make_counting_raytrace(fn):
         out = fn(xy)
         return backend.as_array(out[:, 0]), backend.as_array(out[:, 1])
 
-    return raytrace, calls
+    def jacobian_lens_equation(x, y):
+        xy = np.stack([backend.to_numpy(x), backend.to_numpy(y)], axis=-1)
+        return backend.as_array(jac(xy), dtype=backend.float64)
+
+    lens = SimpleNamespace(
+        raytrace=raytrace, jacobian_lens_equation=jacobian_lens_equation
+    )
+    return lens, calls
 
 
 def sis_raytrace(p, b=1.0):
@@ -147,6 +208,13 @@ def sis_raytrace(p, b=1.0):
         return p * (1.0 - b / r)
 
 
+def sis_jacobian(p, b=1.0):
+    """``(1 - b/r) I + b theta theta^T / r**3``, non-finite at the origin too."""
+    with np.errstate(divide="ignore", invalid="ignore"):
+        r = np.linalg.norm(p, axis=-1)[:, None, None]
+        return (1.0 - b / r) * np.eye(2) + b * p[:, :, None] * p[:, None, :] / r**3
+
+
 def localised_fold(p):
     """Affine away from a narrow band, curved and fold-bearing inside it.
 
@@ -160,9 +228,35 @@ def localised_fold(p):
     return np.stack([p[:, 0], 0.6 * y + bend], axis=-1)
 
 
-def build(fn, fov=4.0, init_res=4, min_img_sep=0.25, **kw):
-    raytrace, calls = make_counting_raytrace(fn)
-    mesh = new.build_adaptive_mesh(raytrace, fov, init_res, min_img_sep, **kw)
+def localised_fold_jacobian(p):
+    """``diag(1, 0.6 + 2y)`` inside the band, ``diag(1, 0.6)`` outside it."""
+    y = p[:, 1]
+    J = np.zeros((p.shape[0], 2, 2))
+    J[:, 0, 0] = 1.0
+    J[:, 1, 1] = 0.6 + np.where(np.abs(y) < 0.5, 2.0 * y, 0.0)
+    return J
+
+
+def affine_np(p):
+    return p @ AFFINE.T
+
+
+def affine_np_jacobian(p):
+    return np.tile(AFFINE, (p.shape[0], 1, 1))
+
+
+def collapse(p):
+    """A ``kappa == 1`` sheet: the whole lens plane maps to one point."""
+    return np.zeros_like(p)
+
+
+def collapse_jacobian(p):
+    return np.zeros((p.shape[0], 2, 2))
+
+
+def build(fn, jac, fov=4.0, init_res=4, min_img_sep=0.25, **kw):
+    lens, calls = make_counting_lens(fn, jac)
+    mesh = new.build_adaptive_mesh(lens, fov, init_res, min_img_sep, **kw)
     return mesh, calls
 
 
@@ -190,7 +284,7 @@ def test_query_seeds_an_inner_image_that_runs_into_the_lens_centre():
     Compose the public ``mesh_query`` and ``mesh_seeds`` interfaces so this
     regression exercises the same seeding path used by forward raytracing.
     """
-    mesh, _ = build(sis_raytrace, min_img_sep=0.05)
+    mesh, _ = build(sis_raytrace, sis_jacobian, min_img_sep=0.05)
     idx, offsets, bary = query_np(mesh, np.array([[0.8, 0.0]]))
     seed = backend.to_numpy(
         new.mesh_seeds(mesh, backend.as_array(idx), backend.as_array(bary))
@@ -210,7 +304,7 @@ def test_query_covers_points_on_the_source_bbox_upper_edge():
     but unreachable. Measured before the fix: 18 of 18 upper-edge vertices
     returned nothing where brute-force containment found candidates.
     """
-    mesh, _ = build(localised_fold, min_img_sep=0.05)
+    mesh, _ = build(localised_fold, localised_fold_jacobian, min_img_sep=0.05)
     vs = backend.to_numpy(mesh.vertices_source)
     leaves = backend.to_numpy(mesh.leaves)
     status = backend.to_numpy(mesh.leaf_status)
@@ -222,18 +316,9 @@ def test_query_covers_points_on_the_source_bbox_upper_edge():
         tri = backend.as_array(vs[leaves])
         pts = backend.as_array(np.repeat(beta[None], leaves.shape[0], axis=0))
         truth = backend.to_numpy(new.contains(new.triangle_weights(tri, pts)))
-        # UPDATED (b6dc3eb): the single legacy INVALID status split into
-        # finite-only LEAF_INVALID and non-finite LEAF_NONFINITE, and
-        # `build_adaptive_mesh` excludes BOTH from the spatial index (see
-        # `AdaptiveMesh`'s docstring, and old_adaptive.py's own
-        # `valid_rows = np.flatnonzero((leaf_status != LeafStatus.INVALID) &
-        # (leaf_status != LeafStatus.NONFINITE))`). The original test filtered
-        # on INVALID alone, which predates that split.
-        expected = set(
-            np.flatnonzero(
-                truth & (status != new.LEAF_INVALID) & (status != new.LEAF_NONFINITE)
-            ).tolist()
-        )
+        # Only LEAF_CONVERGED leaves are indexed (see `AdaptiveMesh`'s
+        # docstring): a leaf carrying any failure flag is never a candidate.
+        expected = set(np.flatnonzero(truth & (status == new.LEAF_CONVERGED)).tolist())
         idx, off, _ = query_np(mesh, beta[None])
         assert (
             set(idx[off[0] : off[1]].tolist()) >= expected
@@ -247,9 +332,9 @@ def test_query_matches_brute_force_containment_on_multi_cell_leaves():
     its three vertex cells -- and no other test distinguishes those, since the
     vertex-cell test checks only vertices and the crack test's uniform reference
     shares `build_index` so a common bug cancels. Measured on this fixture:
-    263 of 1350 leaves span three or more index cells on an axis.
+    520 of 4932 leaves span three or more index cells on an axis.
     """
-    mesh, _ = build(localised_fold, min_img_sep=0.05)
+    mesh, _ = build(localised_fold, localised_fold_jacobian, min_img_sep=0.05)
     vs = backend.to_numpy(mesh.vertices_source)
     leaves = backend.to_numpy(mesh.leaves)
     status = backend.to_numpy(mesh.leaf_status)
@@ -266,18 +351,14 @@ def test_query_matches_brute_force_containment_on_multi_cell_leaves():
     for b in range(beta.shape[0]):
         pts = backend.as_array(np.repeat(beta[b][None], leaves.shape[0], axis=0))
         truth = backend.to_numpy(new.contains(new.triangle_weights(tri_b, pts)))
-        # UPDATED (b6dc3eb): same derivation as
+        # Only LEAF_CONVERGED leaves are indexed, as in
         # test_query_covers_points_on_the_source_bbox_upper_edge above.
-        expected = set(
-            np.flatnonzero(
-                truth & (status != new.LEAF_INVALID) & (status != new.LEAF_NONFINITE)
-            ).tolist()
-        )
+        expected = set(np.flatnonzero(truth & (status == new.LEAF_CONVERGED)).tolist())
         assert set(idx[off[b] : off[b + 1]].tolist()) >= expected
 
 
 def test_query_csr_is_well_formed_on_a_folded_mesh():
-    mesh, _ = build(localised_fold, min_img_sep=0.05)
+    mesh, _ = build(localised_fold, localised_fold_jacobian, min_img_sep=0.05)
     beta = RNG.uniform(-2.5, 2.5, size=(64, 2))
     idx, off, bary = query_np(mesh, beta)
     assert off.shape == (65,) and off[0] == 0 and off[-1] == idx.shape[0]
@@ -289,7 +370,7 @@ def test_query_csr_is_well_formed_on_a_folded_mesh():
 
 
 def test_query_handles_empty_input_and_misses():
-    mesh, _ = build(lambda p: p @ AFFINE.T)
+    mesh, _ = build(affine_np, affine_np_jacobian)
     idx, off, bary = query_np(mesh, np.zeros((0, 2)))
     assert off.tolist() == [0] and idx.shape == (0,) and bary.shape == (0, 3)
     far = np.array([[1e6, 1e6], [-1e6, 0.0]])
@@ -298,7 +379,7 @@ def test_query_handles_empty_input_and_misses():
 
 
 def test_query_rejects_wrong_shapes_on_an_affine_mesh():
-    mesh, _ = build(lambda p: p @ AFFINE.T)
+    mesh, _ = build(affine_np, affine_np_jacobian)
     with pytest.raises(ValueError):
         new.mesh_query(mesh, np.array([0.0, 0.0]))
     with pytest.raises(ValueError):
@@ -306,7 +387,7 @@ def test_query_rejects_wrong_shapes_on_an_affine_mesh():
 
 
 def test_query_is_invariant_to_batch_size_and_point_order():
-    mesh, _ = build(localised_fold, min_img_sep=0.05)
+    mesh, _ = build(localised_fold, localised_fold_jacobian, min_img_sep=0.05)
     beta = RNG.uniform(-1.5, 1.5, size=(97, 2))
     ref = query_np(mesh, beta)
     for bs in (1, 7, 96, 97, 1000):
@@ -328,7 +409,9 @@ def test_query_is_invariant_to_batch_size_and_point_order():
 
 
 def test_query_finds_the_affine_preimage():
-    mesh, _ = build(lambda p: p @ AFFINE.T, fov=4.0, init_res=4, min_img_sep=0.25)
+    mesh, _ = build(
+        affine_np, affine_np_jacobian, fov=4.0, init_res=4, min_img_sep=0.25
+    )
     lens_pts = RNG.uniform(-1.8, 1.8, size=(200, 2))
     beta = lens_pts @ AFFINE.T
     idx, off, bary = query_np(mesh, beta)
@@ -349,25 +432,23 @@ def test_bary_is_in_the_simplex_on_every_leaf():
     returning zero candidates and leaving all three assertions vacuously true,
     since numpy's ``all`` and ``allclose`` are True over empty input. The
     ``idx.shape[0] > 0`` guard is what stops that passing silently for
-    ``localised_fold`` -- measured, the spread-out draw yields 44 candidates
+    ``localised_fold`` -- measured, the spread-out draw yields 46 candidates
     there.
 
-    UPDATED (oracle-derived, see task-13 report) for the degenerate branch:
-    confirmed directly against ``old_adaptive.build_adaptive_mesh`` that this
-    exact fixture has det J == 0 identically, so every leaf's four
-    hypothetical children disagree on parity and all 2048 leaves land on
-    ``LEAF_INVALID`` -- the mesh's own documented "contains a fold the mesh
-    cannot resolve" rule. The spatial index is therefore empty and even an
-    origin query now finds nothing, where an older build criterion found 4096
-    candidates. That is the conservative, deliberate "no coverage" answer, not
-    a regression, so the degenerate branch now asserts the empty result and
-    the all-invalid status directly instead.
+    The degenerate branch has ``A == 0`` identically, so no leaf ever passes
+    the deviation test, and at ``max_level`` the forced Jacobian finds
+    ``det A == 0`` at every sample: all 2048 leaves end
+    ``LEAF_CONVERGENCE_FAILED | LEAF_JACOBIAN_NONFINITE``. The spatial index
+    is therefore empty and even an origin query finds nothing, where an older
+    build criterion found 4096 candidates. That is the conservative,
+    deliberate "no coverage" answer, not a regression, so the degenerate
+    branch asserts the empty result and the flags directly instead.
     """
-    for fn, sep, degenerate in (
-        (localised_fold, 0.05, False),
-        (lambda p: np.zeros_like(p), 0.5, True),
+    for fn, jac, sep, degenerate in (
+        (localised_fold, localised_fold_jacobian, 0.05, False),
+        (collapse, collapse_jacobian, 0.5, True),
     ):
-        mesh, _ = build(fn, min_img_sep=sep)
+        mesh, _ = build(fn, jac, min_img_sep=sep)
         # Drawn in both branches so the shared module-level RNG sequence stays
         # unchanged for the tests that follow; discarded just below for the
         # degenerate case, which queries the origin instead.
@@ -378,7 +459,7 @@ def test_bary_is_in_the_simplex_on_every_leaf():
         if degenerate:
             assert idx.shape[0] == 0
             status = backend.to_numpy(mesh.leaf_status)
-            assert (status == new.LEAF_INVALID).all()
+            assert (status == DEGENERATE).all()
             continue
         assert idx.shape[0] > 0, "fixture returned no candidates"
         assert np.isfinite(bary).all()
@@ -398,7 +479,7 @@ def test_bary_reconstructs_beta_on_every_hit_leaf():
     tests/test_adaptive_kernels.py, and integration-level by
     ``test_centroid_fallback_on_a_totally_degenerate_leaf`` below.
     """
-    mesh, _ = build(localised_fold, min_img_sep=0.05)
+    mesh, _ = build(localised_fold, localised_fold_jacobian, min_img_sep=0.05)
     beta = RNG.uniform(-1.5, 1.5, size=(200, 2))
     idx, off, bary = query_np(mesh, beta)
     area = np.abs(backend.to_numpy(mesh.leaf_area2))[idx]
@@ -414,42 +495,52 @@ def test_bary_reconstructs_beta_on_every_hit_leaf():
     assert np.allclose(recon, beta[owner], atol=1e-8)
 
 
+# Where a kappa == 1 sheet leaves every leaf: it fails the deviation test
+# (``s == 0``) and has ``det A == 0`` at every sample.
+DEGENERATE = new.LEAF_CONVERGENCE_FAILED | new.LEAF_JACOBIAN_NONFINITE
+
+
 def test_centroid_fallback_on_a_totally_degenerate_leaf():
     """kappa == 1 maps every leaf to a point: w and d are exactly zero.
 
-    UPDATED (oracle-derived, see task-13 report): confirmed directly against
-    ``old_adaptive.build_adaptive_mesh`` that for this exact fixture all 2048
-    leaves carry ``LEAF_INVALID`` status (``n_parity_invalid == 2048`` in its
-    ``BuildStats``) -- det J == 0 identically, so no leaf's children can agree
-    on a parity sign, and the mesh's "leaf whose four hypothetical children
-    disagree on sign(det Q_k) contains a fold the mesh cannot resolve" rule
-    marks every one of them invalid. The spatial index is therefore empty, so
-    ``mesh_query`` returns nothing anywhere -- not just at the origin queried
-    below. The centroid fallback this test originally exercised through a live
-    query no longer arises this way; it stays covered directly at the kernel
-    level by
+    With ``A == 0`` identically, no leaf passes the deviation test and the
+    forced Jacobian at ``max_level`` finds ``det A == 0`` at every sample, so
+    all 2048 leaves of this fixture end
+    ``LEAF_CONVERGENCE_FAILED | LEAF_JACOBIAN_NONFINITE`` and none is indexed.
+    ``mesh_query`` therefore returns nothing anywhere -- not just at the
+    origin queried below. The centroid fallback this test originally exercised
+    through a live query no longer arises this way; it stays covered directly
+    at the kernel level by
     ``test_sanitize_bary_falls_back_to_the_centroid_on_total_degeneracy`` in
     tests/test_adaptive_kernels.py.
     """
-    mesh, _ = build(lambda p: np.zeros_like(p), fov=4.0, init_res=4, min_img_sep=0.5)
+    mesh, _ = build(collapse, collapse_jacobian, fov=4.0, init_res=4, min_img_sep=0.5)
     idx, off, bary = query_np(mesh, np.zeros((1, 2)))
     assert idx.shape[0] == 0
     assert off.tolist() == [0, 0]
     assert bary.shape == (0, 3)
     status = backend.to_numpy(mesh.leaf_status)
-    assert (status == new.LEAF_INVALID).all()
+    assert status.shape == (2048,)
+    assert (status == DEGENERATE).all()
 
 
 def test_coverage_does_not_drop_at_level_transitions():
     """Spec test 28. Reports the gap rather than only thresholding it."""
     fov, init_res, sep = 4.0, 4, 0.05
-    mesh, _ = build(localised_fold, fov=fov, init_res=init_res, min_img_sep=sep)
+    mesh, _ = build(
+        localised_fold,
+        localised_fold_jacobian,
+        fov=fov,
+        init_res=init_res,
+        min_img_sep=sep,
+    )
     ml = mesh.max_level
     assert ml >= 3 and len(set(backend.to_numpy(mesh.leaf_level).tolist())) > 1
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         uniform, _ = build(
             localised_fold,
+            localised_fold_jacobian,
             fov=fov,
             init_res=init_res * 2**ml,
             min_img_sep=sep,
@@ -466,7 +557,7 @@ def test_coverage_does_not_drop_at_level_transitions():
     assert gap == 0
 
 
-def _build_with_counters(fn, fov, init_res, min_img_sep, max_depth=25):
+def _build_with_counters(fn, jac, fov, init_res, min_img_sep, max_depth=25):
     """
     Recover the pre-closure termination counters the frozen oracle exposes as
     ``Mesh.stats`` (a ``BuildStats``) -- dropped from ``AdaptiveMesh``, which
@@ -479,7 +570,7 @@ def _build_with_counters(fn, fov, init_res, min_img_sep, max_depth=25):
     ``build_adaptive_mesh``), and ``refine`` in ``func/adaptive.py`` returns
     the same-keyed ``counters`` dict this helper reads directly.
     """
-    raytrace, _ = make_counting_raytrace(fn)
+    lens, _ = make_counting_lens(fn, jac)
     requested_min_img_sep = min_img_sep
     min_img_sep = min_img_sep / 2
     new.validate_build_args(
@@ -489,9 +580,10 @@ def _build_with_counters(fn, fov, init_res, min_img_sep, max_depth=25):
     max_level = min(int(max_depth), d_floor)
     tables = new.child_matrix_tables()
     lat = new.make_lattice(fov, 0.0, 0.0, init_res, max_level + 1)
-    raytrace_fn = new.make_raytrace(raytrace, None)
+    raytrace_fn = new.make_raytrace(lens.raytrace, None)
     _cache, _active, store, counters = new.refine(
         raytrace_fn,
+        lens.jacobian_lens_equation,
         lat,
         init_res,
         fov / init_res,
@@ -524,13 +616,21 @@ def test_criterion_is_blind_to_structure_below_the_sampling_scale():
         bump = (2.0 * np.exp(-r2 / (2 * 0.08**2)))[:, None] * np.array([1.0, 0.0])
         return p * 0.5 + bump
 
+    def bumped_jacobian(p):
+        d = p - centre
+        g = 2.0 * np.exp(-(d**2).sum(axis=-1) / (2 * 0.08**2))
+        grad = -(g / 0.08**2)[:, None] * d
+        return 0.5 * np.eye(2) + np.array([1.0, 0.0])[None, :, None] * grad[:, None, :]
+
     # At init_res=2 the nearest of the six sample points is 0.47 from the bump
     # centre, where the bump is 6e-8 -- far below the threshold. At init_res=32 the
     # cell is 0.125 and the deviation is ~0.6, well above it.
     sep = 0.05
-    coarse_counters, coarse_pre_closure, _ = _build_with_counters(bumped, 4.0, 2, sep)
+    coarse_counters, coarse_pre_closure, _ = _build_with_counters(
+        bumped, bumped_jacobian, 4.0, 2, sep
+    )
     fine_counters, fine_pre_closure, fine_max_level = _build_with_counters(
-        bumped, 4.0, 32, sep
+        bumped, bumped_jacobian, 4.0, 32, sep
     )
     assert fine_max_level >= 1, "fine build must actually run the criterion"
     assert coarse_counters["converged_level0"] == coarse_pre_closure
@@ -552,7 +652,7 @@ def test_seeds_lie_inside_their_lens_triangle(mesh, beta):
 
 
 def test_seeds_match_the_oracle(mesh, beta, oracle_module):
-    old_mesh = oracle_module.build_adaptive_mesh(_sie_like, **BUILD)
+    old_mesh = _oracle_mesh(oracle_module, mesh)
     idx, _, bary = new.mesh_query(mesh, beta)
     idx_o, _, bary_o = old_mesh.query(beta)
     assert np.allclose(
@@ -659,7 +759,7 @@ def test_seeds_lie_inside_their_lens_triangle_on_a_folded_mesh():
     by the same manual ``vertices_lens[leaves[idx]]`` gather ``mesh_seeds``
     itself performs.
     """
-    mesh, _ = build(localised_fold, min_img_sep=0.05)
+    mesh, _ = build(localised_fold, localised_fold_jacobian, min_img_sep=0.05)
     beta = RNG.uniform(-1.5, 1.5, size=(50, 2))
     idx, _, bary = new.mesh_query(mesh, beta)
     seed = backend.to_numpy(new.mesh_seeds(mesh, idx, bary))

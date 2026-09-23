@@ -377,9 +377,9 @@ def child_shape_matrices(beta_v, beta_m):
     """
     Source-plane edge matrices ``Q_k`` of the four red-split children.
 
-    Split out of :func:`evaluate_criterion` so the parity test can be applied on
-    its own at ``max_level``, where there is no split left to decide and the
-    deviation half of the criterion does not run.
+    Split out of :func:`evaluate_criterion` so the child-parity test can be
+    applied on its own, apart from the deviation and Jacobian halves of the
+    criterion.
 
     Parameters
     ----------
@@ -475,25 +475,66 @@ def quadratic_vertex_parity_ok(beta_v, beta_m):
 
 
 def jacobian_parity_ok(jacobian_fn, theta_v, theta_m, *, return_details=False):
-    """Check Jacobian parity at triangle vertices and edge midpoints.
+    """
+    True where ``sign(det A)`` is one strict sign at all six sample points.
+
+    The exact counterpart of :func:`parity_from_children`. That test reads
+    orientation off the six *mapped* samples, so it sees a fold only through
+    the source-plane shapes of the four children. This one evaluates the lens
+    Jacobian ``A = d(beta) / d(theta)`` itself at the same six lens-plane
+    points -- the three vertices and the three edge midpoints -- so a critical
+    curve with samples on both sides of it is caught whatever the mapped
+    shapes look like. It is still a six-point sample: a critical curve that
+    enters and leaves the triangle between samples is invisible to it too.
+
+    ``jacobian_fn`` is called once, on all ``6 * N`` points, flattened
+    triangle-major in the order ``theta_1, theta_2, theta_3, m_1, m_2, m_3`` --
+    and not at all when ``N == 0``.
+
+    The sign is read off a row-scaled copy of ``A``. Dividing a row by a
+    positive number scales ``det A`` by a positive factor, so the sign is
+    unchanged, while the scaled entries are at most one in magnitude -- so a
+    Jacobian with huge entries cannot overflow the determinant to ``inf``,
+    and one with tiny entries cannot underflow it to an exact zero that would
+    read as singular. A non-finite ``A`` is swapped for the identity before
+    any arithmetic, so it never reaches the determinant; the finiteness mask
+    carries its failure instead.
 
     Parameters
     ----------
-    jacobian_fn : callable
-        jacobian_fn(x, y) returns an array of shape (K, 2, 2).
-    theta_v, theta_m : backend arrays
-        Shape (N, 3, 2), containing the selected triangles' lens-plane
-        vertices and edge midpoints.
-    return_details : bool
-        If True, return (parity_ok, jacobian_nonfinite).
+    jacobian_fn: Callable[[ArrayLike, ArrayLike], ArrayLike]
+        ``jacobian_fn(x, y) -> A`` on 1-D arrays of shape ``(K,)``, returning
+        shape ``(K, 2, 2)``, e.g. a lens's ``jacobian_lens_equation``.
+    theta_v: ArrayLike
+        Lens-plane vertices, shape ``(N, 3, 2)``.
+
+        *Unit: arcsec*
+
+    theta_m: ArrayLike
+        Lens-plane edge midpoints ``m1, m2, m3``, with ``m_i`` opposite
+        ``theta_i``, shape ``(N, 3, 2)``.
+
+        *Unit: arcsec*
+
+    return_details: bool
+        Also return the non-finite mask.
 
     Returns
     -------
-    parity_ok : Boolean array, shape (N,)
-        True when all six Jacobians have finite, nonzero determinants
-        with the same sign.
-    jacobian_nonfinite : Boolean array, shape (N,), optional
-        True when any Jacobian is nonfinite or has zero determinant.
+    parity_ok: ArrayLike
+        ``(N,)`` bool, True where all six determinants are finite, nonzero and
+        of one sign.
+    jacobian_nonfinite: ArrayLike
+        ``(N,)`` bool, returned only with ``return_details``. True where some
+        ``A`` is non-finite or has ``det A == 0`` exactly -- a sample whose sign
+        carries no information, which includes one lying exactly on a
+        critical curve. Always a subset of ``~parity_ok``.
+
+    Raises
+    ------
+    ValueError
+        If ``theta_v`` and ``theta_m`` are not both ``(N, 3, 2)``, or if
+        ``jacobian_fn`` does not return ``(6 * N, 2, 2)``.
     """
     if theta_v.shape != theta_m.shape or theta_v.shape[1:] != (3, 2):
         raise ValueError("theta_v and theta_m must both have shape (N, 3, 2)")
@@ -552,11 +593,53 @@ def evaluate_criterion(
     """
     Steps 3 to 7 of the refinement criterion, vectorized over triangles.
 
-    Step 4 (parity) is :func:`parity_from_children`; step 7 (deviation) catches
-    curvature. Neither alone is sufficient.
+    Every failed test is recorded, not just the first: ``status`` is a bitmask
+    of the ``LEAF_*`` flags, and a triangle converges (``keep``) only where it
+    is exactly ``LEAF_CONVERGED``, i.e. where all of the following hold.
+
+    - All six samples in ``beta_v`` and ``beta_m`` are finite; otherwise
+      ``LEAF_RAYTRACE_NONFINITE``.
+    - The four red-split children agree on ``sign(det Q_k)`` (step 4,
+      :func:`parity_from_children`); otherwise
+      ``LEAF_APPROX_PARITY_UNRESOLVED``.
+    - Every mapped midpoint lies within ``s * min_img_sep`` of its affine
+      prediction (step 7, :func:`converged_from_deviation`), which catches
+      curvature; otherwise ``LEAF_CONVERGENCE_FAILED``. Only set on a triangle
+      whose samples are finite.
+    - The lens Jacobian is finite, non-singular and of one sign at all six
+      lens-plane samples (:func:`jacobian_parity_ok`); otherwise
+      ``LEAF_JACOBIAN_PARITY_UNRESOLVED``, or ``LEAF_JACOBIAN_NONFINITE`` where
+      some ``A`` is non-finite or singular.
+
+    The two parity tests complement each other rather than duplicate. Child
+    parity comes free with the six samples, but sees a fold only through the
+    source-plane shapes of the children. The Jacobian test is exact at its six
+    points, but costs a ``jacobian_fn`` call, so it runs lazily: only on the
+    triangles that pass every other test and would otherwise converge. A
+    triangle that has already failed splits whatever the Jacobian says, so
+    this keeps ``jacobian_fn`` off the split path entirely. ``force_jacobian``
+    runs it on every triangle whose samples are finite instead -- for
+    ``max_level``, where nothing splits and ``status`` is the leaf's final
+    record. A triangle with a non-finite sample is never passed to
+    ``jacobian_fn``, forced or not.
+
+    The Jacobian can only add flags. It never clears one the other tests set,
+    so it cannot rescue a triangle into convergence.
 
     Parameters
     ----------
+    jacobian_fn: Callable[[ArrayLike, ArrayLike], ArrayLike]
+        ``jacobian_fn(x, y) -> (K, 2, 2)``, see :func:`jacobian_parity_ok`.
+    theta_v: ArrayLike
+        Lens-plane vertices, shape ``(n, 3, 2)``.
+
+        *Unit: arcsec*
+
+    theta_m: ArrayLike
+        Lens-plane midpoints ``m1, m2, m3``, shape ``(n, 3, 2)``.
+
+        *Unit: arcsec*
+
     beta_v: ndarray
         Source-plane vertices, shape ``(n, 3, 2)``.
 
@@ -585,17 +668,27 @@ def evaluate_criterion(
         ``PINV0`` from :func:`child_matrix_tables`.
     compose: ndarray
         ``COMPOSE`` from :func:`child_matrix_tables`.
+    force_jacobian: bool
+        Evaluate the Jacobian on every triangle with finite samples, not just
+        on those that would otherwise converge.
 
     Returns
     -------
     keep: ndarray
-        ``(n,)`` bool, True where the triangle is converged and terminal.
+        ``(n,)`` bool, ``status == LEAF_CONVERGED``: True where the triangle is
+        converged and terminal.
     parity_ok: ndarray
-        ``(n,)`` bool, True where ``sign(det Q_k)`` is constant over the children.
+        ``(n,)`` bool, the parity verdict the refinement counters read. On a
+        triangle the Jacobian was evaluated on, True where child parity and
+        :func:`jacobian_parity_ok` both pass; on any other, child parity alone.
     s: ndarray
         ``(n,)`` float64, ``min_k sigma_min(A_k)``. Exactly ``0.0`` is legal and
         expected near a critical curve; it forces the split, and the size floor
         terminates the descent.
+    status: ndarray
+        ``(n,)`` int64 bitmask of the ``LEAF_*`` flags above, ``LEAF_CONVERGED``
+        where no test failed. A Jacobian flag can appear only on a triangle the
+        Jacobian was evaluated on.
     """
 
     Q = child_shape_matrices(beta_v, beta_m)
@@ -1119,10 +1212,42 @@ def active_contains(active, cache, keys) -> ArrayLike:
 # Leaf store
 # ---------------------------------------------------------------------------
 
-
-# Failure flags stored in backend.int64 arrays.
-# Zero means no recorded failure; multiple failures combine with bitwise OR.
-# Balance-cascade children and closure triangles inherit their origin's status.
+# Why a leaf is not converged, as a bitmask. Each failed test sets its own bit,
+# so one status records every failure rather than a single chosen reason, and
+# `LEAF_CONVERGED` -- zero, no bit set -- is the only status that means the leaf
+# can be trusted. Only such leaves enter the spatial index. Test a flag with
+# `(status & FLAG) != 0`, never `status == FLAG`, which misses every leaf that
+# carries a second flag as well.
+#
+# Plain ints, not an `IntFlag`: `status` lives in a `backend.int64` array and
+# is compared, OR-ed, scattered and broadcast through backend ops the whole
+# way, which a NumPy-flavoured enum would fight at every one of those call
+# sites for no benefit.
+#
+# - `LEAF_CONVERGENCE_FAILED`: the midpoint-deviation test (step 7) failed, so
+#   the leaf's affine model is not accurate to `min_img_sep`.
+# - `LEAF_APPROX_PARITY_UNRESOLVED`: the four red-split children disagree on
+#   `sign(det Q_k)` (`parity_from_children`) -- a fold, as seen through the
+#   mapped samples.
+# - `LEAF_JACOBIAN_PARITY_UNRESOLVED`: the lens Jacobian's `sign(det A)`
+#   differs between the six lens-plane samples (`jacobian_parity_ok`) -- a
+#   critical curve runs between them.
+# - `LEAF_RAYTRACE_NONFINITE`: some raytraced sample is non-finite, so the rest
+#   of the criterion never ran. Also OR-ed in at freeze, by
+#   `invalidate_nonfinite_origins`, onto every origin whose closure triangles
+#   picked up a non-finite vertex.
+# - `LEAF_JACOBIAN_NONFINITE`: some sample's Jacobian is non-finite or exactly
+#   singular, so its sign says nothing. Singular counts: a sample lying exactly
+#   on a critical curve lands here, not in `LEAF_JACOBIAN_PARITY_UNRESOLVED`.
+#
+# Below `max_level` every failing triangle splits, so no flag is ever stored
+# there -- a failure is a reason to refine, not a verdict. At `max_level`
+# nothing can split: the criterion runs with the Jacobian forced on every
+# finite triangle, and the whole bitmask is stored. Balance-cascade children
+# and closure triangles inherit their origin's status, which for a cascade
+# child is always `LEAF_CONVERGED` (see the cascade in `refine`). So apart from
+# the freeze-time `LEAF_RAYTRACE_NONFINITE`, a nonzero status means a
+# `max_level` leaf.
 LEAF_CONVERGED = 0
 LEAF_CONVERGENCE_FAILED = 1 << 0
 LEAF_APPROX_PARITY_UNRESOLVED = 1 << 1
@@ -1143,7 +1268,7 @@ class LeafStore(NamedTuple):
 
     ``v`` holds the three vertex-cache slots of each leaf, shape ``(N, 3)``.
     ``level``, ``cls``, ``status`` and ``valid`` are per-row, shape ``(N,)``.
-    ``status`` is ``backend.int64`` -- see the ``LEAF_*`` constants above.
+    ``status`` is a ``backend.int64`` bitmask of the ``LEAF_*`` flags above.
     """
 
     v: ArrayLike
@@ -1608,23 +1733,42 @@ def refine(
     criterion vectorized, then partitions into converged and to-split. No
     Python-level recursion over individual triangles, no per-triangle ``raytrace``.
 
-    At ``max_level`` nothing splits, so there is no cascade, so no force-split.
-    The midpoints are still evaluated, but for the parity test alone: a triangle
-    whose four hypothetical children disagree on ``sign(det Q_k)`` contains a
-    fold at a scale no further split can resolve, so it is marked ``LEAF_INVALID``
-    and kept out of the spatial index. Those midpoints are traced once,
-    deduplicated on their lattice keys, consumed, and dropped -- they are the
-    only points with an odd coordinate, so they can never collide with the
-    cache, and nothing downstream reads them.
+    **The criterion converges no triangle without the Jacobian's agreement, at
+    any level.** :func:`evaluate_criterion` evaluates ``jacobian_fn`` on every
+    triangle that passes all its other tests, and one whose six samples
+    disagree on ``sign(det A)`` -- or where some ``A`` is non-finite or
+    singular -- splits instead of converging. So no leaf the criterion
+    converged has a critical curve running between its samples, while the
+    Jacobian cost stays proportional to the triangles about to converge rather
+    than to every triangle tested. A balance-cascade child is the exception:
+    it inherits its parent's verdict without a Jacobian check of its own, and
+    its three edge midpoints are points the parent's check never saw. Unlike
+    raytraced points, Jacobian evaluations are not deduplicated: every checked
+    triangle evaluates its own six points, shared vertices included. The
+    per-level status bitmask is discarded below ``max_level``, since every
+    failure there is a reason to split rather than a verdict.
 
-    That pass is the single largest batch in the build. For a mesh refining
-    uniformly to ``max_level`` on an ``N x N`` cell grid it adds the
-    ``3 * N**2 + 2 * N`` edge midpoints to the ``(N + 1)**2`` vertices, which
-    together are exactly the ``(2 * N + 1)**2`` points of the widened lattice --
-    so a full-depth build now evaluates every lattice point exactly once, where
-    it used to evaluate only the even sublattice. Roughly ``4x`` the
-    ``raytrace`` calls in that worst case, and less on a genuinely adaptive
-    mesh. ``counters["max_level_midpoints"]`` is the measured cost.
+    At ``max_level`` nothing splits, so there is no cascade, so no force-split.
+    The midpoints are still evaluated: traced once, deduplicated on their
+    lattice keys, consumed, and dropped -- they are the only points with an odd
+    coordinate, so they can never collide with the cache, and nothing
+    downstream reads them. The full criterion still runs on them, with the
+    Jacobian forced on every triangle whose six samples are finite, since here
+    ``status`` is the leaf's final record: every test the leaf fails is OR-ed
+    into it, and anything but ``LEAF_CONVERGED`` keeps the leaf out of the
+    spatial index. A triangle that straddles a fold, in particular, contains it
+    at a scale no further split can resolve. A triangle with a non-finite
+    sample skips the criterion and is stored with ``LEAF_RAYTRACE_NONFINITE``
+    alone.
+
+    The ``max_level`` midpoint pass is the single largest batch in the build.
+    For a mesh refining uniformly to ``max_level`` on an ``N x N`` cell grid it
+    adds the ``3 * N**2 + 2 * N`` edge midpoints to the ``(N + 1)**2``
+    vertices, which together are exactly the ``(2 * N + 1)**2`` points of the
+    widened lattice -- so a full-depth build now evaluates every lattice point
+    exactly once, where it used to evaluate only the even sublattice. Roughly
+    ``4x`` the ``raytrace`` calls in that worst case, and less on a genuinely
+    adaptive mesh. ``counters["max_level_midpoints"]`` is the measured cost.
 
     **Non-finite triangles split unconditionally.** A non-finite sample point is
     maximal ignorance about a triangle, so it triggers refinement like every other
@@ -1632,9 +1776,9 @@ def refine(
     be evaluated there, which is why the split carries no verdict. A red split
     hands the bad vertex to exactly one of the four children, so the other three
     re-enter the criterion normally and the singularity ends up ringed by a band of
-    ``LEAF_NONFINITE`` leaves at the smallest allowed size instead of a hexagon of
-    ``fov / init_res``. Terminating on the spot instead would put the hole at
-    whatever level the triangle was first sampled, and ``LEAF_NONFINITE`` leaves are
+    ``LEAF_RAYTRACE_NONFINITE`` leaves at the smallest allowed size instead of a
+    hexagon of ``fov / init_res``. Terminating on the spot instead would put the
+    hole at whatever level the triangle was first sampled, and such leaves are
     excluded from the spatial index -- so on a singular model that hole is exactly
     the region where the mesh is most needed. The cost is
     ``counters["nonfinite_splits"]``: six triangles per level for a point
@@ -1645,6 +1789,11 @@ def refine(
     ----------
     raytrace_fn: Callable[[ArrayLike], ArrayLike]
         From :func:`make_raytrace`.
+    jacobian_fn: Callable[[ArrayLike, ArrayLike], ArrayLike]
+        ``jacobian_fn(x, y) -> (K, 2, 2)``, the Jacobian of the map
+        ``raytrace_fn`` traces, forwarded to :func:`evaluate_criterion`. Called
+        directly on the lattice's float64 lens-plane coordinates: not through
+        :func:`make_raytrace`, and not chunked by ``batch_size``.
     lat: Lattice
     init_res: int
         Level-0 grid resolution.
@@ -1669,11 +1818,17 @@ def refine(
     active: ArrayLike
         The active-vertex set.
     store: LeafStore
+        Every row below ``max_level`` is ``LEAF_CONVERGED``; ``max_level`` rows
+        carry the full status bitmask.
     counters: dict[str, int]
         ``converged_level0``: leaves converged at level 0.
-        ``parity_splits``: level ``< max_level`` triangles split on parity alone.
-        ``parity_invalid``: ``max_level`` triangles condemned by parity.
-        ``deviation_splits``: parity-clean triangles split by the deviation test.
+        ``parity_splits``: level ``< max_level`` triangles split on parity --
+        child parity, or Jacobian parity for a triangle that would otherwise
+        have converged, a non-finite or singular Jacobian included.
+        ``parity_invalid``: ``max_level`` triangles failing child parity or
+        Jacobian parity, the Jacobian evaluated on all of them.
+        ``deviation_splits``: triangles passing child parity but split by the
+        deviation test. The Jacobian is never evaluated on these.
         ``sigma_zero``: triangles seen with ``s == 0`` (parity-ok or not).
         ``nonfinite_splits``: level ``< max_level`` triangles split because some
         sample was non-finite.
@@ -1863,15 +2018,15 @@ def refine(
             # A forced child is auto-converged: steps 3-7 are skipped so the
             # cascade cannot re-enter the split machinery from inside itself.
             #
-            # No FORCED tag of its own: a forced child inherits its parent's
-            # status instead. A violator is bounded to `level <= max_level - 2`
-            # by `find_unbalanced`, and the only INVALID or NONFINITE leaves in
-            # the store sit at `max_level` -- the branch above adds them and
-            # breaks out of the loop before any cascade runs. So no violator is
-            # ever INVALID or NONFINITE, and every forced child inherits
-            # `LEAF_CONVERGED`, transitively, all the way down the cascade. A
-            # forced child can still reach freeze with a non-finite vertex, via
-            # a deferred midpoint the criterion never saw; closure is left to
+            # No flag of its own: a forced child inherits its parent's status
+            # instead. A violator is bounded to `level <= max_level - 2` by
+            # `find_unbalanced`, and the only leaves stored with a nonzero
+            # status sit at `max_level` -- the branch above adds them and
+            # breaks out of the loop before any cascade runs. So every violator
+            # is `LEAF_CONVERGED`, and so is every forced child, transitively,
+            # all the way down the cascade. A forced child can still reach
+            # freeze with a non-finite vertex, via a deferred midpoint the
+            # criterion never saw; `invalidate_nonfinite_origins` is left to
             # catch that.
             kid_status = backend.repeat(store.status[violators], 4, axis=0)
             store, _ = store_add(store, kid_v, kid_level, kid_cls, kid_status)
@@ -2103,20 +2258,24 @@ def close(
 
 def invalidate_nonfinite_origins(vs, leaves, origin, pre_status) -> ArrayLike:
     """
-    Re-check finiteness at freeze and propagate invalidity through the origin.
+    Re-check finiteness at freeze and flag non-finite origins.
 
-    A ``LEAF_FORCED`` leaf inherits its vertices from a parent whose
+    A balance-cascade child inherits its vertices from a parent whose
     midpoints were never finiteness-tested, and a closure triangle can pick
     up a midpoint no criterion ever saw, so a non-finite vertex can reach
-    freeze on a leaf not already marked invalid. Without this it would enter
-    the spatial index and swallow every query in its cell.
+    freeze on a leaf not already flagged. Without this it would enter the
+    spatial index and swallow every query in its cell.
 
-    Invalidity is propagated UP to the origin and then back DOWN to every one
+    The flag is propagated UP to the origin and then back DOWN to every one
     of its leaves, rather than applied to the bad leaf alone: the
     termination-reason counts are pre-closure, so marking only the leaf would
     leave them disagreeing with the pre-closure leaf count. It is also the
     conservative direction -- if one triangle of a region has a bad vertex,
     the region is not trustworthy.
+
+    ``LEAF_RAYTRACE_NONFINITE`` is OR-ed in rather than assigned, so an origin
+    keeps every flag it already carried and gains this one alongside. The
+    oracle instead overwrote the status with its single ``NONFINITE`` code.
 
     The oracle (``old_adaptive._invalidate_nonfinite_origins``) computes the
     per-origin flag with ``np.logical_or.at(origin_bad, origin, ~leaf_finite)``,
@@ -2143,13 +2302,13 @@ def invalidate_nonfinite_origins(vs, leaves, origin, pre_status) -> ArrayLike:
     origin: ArrayLike
         Shape ``(L,)``, int64 index into ``pre_status``. Need not be sorted.
     pre_status: ArrayLike
-        Shape ``(N,)``, one status per origin.
+        Shape ``(N,)``, one status bitmask per origin.
 
     Returns
     -------
     ArrayLike
-        ``pre_status`` with every origin owning a non-finite leaf set to
-        ``LEAF_NONFINITE``.
+        ``pre_status`` with ``LEAF_RAYTRACE_NONFINITE`` OR-ed into every origin
+        owning a non-finite leaf, and every other origin unchanged.
     """
     n_origins = pre_status.shape[0]
     leaf_finite = backend.all(backend.isfinite(vs[leaves]), dim=(1, 2))
@@ -2323,22 +2482,28 @@ class AdaptiveMesh(NamedTuple):
     table; the correspondence is structural rather than an invariant kept in
     sync.
 
-    ``LEAF_INVALID`` and ``LEAF_NONFINITE`` leaves remain in ``leaves`` and
-    ``leaf_status`` but are never registered in ``index``, so a source-plane
-    query cannot return them. That is a genuine coverage hole in the lens
-    plane, sized at ``min_img_sep`` scale rather than ``init_res`` scale,
-    since both causes can only come to rest at ``max_level``: a leaf whose
-    four hypothetical children disagree on ``sign(det Q_k)`` (or whose
-    criterion could never be evaluated because a sample was non-finite)
-    contains a fold or singularity the mesh cannot resolve, and reporting no
-    coverage there is the conservative, deliberate answer -- correctness over
-    completeness exactly where images merge or diverge.
+    Leaves with any failure flag set -- every status but ``LEAF_CONVERGED`` --
+    remain in ``leaves`` and ``leaf_status`` but are never registered in
+    ``index``, so a source-plane query cannot return them. That is a genuine
+    coverage hole in the lens plane, sized at ``min_img_sep`` scale rather
+    than ``init_res`` scale, since a flag is only ever stored at ``max_level``
+    (or OR-ed in at freeze, for a non-finite vertex): a leaf failing either
+    parity test straddles a fold or critical curve the mesh cannot resolve, one
+    failing the deviation test has no affine model accurate to
+    ``min_img_sep``, and one with a non-finite sample could never be tested at
+    all. Reporting no coverage there is the conservative, deliberate answer --
+    correctness over completeness exactly where images merge or diverge.
+    ``leaf_status`` keeps every reason, so the hole can be taken apart
+    afterwards: ``(leaf_status & LEAF_JACOBIAN_PARITY_UNRESOLVED) != 0``, for
+    instance, selects the leaves with a critical curve running between their
+    samples.
 
     ``min_img_sep`` is stored because it is the mesh's own defining tolerance
     -- the halved value :func:`build_adaptive_mesh` actually refined to, not
-    the value the caller passed. ``raytrace`` deliberately is **not** stored:
-    a callable carries no identity the mesh could check, so holding one would
-    imply a guarantee that it matches the build when nothing can enforce it.
+    the value the caller passed. The lens deliberately is **not** stored, nor
+    its ``raytrace``: a callable carries no identity the mesh could check, so
+    holding one would imply a guarantee that it matches the build when nothing
+    can enforce it.
 
     Parameters
     ----------
@@ -2357,8 +2522,8 @@ class AdaptiveMesh(NamedTuple):
         Twice the signed source-plane area of each leaf, shape ``(L,)``.
         Computed from ``vertices_source`` at ``dtype``, so it is exact for
         whatever precision the mesh was frozen at -- not a higher-precision
-        value cast down afterwards. Meaningless (and never consumed) on a
-        ``LEAF_INVALID`` or ``LEAF_NONFINITE`` leaf.
+        value cast down afterwards. Never consumed on a leaf outside the index,
+        and meaningless on one with ``LEAF_RAYTRACE_NONFINITE`` set.
 
         *Unit: arcsec^2*
     leaf_origin: ArrayLike
@@ -2367,8 +2532,9 @@ class AdaptiveMesh(NamedTuple):
         closed from. Non-decreasing, so one origin's terminal triangles are
         contiguous.
     leaf_status: ArrayLike
-        Shape ``(L,)`` int64, one of the ``LEAF_*`` constants, inherited from
-        the leaf's origin.
+        Shape ``(L,)`` int64 bitmask of ``LEAF_*`` failure flags,
+        ``LEAF_CONVERGED`` (zero) where none is set, inherited from the leaf's
+        origin.
     leaf_level: ArrayLike
         Shape ``(L,)`` int64 refinement level, inherited from the leaf's
         origin.
@@ -2376,8 +2542,8 @@ class AdaptiveMesh(NamedTuple):
         Shape ``(N, 3)`` int64, the pre-closure leaves' own vertex slots --
         what ``leaf_origin`` indexes into.
     index: MeshIndex
-        Spatial index over the source-plane bounding boxes of every leaf
-        **except** ``LEAF_INVALID`` and ``LEAF_NONFINITE`` ones.
+        Spatial index over the source-plane bounding boxes of the
+        ``LEAF_CONVERGED`` leaves, and of no other.
     d_floor: int
         Level at which the level-0 hypotenuse first falls to ``min_img_sep``,
         uncapped by ``max_depth``.
@@ -2442,9 +2608,17 @@ def build_adaptive_mesh(
 
     Parameters
     ----------
-    raytrace: Callable
-        Maps lens-plane to source-plane coordinates, called as
-        ``raytrace(x, y) -> (bx, by)`` on 1-D arrays of shape ``(N,)``.
+    lens:
+        The lens to mesh -- any caustics lens, or anything else exposing the
+        same two methods on 1-D arrays of shape ``(N,)``:
+        ``lens.raytrace(x, y) -> (bx, by)``, mapping lens-plane to
+        source-plane coordinates, and ``lens.jacobian_lens_equation(x, y)``,
+        returning that map's ``(N, 2, 2)`` Jacobian ``d(beta) / d(theta)``. The
+        Jacobian decides :func:`jacobian_parity_ok`, which the criterion
+        requires before it converges any leaf. ``raytrace`` goes through
+        :func:`make_raytrace` -- float64 in and out, on ``device``, chunked by
+        ``raytrace_batch_size`` -- while ``jacobian_lens_equation`` is called
+        directly on the build's own float64 coordinates.
     fov: float
         Side length of the square lens-plane domain.
 
@@ -2597,11 +2771,11 @@ def build_adaptive_mesh(
     # balance cascade inherits vertices from a parent whose midpoints were
     # never finiteness-tested, and a closure triangle can pick up a midpoint
     # no criterion ever saw, so a non-finite vertex can reach here on a leaf
-    # not already marked invalid. Without this it would enter the index and
-    # swallow every query in its cell.
+    # not already flagged. Without this it would enter the index and swallow
+    # every query in its cell.
     #
-    # Invalidity is propagated UP to the origin and then back DOWN to every
-    # leaf, rather than being applied to the leaf alone: the
+    # `LEAF_RAYTRACE_NONFINITE` is propagated UP to the origin and then back
+    # DOWN to every leaf, rather than being applied to the leaf alone: the
     # termination-reason counts are pre-closure, so marking only the leaf
     # would leave them disagreeing with the pre-closure leaf count. It is
     # also the conservative direction -- if one triangle of a region has a
@@ -3150,13 +3324,14 @@ def mesh_forward_raytrace(
         *Unit: arcsec*
 
     raytrace: Callable
-        **Must be the same callable this mesh was built from**, called as
-        ``raytrace(x, y) -> (bx, by)``. The seeds handed to the root finder are
-        preimages under *this* mesh's leaves, so a different lens would be
-        root-found from meaningless starting points -- silently, since the
-        residual filter would simply reject most of them and return too few
-        images rather than raising. This cannot be checked: a callable carries
-        no identity the mesh could have recorded at build time.
+        **Must be the raytrace of the lens this mesh was built from**, i.e.
+        ``lens.raytrace``, called as ``raytrace(x, y) -> (bx, by)``. The seeds
+        handed to the root finder are preimages under *this* mesh's leaves, so
+        a different lens would be root-found from meaningless starting points
+        -- silently, since the residual filter would simply reject most of them
+        and return too few images rather than raising. This cannot be checked:
+        a callable carries no identity the mesh could have recorded at build
+        time.
     batch_size: Optional[int]
         Chunk size over source points. Bounds peak memory for the whole
         pipeline, not just :func:`mesh_query` -- the root finder holds
@@ -3181,13 +3356,15 @@ def mesh_forward_raytrace(
         guaranteed to satisfy the odd-image theorem any longer:
         ``"dedup"`` can merge a near-tangential pair closer than
         ``min_img_sep`` into one, and ``"rootfind"`` can miss an image
-        outright whose seed fell in a parity-condemned leaf and so was
-        never in the index to seed the root finder in the first place.
-        Measured on the SIE fixture, a 25x25 source grid, ``"rootfind"``:
-        even image counts -- impossible for this non-singular lens --
-        turn up at 42 of 625 pixels at ``min_img_sep=0.04``, 2 at ``0.02``,
-        and 0 at ``0.01``. Use ``"rootfind"`` when the position itself
-        matters, ``"dedup"`` when the count does.
+        outright whose seed would have fallen in a non-converged
+        ``max_level`` leaf, which was never in the index to seed the root
+        finder in the first place. Measured on the cored SIE fixture
+        (``fov=5``, ``init_res=32``) over a 25x25 source grid of 0.08 arcsec
+        pixels centred on the lens, ``"rootfind"``: even image counts --
+        impossible for this non-singular lens -- turn up at 371 of 625
+        pixels at ``min_img_sep=0.04``, 263 at ``0.02``, and 4 at ``0.01``.
+        Use ``"rootfind"`` when the position itself matters, ``"dedup"``
+        when the count does.
     residual_tol: Optional[float]
         Source-plane tolerance on ``|raytrace(x) - beta|`` for accepting a
         root. Defaults to ``min_img_sep``.

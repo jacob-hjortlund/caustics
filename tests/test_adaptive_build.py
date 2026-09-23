@@ -248,7 +248,7 @@ def test_store_add_remove_compact():
     assert backend.to_numpy(rows).tolist() == [0, 1]
 
     store, rows2 = new.store_add(
-        store, _i64([[6, 7, 8]]), 2, _i64([2]), new.LEAF_FORCED
+        store, _i64([[6, 7, 8]]), 2, _i64([2]), new.LEAF_CONVERGENCE_FAILED
     )
     assert backend.to_numpy(rows2).tolist() == [2]
 
@@ -256,21 +256,26 @@ def test_store_add_remove_compact():
     v, level, cls, status = new.store_compact(store)
     assert backend.to_numpy(v).tolist() == [[3, 4, 5], [6, 7, 8]]
     assert backend.to_numpy(level).tolist() == [1, 2]
-    assert backend.to_numpy(status).tolist() == [new.LEAF_CONVERGED, new.LEAF_FORCED]
+    assert backend.to_numpy(status).tolist() == [
+        new.LEAF_CONVERGED,
+        new.LEAF_CONVERGENCE_FAILED,
+    ]
 
 
 def test_store_add_accepts_per_row_level_and_status():
+    """A per-row status is stored as given, combined flags included."""
+    both = new.LEAF_APPROX_PARITY_UNRESOLVED | new.LEAF_JACOBIAN_PARITY_UNRESOLVED
     store = new.empty_store()
     store, _ = new.store_add(
         store,
         _i64([[0, 1, 2], [3, 4, 5]]),
         _i64([1, 4]),
         _i64([0, 1]),
-        _i64([new.LEAF_CONVERGED, new.LEAF_INVALID]),
+        _i64([new.LEAF_CONVERGED, both]),
     )
     _, level, _, status = new.store_compact(store)
     assert backend.to_numpy(level).tolist() == [1, 4]
-    assert backend.to_numpy(status).tolist() == [new.LEAF_CONVERGED, new.LEAF_INVALID]
+    assert backend.to_numpy(status).tolist() == [new.LEAF_CONVERGED, both]
 
 
 def test_store_survives_many_small_adds_and_removals():
@@ -289,16 +294,30 @@ def test_store_survives_many_small_adds_and_removals():
     assert backend.to_numpy(v_out).tolist() == [rec[1] for rec in alive]
 
 
-def test_leaf_status_constants_are_distinct_plain_ints():
-    values = [
-        new.LEAF_CONVERGED,
-        new.LEAF_SIZE_FLOOR,
-        new.LEAF_FORCED,
-        new.LEAF_INVALID,
-        new.LEAF_NONFINITE,
+def test_leaf_status_constants_are_distinct_single_bit_flags():
+    """Every failure flag is its own bit, so any OR of them decodes uniquely.
+
+    ``LEAF_CONVERGED`` is zero -- the empty set of failures -- which is what
+    lets ``status == LEAF_CONVERGED`` mean "no test failed" however many flags
+    a failing leaf carries.
+    """
+    flags = [
+        new.LEAF_CONVERGENCE_FAILED,
+        new.LEAF_APPROX_PARITY_UNRESOLVED,
+        new.LEAF_JACOBIAN_PARITY_UNRESOLVED,
+        new.LEAF_RAYTRACE_NONFINITE,
+        new.LEAF_JACOBIAN_NONFINITE,
     ]
-    assert values == [0, 1, 2, 3, 4]
-    assert all(type(v) is int for v in values)
+    assert new.LEAF_CONVERGED == 0
+    assert flags == [1, 2, 4, 8, 16]
+    assert all(type(v) is int for v in [new.LEAF_CONVERGED, *flags])
+    combos = {
+        sum(f for i, f in enumerate(flags) if mask >> i & 1)
+        for mask in range(2 ** len(flags))
+    }
+    assert len(combos) == 2 ** len(flags), "some OR of flags is ambiguous"
+    for name in ("LEAF_SIZE_FLOOR", "LEAF_FORCED", "LEAF_INVALID", "LEAF_NONFINITE"):
+        assert not hasattr(new, name), f"{name} was retired with the bitmask"
 
 
 def test_store_remove_does_not_mutate_its_input():

@@ -36,9 +36,14 @@ def test_the_old_module_no_longer_exists():
 def test_leaf_status_constants_are_exported():
     for name in (
         "LEAF_CONVERGED",
-        "LEAF_SIZE_FLOOR",
-        "LEAF_FORCED",
-        "LEAF_INVALID",
-        "LEAF_NONFINITE",
+        "LEAF_CONVERGENCE_FAILED",
+        "LEAF_APPROX_PARITY_UNRESOLVED",
+        "LEAF_JACOBIAN_PARITY_UNRESOLVED",
+        "LEAF_RAYTRACE_NONFINITE",
+        "LEAF_JACOBIAN_NONFINITE",
     ):
-        assert hasattr(func, name), name
+        assert getattr(func, name) is getattr(func.adaptive, name), name
+        assert name in func.__all__, name
+    for name in ("LEAF_SIZE_FLOOR", "LEAF_FORCED", "LEAF_INVALID", "LEAF_NONFINITE"):
+        assert not hasattr(func, name), name
+        assert name not in func.__all__, name

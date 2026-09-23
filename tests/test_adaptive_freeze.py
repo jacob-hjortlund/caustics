@@ -1,5 +1,7 @@
 """Freeze-time invalidation and the source-plane spatial index."""
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
@@ -35,13 +37,45 @@ def test_invalidate_propagates_one_bad_vertex_to_the_whole_origin_group():
             _f64(vs), _i64(leaves), _i64(origin), _i64(pre_status)
         )
     )
-    assert got.tolist() == [new.LEAF_NONFINITE, new.LEAF_CONVERGED]
+    assert got.tolist() == [new.LEAF_RAYTRACE_NONFINITE, new.LEAF_CONVERGED]
+
+
+def test_invalidate_ors_the_flag_into_the_status_an_origin_already_has():
+    """The freeze-time flag adds to an origin's record rather than replacing it.
+
+    Origin 0 keeps its parity flag and gains the non-finite one; origin 1
+    already carries it, and ORing it in again changes nothing; origin 2 owns
+    no non-finite leaf and keeps its status untouched.
+    """
+    vs = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [np.nan, 0.0]])
+    leaves = np.array([[0, 1, 3], [0, 3, 2], [0, 1, 2]])
+    origin = np.array([0, 1, 2])
+    pre_status = np.array(
+        [
+            new.LEAF_APPROX_PARITY_UNRESOLVED,
+            new.LEAF_CONVERGENCE_FAILED | new.LEAF_RAYTRACE_NONFINITE,
+            new.LEAF_JACOBIAN_PARITY_UNRESOLVED,
+        ]
+    )
+    got = backend.to_numpy(
+        new.invalidate_nonfinite_origins(
+            _f64(vs), _i64(leaves), _i64(origin), _i64(pre_status)
+        )
+    )
+    assert got.tolist() == [
+        new.LEAF_APPROX_PARITY_UNRESOLVED | new.LEAF_RAYTRACE_NONFINITE,
+        new.LEAF_CONVERGENCE_FAILED | new.LEAF_RAYTRACE_NONFINITE,
+        new.LEAF_JACOBIAN_PARITY_UNRESOLVED,
+    ]
 
 
 def test_invalidate_matches_the_oracle_on_duplicate_origins(oracle_module):
     rng = np.random.default_rng(5)
     vs = rng.normal(size=(30, 2))
-    vs[7] = np.inf
+    # Vertex 18 sits in two leaves of origin 3 -- the repeated-origin OR this
+    # test is about -- and one each of origins 5, 6 and 7. (Vertex 7, used
+    # before, appears in no leaf at this seed, which left both sides all-zero.)
+    vs[18] = np.inf
     leaves = rng.integers(0, 30, (24, 3))
     origin = np.repeat(np.arange(8), 3)
     pre_status = np.zeros(8, dtype=np.int64)
@@ -54,8 +88,13 @@ def test_invalidate_matches_the_oracle_on_duplicate_origins(oracle_module):
     want = oracle_module._invalidate_nonfinite_origins(
         vs, leaves, origin, pre_status.astype(np.int8)
     )
-    # The oracle marks NONFINITE; only the constant's spelling differs.
-    assert got.tolist() == want.astype(np.int64).tolist()
+    # The oracle overwrites a bad origin's status with its own NONFINITE code,
+    # where this module ORs in LEAF_RAYTRACE_NONFINITE. From an all-converged
+    # start the two differ only in the value written, so what must agree is
+    # which origins were flagged -- the bincount OR-reduction under test.
+    flagged = want != oracle_module.LeafStatus.CONVERGED
+    assert flagged.any() and not flagged.all(), "fixture must flag and spare"
+    assert got.tolist() == np.where(flagged, new.LEAF_RAYTRACE_NONFINITE, 0).tolist()
 
 
 def test_build_index_matches_the_oracle(oracle_module):
@@ -114,8 +153,13 @@ def to_np(x):
     return backend.to_numpy(x)
 
 
-def make_counting_raytrace(fn):
-    """Wrap a numpy (N,2)->(N,2) map as a backend raytrace, counting evaluations."""
+def make_counting_lens(fn, jac):
+    """Wrap numpy maps as a lens, counting raytrace evaluations.
+
+    ``fn`` is a ``(N, 2) -> (N, 2)`` lens map and ``jac`` its Jacobian,
+    ``(N, 2) -> (N, 2, 2)``; the stand-in exposes the two methods
+    `build_adaptive_mesh` reads, ``raytrace`` and ``jacobian_lens_equation``.
+    """
     calls = {"points": 0, "batches": 0}
 
     def raytrace(x, y):
@@ -125,7 +169,32 @@ def make_counting_raytrace(fn):
         out = fn(xy)
         return backend.as_array(out[:, 0]), backend.as_array(out[:, 1])
 
-    return raytrace, calls
+    def jacobian_lens_equation(x, y):
+        xy = np.stack([backend.to_numpy(x), backend.to_numpy(y)], axis=-1)
+        return backend.as_array(jac(xy), dtype=backend.float64)
+
+    lens = SimpleNamespace(
+        raytrace=raytrace, jacobian_lens_equation=jacobian_lens_equation
+    )
+    return lens, calls
+
+
+def broken_where(fn, jac, where, value=np.nan):
+    """``fn`` and ``jac`` with ``value`` wherever ``where(p)`` holds -- the
+    raytrace and its Jacobian breaking over the same region, as a lens's would.
+    """
+
+    def broken(p):
+        out = fn(p)
+        out[where(p)] = value
+        return out
+
+    def broken_jacobian(p):
+        J = jac(p)
+        J[where(p)] = value
+        return J
+
+    return broken, broken_jacobian
 
 
 def localised_fold(p):
@@ -149,13 +218,37 @@ def localised_fold(p):
     return np.stack([p[:, 0], 0.6 * y + bend], axis=-1)
 
 
-def test_every_indexed_leaf_has_finite_source_vertices():
-    def broken(p):
-        out = localised_fold(p)
-        out[p[:, 0] > 1.0] = np.nan
-        return out
+def localised_fold_jacobian(p):
+    """``diag(1, 0.6 + 2y)`` inside the band, ``diag(1, 0.6)`` outside it."""
+    y = p[:, 1]
+    J = np.zeros((p.shape[0], 2, 2))
+    J[:, 0, 0] = 1.0
+    J[:, 1, 1] = 0.6 + np.where(np.abs(y) < 0.5, 2.0 * y, 0.0)
+    return J
 
-    mesh, _ = new_build(broken, min_img_sep=0.05)
+
+def identity(p):
+    return p * 1.0
+
+
+def identity_jacobian(p):
+    return np.tile(np.eye(2), (p.shape[0], 1, 1))
+
+
+def collapse(p):
+    """A ``kappa == 1`` sheet: the whole lens plane maps to one point."""
+    return np.zeros_like(p)
+
+
+def collapse_jacobian(p):
+    return np.zeros((p.shape[0], 2, 2))
+
+
+def test_every_indexed_leaf_has_finite_source_vertices():
+    fn, jac = broken_where(
+        localised_fold, localised_fold_jacobian, lambda p: p[:, 0] > 1.0
+    )
+    mesh, _ = new_build(fn, jac, min_img_sep=0.05)
     vs = backend.to_numpy(mesh.vertices_source)
     leaves = backend.to_numpy(mesh.leaves)
     for leaf in np.unique(backend.to_numpy(mesh.index.cell_leaves)):
@@ -174,7 +267,7 @@ def test_every_indexed_leaf_has_finite_source_vertices():
     strict=False,
 )
 def test_index_registers_every_leaf_in_the_cell_of_each_of_its_vertices():
-    mesh, _ = new_build(localised_fold, min_img_sep=0.05)
+    mesh, _ = new_build(localised_fold, localised_fold_jacobian, min_img_sep=0.05)
     vs = backend.to_numpy(mesh.vertices_source)
     leaves = backend.to_numpy(mesh.leaves)
     offs = backend.to_numpy(mesh.index.cell_offsets)
@@ -183,7 +276,7 @@ def test_index_registers_every_leaf_in_the_cell_of_each_of_its_vertices():
     cell = backend.to_numpy(mesh.index.cell)
     status = backend.to_numpy(mesh.leaf_status)
     for leaf in RNG.choice(len(leaves), size=50, replace=False):
-        if status[leaf] == new.LEAF_INVALID:
+        if status[leaf] != new.LEAF_CONVERGED:
             continue
         for q in vs[leaves[leaf]]:
             ix = int(np.clip((q[0] - lo[0]) // cell[0], 0, mesh.index.nx - 1))
@@ -222,7 +315,7 @@ def test_freeze_invalidates_a_whole_origin_group_from_one_bad_vertex():
 
     It cannot be reached through a full build: every vertex that becomes a
     corner or midpoint of an evaluated triangle is finiteness-checked by
-    ``_refine`` first, except on a narrow cascade path (a FORCED leaf re-forced
+    ``refine`` first, except on a narrow cascade path (a forced child re-forced
     in a later round via a deferred, never-checked midpoint) that no available
     fixture reaches. Unit-tested on a synthetic triple instead -- otherwise the
     re-check could be deleted with no test failing.
@@ -236,13 +329,9 @@ def test_freeze_invalidates_a_whole_origin_group_from_one_bad_vertex():
             _f64(vs), _i64(leaves), _i64(origin), _i64(pre_status)
         )
     )
-    # UPDATED from `LeafStatus.INVALID`: b6dc3eb split the old INVALID status
-    # into finite-only INVALID vs non-finite NONFINITE. The frozen oracle
-    # (`old_adaptive._invalidate_nonfinite_origins`) returns
-    # `np.where(origin_bad, np.int8(LeafStatus.NONFINITE), pre_status)`, and
-    # running it directly on these exact inputs gives `out == [4, 0]`, i.e.
-    # NONFINITE for the bad origin -- confirmed against the oracle, not guessed.
-    assert out[0] == new.LEAF_NONFINITE, "one bad leaf must invalidate its origin"
+    assert (
+        out[0] == new.LEAF_RAYTRACE_NONFINITE
+    ), "one bad leaf must flag its whole origin"
     assert out[1] == new.LEAF_CONVERGED, "a clean origin must be untouched"
 
 
@@ -251,21 +340,79 @@ def test_freeze_invalidates_a_whole_origin_group_from_one_bad_vertex():
 # ---------------------------------------------------------------------------
 
 
+def _stack_2x2(a, b, c, d):
+    """``[[a, b], [c, d]]`` at every point, shape ``(N, 2, 2)``."""
+    return backend.stack(
+        (backend.stack((a, b), dim=-1), backend.stack((c, d), dim=-1)), dim=-2
+    )
+
+
+def _lens(raytrace, jacobian):
+    """A lens stand-in exposing the two methods `build_adaptive_mesh` reads."""
+    return SimpleNamespace(raytrace=raytrace, jacobian_lens_equation=jacobian)
+
+
 def _sie_like(x, y):
     r = (x * x + y * y + 0.05) ** 0.5
     return x - 1.2 * x / r, y - 1.2 * y / r
+
+
+def _sie_like_jacobian(x, y):
+    r = (x * x + y * y + 0.05) ** 0.5
+    k = 1.2 / r**3
+    return _stack_2x2(
+        1.0 - 1.2 / r + k * x * x, k * x * y, k * x * y, 1.0 - 1.2 / r + k * y * y
+    )
 
 
 def _affine(x, y):
     return 2.0 * x + 0.5 * y, -0.25 * x + 1.5 * y
 
 
+def _affine_jacobian(x, y):
+    one = backend.ones_like(x)
+    return _stack_2x2(2.0 * one, 0.5 * one, -0.25 * one, 1.5 * one)
+
+
+def _fold_free(x, y):
+    """Curved everywhere, folded nowhere on ``|x| <= 2.5``.
+
+    ``det A = 1 + 0.2 x - 0.48 cos(1.5 x) cos(2 y) >= 0.02`` there, so neither
+    parity test has a critical curve to find and the build must reproduce the
+    oracle's exactly.
+    """
+    return x + 0.4 * backend.sin(2.0 * y) + 0.1 * x * x, y + 0.4 * backend.sin(1.5 * x)
+
+
+def _fold_free_jacobian(x, y):
+    return _stack_2x2(
+        1.0 + 0.2 * x,
+        0.8 * backend.cos(2.0 * y),
+        0.6 * backend.cos(1.5 * x),
+        backend.ones_like(x),
+    )
+
+
+SIE_LIKE = _lens(_sie_like, _sie_like_jacobian)
+AFFINE_LENS = _lens(_affine, _affine_jacobian)
 BUILD = dict(fov=4.0, init_res=3, min_img_sep=0.5, max_depth=3)
 
 
 def test_build_matches_the_oracle_mesh(oracle_module):
-    got = new.build_adaptive_mesh(_sie_like, **BUILD)
-    want = oracle_module.build_adaptive_mesh(_sie_like, **BUILD)
+    """Bit for bit, on a map where the two refinement criteria coincide.
+
+    The Jacobian test replaced the oracle's quadratic-vertex parity check, so
+    across a fold the two builds deliberately differ, and `_sie_like` no
+    longer serves. `_fold_free` has no fold for either check to find, so the
+    refinement matches the oracle leaf for leaf (see
+    `test_refine_reproduces_the_oracle_leaf_set_where_no_fold_exists`) and
+    everything downstream of it -- canonical ordering, closure, the vertex
+    remap, freeze-time invalidation and the spatial index -- must match too.
+    """
+    build = dict(fov=4.0, init_res=3, min_img_sep=0.2, max_depth=5)
+    got = new.build_adaptive_mesh(_lens(_fold_free, _fold_free_jacobian), **build)
+    want = oracle_module.build_adaptive_mesh(_fold_free, **build)
+    assert got.leaves.shape[0] > got.origin_leaves.shape[0], "closure must run"
 
     assert np.allclose(
         backend.to_numpy(got.vertices_lens), backend.to_numpy(want.vertices_lens)
@@ -287,8 +434,16 @@ def test_build_matches_the_oracle_mesh(oracle_module):
         == backend.to_numpy(want.leaf_level).tolist()
     )
     assert (
-        backend.to_numpy(got.leaf_status).tolist()
-        == backend.to_numpy(want.leaf_status).tolist()
+        (backend.to_numpy(got.leaf_status) == new.LEAF_CONVERGED)
+        == (backend.to_numpy(want.leaf_status) == oracle_module.LeafStatus.CONVERGED)
+    ).all()
+    assert (
+        backend.to_numpy(got.index.cell_offsets).tolist()
+        == backend.to_numpy(want._cell_offsets).tolist()
+    )
+    assert (
+        backend.to_numpy(got.index.cell_leaves).tolist()
+        == backend.to_numpy(want._cell_leaves).tolist()
     )
     assert got.d_floor == want.d_floor and got.max_level == want.max_level
     assert got.min_img_sep == want.min_img_sep
@@ -296,14 +451,14 @@ def test_build_matches_the_oracle_mesh(oracle_module):
 
 def test_build_halves_the_requested_min_img_sep():
     mesh = new.build_adaptive_mesh(
-        _affine, fov=4.0, init_res=2, min_img_sep=0.4, max_depth=3
+        AFFINE_LENS, fov=4.0, init_res=2, min_img_sep=0.4, max_depth=3
     )
     assert mesh.min_img_sep == pytest.approx(0.2)
 
 
 def test_build_is_deterministic():
-    a = new.build_adaptive_mesh(_sie_like, **BUILD)
-    b = new.build_adaptive_mesh(_sie_like, **BUILD)
+    a = new.build_adaptive_mesh(SIE_LIKE, **BUILD)
+    b = new.build_adaptive_mesh(SIE_LIKE, **BUILD)
     assert backend.to_numpy(a.leaves).tolist() == backend.to_numpy(b.leaves).tolist()
     assert np.array_equal(
         backend.to_numpy(a.vertices_source),
@@ -315,33 +470,40 @@ def test_build_is_deterministic():
 def test_build_warns_when_depth_limited():
     with pytest.warns(UserWarning, match="depth-limited"):
         new.build_adaptive_mesh(
-            _sie_like, fov=4.0, init_res=2, min_img_sep=1e-4, max_depth=2
+            SIE_LIKE, fov=4.0, init_res=2, min_img_sep=1e-4, max_depth=2
         )
 
 
 def test_depth_limited_warning_names_the_caller_requested_min_img_sep():
     with pytest.warns(UserWarning, match="min_img_sep=0.0001"):
         new.build_adaptive_mesh(
-            _sie_like, fov=4.0, init_res=2, min_img_sep=1e-4, max_depth=2
+            SIE_LIKE, fov=4.0, init_res=2, min_img_sep=1e-4, max_depth=2
         )
 
 
-def test_invalid_leaves_are_kept_but_excluded_from_the_index():
-    mesh = new.build_adaptive_mesh(_sie_like, **BUILD)
+def test_unconverged_leaves_are_kept_but_excluded_from_the_index():
+    """The index holds exactly the ``LEAF_CONVERGED`` leaves, and no other.
+
+    Every indexed leaf registers in at least one cell, so the set of leaves
+    appearing in ``cell_leaves`` is the index's whole membership, and it must
+    equal the converged set -- a leaf carrying any flag at all stays in
+    ``leaves`` but is never a query candidate.
+    """
+    mesh = new.build_adaptive_mesh(SIE_LIKE, **BUILD)
     status = backend.to_numpy(mesh.leaf_status)
     indexed = set(backend.to_numpy(mesh.index.cell_leaves).tolist())
-    bad = np.flatnonzero((status == new.LEAF_INVALID) | (status == new.LEAF_NONFINITE))
-    assert not (set(bad.tolist()) & indexed)
+    assert (status != new.LEAF_CONVERGED).any(), "fixture must flag some leaf"
+    assert indexed == set(np.flatnonzero(status == new.LEAF_CONVERGED).tolist())
 
 
 def test_mesh_dtype_is_a_backend_dtype():
-    mesh = new.build_adaptive_mesh(_affine, **BUILD)
+    mesh = new.build_adaptive_mesh(AFFINE_LENS, **BUILD)
     assert mesh.dtype is backend.float64
     assert backend.to_numpy(mesh.vertices_lens).dtype == np.float64
 
 
 def test_mesh_honours_a_float32_request():
-    mesh = new.build_adaptive_mesh(_affine, dtype=backend.float32, **BUILD)
+    mesh = new.build_adaptive_mesh(AFFINE_LENS, dtype=backend.float32, **BUILD)
     assert backend.to_numpy(mesh.vertices_lens).dtype == np.float32
 
 
@@ -360,9 +522,17 @@ def test_mesh_honours_a_float32_request():
 AFFINE = np.array([[0.7, 0.1], [-0.2, 0.9]])
 
 
-def new_build(fn, fov=4.0, init_res=4, min_img_sep=0.25, **kw):
-    raytrace, calls = make_counting_raytrace(fn)
-    mesh = new.build_adaptive_mesh(raytrace, fov, init_res, min_img_sep, **kw)
+def affine_np(p):
+    return p @ AFFINE.T
+
+
+def affine_np_jacobian(p):
+    return np.tile(AFFINE, (p.shape[0], 1, 1))
+
+
+def new_build(fn, jac, fov=4.0, init_res=4, min_img_sep=0.25, **kw):
+    lens, calls = make_counting_lens(fn, jac)
+    mesh = new.build_adaptive_mesh(lens, fov, init_res, min_img_sep, **kw)
     return mesh, calls
 
 
@@ -379,9 +549,7 @@ def new_sie_fixture():
         Rein=1.0,
         s=1e-3,
     )
-    mesh = new.build_adaptive_mesh(
-        lens.raytrace, fov=5.0, init_res=32, min_img_sep=1e-2
-    )
+    mesh = new.build_adaptive_mesh(lens, fov=5.0, init_res=32, min_img_sep=1e-2)
     return lens, mesh
 
 
@@ -399,7 +567,7 @@ def signed_area(tri):
 
 
 def test_build_returns_a_consistent_mesh_for_an_affine_map():
-    mesh, calls = new_build(lambda p: p @ AFFINE.T)
+    mesh, calls = new_build(affine_np, affine_np_jacobian)
     L = backend.to_numpy(mesh.leaves).shape[0]
     assert L == 2 * 4**2
     # ADAPTED (not one of the three the task brief named, but it reads
@@ -407,12 +575,11 @@ def test_build_returns_a_consistent_mesh_for_an_affine_map():
     # never fans a triangle out -- confirmed by the `leaf_origin ==
     # arange(L)` check below, which only holds when pre- and post-closure
     # leaves coincide 1:1. That makes `leaf_status` an exact (not
-    # approximate) stand-in for the old pre-closure `stats.n_converged`/
-    # `n_invalid`, and `origin_leaves.shape[0]` -- the pre-closure leaves'
-    # own row count -- an exact stand-in for `stats.n_leaves_pre_closure`.
+    # approximate) stand-in for the old pre-closure `stats.n_converged`, and
+    # `origin_leaves.shape[0]` -- the pre-closure leaves' own row count -- an
+    # exact stand-in for `stats.n_leaves_pre_closure`.
     leaf_status = backend.to_numpy(mesh.leaf_status)
     assert (leaf_status == new.LEAF_CONVERGED).sum() == L
-    assert (leaf_status == new.LEAF_INVALID).sum() == 0
     assert backend.to_numpy(mesh.origin_leaves).shape[0] == L
     assert np.array_equal(backend.to_numpy(mesh.leaf_origin), np.arange(L))
     src = backend.to_numpy(mesh.vertices_source)
@@ -421,7 +588,7 @@ def test_build_returns_a_consistent_mesh_for_an_affine_map():
 
 
 def test_leaf_area2_is_computed_from_the_stored_source_vertices():
-    mesh, calls = new_build(localised_fold, min_img_sep=0.05)
+    mesh, calls = new_build(localised_fold, localised_fold_jacobian, min_img_sep=0.05)
     tri = backend.to_numpy(mesh.vertices_source)[backend.to_numpy(mesh.leaves)]
     P = np_shape_matrix(tri)
     expected = P[:, 0, 0] * P[:, 1, 1] - P[:, 0, 1] * P[:, 1, 0]
@@ -429,7 +596,7 @@ def test_leaf_area2_is_computed_from_the_stored_source_vertices():
 
 
 def test_vertices_are_compacted_and_ordered_by_lattice_key():
-    mesh, calls = new_build(localised_fold, min_img_sep=0.05)
+    mesh, calls = new_build(localised_fold, localised_fold_jacobian, min_img_sep=0.05)
     used = np.unique(backend.to_numpy(mesh.leaves))
     assert used.tolist() == list(range(mesh.vertices_lens.shape[0]))
     lens = backend.to_numpy(mesh.vertices_lens)
@@ -439,7 +606,7 @@ def test_vertices_are_compacted_and_ordered_by_lattice_key():
 
 def test_leaf_origin_survives_the_vertex_remap():
     """Spec test 15, at Mesh level: the compaction must not scramble origins."""
-    mesh, _ = new_build(localised_fold, min_img_sep=0.05)
+    mesh, _ = new_build(localised_fold, localised_fold_jacobian, min_img_sep=0.05)
     leaves = backend.to_numpy(mesh.leaves)
     origin = backend.to_numpy(mesh.leaf_origin)
     origins = backend.to_numpy(mesh.origin_leaves)
@@ -466,8 +633,8 @@ def test_build_is_deterministic_on_a_refined_mesh():
     Renamed on porting (was `test_build_is_deterministic` in the legacy
     suite) to avoid colliding with the Step 1 test of that name above.
     """
-    a, _ = new_build(localised_fold, min_img_sep=0.05)
-    b, _ = new_build(localised_fold, min_img_sep=0.05)
+    a, _ = new_build(localised_fold, localised_fold_jacobian, min_img_sep=0.05)
+    b, _ = new_build(localised_fold, localised_fold_jacobian, min_img_sep=0.05)
     for name in ("leaves", "leaf_area2", "leaf_origin", "leaf_status", "leaf_level"):
         assert np.array_equal(
             backend.to_numpy(getattr(a, name)), backend.to_numpy(getattr(b, name))
@@ -479,7 +646,9 @@ def test_build_is_deterministic_on_a_refined_mesh():
 
 def test_depth_limit_warns_and_names_the_required_max_depth():
     with pytest.warns(UserWarning, match=r"Set max_depth >= \d+"):
-        mesh, _ = new_build(localised_fold, min_img_sep=1e-4, max_depth=2)
+        mesh, _ = new_build(
+            localised_fold, localised_fold_jacobian, min_img_sep=1e-4, max_depth=2
+        )
     # ADAPTED (not one of the three the brief named, but it reads `stats`
     # too): `d_floor` and `max_level` are direct `AdaptiveMesh` fields, an
     # exact replacement for `stats.d_floor`/`stats.max_level`. `depth_limited`
@@ -508,34 +677,32 @@ def test_depth_limited_warning_never_bare_quotes_the_halved_value():
     stronger, negative half.
     """
     with pytest.warns(UserWarning, match=r"min_img_sep=0\.0002 arcsec") as record:
-        new_build(lambda p: p, min_img_sep=2e-4, max_depth=1)
+        new_build(identity, identity_jacobian, min_img_sep=2e-4, max_depth=1)
     assert not any(
         "min_img_sep=0.0001" in str(w.message) for w in record
     ), "must not quote the halved value as if it were what the caller passed"
 
 
-def test_invalid_leaves_from_a_nonfinite_region_are_excluded_from_the_index():
+def test_nonfinite_leaves_from_a_nonfinite_region_are_excluded_from_the_index():
     """Renamed on porting (was `test_invalid_leaves_are_kept_but_excluded_
     from_the_index` in the legacy suite) to avoid colliding with the Step 1
     test of that name above, which exercises SIE parity condemnation rather
     than an injected non-finite region.
     """
-
-    def broken(p):
-        out = localised_fold(p)
-        out[p[:, 0] > 1.0] = np.inf
-        return out
-
-    mesh, _ = new_build(broken, min_img_sep=0.05)
+    fn, jac = broken_where(
+        localised_fold, localised_fold_jacobian, lambda p: p[:, 0] > 1.0, np.inf
+    )
+    mesh, _ = new_build(fn, jac, min_img_sep=0.05)
     status = backend.to_numpy(mesh.leaf_status)
-    assert (status == new.LEAF_INVALID).any()
+    nonfinite = (status & new.LEAF_RAYTRACE_NONFINITE) != 0
+    assert nonfinite.any()
     # ADAPTED: `stats.n_nonfinite_vertices` has no `AdaptiveMesh` equivalent.
-    # `LEAF_INVALID`/`LEAF_NONFINITE` leaves keep their (possibly non-finite)
-    # vertices rather than dropping them, so a non-finite raytrace region
-    # reaches `vertices_source` directly.
+    # Flagged leaves keep their (possibly non-finite) vertices rather than
+    # dropping them, so a non-finite raytrace region reaches `vertices_source`
+    # directly.
     assert not np.isfinite(backend.to_numpy(mesh.vertices_source)).all()
     indexed = set(backend.to_numpy(mesh.index.cell_leaves).tolist())
-    assert not indexed & set(np.flatnonzero(status == new.LEAF_INVALID).tolist())
+    assert not indexed & set(np.flatnonzero(nonfinite).tolist())
 
 
 def test_parity_condemned_leaves_are_excluded_from_the_index():
@@ -552,7 +719,10 @@ def test_parity_condemned_leaves_are_excluded_from_the_index():
 
     status = backend.to_numpy(mesh.leaf_status)
     level = backend.to_numpy(mesh.leaf_level)
-    invalid = np.flatnonzero(status == new.LEAF_INVALID)
+    parity_flags = (
+        new.LEAF_APPROX_PARITY_UNRESOLVED | new.LEAF_JACOBIAN_PARITY_UNRESOLVED
+    )
+    invalid = np.flatnonzero((status & parity_flags) != 0)
     assert invalid.size > 0
     assert (level[invalid] == mesh.max_level).all()
     indexed = set(backend.to_numpy(mesh.index.cell_leaves).tolist())
@@ -560,24 +730,16 @@ def test_parity_condemned_leaves_are_excluded_from_the_index():
 
 
 def test_parity_invalid_partitions_the_max_level_leaves():
-    """Exact conservation, re-derived for the current per-leaf status model.
+    """Exact conservation, re-derived for the bitmask status model.
 
-    ADAPTED beyond the `stats` -> mesh-field substitution the brief asked
-    for: the original invariant (``n_parity_invalid + n_size_floor ==
-    leaves_by_level[max_level]``) assumed every max-level leaf is either
-    SIZE_FLOOR or INVALID, which was true only pre-b6dc3eb. The pre-b6dc3eb
-    oracle skipped the deviation test entirely at `max_level` -- see the
-    commented-out block directly above the live ``if level == max_level:``
-    branch in `old_adaptive._refine`, which condemns on parity alone and
-    never assigns CONVERGED there. The live oracle (and this port) instead
-    runs the full parity-and-deviation criterion at `max_level` too, so a
-    max-level leaf CAN genuinely converge, and SIZE_FLOOR/FORCED are
-    consequently never produced at all (confirmed empirically against the
-    live oracle across every fixture probed while designing this port: both
-    counters are 0 throughout, including on this fixture). What survives as
-    an exact, falsifiable conservation law is that CONVERGED and INVALID
-    exhaustively and disjointly partition every max-level leaf, with both
-    sides non-empty.
+    The full criterion runs at `max_level`, Jacobian forced, so a max-level
+    leaf either genuinely converges or records which tests it failed. On a
+    fixture finite everywhere, those are only ever the three criterion flags
+    -- deviation, child parity and Jacobian parity -- never a non-finite
+    flag, since no raytraced sample is non-finite and the cored SIE's
+    Jacobian is finite and never exactly singular at a sample. Both sides of
+    the partition must be non-empty, and every combination of criterion
+    flags is allowed.
     """
     lens, mesh = new_sie_fixture()
     vs = backend.to_numpy(mesh.vertices_source)
@@ -587,10 +749,15 @@ def test_parity_invalid_partitions_the_max_level_leaves():
     level = backend.to_numpy(mesh.leaf_level)
     at_max = level == mesh.max_level
     assert at_max.any()
-    assert (
-        (status[at_max] == new.LEAF_CONVERGED) | (status[at_max] == new.LEAF_INVALID)
-    ).all(), "no other status should occur at max_level on a finite fixture"
-    assert (status[at_max] == new.LEAF_INVALID).any(), "parity must condemn something"
+    criterion_flags = (
+        new.LEAF_CONVERGENCE_FAILED
+        | new.LEAF_APPROX_PARITY_UNRESOLVED
+        | new.LEAF_JACOBIAN_PARITY_UNRESOLVED
+    )
+    assert not (
+        status[at_max] & ~criterion_flags
+    ).any(), "no non-finite flag should occur at max_level on a finite fixture"
+    assert (status[at_max] != new.LEAF_CONVERGED).any(), "parity must condemn something"
     assert (
         status[at_max] == new.LEAF_CONVERGED
     ).any(), "some max-level leaf must genuinely converge"
@@ -600,31 +767,24 @@ def test_parity_band_is_bounded_by_a_small_multiple_of_min_img_sep():
     """The single claim spec section 4.8's internal halving exists to deliver.
 
     Nothing else in the suite checks that halving ``min_img_sep`` before the
-    build actually bounds the parity-condemned band by anything related to
-    what the caller asked for.
+    build actually bounds the condemned band by anything related to what the
+    caller asked for.
 
-    STALE, UPDATED ON PORTING: the legacy ``1.5x`` bound (and the ``0.91`` to
-    ``1.04`` measurement it was based on) predates b6dc3eb. Before that
-    commit, `_refine` skipped the deviation test entirely at `max_level` and
-    condemned on parity alone (see the commented-out block above the live
-    ``if level == max_level:`` branch in `old_adaptive._refine`), so every
-    condemned leaf was, in effect, exactly at the fold. The live oracle now
-    runs the full parity-and-deviation criterion at `max_level` too (Task 12
-    ports it unchanged), which changes which leaves end up INVALID and
-    measurably widens this band. Re-measured directly against the frozen
-    oracle (`old_adaptive.build_adaptive_mesh`) on this exact fixture --
-    fov=5.0, init_res=32, q=0.4, phi=pi/5, Rein=1.0, s=1e-3 -- band-to-request
-    ratios now run 1.79 to 3.11 across requested separations of 2.5e-3 to
-    2e-2 (was 0.91 to 1.04), with the worst case landing exactly on this
-    test's own min_img_sep=1e-2 (measured band_width=0.031074028470111946,
-    ratio 3.107). ``3.5x`` reproduces the original's proportional headroom
-    (roughly 1.4x-1.6x over its own worst measured case) over this new worst
-    case, while still being a real, falsifiable bound rather than a vacuous
-    one.
+    The band is the coverage hole: every leaf the index excludes, i.e. any
+    status but ``LEAF_CONVERGED``. Its width is measured as it always was --
+    condemned-leaf centroids within 0.05 arcsec of the lens centre, max radius
+    minus min radius. Measured on this exact fixture (fov=5.0, init_res=32,
+    q=0.4, phi=pi/5, Rein=1.0, s=1e-3), band-to-request ratios run 1.77 to
+    1.83 across requested separations of 2e-2 to 2.5e-3, and 1.774 at this
+    test's own 1e-2 (band width 0.01774). The Jacobian criterion narrowed it:
+    the frozen oracle, whose quadratic-vertex check condemned curvature as
+    well as folds, measures 0.03107 here, ratio 3.107. The parity-flagged
+    leaves alone span about one requested separation, 0.00992 here, and the
+    deviation failures around them make up the rest.
 
-    Band width is measured the way those numbers were produced: INVALID leaf
-    centroids within 0.05 arcsec of the lens centre, max radius minus min
-    radius.
+    ``2.5x`` keeps roughly the original bound's proportional headroom -- about
+    1.4x -- over the worst measured case, while still being a real,
+    falsifiable bound rather than a vacuous one.
     """
     requested_min_img_sep = 1e-2  # the value new_sie_fixture's own build call uses
     lens, mesh = new_sie_fixture()
@@ -632,7 +792,7 @@ def test_parity_band_is_bounded_by_a_small_multiple_of_min_img_sep():
     leaves = backend.to_numpy(mesh.leaves)
     vl = backend.to_numpy(mesh.vertices_lens)
 
-    invalid = np.flatnonzero(status == new.LEAF_INVALID)
+    invalid = np.flatnonzero(status != new.LEAF_CONVERGED)
     assert invalid.size > 0, "fixture must condemn leaves to measure a band"
     centroids = vl[leaves[invalid]].mean(axis=1)
     radius = np.linalg.norm(centroids, axis=-1)
@@ -641,7 +801,7 @@ def test_parity_band_is_bounded_by_a_small_multiple_of_min_img_sep():
 
     core_radius = radius[near_centre]
     band_width = core_radius.max() - core_radius.min()
-    assert band_width <= 3.5 * requested_min_img_sep
+    assert band_width <= 2.5 * requested_min_img_sep
 
 
 def test_leaf_area2_uses_the_downcast_vertices_at_reduced_precision():
@@ -653,14 +813,16 @@ def test_leaf_area2_uses_the_downcast_vertices_at_reduced_precision():
     has teeth at a precision-losing dtype: here the two orderings disagree on
     the great majority of leaves, so this is the test that actually pins it.
     """
-    mesh, _ = new_build(localised_fold, min_img_sep=0.05, dtype=backend.float32)
+    mesh, _ = new_build(
+        localised_fold, localised_fold_jacobian, min_img_sep=0.05, dtype=backend.float32
+    )
     vs = backend.to_numpy(mesh.vertices_source)
     assert vs.dtype == np.float32
     P = np_shape_matrix(vs[backend.to_numpy(mesh.leaves)])
     from_stored = P[:, 0, 0] * P[:, 1, 1] - P[:, 0, 1] * P[:, 1, 0]
     assert np.array_equal(backend.to_numpy(mesh.leaf_area2), from_stored)
 
-    mesh64, _ = new_build(localised_fold, min_img_sep=0.05)
+    mesh64, _ = new_build(localised_fold, localised_fold_jacobian, min_img_sep=0.05)
     vs64 = backend.to_numpy(mesh64.vertices_source)
     Q = np_shape_matrix(vs64[backend.to_numpy(mesh64.leaves)])
     computed_then_cast = (Q[:, 0, 0] * Q[:, 1, 1] - Q[:, 0, 1] * Q[:, 1, 0]).astype(
@@ -672,7 +834,7 @@ def test_leaf_area2_uses_the_downcast_vertices_at_reduced_precision():
 
 
 def test_kappa_one_sheet_builds_without_nan():
-    mesh, calls = new_build(lambda p: np.zeros_like(p), min_img_sep=0.5)
+    mesh, calls = new_build(collapse, collapse_jacobian, min_img_sep=0.5)
     # ADAPTED: `stats.n_sigma_min_exactly_zero` is an internal `refine()`
     # counter with no `AdaptiveMesh` field to recompute it from -- unlike
     # `n_invalid`/`n_nonfinite_vertices` elsewhere, nothing on the mesh
@@ -686,9 +848,9 @@ def test_kappa_one_sheet_builds_without_nan():
 def test_mesh_stores_min_img_sep():
     """`forward_raytrace` needs the dedup radius, and only the build knows it.
 
-    `raytrace` is deliberately *not* stored -- it is passed per call -- but
-    `min_img_sep` is the mesh's own defining tolerance, so a caller should never
-    have to restate it and risk restating it wrong.
+    The lens and its `raytrace` are deliberately *not* stored -- `raytrace` is
+    passed per call -- but `min_img_sep` is the mesh's own defining tolerance,
+    so a caller should never have to restate it and risk restating it wrong.
     """
     lens = Point(
         name="pt",
@@ -700,7 +862,7 @@ def test_mesh_stores_min_img_sep():
         Rein=1.0,
         s=1e-6,
     )
-    mesh = new.build_adaptive_mesh(lens.raytrace, fov=4.0, init_res=8, min_img_sep=0.05)
+    mesh = new.build_adaptive_mesh(lens, fov=4.0, init_res=8, min_img_sep=0.05)
     # The build halves min_img_sep internally (the parity-condemned band at
     # max_level is about twice a leaf's size), and stores that halved value --
     # not the value passed in -- since the halved value is what the size floor

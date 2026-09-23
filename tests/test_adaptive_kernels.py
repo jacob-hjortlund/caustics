@@ -1,4 +1,5 @@
-"""The backend kernels must agree with the frozen numpy oracle."""
+"""The backend kernels: agreement with the frozen numpy oracle, and the
+Jacobian parity test the oracle never had."""
 
 import numpy as np
 import pytest
@@ -52,6 +53,53 @@ def _six_points(tri):
     t1, t2, t3 = tri[:, 0, :], tri[:, 1, :], tri[:, 2, :]
     mid = np.stack([(t2 + t3) / 2, (t3 + t1) / 2, (t1 + t2) / 2], axis=1)
     return tri, mid
+
+
+def _constant_jacobian(J):
+    """A ``jacobian_fn`` returning the same ``2 x 2`` matrix at every point."""
+    J = _arr(J)
+
+    def jacobian_fn(x, y):
+        return J + backend.zeros((x.shape[0], 2, 2), dtype=backend.float64)
+
+    return jacobian_fn
+
+
+def _fixed_jacobians(J):
+    """A ``jacobian_fn`` returning the ``(6 * N, 2, 2)`` array ``J`` as given."""
+
+    def jacobian_fn(x, y):
+        return _arr(J)
+
+    return jacobian_fn
+
+
+def _fold_jacobian(x, y):
+    """Jacobian of the fold ``(x, y) -> (x, y**2)``: ``diag(1, 2y)``."""
+    one, zero = backend.ones_like(x), backend.zeros_like(x)
+    return backend.stack(
+        (backend.stack((one, zero), dim=-1), backend.stack((zero, 2 * y), dim=-1)),
+        dim=-2,
+    )
+
+
+def _recording(jacobian_fn):
+    """Wrap ``jacobian_fn``, recording the ``(K, 2)`` points of every call."""
+    calls = []
+
+    def wrapped(x, y):
+        calls.append(np.stack([backend.to_numpy(x), backend.to_numpy(y)], axis=-1))
+        return jacobian_fn(x, y)
+
+    return wrapped, calls
+
+
+def _exploding_jacobian(x, y):
+    raise AssertionError("jacobian_fn must not be called here")
+
+
+def _flagged(status, flag):
+    return (np.asarray(status) & flag) != 0
 
 
 def test_shape_matrix_matches_the_oracle(oracle_module):
@@ -130,8 +178,10 @@ def test_parity_from_children_matches_the_oracle(oracle_module):
 def test_parity_from_children_fails_closed_on_a_nonfinite_child():
     """A NaN determinant stays NaN, so sign constancy fails closed.
 
-    This is what lets `_refine` condemn a max_level triangle with a non-finite
-    midpoint without a branch of its own. See spec section 3.3.
+    Which is why a triangle with a non-finite sample carries
+    ``LEAF_APPROX_PARITY_UNRESOLVED`` alongside ``LEAF_RAYTRACE_NONFINITE``
+    when `evaluate_criterion` sees one; see
+    `test_criterion_reports_nonfinite_as_split`. See spec section 3.3.
     """
     Q = np.tile(np.eye(2), (1, 4, 1, 1)).reshape(1, 4, 2, 2)
     Q[0, 2, 0, 0] = np.nan
@@ -148,25 +198,54 @@ def test_quadratic_vertex_parity_matches_the_oracle(oracle_module):
 
 @pytest.mark.parametrize("level", [0, 2, 5])
 def test_evaluate_criterion_matches_the_oracle(oracle_module, level):
+    """The criterion's approximate half is still exactly the oracle's.
+
+    The oracle's own ``evaluate_criterion`` also ran
+    ``quadratic_vertex_parity_ok``, which the Jacobian test has replaced, so
+    its ``keep`` and ``parity_ok`` are no longer a reference. Its parts still
+    are. With a Jacobian that passes everywhere, ``s`` must be the oracle's,
+    the child-parity flag exactly the oracle's ``parity_from_children``
+    failures, the deviation flag exactly its ``converged_from_deviation``
+    failures, and ``keep`` exactly where both pass.
+    """
     beta_v, beta_m = _samples()
     classes = RNG.integers(0, 6, beta_v.shape[0])
     _, _, compose, pinv0, _ = oracle_module.child_matrix_tables()
-    want = oracle_module.evaluate_criterion(
+    _, _, want_s = oracle_module.evaluate_criterion(
         beta_v, beta_m, classes, level, 0.5, 0.01, pinv0, compose
     )
-    got = new.evaluate_criterion(
-        _arr(beta_v),
-        _arr(beta_m),
-        backend.as_array(classes, dtype=backend.int64),
-        level,
-        0.5,
-        0.01,
-        _arr(pinv0),
-        backend.as_array(compose, dtype=backend.int64),
+    want_child = oracle_module.parity_from_children(
+        oracle_module.child_shape_matrices(beta_v, beta_m)
     )
-    assert (backend.to_numpy(got[0]) == want[0]).all()
-    assert (backend.to_numpy(got[1]) == want[1]).all()
-    assert np.allclose(backend.to_numpy(got[2]), want[2], equal_nan=True)
+    want_deviation = oracle_module.converged_from_deviation(
+        oracle_module.midpoint_deviation(beta_v, beta_m), want_s, 0.01
+    )
+    assert want_child.any() and not want_child.all(), "both parity arms must occur"
+
+    keep, parity_ok, s, status = (
+        backend.to_numpy(x)
+        for x in new.evaluate_criterion(
+            _constant_jacobian(np.eye(2)),
+            _arr(np.zeros_like(beta_v)),
+            _arr(np.zeros_like(beta_m)),
+            _arr(beta_v),
+            _arr(beta_m),
+            backend.as_array(classes, dtype=backend.int64),
+            level,
+            0.5,
+            0.01,
+            _arr(pinv0),
+            backend.as_array(compose, dtype=backend.int64),
+        )
+    )
+    assert np.allclose(s, want_s, equal_nan=True)
+    assert (_flagged(status, new.LEAF_APPROX_PARITY_UNRESOLVED) == ~want_child).all()
+    assert (_flagged(status, new.LEAF_CONVERGENCE_FAILED) == ~want_deviation).all()
+    assert (keep == (want_child & want_deviation)).all()
+    assert (parity_ok == want_child).all()
+    # Every sample is finite and the Jacobian passes, so no other flag can occur.
+    expected_flags = new.LEAF_APPROX_PARITY_UNRESOLVED | new.LEAF_CONVERGENCE_FAILED
+    assert not (status & ~expected_flags).any()
 
 
 def test_group_tables_close_and_have_order_six():
@@ -328,9 +407,12 @@ def test_criterion_converges_on_an_affine_map():
     classes = backend.copy(ROOT_CLASS)
     lens_map = np.array([[0.7, 0.1], [-0.2, 0.9]])
     v, m = _six_points(tri)
-    keep, parity_ok, s = (
+    keep, parity_ok, s, status = (
         backend.to_numpy(x)
         for x in new.evaluate_criterion(
+            _constant_jacobian(lens_map),
+            _arr(v),
+            _arr(m),
             _arr(v @ lens_map.T),
             _arr(m @ lens_map.T),
             classes,
@@ -342,7 +424,12 @@ def test_criterion_converges_on_an_affine_map():
         )
     )
     assert keep.all() and parity_ok.all()
+    assert (status == new.LEAF_CONVERGED).all()
     assert np.allclose(s, np.linalg.svd(lens_map, compute_uv=False)[-1])
+
+
+def _fold(p):
+    return np.stack([p[..., 0], p[..., 1] ** 2], axis=-1)
 
 
 def test_criterion_parity_fires_across_a_fold():
@@ -352,15 +439,73 @@ def test_criterion_parity_fires_across_a_fold():
         [0.0, 0.5]
     )
     classes = backend.copy(ROOT_CLASS[1:2])
-    fold = lambda p: np.stack([p[..., 0], p[..., 1] ** 2], axis=-1)  # noqa: E731
     v, m = _six_points(tri)
-    keep, parity_ok, s = (
+    keep, parity_ok, s, status = (
         backend.to_numpy(x)
         for x in new.evaluate_criterion(
-            _arr(fold(v)), _arr(fold(m)), classes, 0, h0, 1e-3, PINV0, COMPOSE
+            _fold_jacobian,
+            _arr(v),
+            _arr(m),
+            _arr(_fold(v)),
+            _arr(_fold(m)),
+            classes,
+            0,
+            h0,
+            1e-3,
+            PINV0,
+            COMPOSE,
         )
     )
     assert not parity_ok[0] and not keep[0]
+    assert _flagged(status, new.LEAF_APPROX_PARITY_UNRESOLVED)[0]
+
+
+@pytest.mark.parametrize(
+    "shift,jacobian_flag",
+    [
+        # Two midpoints sit exactly on the critical line y == 0, where
+        # det A == 0: a sign that says nothing, which is the non-finite flag.
+        (0.5, new.LEAF_JACOBIAN_NONFINITE),
+        # Off the line, the six determinants 2y are nonzero but mixed in sign.
+        (0.4, new.LEAF_JACOBIAN_PARITY_UNRESOLVED),
+    ],
+)
+def test_forced_jacobian_joins_the_approximate_flags_across_a_fold(
+    shift, jacobian_flag
+):
+    """Without ``force_jacobian`` a failing triangle never reaches the Jacobian.
+
+    Both placements fail child parity and the deviation test, so the
+    Jacobian is skipped and ``status`` holds exactly those two flags. Forcing
+    it adds the Jacobian's own verdict on top, which is what ``max_level``
+    relies on to record every reason a leaf failed.
+    """
+    M, G, COMPOSE, PINV0, ROOT_CLASS = new.child_matrix_tables()
+    tri = np.asarray(new.ROOT_SHAPES[1], dtype=np.float64)[None] - np.array(
+        [0.0, shift]
+    )
+    v, m = _six_points(tri)
+    approx = new.LEAF_APPROX_PARITY_UNRESOLVED | new.LEAF_CONVERGENCE_FAILED
+    for force, want in ((False, approx), (True, approx | jacobian_flag)):
+        keep, parity_ok, s, status = (
+            backend.to_numpy(x)
+            for x in new.evaluate_criterion(
+                _fold_jacobian,
+                _arr(v),
+                _arr(m),
+                _arr(_fold(v)),
+                _arr(_fold(m)),
+                backend.copy(ROOT_CLASS[1:2]),
+                0,
+                1.0,
+                1e-3,
+                PINV0,
+                COMPOSE,
+                force_jacobian=force,
+            )
+        )
+        assert status.tolist() == [want], f"force_jacobian={force}"
+        assert not keep[0] and not parity_ok[0]
 
 
 def test_affine_and_sigma_min_are_invariant_to_simultaneous_relabelling():
@@ -383,7 +528,16 @@ def test_affine_and_sigma_min_are_invariant_to_simultaneous_relabelling():
     )
 
 
-def test_criterion_reports_nonfinite_as_split():
+@pytest.mark.parametrize("force", [False, True])
+def test_criterion_reports_nonfinite_as_split(force):
+    """A non-finite sample is flagged, never converges, and never reaches the
+    Jacobian -- not even under ``force_jacobian``, since a triangle the
+    raytrace could not evaluate has nothing for the Jacobian to confirm.
+
+    The NaN also fails child parity, so that flag rides along; the deviation
+    flag does not, since it is only set on a triangle whose samples are
+    finite.
+    """
     M, G, COMPOSE, PINV0, ROOT_CLASS = new.child_matrix_tables()
     h0 = 0.05
     tri = np.asarray(new.ROOT_SHAPES[0], dtype=np.float64)[None] * h0
@@ -391,13 +545,300 @@ def test_criterion_reports_nonfinite_as_split():
     v, m = _six_points(tri)
     bad = m.copy()
     bad[0, 0, 0] = np.nan
-    keep, parity_ok, s = (
+    keep, parity_ok, s, status = (
         backend.to_numpy(x)
         for x in new.evaluate_criterion(
-            _arr(v), _arr(bad), classes, 0, h0, 1e-3, PINV0, COMPOSE
+            _exploding_jacobian,
+            _arr(v),
+            _arr(m),
+            _arr(v),
+            _arr(bad),
+            classes,
+            0,
+            h0,
+            1e-3,
+            PINV0,
+            COMPOSE,
+            force_jacobian=force,
         )
     )
     assert not keep[0]
+    assert status.tolist() == [
+        new.LEAF_RAYTRACE_NONFINITE | new.LEAF_APPROX_PARITY_UNRESOLVED
+    ]
+
+
+def _affine_pair(lens_map, h0=0.05):
+    """Both level-0 root triangles and their exact affine images."""
+    tri = np.stack(
+        [np.asarray(new.ROOT_SHAPES[s], dtype=np.float64) * h0 for s in (0, 1)]
+    )
+    v, m = _six_points(tri)
+    return v, m, v @ lens_map.T, m @ lens_map.T
+
+
+def test_criterion_withholds_convergence_when_the_jacobian_disagrees():
+    """The gate this criterion exists for: approximate tests are not enough.
+
+    The samples are exactly affine, so child parity and the deviation test
+    both pass and the triangle would converge on them alone. Flipping
+    ``sign(det A)`` at a single one of its six samples -- an ``A`` that
+    contradicts the samples, which only a unit test can build -- must still
+    withhold convergence, and blame the Jacobian alone.
+    """
+    M, G, COMPOSE, PINV0, ROOT_CLASS = new.child_matrix_tables()
+    lens_map = np.array([[0.7, 0.1], [-0.2, 0.9]])
+    v, m, bv, bm = _affine_pair(lens_map)
+    J = np.tile(lens_map, (12, 1, 1))
+    J[7] = np.diag([1.0, -1.0])  # the second triangle's second vertex
+    keep, parity_ok, s, status = (
+        backend.to_numpy(x)
+        for x in new.evaluate_criterion(
+            _fixed_jacobians(J),
+            _arr(v),
+            _arr(m),
+            _arr(bv),
+            _arr(bm),
+            backend.copy(ROOT_CLASS),
+            0,
+            0.05,
+            1e-3,
+            PINV0,
+            COMPOSE,
+        )
+    )
+    assert keep.tolist() == [True, False]
+    assert parity_ok.tolist() == [True, False]
+    assert status.tolist() == [new.LEAF_CONVERGED, new.LEAF_JACOBIAN_PARITY_UNRESOLVED]
+
+
+def test_criterion_withholds_convergence_on_a_nonfinite_jacobian():
+    M, G, COMPOSE, PINV0, ROOT_CLASS = new.child_matrix_tables()
+    lens_map = np.array([[0.7, 0.1], [-0.2, 0.9]])
+    v, m, bv, bm = _affine_pair(lens_map)
+    J = np.tile(lens_map, (12, 1, 1))
+    J[3, 0, 1] = np.nan  # the first triangle's first midpoint
+    keep, parity_ok, s, status = (
+        backend.to_numpy(x)
+        for x in new.evaluate_criterion(
+            _fixed_jacobians(J),
+            _arr(v),
+            _arr(m),
+            _arr(bv),
+            _arr(bm),
+            backend.copy(ROOT_CLASS),
+            0,
+            0.05,
+            1e-3,
+            PINV0,
+            COMPOSE,
+        )
+    )
+    assert keep.tolist() == [False, True]
+    assert parity_ok.tolist() == [False, True]
+    assert status.tolist() == [new.LEAF_JACOBIAN_NONFINITE, new.LEAF_CONVERGED]
+
+
+def test_criterion_evaluates_the_jacobian_only_where_it_could_matter():
+    """Only a triangle about to converge pays for a Jacobian evaluation.
+
+    The second triangle's midpoint is displaced far past the deviation
+    tolerance, so it splits whatever its Jacobian says, and ``jacobian_fn``
+    sees only the first triangle's six samples. ``force_jacobian`` evaluates
+    both. Either way the call is a single batch, and a triangle the Jacobian
+    never saw keeps its child-parity verdict in ``parity_ok``.
+    """
+    M, G, COMPOSE, PINV0, ROOT_CLASS = new.child_matrix_tables()
+    lens_map = np.array([[0.7, 0.1], [-0.2, 0.9]])
+    v, m, bv, bm = _affine_pair(lens_map)
+    bm[1, 0] += 2e-3
+    for force, checked in ((False, [0]), (True, [0, 1])):
+        jacobian_fn, calls = _recording(_constant_jacobian(lens_map))
+        keep, parity_ok, s, status = (
+            backend.to_numpy(x)
+            for x in new.evaluate_criterion(
+                jacobian_fn,
+                _arr(v),
+                _arr(m),
+                _arr(bv),
+                _arr(bm),
+                backend.copy(ROOT_CLASS),
+                0,
+                0.05,
+                1e-3,
+                PINV0,
+                COMPOSE,
+                force_jacobian=force,
+            )
+        )
+        assert len(calls) == 1
+        want = np.concatenate([v[checked], m[checked]], axis=1).reshape(-1, 2)
+        assert np.array_equal(calls[0], want), f"force_jacobian={force}"
+        assert keep.tolist() == [True, False]
+        assert parity_ok.tolist() == [True, True]
+        assert status.tolist() == [new.LEAF_CONVERGED, new.LEAF_CONVERGENCE_FAILED]
+
+
+def test_forced_jacobian_adds_flags_but_never_rescues():
+    """A clean Jacobian cannot clear a failed test, and a bad one only adds.
+
+    Both triangles fail the deviation test. Forced, the Jacobian passes on the
+    first -- which must still not converge -- and flips sign on the second,
+    whose status must then carry both reasons.
+    """
+    M, G, COMPOSE, PINV0, ROOT_CLASS = new.child_matrix_tables()
+    lens_map = np.array([[0.7, 0.1], [-0.2, 0.9]])
+    v, m, bv, bm = _affine_pair(lens_map)
+    bm[:, 0] += 2e-3
+    J = np.tile(lens_map, (12, 1, 1))
+    J[11] = np.diag([1.0, -1.0])  # the second triangle's third midpoint
+    keep, parity_ok, s, status = (
+        backend.to_numpy(x)
+        for x in new.evaluate_criterion(
+            _fixed_jacobians(J),
+            _arr(v),
+            _arr(m),
+            _arr(bv),
+            _arr(bm),
+            backend.copy(ROOT_CLASS),
+            0,
+            0.05,
+            1e-3,
+            PINV0,
+            COMPOSE,
+            force_jacobian=True,
+        )
+    )
+    assert keep.tolist() == [False, False]
+    assert parity_ok.tolist() == [True, False]
+    assert status.tolist() == [
+        new.LEAF_CONVERGENCE_FAILED,
+        new.LEAF_CONVERGENCE_FAILED | new.LEAF_JACOBIAN_PARITY_UNRESOLVED,
+    ]
+
+
+def _unit_triangles(n):
+    """``n`` lens-plane unit triangles; only their count and shape matter here."""
+    tri = np.tile(np.asarray(new.ROOT_SHAPES[0], dtype=np.float64), (n, 1, 1))
+    return _six_points(tri)
+
+
+@pytest.mark.parametrize("sign", [1.0, -1.0])
+def test_jacobian_parity_accepts_a_strict_sign_of_either_orientation(sign):
+    v, m = _unit_triangles(2)
+    ok, nonfinite = (
+        backend.to_numpy(x)
+        for x in new.jacobian_parity_ok(
+            _constant_jacobian(np.diag([1.0, sign])),
+            _arr(v),
+            _arr(m),
+            return_details=True,
+        )
+    )
+    assert ok.tolist() == [True, True]
+    assert nonfinite.tolist() == [False, False]
+
+
+@pytest.mark.parametrize("sample", range(6))
+def test_jacobian_parity_rejects_a_sign_change_at_any_sample(sample):
+    """A single flipped determinant, at each of the six positions in turn,
+    condemns its own triangle and only its own."""
+    v, m = _unit_triangles(2)
+    J = np.tile(np.eye(2), (12, 1, 1))
+    J[6 + sample] = np.diag([1.0, -1.0])
+    ok, nonfinite = (
+        backend.to_numpy(x)
+        for x in new.jacobian_parity_ok(
+            _fixed_jacobians(J), _arr(v), _arr(m), return_details=True
+        )
+    )
+    assert ok.tolist() == [True, False]
+    assert nonfinite.tolist() == [False, False]
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        np.array([[np.nan, 0.0], [0.0, 1.0]]),
+        np.array([[1.0, np.inf], [0.0, 1.0]]),
+        np.zeros((2, 2)),
+        np.array([[1.0, 2.0], [2.0, 4.0]]),  # rank 1: det is exactly 0
+    ],
+    ids=["nan", "inf", "zero", "rank_one"],
+)
+def test_jacobian_parity_flags_nonfinite_and_singular_samples(bad):
+    """Neither a non-finite nor a singular ``A`` has a usable sign.
+
+    Both are reported through ``jacobian_nonfinite``, which is what separates
+    them from a genuine sign change, and both fail parity.
+    """
+    v, m = _unit_triangles(2)
+    J = np.tile(np.eye(2), (12, 1, 1))
+    J[4] = bad
+    ok, nonfinite = (
+        backend.to_numpy(x)
+        for x in new.jacobian_parity_ok(
+            _fixed_jacobians(J), _arr(v), _arr(m), return_details=True
+        )
+    )
+    assert ok.tolist() == [False, True]
+    assert nonfinite.tolist() == [True, False]
+
+
+@pytest.mark.parametrize("scale", [1e200, 1e-200])
+def test_jacobian_parity_survives_overflow_and_underflow_of_the_determinant(scale):
+    """The row scaling, at the magnitudes that would defeat a plain ``det``.
+
+    ``scale**2`` overflows to ``inf`` at ``1e200`` and underflows to exactly
+    ``0.0`` at ``1e-200``, so an unscaled determinant would misreport both
+    perfectly regular Jacobians as non-finite or singular.
+    """
+    with np.errstate(over="ignore", under="ignore"):
+        naive = np.float64(scale) * np.float64(scale)
+    assert naive in (np.inf, 0.0), "fixture no longer defeats a plain determinant"
+    v, m = _unit_triangles(1)
+    for J in (scale * np.eye(2), scale * np.diag([1.0, -1.0])):
+        ok, nonfinite = (
+            backend.to_numpy(x)
+            for x in new.jacobian_parity_ok(
+                _constant_jacobian(J), _arr(v), _arr(m), return_details=True
+            )
+        )
+        assert ok.tolist() == [True]
+        assert nonfinite.tolist() == [False]
+
+
+def test_jacobian_parity_evaluates_all_six_samples_in_one_call():
+    """Vertices then midpoints, triangle-major, in a single batch."""
+    v, m = _six_points(RNG.normal(size=(5, 3, 2)))
+    jacobian_fn, calls = _recording(_constant_jacobian(np.eye(2)))
+    ok = backend.to_numpy(new.jacobian_parity_ok(jacobian_fn, _arr(v), _arr(m)))
+    assert ok.tolist() == [True] * 5
+    assert len(calls) == 1
+    assert np.array_equal(calls[0], np.concatenate([v, m], axis=1).reshape(-1, 2))
+
+
+def test_jacobian_parity_of_no_triangles_never_calls_the_jacobian():
+    empty = _arr(np.zeros((0, 3, 2)))
+    ok = new.jacobian_parity_ok(_exploding_jacobian, empty, empty)
+    assert backend.to_numpy(ok).shape == (0,)
+    ok, nonfinite = new.jacobian_parity_ok(
+        _exploding_jacobian, empty, empty, return_details=True
+    )
+    assert backend.to_numpy(ok).shape == (0,)
+    assert backend.to_numpy(nonfinite).shape == (0,)
+
+
+def test_jacobian_parity_rejects_mismatched_shapes():
+    v, m = _unit_triangles(2)
+    with pytest.raises(ValueError, match=r"\(N, 3, 2\)"):
+        new.jacobian_parity_ok(_exploding_jacobian, _arr(v), _arr(m[:1]))
+    with pytest.raises(ValueError, match=r"\(N, 3, 2\)"):
+        new.jacobian_parity_ok(_exploding_jacobian, _arr(v[:, :2]), _arr(m[:, :2]))
+    with pytest.raises(ValueError, match=r"\(6 \* N, 2, 2\)"):
+        new.jacobian_parity_ok(
+            _fixed_jacobians(np.tile(np.eye(2), (2, 1, 1))), _arr(v), _arr(m)
+        )
 
 
 def test_child_shape_matrices_match_shape_matrix_of_each_child():
