@@ -997,3 +997,129 @@ def test_sanitize_bary_recovers_ordinary_coordinates():
 def test_no_numpy_import_in_the_module():
     source = open(new.__file__).read()
     assert "import numpy" not in source
+
+
+def test_parity_from_jacobians_matches_the_call_row_for_row():
+    """The split-out arithmetic gives `jacobian_parity_ok`'s verdict exactly.
+
+    One triangle per case: a sign change, a non-finite ``A``, an exactly
+    singular ``A``, and a clean one.
+    """
+    v, m = _unit_triangles(4)
+    J = np.tile(np.eye(2), (24, 1, 1))
+    J[3] = np.diag([1.0, -1.0])
+    J[8] = np.array([[np.nan, 0.0], [0.0, 1.0]])
+    J[14] = np.array([[1.0, 2.0], [2.0, 4.0]])
+    want = [
+        backend.to_numpy(x)
+        for x in new.jacobian_parity_ok(
+            _fixed_jacobians(J), _arr(v), _arr(m), return_details=True
+        )
+    ]
+    got = [
+        backend.to_numpy(x)
+        for x in new.parity_from_jacobians(
+            _arr(J.reshape(4, 6, 2, 2)), return_details=True
+        )
+    ]
+    assert got[0].tolist() == want[0].tolist() == [False, False, False, True]
+    assert got[1].tolist() == want[1].tolist() == [False, True, True, False]
+
+
+def test_parity_from_jacobians_of_no_triangles_is_empty():
+    ok, nonfinite = new.parity_from_jacobians(
+        _arr(np.zeros((0, 6, 2, 2))), return_details=True
+    )
+    assert backend.to_numpy(ok).shape == (0,)
+    assert backend.to_numpy(nonfinite).shape == (0,)
+
+
+def test_parity_from_jacobians_rejects_a_wrong_shape():
+    with pytest.raises(ValueError, match=r"\(N, 6, 2, 2\)"):
+        new.parity_from_jacobians(_arr(np.zeros((2, 5, 2, 2))))
+
+
+def test_criterion_on_precomputed_jacobians_matches_the_call_when_forced():
+    """``jacobian=`` gives the same four outputs as the call it replaces.
+
+    Forced, both triangles are tested: the first has a non-finite ``A`` at its
+    third vertex, the second a sign change at its second vertex. The
+    precomputed path must reach the same verdicts without ever calling
+    ``jacobian_fn``.
+    """
+    M, G, COMPOSE, PINV0, ROOT_CLASS = new.child_matrix_tables()
+    lens_map = np.array([[0.7, 0.1], [-0.2, 0.9]])
+    v, m, bv, bm = _affine_pair(lens_map)
+    J = np.tile(lens_map, (12, 1, 1))
+    J[2, 0, 0] = np.nan
+    J[7] = np.diag([1.0, -1.0])
+    args = (_arr(v), _arr(m), _arr(bv), _arr(bm))
+    rest = (0, 0.05, 1e-3, PINV0, COMPOSE)
+    want = [
+        backend.to_numpy(x)
+        for x in new.evaluate_criterion(
+            _fixed_jacobians(J),
+            *args,
+            backend.copy(ROOT_CLASS),
+            *rest,
+            force_jacobian=True,
+        )
+    ]
+    got = [
+        backend.to_numpy(x)
+        for x in new.evaluate_criterion(
+            _exploding_jacobian,
+            *args,
+            backend.copy(ROOT_CLASS),
+            *rest,
+            force_jacobian=True,
+            jacobian=_arr(J.reshape(2, 6, 2, 2)),
+        )
+    ]
+    for g, w in zip(got, want):
+        assert g.tolist() == w.tolist()
+    assert want[3].tolist() == [
+        new.LEAF_JACOBIAN_NONFINITE,
+        new.LEAF_JACOBIAN_PARITY_UNRESOLVED,
+    ]
+
+
+@pytest.mark.parametrize(
+    "flipped, want",
+    [
+        (3, [new.LEAF_JACOBIAN_PARITY_UNRESOLVED, new.LEAF_CONVERGENCE_FAILED]),
+        (9, [new.LEAF_CONVERGED, new.LEAF_CONVERGENCE_FAILED]),
+    ],
+    ids=["candidate", "splitting"],
+)
+def test_criterion_reads_precomputed_jacobians_only_on_the_rows_it_tests(flipped, want):
+    """Unforced, only the candidate's six rows of ``jacobian`` are read.
+
+    The second triangle fails the deviation test, so it is never a candidate:
+    a sign change in its rows must change nothing, while one in the first
+    triangle's rows must withhold its convergence.
+    """
+    M, G, COMPOSE, PINV0, ROOT_CLASS = new.child_matrix_tables()
+    lens_map = np.array([[0.7, 0.1], [-0.2, 0.9]])
+    v, m, bv, bm = _affine_pair(lens_map)
+    bm[1, 0] += 2e-3
+    J = np.tile(lens_map, (12, 1, 1))
+    J[flipped] = np.diag([1.0, -1.0])
+    keep, parity_ok, s, status = (
+        backend.to_numpy(x)
+        for x in new.evaluate_criterion(
+            _exploding_jacobian,
+            _arr(v),
+            _arr(m),
+            _arr(bv),
+            _arr(bm),
+            backend.copy(ROOT_CLASS),
+            0,
+            0.05,
+            1e-3,
+            PINV0,
+            COMPOSE,
+            jacobian=_arr(J.reshape(2, 6, 2, 2)),
+        )
+    )
+    assert status.tolist() == want

@@ -33,6 +33,7 @@ __all__ = (
     "converged_from_deviation",
     "child_shape_matrices",
     "parity_from_children",
+    "parity_from_jacobians",
     "evaluate_criterion",
     "triangle_weights",
     "contains",
@@ -489,16 +490,8 @@ def jacobian_parity_ok(jacobian_fn, theta_v, theta_m, *, return_details=False):
 
     ``jacobian_fn`` is called once, on all ``6 * N`` points, flattened
     triangle-major in the order ``theta_1, theta_2, theta_3, m_1, m_2, m_3`` --
-    and not at all when ``N == 0``.
-
-    The sign is read off a row-scaled copy of ``A``. Dividing a row by a
-    positive number scales ``det A`` by a positive factor, so the sign is
-    unchanged, while the scaled entries are at most one in magnitude -- so a
-    Jacobian with huge entries cannot overflow the determinant to ``inf``,
-    and one with tiny entries cannot underflow it to an exact zero that would
-    read as singular. A non-finite ``A`` is swapped for the identity before
-    any arithmetic, so it never reaches the determinant; the finiteness mask
-    carries its failure instead.
+    and not at all when ``N == 0``. The verdict itself is
+    :func:`parity_from_jacobians` on the result.
 
     Parameters
     ----------
@@ -550,6 +543,58 @@ def jacobian_parity_ok(jacobian_fn, theta_v, theta_m, *, return_details=False):
     if J.shape != (6 * n, 2, 2):
         raise ValueError("jacobian_fn must return shape (6 * N, 2, 2)")
 
+    return parity_from_jacobians(J.reshape(n, 6, 2, 2), return_details=return_details)
+
+
+def parity_from_jacobians(J, *, return_details=False):
+    """
+    True where ``sign(det A)`` is one strict sign at all six samples of a triangle.
+
+    The arithmetic half of :func:`jacobian_parity_ok`, on Jacobians already
+    evaluated, so a caller holding them makes no second call. The
+    ``max_level`` pass of :func:`refine` is that caller: it evaluates each
+    lattice point once, however many triangles share it, and keeps the
+    values for the critical band.
+
+    The sign is read off a row-scaled copy of ``A``. Dividing a row by a
+    positive number scales ``det A`` by a positive factor, so the sign is
+    unchanged, while the scaled entries are at most one in magnitude -- so a
+    Jacobian with huge entries cannot overflow the determinant to ``inf``,
+    and one with tiny entries cannot underflow it to an exact zero that would
+    read as singular. A non-finite ``A`` is swapped for the identity before
+    any arithmetic, so it never reaches the determinant; the finiteness mask
+    carries its failure instead.
+
+    Parameters
+    ----------
+    J: ArrayLike
+        Shape ``(N, 6, 2, 2)``: each triangle's Jacobians at ``theta_1,
+        theta_2, theta_3, m_1, m_2, m_3``.
+    return_details: bool
+        Also return the non-finite mask.
+
+    Returns
+    -------
+    parity_ok: ArrayLike
+        ``(N,)`` bool, as :func:`jacobian_parity_ok`.
+    jacobian_nonfinite: ArrayLike
+        ``(N,)`` bool, returned only with ``return_details``, as
+        :func:`jacobian_parity_ok`.
+
+    Raises
+    ------
+    ValueError
+        If ``J`` is not ``(N, 6, 2, 2)``.
+    """
+    if len(J.shape) != 4 or tuple(J.shape[1:]) != (6, 2, 2):
+        raise ValueError("J must have shape (N, 6, 2, 2)")
+
+    n = J.shape[0]
+    if n == 0:
+        empty = backend.zeros((0,), dtype=backend.bool, device=backend.device(J))
+        return (empty, empty) if return_details else empty
+
+    J = J.reshape(-1, 2, 2)
     finite_J = backend.all(backend.isfinite(J), dim=(-2, -1))
 
     # Keep nonfinite matrices out of subsequent arithmetic.
@@ -589,6 +634,7 @@ def evaluate_criterion(
     pinv0,
     compose,
     force_jacobian=False,
+    jacobian=None,
 ):
     """
     Steps 3 to 7 of the refinement criterion, vectorized over triangles.
@@ -671,6 +717,12 @@ def evaluate_criterion(
     force_jacobian: bool
         Evaluate the Jacobian on every triangle with finite samples, not just
         on those that would otherwise converge.
+    jacobian: Optional[ArrayLike]
+        Precomputed Jacobians, shape ``(n, 6, 2, 2)``, at each triangle's
+        ``theta_1, theta_2, theta_3, m_1, m_2, m_3``. When given, the
+        triangles chosen for the Jacobian test -- the same ones as without it
+        -- are tested on these values through :func:`parity_from_jacobians`,
+        and ``jacobian_fn`` is never called.
 
     Returns
     -------
@@ -716,12 +768,17 @@ def evaluate_criterion(
     candidate = status == LEAF_CONVERGED
     rows = backend.flatnonzero(finite_samples & (candidate | force_jacobian))
 
-    jacobian_ok, jacobian_nonfinite = jacobian_parity_ok(
-        jacobian_fn,
-        theta_v[rows],
-        theta_m[rows],
-        return_details=True,
-    )
+    if jacobian is None:
+        jacobian_ok, jacobian_nonfinite = jacobian_parity_ok(
+            jacobian_fn,
+            theta_v[rows],
+            theta_m[rows],
+            return_details=True,
+        )
+    else:
+        jacobian_ok, jacobian_nonfinite = parity_from_jacobians(
+            jacobian[rows], return_details=True
+        )
 
     jacobian_status = (
         backend.long(~jacobian_ok & ~jacobian_nonfinite)
