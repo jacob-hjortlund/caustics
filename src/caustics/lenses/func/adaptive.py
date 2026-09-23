@@ -660,7 +660,8 @@ def evaluate_criterion(
       curvature; otherwise ``LEAF_CONVERGENCE_FAILED``. Only set on a triangle
       whose samples are finite.
     - The lens Jacobian is finite, non-singular and of one sign at all six
-      lens-plane samples (:func:`jacobian_parity_ok`); otherwise
+      lens-plane samples (the Jacobian parity test, :func:`jacobian_parity_ok`
+      or :func:`parity_from_jacobians` on precomputed values); otherwise
       ``LEAF_JACOBIAN_PARITY_UNRESOLVED``, or ``LEAF_JACOBIAN_NONFINITE`` where
       some ``A`` is non-finite or singular.
 
@@ -729,7 +730,8 @@ def evaluate_criterion(
         ``theta_1, theta_2, theta_3, m_1, m_2, m_3``. When given, the
         triangles chosen for the Jacobian test -- the same ones as without it
         -- are tested on these values through :func:`parity_from_jacobians`,
-        and ``jacobian_fn`` is never called.
+        and ``jacobian_fn`` is never called. ``theta_v`` and ``theta_m`` are
+        not read on this path.
 
     Returns
     -------
@@ -739,7 +741,9 @@ def evaluate_criterion(
     parity_ok: ndarray
         ``(n,)`` bool, the parity verdict the refinement counters read. On a
         triangle the Jacobian was evaluated on, True where child parity and
-        :func:`jacobian_parity_ok` both pass; on any other, child parity alone.
+        the Jacobian parity test (:func:`jacobian_parity_ok`, or
+        :func:`parity_from_jacobians` on precomputed values) both pass; on
+        any other, child parity alone.
     s: ndarray
         ``(n,)`` float64, ``min_k sigma_min(A_k)``. Exactly ``0.0`` is legal and
         expected near a critical curve; it forces the split, and the size floor
@@ -1791,9 +1795,16 @@ class CriticalBand(NamedTuple):
     flagged ``LEAF_JACOBIAN_NONFINITE`` only because some sample's
     determinant is exactly zero, when zero counting as positive leaves its
     classes mixed -- which is what keeps a critical curve through lattice
-    points from vanishing. The one exception needs ``det A`` itself to
-    overflow or underflow float64, where the flag's row-scaled sign and the
-    raw sign stored here can differ.
+    points from vanishing. The one exception is rounding, not overflow: the
+    sign test behind the flags reads a row-scaled ``det A``, while this band
+    stores the raw ``det A``, and the two can disagree whenever ``det A`` is
+    within a few ulps of zero, even with O(1) entries. Measured on 1e6
+    near-singular matrices, 154,070 had a raw determinant ``>= 0`` paired
+    with a scaled determinant ``< 0``, and 48,349 had a nonzero raw
+    determinant paired with a scaled determinant of exactly zero. So,
+    rarely, a flagged leaf can be missing from the band, or a band leaf can
+    carry neither flag. Tracing is unaffected, because the band is
+    consistent with itself.
 
     Samples are deduplicated by lattice key: a sample shared by several band
     leaves is one row, with one ``det``, so every leaf sharing it agrees on
@@ -1880,7 +1891,7 @@ def sample_jacobians(
     Raises
     ------
     ValueError
-        If ``jacobian_fn`` does not return ``(U, 2, 2)``.
+        If ``jacobian_fn`` does not return ``(K, 2, 2)`` for ``K`` points.
     """
     n = six_ij.shape[0]
     if n == 0:
@@ -2044,21 +2055,22 @@ def refine(
 
     At ``max_level`` nothing splits, so there is no cascade, so no force-split.
     The midpoints are still evaluated: traced once, deduplicated on their
-    lattice keys, consumed, and dropped -- they are the only points with an odd
-    coordinate, so they can never collide with the cache, and nothing
-    downstream reads them. The full criterion still runs on them, with the
-    Jacobian forced on every triangle whose six samples are finite, since here
-    ``status`` is the leaf's final record: every test the leaf fails is OR-ed
-    into it, and anything but ``LEAF_CONVERGED`` keeps the leaf out of the
-    spatial index. That forced pass evaluates each distinct lattice sample
-    once (:func:`sample_jacobians`) rather than six times per triangle, and
-    the same values build the :class:`CriticalBand` (:func:`band_from_samples`)
-    -- the leaves ``det A`` changes sign across, with ``det A`` and the image
-    at their samples, midpoint images included, that would otherwise be
-    dropped. A triangle that straddles a fold, in particular, contains it
-    at a scale no further split can resolve. A triangle with a non-finite
-    sample skips the criterion and is stored with ``LEAF_RAYTRACE_NONFINITE``
-    alone.
+    lattice keys, and still never added to the vertex cache -- they are the
+    only points with an odd coordinate, so they could never collide with a
+    cache entry regardless. Their images are kept only where the critical
+    band needs them. The full criterion still runs on them, with the
+    Jacobian forced on every triangle whose six samples are finite, since
+    here ``status`` is the leaf's final record: every test the leaf fails is
+    OR-ed into it, and anything but ``LEAF_CONVERGED`` keeps the leaf out of
+    the spatial index. A triangle that straddles a fold, in particular,
+    contains it at a scale no further split can resolve. That forced pass
+    evaluates each distinct lattice sample once (:func:`sample_jacobians`)
+    rather than six times per triangle, and the same values build the
+    :class:`CriticalBand` (:func:`band_from_samples`) -- the leaves ``det A``
+    changes sign across, with ``det A`` and the image at their samples,
+    midpoint images included, that would otherwise be dropped. A triangle
+    with a non-finite sample skips the criterion and is stored with
+    ``LEAF_RAYTRACE_NONFINITE`` alone.
 
     The ``max_level`` midpoint pass is the single largest batch in the build.
     For a mesh refining uniformly to ``max_level`` on an ``N x N`` cell grid it
@@ -2813,7 +2825,11 @@ class AdaptiveMesh(NamedTuple):
     ``leaf_status`` keeps every reason, so the hole can be taken apart
     afterwards: ``(leaf_status & LEAF_JACOBIAN_PARITY_UNRESOLVED) != 0``, for
     instance, selects the leaves with a critical curve running between their
-    samples.
+    samples. That flag misses a leaf whose samples straddle the curve only
+    through an exact ``det A == 0``, so ``critical_band`` is the complete
+    record of every ``max_level`` leaf ``det A`` changes sign across;
+    :func:`~caustics.lenses.func.adaptive_critical.mesh_critical_curves`
+    turns it into the ordered curves themselves.
 
     ``min_img_sep`` is stored because it is the mesh's own defining tolerance
     -- the halved value :func:`build_adaptive_mesh` actually refined to, not

@@ -152,6 +152,12 @@ def test_child_segments_keep_positive_det_on_the_left(signs):
     band = _unit_band(det)
     start, end = crit.child_segments(band.samples, band.det)
     start, end = to_np(start), to_np(end)
+    # Every mixed child -- not all three corners of one class -- returns
+    # exactly one segment, and no other child returns any.
+    children = np.asarray(new.CHILD_VERTEX_INDICES)
+    classes = det[children] >= 0
+    mixed = classes.any(axis=1) & ~classes.all(axis=1)
+    assert start.shape[0] == int(mixed.sum())
     p, _ = crit.crossing_points(
         backend.as_array(start), band.lens, band.source, band.det
     )
@@ -242,6 +248,35 @@ def test_trace_band_rejects_a_crossing_with_two_successors():
     det = np.array([1.0, -1.0, -1.0, 1.0, -1.0, 1.0])
     band = _band([[0, 1, 2, 3, 4, 5], [0, 1, 2, 3, 4, 5]], UNIT_LENS, det)
     with pytest.raises(AssertionError, match="two successors"):
+        crit.trace_band(band)
+
+
+def test_trace_band_rejects_a_crossing_with_two_predecessors():
+    """The two-leaf fixture above, with leaf A's orientation reversed.
+
+    Swapping ``theta_2`` and ``theta_3`` -- and so ``m_2`` and ``m_3``, to
+    keep ``m_i`` opposite ``theta_i`` -- makes leaf A clockwise, so both of
+    its segments run backwards along the edge it shares with leaf B: instead
+    of one segment ending where the other starts, both end on the shared
+    node, giving it two predecessors and leaving no node with two
+    successors.
+    """
+    lens = np.array(
+        [
+            [0.0, 0.0],
+            [2.0, 0.0],
+            [2.0, 2.0],
+            [0.0, 2.0],
+            [2.0, 1.0],
+            [1.0, 1.0],
+            [1.0, 0.0],
+            [1.0, 2.0],
+            [0.0, 1.0],
+        ]
+    )
+    samples = [[0, 2, 1, 4, 6, 5], [0, 2, 3, 7, 8, 5]]
+    band = _band(samples, lens, lens[:, 0] - 1.5)
+    with pytest.raises(AssertionError, match="two predecessors"):
         crit.trace_band(band)
 
 
@@ -398,6 +433,9 @@ def test_a_curve_through_lattice_points_is_traced_without_any_parity_flag():
     flag finds nothing -- yet the band's zero-is-positive rule traces one open
     curve along the row, exactly. ``det A > 0`` below the row puts it on the
     left of travel in ``-x``, so the curve runs from ``x = 2`` to ``x = -2``.
+    This also pins the spec's rule that coincident consecutive points --
+    which tracing a curve through lattice points produces -- are kept, not
+    removed.
     """
     mesh = new.build_adaptive_mesh(ROW_FOLD, fov=4.0, init_res=8, min_img_sep=2e-2)
     status = to_np(mesh.leaf_status)
@@ -408,6 +446,7 @@ def test_a_curve_through_lattice_points_is_traced_without_any_parity_flag():
     assert not closed
     assert np.abs(lens[:, 1] - 0.5).max() < 1e-12
     assert lens[0, 0] == 2.0 and lens[-1, 0] == -2.0
+    assert (np.diff(lens, axis=0) == 0).all(axis=1).any()
 
 
 def test_a_curve_ends_where_the_lens_turns_nonfinite():

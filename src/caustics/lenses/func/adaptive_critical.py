@@ -49,6 +49,18 @@ class CriticalCurves(NamedTuple):
     their lowest-indexed crossing, deterministically but with no physical
     meaning, and a loop starts there.
 
+    When ``det A`` is exactly zero at a sample, several crossings sit on
+    that sample -- which happens whenever a curve runs through lattice
+    points; an SIS with ``Rein = 1`` centred on the origin hits ``(1, 0)``,
+    ``(-1, 0)``, ``(0, 1)`` and ``(0, -1)`` exactly. Consecutive points can
+    then coincide, so some segments of ``lens`` and ``source`` have zero
+    length; they are kept, not removed, so anything computing tangents,
+    normals or arc length from consecutive differences must guard against a
+    zero-length segment. Where ``det A`` only touches zero at one sample
+    without changing sign -- an isolated degenerate critical point -- the
+    zero-is-positive rule yields a closed curve of zero extent, every point
+    of it at that one sample.
+
     Parameters
     ----------
     lens: ArrayLike
@@ -288,10 +300,11 @@ def trace_band(band) -> CriticalCurves:
     Raises
     ------
     AssertionError
-        If a crossing has two successors or two predecessors. On a
-        conforming, positively oriented band with one ``det`` per sample that
-        cannot happen, so this guards against silent corruption rather than
-        a reachable input.
+        "a critical-curve crossing has two successors" if a crossing has two
+        successors, or "a critical-curve crossing has two predecessors" if
+        one has two predecessors. On a conforming, positively oriented band
+        with one ``det`` per sample neither can happen, so this guards
+        against silent corruption rather than a reachable input.
     """
     start, end = child_segments(band.samples, band.det)
     k = start.shape[0]
@@ -306,13 +319,12 @@ def trace_band(band) -> CriticalCurves:
     frm, to = inverse[:k], inverse[k:]
     n = nodes.shape[0]
     # `raise AssertionError` rather than a bare `assert`, as elsewhere in the
-    # adaptive kernels: `python -O` strips bare asserts.
-    if bool(backend.any(backend.bincount(frm, minlength=n) > 1)) or bool(
-        backend.any(backend.bincount(to, minlength=n) > 1)
-    ):
-        raise AssertionError(
-            "a critical-curve crossing has two successors or two predecessors"
-        )
+    # adaptive kernels: `python -O` strips bare asserts. Two separate guards,
+    # so each reports which side of the chain actually broke.
+    if bool(backend.any(backend.bincount(frm, minlength=n) > 1)):
+        raise AssertionError("a critical-curve crossing has two successors")
+    if bool(backend.any(backend.bincount(to, minlength=n) > 1)):
+        raise AssertionError("a critical-curve crossing has two predecessors")
 
     device = backend.device(band.det)
     succ = backend.fill_at_indices(
@@ -346,6 +358,17 @@ def mesh_critical_curves(mesh) -> CriticalCurves:
     whose samples or Jacobian are non-finite, or, in principle, next to a
     coarser converged leaf. Pseudo-caustics of lenses with a singular centre
     are not zero sets of ``det A`` and are not traced.
+
+    Where ``det A`` is exactly zero at a sample -- as it is at ``(1, 0)``,
+    ``(-1, 0)``, ``(0, 1)`` and ``(0, -1)`` for an SIS with ``Rein = 1``
+    centred on the origin, for instance -- several crossings can sit on that
+    sample, so consecutive points of the returned curves can coincide
+    exactly and some segments have zero length. They are kept, not removed;
+    see :class:`CriticalCurves` for the guard this implies for callers
+    computing tangents, normals or arc length. An isolated degenerate
+    critical point -- where ``det A`` touches zero at one sample without
+    changing sign -- comes back as a closed curve of zero extent, every
+    point of it at that one sample.
 
     Parameters
     ----------
