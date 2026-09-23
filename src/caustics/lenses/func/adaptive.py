@@ -76,7 +76,11 @@ __all__ = (
     "make_raytrace",
     "trace_keys",
     "evaluate",
+    "CriticalBand",
+    "empty_band",
     "sample_jacobians",
+    "band_from_samples",
+    "band_leaf_index",
     "refine",
     "canonical_order",
     "min_angle",
@@ -1297,6 +1301,7 @@ def active_contains(active, cache, keys) -> ArrayLike:
 # - `LEAF_JACOBIAN_NONFINITE`: some sample's Jacobian is non-finite or exactly
 #   singular, so its sign says nothing. Singular counts: a sample lying exactly
 #   on a critical curve lands here, not in `LEAF_JACOBIAN_PARITY_UNRESOLVED`.
+#   The critical band still traces such a leaf, from its stored determinants.
 #
 # Below `max_level` every failing triangle splits, so no flag is ever stored
 # there -- a failure is a reason to refine, not a verdict. At `max_level`
@@ -1772,6 +1777,70 @@ def evaluate(cache, lat, keys, raytrace_fn, batch_size) -> VertexCache:
 # ---------------------------------------------------------------------------
 
 
+class CriticalBand(NamedTuple):
+    """
+    The ``max_level`` leaves ``det A`` changes sign across, with ``det A`` at their samples.
+
+    A leaf is in the band when the determinants at its six samples -- the
+    three vertices and the three edge midpoints, the corners of its four
+    red-split children -- are all finite and not all of one class, where a
+    sample's class is ``det >= 0``: an exact zero counts as positive. Every
+    ``LEAF_JACOBIAN_PARITY_UNRESOLVED`` leaf is in the band. So is a leaf
+    flagged ``LEAF_JACOBIAN_NONFINITE`` only because some sample's
+    determinant is exactly zero, when zero counting as positive leaves its
+    classes mixed -- which is what keeps a critical curve through lattice
+    points from vanishing. The one exception needs ``det A`` itself to
+    overflow or underflow float64, where the flag's row-scaled sign and the
+    raw sign stored here can differ.
+
+    Samples are deduplicated by lattice key: a sample shared by several band
+    leaves is one row, with one ``det``, so every leaf sharing it agrees on
+    its class. That consistency is what lets
+    :func:`~caustics.lenses.func.adaptive_critical.mesh_critical_curves`
+    chain the crossings of neighbouring leaves.
+
+    Parameters
+    ----------
+    leaves: ArrayLike
+        Shape ``(F,)`` int64 index into ``AdaptiveMesh.leaves``. As
+        :func:`refine` returns it, an index into the :class:`LeafStore`'s
+        rows instead; :func:`build_adaptive_mesh` maps it onto the mesh.
+    samples: ArrayLike
+        Shape ``(F, 6)`` int64 index into ``lens``, ``source`` and ``det``:
+        each leaf's ``theta_1, theta_2, theta_3, m_1, m_2, m_3``, the vertices
+        in the leaf's own order and ``m_i`` opposite ``theta_i``.
+    lens: ArrayLike
+        Lens-plane position of each sample, shape ``(S, 2)``, at the mesh
+        dtype.
+
+        *Unit: arcsec*
+    source: ArrayLike
+        Source-plane image of each sample, shape ``(S, 2)``, at the mesh
+        dtype.
+
+        *Unit: arcsec*
+    det: ArrayLike
+        ``det A`` at each sample, shape ``(S,)``, always float64.
+    """
+
+    leaves: ArrayLike
+    samples: ArrayLike
+    lens: ArrayLike
+    source: ArrayLike
+    det: ArrayLike
+
+
+def empty_band(device=None) -> CriticalBand:
+    """A :class:`CriticalBand` with no leaves."""
+    return CriticalBand(
+        leaves=backend.zeros((0,), dtype=backend.int64, device=device),
+        samples=backend.zeros((0, 6), dtype=backend.int64, device=device),
+        lens=backend.zeros((0, 2), dtype=backend.float64, device=device),
+        source=backend.zeros((0, 2), dtype=backend.float64, device=device),
+        det=backend.zeros((0,), dtype=backend.float64, device=device),
+    )
+
+
 def sample_jacobians(
     lat, six_ij, jacobian_fn
 ) -> Tuple[ArrayLike, ArrayLike, ArrayLike]:
@@ -1828,6 +1897,109 @@ def sample_jacobians(
     return keys, index.reshape(n, 6), J
 
 
+def band_from_samples(lat, cache, keys, index, J, mid_keys, mid_beta) -> CriticalBand:
+    """
+    The :class:`CriticalBand` among triangles whose six samples are evaluated.
+
+    Parameters
+    ----------
+    lat: Lattice
+    cache: VertexCache
+        Supplies each vertex sample's image.
+    keys, index, J: ArrayLike
+        From :func:`sample_jacobians`.
+    mid_keys: ArrayLike
+        ``(M,)`` int64 keys of the traced ``max_level`` midpoints, ascending.
+    mid_beta: ArrayLike
+        ``(M, 2)`` float64, their images.
+
+        *Unit: arcsec*
+
+    Returns
+    -------
+    CriticalBand
+        With ``leaves`` indexing the rows of ``index``, and positions and
+        images at float64.
+
+    Raises
+    ------
+    AssertionError
+        If a band sample is neither a cached vertex nor a traced midpoint.
+    """
+    det = backend.to(
+        J[:, 0, 0] * J[:, 1, 1] - J[:, 0, 1] * J[:, 1, 0], dtype=backend.float64
+    )
+    det6 = det[index]
+    positive = det6 >= 0
+    in_band = (
+        backend.all(backend.isfinite(det6), dim=1)
+        & backend.any(positive, dim=1)
+        & backend.any(~positive, dim=1)
+    )
+    rows = backend.flatnonzero(in_band)
+    if rows.shape[0] == 0:
+        return empty_band()
+
+    used, samples = backend.unique(index[rows].reshape(-1), return_inverse=True)
+    point_keys = keys[used]
+    # A vertex key is always cached and a max_level midpoint key never is --
+    # it has an odd coordinate -- so cache membership alone tells them apart.
+    slot = cache_lookup(cache, point_keys)
+    vertex = slot >= 0
+    at = backend.clamp(
+        backend.searchsorted(mid_keys, point_keys), 0, mid_keys.shape[0] - 1
+    )
+    # `raise AssertionError` rather than a bare `assert`, as in
+    # `active_add_slots`: `python -O` strips bare asserts, and a sample
+    # matched to the wrong image would silently misplace the caustic.
+    if not bool(backend.all(vertex | (mid_keys[at] == point_keys))):
+        raise AssertionError("band sample is neither a cached vertex nor a midpoint")
+    source = backend.where(
+        backend.unsqueeze(vertex, -1),
+        cache.beta[backend.where(vertex, slot, 0)],
+        mid_beta[at],
+    )
+    return CriticalBand(
+        leaves=rows,
+        samples=samples.reshape(-1, 6),
+        lens=lattice_xy(lat, lattice_ij_from_key(lat, point_keys)),
+        source=source,
+        det=det[used],
+    )
+
+
+def band_leaf_index(valid, order, origin, rows) -> ArrayLike:
+    """
+    Frozen-mesh leaf of each ``max_level`` :class:`LeafStore` row.
+
+    A ``max_level`` row is never invalidated -- :func:`refine` breaks right
+    after adding it, before any cascade -- so its compact position is the
+    count of valid rows before it. :func:`canonical_order` then permutes the
+    compact rows, and :func:`close` emits exactly one leaf per ``max_level``
+    origin, since none has a hanging node; ``origin`` is non-decreasing, so
+    ``searchsorted`` finds it.
+
+    Parameters
+    ----------
+    valid: ArrayLike
+        ``LeafStore.valid``, shape ``(N,)`` bool.
+    order: ArrayLike
+        The :func:`canonical_order` permutation of the compact rows.
+    origin: ArrayLike
+        From :func:`close`, shape ``(L,)``, non-decreasing.
+    rows: ArrayLike
+        ``(F,)`` int64 store rows, each a ``max_level`` leaf.
+
+    Returns
+    -------
+    ArrayLike
+        ``(F,)`` int64 index into the closed leaves.
+    """
+    compact = backend.cumsum(backend.long(valid), dim=0)[rows] - 1
+    canonical = backend.argsort(order)[compact]
+    return backend.searchsorted(origin, canonical)
+
+
 # ---------------------------------------------------------------------------
 # The refinement loop
 # ---------------------------------------------------------------------------
@@ -1877,8 +2049,11 @@ def refine(
     ``status`` is the leaf's final record: every test the leaf fails is OR-ed
     into it, and anything but ``LEAF_CONVERGED`` keeps the leaf out of the
     spatial index. That forced pass evaluates each distinct lattice sample
-    once (:func:`sample_jacobians`) rather than six times per triangle. A
-    triangle that straddles a fold, in particular, contains it
+    once (:func:`sample_jacobians`) rather than six times per triangle, and
+    the same values build the :class:`CriticalBand` (:func:`band_from_samples`)
+    -- the leaves ``det A`` changes sign across, with ``det A`` and the image
+    at their samples, midpoint images included, that would otherwise be
+    dropped. A triangle that straddles a fold, in particular, contains it
     at a scale no further split can resolve. A triangle with a non-finite
     sample skips the criterion and is stored with ``LEAF_RAYTRACE_NONFINITE``
     alone.
@@ -1958,6 +2133,9 @@ def refine(
         parity test.
         ``forced``: children produced by the balance cascade.
         ``cascade_rounds``: balance-cascade rounds run over the whole build.
+    band: CriticalBand
+        The critical band, with ``leaves`` indexing ``store``'s rows. Empty
+        when the loop ends before ``max_level``.
     """
     M, G, COMPOSE, PINV0, ROOT_CLASS = tables
     cache = empty_cache()
@@ -1977,6 +2155,7 @@ def refine(
 
     active_ij, active_cls = initial_triangles(init_res, lat.level, ROOT_CLASS)
     deferred = backend.empty((0,), dtype=backend.int64)
+    band = empty_band()
 
     for level in range(max_level + 1):
         vert_keys = lattice_key(lat, active_ij)  # (n, 3)
@@ -2013,9 +2192,10 @@ def refine(
                 keys = lattice_key(lat, midpoint_ij(active_ij[rows])).reshape(-1)
                 uniq, inv = backend.unique(keys, return_inverse=True)
                 inv = inv.reshape(-1)
-                beta_m = trace_keys(
+                mid_beta = trace_keys(
                     lat, lattice_ij_from_key(lat, uniq), raytrace_fn, batch_size
-                )[inv].reshape(-1, 3, 2)
+                )
+                beta_m = mid_beta[inv].reshape(-1, 3, 2)
                 counters["max_level_midpoints"] = int(uniq.shape[0])
 
                 # Only evaluate the criterion where all six samples are finite.
@@ -2057,9 +2237,15 @@ def refine(
                     )
                     counters["sigma_zero"] += int(backend.to_numpy(backend.sum(s == 0)))
 
+                    band = band_from_samples(
+                        lat, cache, sample_keys, sample_index, J, uniq, mid_beta
+                    )
+                    band = band._replace(leaves=good_rows[band.leaves])
+
             has_converged = status == LEAF_CONVERGED
 
-            store, _ = store_add(store, v, level, active_cls, status)
+            store, max_rows = store_add(store, v, level, active_cls, status)
+            band = band._replace(leaves=max_rows[band.leaves])
 
             if level == 0:
                 counters["converged_level0"] = int(
@@ -2180,7 +2366,7 @@ def refine(
         if active_ij.shape[0] == 0:
             break
 
-    return cache, active, store, counters
+    return cache, active, store, counters, band
 
 
 # ---------------------------------------------------------------------------
@@ -2673,6 +2859,13 @@ class AdaptiveMesh(NamedTuple):
     index: MeshIndex
         Spatial index over the source-plane bounding boxes of the
         ``LEAF_CONVERGED`` leaves, and of no other.
+    critical_band: CriticalBand
+        The ``max_level`` leaves ``det A`` changes sign across, with ``det A``
+        and the image at their six samples, kept from the build's own
+        ``max_level`` pass so that
+        :func:`~caustics.lenses.func.adaptive_critical.mesh_critical_curves`
+        needs no lens. A superset of the ``LEAF_JACOBIAN_PARITY_UNRESOLVED``
+        leaves; see :class:`CriticalBand`.
     d_floor: int
         Level at which the level-0 hypotenuse first falls to ``min_img_sep``,
         uncapped by ``max_depth``.
@@ -2704,6 +2897,7 @@ class AdaptiveMesh(NamedTuple):
     # `mesh.index` always resolves to the field; nothing in this module ever
     # calls the shadowed `.index(value)` lookup method.
     index: MeshIndex  # type: ignore[assignment]
+    critical_band: CriticalBand
     d_floor: int
     max_level: int
     min_img_sep: float
@@ -2830,7 +3024,7 @@ def build_adaptive_mesh(
     tables = child_matrix_tables()
     lat = make_lattice(fov, x0, y0, init_res, max_level + 1)
     raytrace_fn = make_raytrace(raytrace, device)
-    cache, active, store, _counters = refine(
+    cache, active, store, _counters, band = refine(
         raytrace_fn,
         jacobian,
         lat,
@@ -2866,6 +3060,11 @@ def build_adaptive_mesh(
     leaf_v, origin, leaf_level, leaf_status = close(
         lat, cache, active, pre_v, pre_level, pre_status
     )
+    band_leaves = band_leaf_index(store.valid, order, origin, band.leaves)
+    # Trip-wire for the index chase above: a band row that landed on any leaf
+    # but its own would pair one leaf's samples with another's vertices.
+    if not bool(backend.all(leaf_v[band_leaves] == store.v[band.leaves])):
+        raise AssertionError("a critical-band row did not map onto its own leaf")
 
     # Compaction: sorting by lattice key makes vertex order a function of the
     # geometry alone and gives row-major locality for query-time gathers.
@@ -2920,6 +3119,14 @@ def build_adaptive_mesh(
     def to_device(array):
         return backend.to(array, device=device)
 
+    critical_band = CriticalBand(
+        leaves=to_device(band_leaves),
+        samples=to_device(band.samples),
+        lens=to_device(backend.to(band.lens, dtype=dtype)),
+        source=to_device(backend.to(band.source, dtype=dtype)),
+        det=to_device(band.det),
+    )
+
     return AdaptiveMesh(
         vertices_lens=to_device(vl),
         vertices_source=to_device(vs),
@@ -2938,6 +3145,7 @@ def build_adaptive_mesh(
             cell_offsets=to_device(index.cell_offsets),
             cell_leaves=to_device(index.cell_leaves),
         ),
+        critical_band=critical_band,
         d_floor=d_floor,
         max_level=max_level,
         min_img_sep=float(min_img_sep),

@@ -75,7 +75,7 @@ def _run_new(raytrace, jacobian, fov, init_res, min_img_sep, max_level):
     tables = new.child_matrix_tables()
     lat = new.make_lattice(fov, 0.0, 0.0, init_res, max_level + 1)
     fn = new.make_raytrace(raytrace, None)
-    return new.refine(
+    cache, active, store, counters, _band = new.refine(
         fn,
         jacobian,
         lat,
@@ -86,6 +86,7 @@ def _run_new(raytrace, jacobian, fov, init_res, min_img_sep, max_level):
         tables,
         None,
     )
+    return cache, active, store, counters
 
 
 def _run_old(oracle_module, raytrace, fov, init_res, min_img_sep, max_level):
@@ -253,7 +254,7 @@ def _refine_with(fn, jac, fov=4.0, init_res=4, min_img_sep=0.5, max_depth=25):
     max_level = min(max_depth, new.depth_floor(fov, init_res, min_img_sep))
     lat = new.make_lattice(fov, 0.0, 0.0, init_res, max_level + 1)
     lens, calls = _make_counting_lens(fn, jac)
-    cache, active, store, counters = new.refine(
+    cache, active, store, counters, _band = new.refine(
         new.make_raytrace(lens.raytrace, None),
         lens.jacobian_lens_equation,
         lat,

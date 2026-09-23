@@ -868,3 +868,195 @@ def test_mesh_stores_min_img_sep():
     # not the value passed in -- since the halved value is what the size floor
     # and the dedup radius actually are.
     assert mesh.min_img_sep == 0.025
+
+
+# ---------------------------------------------------------------------------
+# The critical band
+# ---------------------------------------------------------------------------
+
+
+def row_fold(p):
+    """``(x, y) -> (x, y - y**2)``, so ``det A = 1 - 2y``, zero on ``y = 0.5``.
+
+    ``y = 0.5`` is a lattice row for ``fov=4`` about the origin whenever
+    ``init_res`` is a multiple of 4, so every sample on it has ``det A``
+    exactly zero: the build flags those leaves ``LEAF_JACOBIAN_NONFINITE``,
+    never ``LEAF_JACOBIAN_PARITY_UNRESOLVED``, yet the curve runs through them.
+    """
+    return np.stack([p[:, 0], p[:, 1] - p[:, 1] ** 2], axis=-1)
+
+
+def row_fold_jacobian(p):
+    J = np.zeros((p.shape[0], 2, 2))
+    J[:, 0, 0] = 1.0
+    J[:, 1, 1] = 1.0 - 2.0 * p[:, 1]
+    return J
+
+
+def lattice_samples(mesh, fov, init_res):
+    """Lattice-exact positions of every finite ``max_level`` leaf's six samples.
+
+    Midpoints come from integer lattice coordinates, not from averaging vertex
+    positions: the two differ in the last ulp, enough to flip the sign of a
+    near-zero determinant right at the curve.
+    """
+    lat = new.make_lattice(fov, 0.0, 0.0, init_res, mesh.max_level + 1)
+    lo, scale = to_np(lat.lo), lat.scale
+    ij = np.rint((to_np(mesh.vertices_lens) - lo) / scale).astype(np.int64)
+    leaves = to_np(mesh.leaves)
+    level, status = to_np(mesh.leaf_level), to_np(mesh.leaf_status)
+    rows = np.flatnonzero(
+        (level == mesh.max_level) & ((status & new.LEAF_RAYTRACE_NONFINITE) == 0)
+    )
+    vij = ij[leaves[rows]]
+    mij = np.stack(
+        [
+            (vij[:, 1] + vij[:, 2]) // 2,
+            (vij[:, 2] + vij[:, 0]) // 2,
+            (vij[:, 0] + vij[:, 1]) // 2,
+        ],
+        axis=1,
+    )
+    return rows, lo + np.concatenate([vij, mij], axis=1).astype(np.float64) * scale
+
+
+def independent_band(mesh, jac, fov, init_res):
+    """Band leaves recomputed from lattice-exact samples, without the build."""
+    rows, xy = lattice_samples(mesh, fov, init_res)
+    J = jac(xy.reshape(-1, 2)).reshape(-1, 6, 2, 2)
+    det = J[..., 0, 0] * J[..., 1, 1] - J[..., 0, 1] * J[..., 1, 0]
+    positive = det >= 0
+    band = np.isfinite(det).all(axis=1) & positive.any(axis=1) & (~positive).any(axis=1)
+    return rows[band]
+
+
+@pytest.mark.parametrize(
+    "fn, jac, build",
+    [
+        (localised_fold, localised_fold_jacobian, dict(init_res=4, min_img_sep=0.05)),
+        (row_fold, row_fold_jacobian, dict(init_res=8, min_img_sep=2e-2)),
+    ],
+    ids=["localised_fold", "row_fold"],
+)
+def test_band_is_the_sign_change_leaves_recomputed_independently(fn, jac, build):
+    """The band is exactly the leaves whose six dets change class.
+
+    Recomputed here from lattice-exact samples and the fixture's own
+    Jacobian, with an exact zero counted as positive. Every
+    ``LEAF_JACOBIAN_PARITY_UNRESOLVED`` leaf is in it; every other band leaf
+    is flagged ``LEAF_JACOBIAN_NONFINITE`` and has an exactly zero sample.
+    `localised_fold`'s curve, ``y = -0.3``, is never a lattice row, so there
+    the band is the flagged set; `row_fold`'s is one, so there no leaf is
+    flagged and the whole band is exact-zero leaves.
+    """
+    fov = 4.0
+    mesh, _ = new_build(fn, jac, fov=fov, **build)
+    band = mesh.critical_band
+    got = to_np(band.leaves)
+    want = independent_band(mesh, jac, fov, build["init_res"])
+    assert want.size > 0, "fixture must have a critical curve"
+    assert sorted(got.tolist()) == sorted(want.tolist())
+
+    status = to_np(mesh.leaf_status)
+    flagged = np.flatnonzero((status & new.LEAF_JACOBIAN_PARITY_UNRESOLVED) != 0)
+    assert set(flagged.tolist()) <= set(got.tolist())
+    extra = ~np.isin(got, flagged)
+    assert ((status[got[extra]] & new.LEAF_JACOBIAN_NONFINITE) != 0).all()
+    det = to_np(band.det)[to_np(band.samples)]
+    assert (det[extra] == 0).any(axis=1).all()
+    if fn is row_fold:
+        assert flagged.size == 0 and extra.all()
+    else:
+        assert not extra.any()
+
+
+def test_band_samples_are_lattice_exact_and_carry_the_lens_values():
+    """Each band row holds its leaf's own samples, once each, with exact values.
+
+    The vertices are the mesh's own, bit for bit and in the leaf's order; the
+    midpoints are the lattice midpoints opposite each vertex; no sample
+    appears twice; and ``source`` and ``det`` are what the lens gives at
+    ``lens``.
+    """
+    fov, init_res = 4.0, 8
+    mesh, _ = new_build(
+        row_fold, row_fold_jacobian, fov=fov, init_res=init_res, min_img_sep=2e-2
+    )
+    band = mesh.critical_band
+    leaves, samples = to_np(band.leaves), to_np(band.samples)
+    lens, source, det = to_np(band.lens), to_np(band.source), to_np(band.det)
+    assert leaves.size > 0
+
+    vertices = to_np(mesh.vertices_lens)[to_np(mesh.leaves)[leaves]]
+    assert np.array_equal(lens[samples[:, :3]], vertices)
+    rows, xy = lattice_samples(mesh, fov, init_res)
+    position = {r: i for i, r in enumerate(rows.tolist())}
+    assert np.array_equal(lens[samples], xy[[position[r] for r in leaves.tolist()]])
+    assert np.unique(lens, axis=0).shape[0] == lens.shape[0]
+
+    assert np.array_equal(source, row_fold(lens))
+    J = row_fold_jacobian(lens)
+    assert np.array_equal(det, J[:, 0, 0] * J[:, 1, 1] - J[:, 0, 1] * J[:, 1, 0])
+
+
+def test_band_never_holds_a_leaf_with_a_nonfinite_sample():
+    """`localised_fold` broken to NaN for ``x > 1``, raytrace and Jacobian alike.
+
+    The band still matches the independent recomputation, and nothing
+    non-finite reaches it: no band leaf carries ``LEAF_RAYTRACE_NONFINITE``,
+    every stored ``det`` is finite, and no sample lies in the broken region.
+    """
+    fn, jac = broken_where(
+        localised_fold, localised_fold_jacobian, lambda p: p[:, 0] > 1.0
+    )
+    mesh, _ = new_build(fn, jac, init_res=4, min_img_sep=0.05)
+    band = mesh.critical_band
+    got = to_np(band.leaves)
+    assert got.size > 0
+    assert sorted(got.tolist()) == sorted(independent_band(mesh, jac, 4.0, 4).tolist())
+    status = to_np(mesh.leaf_status)
+    assert not ((status[got] & new.LEAF_RAYTRACE_NONFINITE) != 0).any()
+    assert np.isfinite(to_np(band.det)).all()
+    assert (to_np(band.lens)[:, 0] <= 1.0).all()
+
+
+@pytest.mark.parametrize(
+    "fn, jac, build",
+    [
+        (affine_np, affine_np_jacobian, dict()),
+        (collapse, collapse_jacobian, dict(min_img_sep=0.5)),
+    ],
+    ids=["affine", "kappa_one_sheet"],
+)
+def test_band_is_empty_without_a_sign_change(fn, jac, build):
+    """No leaf's samples change class, so no band leaf can exist.
+
+    An affine map converges at level 0 and never reaches ``max_level``. A
+    ``kappa == 1`` sheet reaches it everywhere, but ``det A`` is exactly zero
+    at every sample, and zero counts as positive.
+    """
+    mesh, _ = new_build(fn, jac, **build)
+    band = mesh.critical_band
+    assert tuple(band.leaves.shape) == (0,)
+    assert tuple(band.samples.shape) == (0, 6)
+    assert tuple(band.lens.shape) == (0, 2)
+    assert tuple(band.source.shape) == (0, 2)
+    assert tuple(band.det.shape) == (0,)
+
+
+def test_band_positions_follow_the_mesh_dtype_and_det_stays_float64():
+    """``det`` decides every class, so it keeps the build's precision."""
+    lens, _ = make_counting_lens(row_fold, row_fold_jacobian)
+    mesh = new.build_adaptive_mesh(lens, 4.0, 8, 2e-2, dtype=backend.float32)
+    band = mesh.critical_band
+    assert band.leaves.shape[0] > 0
+    assert band.lens.dtype == backend.float32
+    assert band.source.dtype == backend.float32
+    assert band.det.dtype == backend.float64
+
+
+def test_band_is_deterministic():
+    a, _ = new_build(row_fold, row_fold_jacobian, init_res=8, min_img_sep=2e-2)
+    b, _ = new_build(row_fold, row_fold_jacobian, init_res=8, min_img_sep=2e-2)
+    for x, y in zip(a.critical_band, b.critical_band):
+        assert np.array_equal(to_np(x), to_np(y))
