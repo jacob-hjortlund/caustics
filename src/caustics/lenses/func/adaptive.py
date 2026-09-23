@@ -12,7 +12,9 @@ verifiable.
 :func:`mesh_seeds` return candidate regions and Newton seeds;
 :func:`mesh_forward_raytrace` goes on to return images, either refining
 those seeds to machine precision or deduplicating them as they stand,
-depending on its ``method`` argument.
+depending on its ``method`` argument. The critical curves and caustics
+through the mesh's :class:`CriticalBand` are traced by
+:mod:`~caustics.lenses.func.adaptive_critical`.
 """
 
 import math

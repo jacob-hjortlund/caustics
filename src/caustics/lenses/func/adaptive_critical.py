@@ -27,6 +27,7 @@ __all__ = (
     "crossing_points",
     "chain_order",
     "trace_band",
+    "mesh_critical_curves",
 )
 
 
@@ -326,3 +327,32 @@ def trace_band(band) -> CriticalCurves:
     return CriticalCurves(
         lens=lens_points, source=source_points, offsets=offsets, closed=closed
     )
+
+
+def mesh_critical_curves(mesh) -> CriticalCurves:
+    """
+    Critical curves and caustics of the lens an adaptive mesh was built from.
+
+    A pure function of ``mesh.critical_band``: no raytrace and no Jacobian
+    call. Each lens-plane point lies on a child edge whose ends straddle the
+    curve, so where ``det A`` is continuous it is within one child edge of
+    the true critical curve -- at most ``mesh.min_img_sep / 2``, a quarter of
+    the ``min_img_sep`` passed to the build, unless ``max_depth`` bound, when
+    it is half the actual ``max_level`` leaf edge. Each caustic point is the
+    image interpolated along the same edge; for exact images, raytrace
+    ``lens`` directly.
+
+    A curve ends where the band does: at the fov boundary, or next to a leaf
+    whose samples or Jacobian are non-finite, or, in principle, next to a
+    coarser converged leaf. Pseudo-caustics of lenses with a singular centre
+    are not zero sets of ``det A`` and are not traced.
+
+    Parameters
+    ----------
+    mesh: AdaptiveMesh
+
+    Returns
+    -------
+    CriticalCurves
+    """
+    return trace_band(mesh.critical_band)

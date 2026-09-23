@@ -99,6 +99,7 @@ from .adaptive import (
     mesh_forward_raytrace,
     AdaptiveMesh,
     MeshIndex,
+    CriticalBand,
     LEAF_CONVERGED,
     LEAF_CONVERGENCE_FAILED,
     LEAF_APPROX_PARITY_UNRESOLVED,
@@ -106,6 +107,7 @@ from .adaptive import (
     LEAF_RAYTRACE_NONFINITE,
     LEAF_JACOBIAN_NONFINITE,
 )
+from .adaptive_critical import CriticalCurves, mesh_critical_curves
 
 __all__ = (
     "forward_raytrace",
@@ -189,6 +191,9 @@ __all__ = (
     "mesh_forward_raytrace",
     "AdaptiveMesh",
     "MeshIndex",
+    "CriticalBand",
+    "CriticalCurves",
+    "mesh_critical_curves",
     # "LEAF_CONVERGED",
     # "LEAF_SIZE_FLOOR",
     # "LEAF_FORCED",

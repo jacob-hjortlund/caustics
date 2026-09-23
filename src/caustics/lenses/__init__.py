@@ -23,6 +23,9 @@ from .func import (
     mesh_forward_raytrace,
     AdaptiveMesh,
     MeshIndex,
+    CriticalBand,
+    CriticalCurves,
+    mesh_critical_curves,
 )
 
 __all__ = [
@@ -51,4 +54,7 @@ __all__ = [
     "mesh_forward_raytrace",
     "AdaptiveMesh",
     "MeshIndex",
+    "CriticalBand",
+    "CriticalCurves",
+    "mesh_critical_curves",
 ]

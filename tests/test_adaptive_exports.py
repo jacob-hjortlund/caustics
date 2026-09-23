@@ -16,6 +16,9 @@ def test_new_symbols_are_re_exported_at_every_package_level(package):
         "mesh_forward_raytrace",
         "AdaptiveMesh",
         "MeshIndex",
+        "CriticalBand",
+        "CriticalCurves",
+        "mesh_critical_curves",
     ):
         assert getattr(package, name) is getattr(func, name), name
         assert name in package.__all__, name

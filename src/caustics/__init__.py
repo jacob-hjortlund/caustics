@@ -31,6 +31,9 @@ from .lenses.func import (
     mesh_forward_raytrace,
     AdaptiveMesh,
     MeshIndex,
+    CriticalBand,
+    CriticalCurves,
+    mesh_critical_curves,
 )
 from .light import (
     Source,
@@ -82,6 +85,9 @@ __all__ = [
     "mesh_forward_raytrace",
     "AdaptiveMesh",
     "MeshIndex",
+    "CriticalBand",
+    "CriticalCurves",
+    "mesh_critical_curves",
     "Source",
     "Pixelated",
     "PixelatedTime",

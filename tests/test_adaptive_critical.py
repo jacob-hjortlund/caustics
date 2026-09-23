@@ -1,6 +1,8 @@
 """Critical curves and caustics traced through the adaptive mesh's band."""
 
 import itertools
+import math
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -254,3 +256,176 @@ def test_a_band_without_crossings_has_no_curves(band):
     assert tuple(curves.lens.shape) == (0, 2)
     assert tuple(curves.source.shape) == (0, 2)
     assert tuple(curves.closed.shape) == (0,)
+
+
+# ---------------------------------------------------------------------------
+# End to end, against known answers
+# ---------------------------------------------------------------------------
+
+
+def _stack_2x2(a, b, c, d):
+    """``[[a, b], [c, d]]`` at every point, shape ``(N, 2, 2)``."""
+    return backend.stack(
+        (backend.stack((a, b), dim=-1), backend.stack((c, d), dim=-1)), dim=-2
+    )
+
+
+def _cored_isothermal(x, y):
+    """``alpha = 1.2 theta / sqrt(theta**2 + 0.05)``: two circular critical curves."""
+    r = (x * x + y * y + 0.05) ** 0.5
+    return x - 1.2 * x / r, y - 1.2 * y / r
+
+
+def _cored_isothermal_jacobian(x, y):
+    r = (x * x + y * y + 0.05) ** 0.5
+    k = 1.2 / r**3
+    return _stack_2x2(
+        1.0 - 1.2 / r + k * x * x, k * x * y, k * x * y, 1.0 - 1.2 / r + k * y * y
+    )
+
+
+def _row_fold(x, y):
+    """``det A = 1 - 2y``: zero on ``y = 0.5``, a lattice row for ``fov=4``."""
+    return x * 1.0, y - y * y
+
+
+def _row_fold_jacobian(x, y):
+    one, zero = backend.ones_like(x), backend.zeros_like(x)
+    return _stack_2x2(one, zero, zero, 1.0 - 2.0 * y)
+
+
+def _broken_fold(x, y):
+    """``det A = 0.6 + 2y``, zero on ``y = -0.3``, and NaN wherever ``x > 1``."""
+    nan = backend.where(
+        x > 1.0, backend.zeros_like(x) + float("nan"), backend.zeros_like(x)
+    )
+    return x + nan, 0.6 * y + y * y + nan
+
+
+def _broken_fold_jacobian(x, y):
+    nan = backend.where(
+        x > 1.0, backend.zeros_like(x) + float("nan"), backend.zeros_like(x)
+    )
+    one, zero = backend.ones_like(x), backend.zeros_like(x)
+    return _stack_2x2(one + nan, zero, zero, 0.6 + 2.0 * y + nan)
+
+
+CORED = SimpleNamespace(
+    raytrace=_cored_isothermal, jacobian_lens_equation=_cored_isothermal_jacobian
+)
+ROW_FOLD = SimpleNamespace(
+    raytrace=_row_fold, jacobian_lens_equation=_row_fold_jacobian
+)
+BROKEN_FOLD = SimpleNamespace(
+    raytrace=_broken_fold, jacobian_lens_equation=_broken_fold_jacobian
+)
+
+# Tangential: 1 - 1.2 / r = 0 at r = sqrt(theta**2 + 0.05) = 1.2. Radial:
+# 1 - 1.2 * 0.05 / r**3 = 0. The tangential caustic is the origin; the radial
+# one is a circle of radius theta * |1 - 1.2 / r| there.
+TANGENTIAL = math.sqrt(1.2**2 - 0.05)
+_R_RADIAL = (1.2 * 0.05) ** (1.0 / 3.0)
+RADIAL = math.sqrt(_R_RADIAL**2 - 0.05)
+RADIAL_CAUSTIC = RADIAL * abs(1.0 - 1.2 / _R_RADIAL)
+
+
+def _curves(mesh):
+    """``[(lens, source, closed), ...]`` per curve, as numpy."""
+    curves = crit.mesh_critical_curves(mesh)
+    off = to_np(curves.offsets)
+    lens, source, closed = (
+        to_np(curves.lens),
+        to_np(curves.source),
+        to_np(curves.closed),
+    )
+    return [
+        (lens[a:b], source[a:b], bool(c)) for a, b, c in zip(off[:-1], off[1:], closed)
+    ]
+
+
+def _signed_area(p):
+    x, y = p[:, 0], p[:, 1]
+    return 0.5 * np.sum(x * np.roll(y, -1) - np.roll(x, -1) * y)
+
+
+def test_cored_isothermal_curves_match_the_analytic_answers():
+    """Two loops at the analytic radii, oriented, with the analytic caustics.
+
+    The lens-plane tolerance is the guaranteed one, a quarter of the
+    ``min_img_sep`` passed. The caustic has no guaranteed bound; measured on
+    this exact fixture the tangential caustic lies within 3.5e-7 of the origin
+    and the radial caustic radius within 1.5e-6, so 1e-4 is headroom, not
+    slack. ``det A > 0`` outside the tangential curve and inside the radial
+    one, so keeping it on the left runs the first clockwise and the second
+    counter-clockwise.
+    """
+    min_img_sep = 1e-2
+    mesh = new.build_adaptive_mesh(CORED, fov=4.0, init_res=16, min_img_sep=min_img_sep)
+    curves = _curves(mesh)
+    assert len(curves) == 2 and all(closed for _, _, closed in curves)
+    (t_lens, t_src, _), (r_lens, r_src, _) = sorted(
+        curves, key=lambda c: -np.hypot(*c[0].T).mean()
+    )
+    assert np.abs(np.hypot(*t_lens.T) - TANGENTIAL).max() < min_img_sep / 4
+    assert np.abs(np.hypot(*r_lens.T) - RADIAL).max() < min_img_sep / 4
+    assert _signed_area(t_lens) < 0 < _signed_area(r_lens)
+    assert np.hypot(*t_src.T).max() < 1e-4
+    assert np.abs(np.hypot(*r_src.T) - RADIAL_CAUSTIC).max() < 1e-4
+
+
+def test_the_fov_cuts_the_tangential_circle_into_four_open_arcs():
+    """The square ``[-1, 1]**2`` meets the tangential circle only near its corners.
+
+    ``TANGENTIAL`` lies between 1 and ``sqrt(2)``, so four arcs of the circle
+    are inside the fov, each ending on it, while the radial loop is whole.
+    Every end sits on a boundary edge, whose two samples share the boundary
+    coordinate exactly, so the end is on the boundary exactly.
+    """
+    mesh = new.build_adaptive_mesh(CORED, fov=2.0, init_res=8, min_img_sep=1e-2)
+    curves = _curves(mesh)
+    arcs = [lens for lens, _, closed in curves if not closed]
+    loops = [lens for lens, _, closed in curves if closed]
+    assert len(arcs) == 4 and len(loops) == 1
+    for lens in arcs:
+        for end in (lens[0], lens[-1]):
+            assert np.abs(end).max() == 1.0
+
+
+def test_a_curve_through_lattice_points_is_traced_without_any_parity_flag():
+    """Every sample on ``y = 0.5`` has ``det A`` exactly zero.
+
+    So no leaf carries ``LEAF_JACOBIAN_PARITY_UNRESOLVED`` -- a mask on that
+    flag finds nothing -- yet the band's zero-is-positive rule traces one open
+    curve along the row, exactly. ``det A > 0`` below the row puts it on the
+    left of travel in ``-x``, so the curve runs from ``x = 2`` to ``x = -2``.
+    """
+    mesh = new.build_adaptive_mesh(ROW_FOLD, fov=4.0, init_res=8, min_img_sep=2e-2)
+    status = to_np(mesh.leaf_status)
+    assert not ((status & new.LEAF_JACOBIAN_PARITY_UNRESOLVED) != 0).any()
+    curves = _curves(mesh)
+    assert len(curves) == 1
+    lens, _, closed = curves[0]
+    assert not closed
+    assert np.abs(lens[:, 1] - 0.5).max() < 1e-12
+    assert lens[0, 0] == 2.0 and lens[-1, 0] == -2.0
+
+
+def test_a_curve_ends_where_the_lens_turns_nonfinite():
+    """The fold ``y = -0.3`` runs into a region where the lens is NaN.
+
+    No band leaf has a non-finite sample, so the curve is open: one end on the
+    fov boundary at ``x = -2``, the other where the band stops, within a leaf
+    edge of ``x = 1``.
+    """
+    min_img_sep = 0.05
+    mesh = new.build_adaptive_mesh(
+        BROKEN_FOLD, fov=4.0, init_res=4, min_img_sep=min_img_sep
+    )
+    curves = _curves(mesh)
+    assert len(curves) == 1
+    lens, _, closed = curves[0]
+    assert not closed
+    assert np.abs(lens[:, 1] + 0.3).max() < min_img_sep / 4
+    left, right = sorted([lens[0, 0], lens[-1, 0]])
+    assert left == -2.0
+    assert 1.0 - min_img_sep < right <= 1.0
