@@ -1123,3 +1123,44 @@ def test_criterion_reads_precomputed_jacobians_only_on_the_rows_it_tests(flipped
         )
     )
     assert status.tolist() == want
+
+
+def _two_triangles_sharing_an_edge():
+    """Cell (0, 0)'s two level-0 triangles: 12 samples, 9 distinct points."""
+    M, G, COMPOSE, PINV0, ROOT_CLASS = new.child_matrix_tables()
+    lat = new.make_lattice(4.0, 0.0, 0.0, 2, 1)
+    ij, _ = new.initial_triangles(2, 1, ROOT_CLASS)
+    tri = ij[backend.as_array([0, 4], dtype=backend.int64)]
+    return lat, backend.concatenate((tri, new.midpoint_ij(tri)), dim=1)
+
+
+def test_sample_jacobians_evaluates_each_distinct_lattice_point_once():
+    """The shared edge's two ends and midpoint are evaluated once, not twice.
+
+    Gathering the result back through ``index`` must reproduce the Jacobian
+    at every one of the twelve samples, in triangle-major sample order.
+    """
+    lat, six_ij = _two_triangles_sharing_an_edge()
+    jacobian_fn, calls = _recording(_fold_jacobian)
+    keys, index, J = new.sample_jacobians(lat, six_ij, jacobian_fn)
+    assert len(calls) == 1
+    assert calls[0].shape == (9, 2)
+    assert tuple(keys.shape) == (9,) and tuple(index.shape) == (2, 6)
+    xy = backend.to_numpy(new.lattice_xy(lat, six_ij)).reshape(-1, 2)
+    want = backend.to_numpy(_fold_jacobian(_arr(xy[:, 0]), _arr(xy[:, 1])))
+    assert np.array_equal(backend.to_numpy(J[index]).reshape(-1, 2, 2), want)
+
+
+def test_sample_jacobians_of_no_triangles_never_calls_the_jacobian():
+    lat, _ = _two_triangles_sharing_an_edge()
+    empty = backend.zeros((0, 6, 2), dtype=backend.int64)
+    keys, index, J = new.sample_jacobians(lat, empty, _exploding_jacobian)
+    assert tuple(keys.shape) == (0,)
+    assert tuple(index.shape) == (0, 6)
+    assert tuple(J.shape) == (0, 2, 2)
+
+
+def test_sample_jacobians_rejects_a_wrong_shape():
+    lat, six_ij = _two_triangles_sharing_an_edge()
+    with pytest.raises(ValueError, match=r"\(K, 2, 2\)"):
+        new.sample_jacobians(lat, six_ij, _fixed_jacobians(np.zeros((12, 2, 2))))

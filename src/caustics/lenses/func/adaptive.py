@@ -76,6 +76,7 @@ __all__ = (
     "make_raytrace",
     "trace_keys",
     "evaluate",
+    "sample_jacobians",
     "refine",
     "canonical_order",
     "min_angle",
@@ -1767,6 +1768,67 @@ def evaluate(cache, lat, keys, raytrace_fn, batch_size) -> VertexCache:
 
 
 # ---------------------------------------------------------------------------
+# The critical band
+# ---------------------------------------------------------------------------
+
+
+def sample_jacobians(
+    lat, six_ij, jacobian_fn
+) -> Tuple[ArrayLike, ArrayLike, ArrayLike]:
+    """
+    The lens Jacobian at every triangle's six samples, one call per lattice point.
+
+    A vertex is shared by about six triangles and a midpoint by two, so
+    evaluating per triangle, as :func:`jacobian_parity_ok` does, repeats
+    most points. Deduplicating on the lattice key first cuts the batch by
+    roughly ``2.5x`` on a refined region, and it gives every triangle that
+    shares a sample the same ``A`` there -- which the critical band relies
+    on.
+
+    ``jacobian_fn`` is called exactly once, on the lattice's own float64
+    coordinates, and not at all when there are no triangles.
+
+    Parameters
+    ----------
+    lat: Lattice
+    six_ij: ArrayLike
+        Lattice coordinates of each triangle's ``theta_1, theta_2, theta_3,
+        m_1, m_2, m_3``, shape ``(G, 6, 2)`` int64.
+    jacobian_fn: Callable[[ArrayLike, ArrayLike], ArrayLike]
+        ``jacobian_fn(x, y) -> (K, 2, 2)``.
+
+    Returns
+    -------
+    keys: ArrayLike
+        ``(U,)`` int64, the distinct sample keys, ascending.
+    index: ArrayLike
+        ``(G, 6)`` int64 index into ``keys`` of each triangle's samples.
+    J: ArrayLike
+        ``(U, 2, 2)``, the Jacobian at each distinct sample.
+
+    Raises
+    ------
+    ValueError
+        If ``jacobian_fn`` does not return ``(U, 2, 2)``.
+    """
+    n = six_ij.shape[0]
+    if n == 0:
+        return (
+            backend.zeros((0,), dtype=backend.int64),
+            backend.zeros((0, 6), dtype=backend.int64),
+            backend.zeros((0, 2, 2), dtype=backend.float64),
+        )
+    keys, index = backend.unique(
+        lattice_key(lat, six_ij).reshape(-1), return_inverse=True
+    )
+    xy = lattice_xy(lat, lattice_ij_from_key(lat, keys))
+    J = jacobian_fn(xy[:, 0], xy[:, 1])
+    if J.shape != (keys.shape[0], 2, 2):
+        raise ValueError("jacobian_fn must return shape (K, 2, 2) for K points")
+    return keys, index.reshape(n, 6), J
+
+
+# ---------------------------------------------------------------------------
 # The refinement loop
 # ---------------------------------------------------------------------------
 
@@ -1799,11 +1861,12 @@ def refine(
     Jacobian cost stays proportional to the triangles about to converge rather
     than to every triangle tested. A balance-cascade child is the exception:
     it inherits its parent's verdict without a Jacobian check of its own, and
-    its three edge midpoints are points the parent's check never saw. Unlike
-    raytraced points, Jacobian evaluations are not deduplicated: every checked
-    triangle evaluates its own six points, shared vertices included. The
-    per-level status bitmask is discarded below ``max_level``, since every
-    failure there is a reason to split rather than a verdict.
+    its three edge midpoints are points the parent's check never saw. Below
+    ``max_level``, unlike raytraced points, Jacobian evaluations are not
+    deduplicated: every checked triangle evaluates its own six points, shared
+    vertices included. The per-level status bitmask is discarded below
+    ``max_level``, since every failure there is a reason to split rather than
+    a verdict.
 
     At ``max_level`` nothing splits, so there is no cascade, so no force-split.
     The midpoints are still evaluated: traced once, deduplicated on their
@@ -1813,7 +1876,9 @@ def refine(
     Jacobian forced on every triangle whose six samples are finite, since here
     ``status`` is the leaf's final record: every test the leaf fails is OR-ed
     into it, and anything but ``LEAF_CONVERGED`` keeps the leaf out of the
-    spatial index. A triangle that straddles a fold, in particular, contains it
+    spatial index. That forced pass evaluates each distinct lattice sample
+    once (:func:`sample_jacobians`) rather than six times per triangle. A
+    triangle that straddles a fold, in particular, contains it
     at a scale no further split can resolve. A triangle with a non-finite
     sample skips the criterion and is stored with ``LEAF_RAYTRACE_NONFINITE``
     alone.
@@ -1958,14 +2023,20 @@ def refine(
                 good_rows = rows[finite_m]
 
                 if good_rows.shape[0]:
-
-                    theta_v = lattice_xy(lat, active_ij[good_rows])
-                    theta_m = lattice_xy(lat, midpoint_ij(active_ij[good_rows]))
+                    good_ij = active_ij[good_rows]
+                    six_ij = backend.concatenate((good_ij, midpoint_ij(good_ij)), dim=1)
+                    theta = lattice_xy(lat, six_ij)
+                    # One Jacobian call over the distinct samples, not six per
+                    # triangle: shared samples then carry one `A`, which the
+                    # critical band needs, and the batch shrinks ~2.5x.
+                    sample_keys, sample_index, J = sample_jacobians(
+                        lat, six_ij, jacobian_fn
+                    )
 
                     keep, parity_ok, s, criterion_status = evaluate_criterion(
                         jacobian_fn,
-                        theta_v,
-                        theta_m,
+                        theta[:, :3],
+                        theta[:, 3:],
                         beta_v[good_rows],
                         beta_m[finite_m],
                         active_cls[good_rows],
@@ -1975,6 +2046,7 @@ def refine(
                         PINV0,
                         COMPOSE,
                         force_jacobian=True,
+                        jacobian=J[sample_index],
                     )
 
                     status = backend.fill_at_indices(

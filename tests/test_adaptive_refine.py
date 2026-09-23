@@ -267,6 +267,13 @@ def _refine_with(fn, jac, fov=4.0, init_res=4, min_img_sep=0.5, max_depth=25):
     return cache, active, store, counters, lat, calls, max_level
 
 
+def _distinct_samples(cache, v, lat):
+    """How many distinct lattice points the six samples of leaves ``v`` hold."""
+    ij = cache.ij[v]
+    six = backend.concatenate((ij, new.midpoint_ij(ij)), dim=1)
+    return int(backend.unique(new.lattice_key(lat, six).reshape(-1)).shape[0])
+
+
 def _broken(fn, jac, where, value=np.nan):
     """``fn`` and ``jac`` with ``value`` wherever ``where(p)`` holds.
 
@@ -383,21 +390,32 @@ def test_refine_terminates_at_max_level_on_a_kappa_one_sheet():
 def test_refine_evaluates_the_jacobian_only_where_it_can_withhold_convergence():
     """Below ``max_level``, only a triangle about to converge is checked.
 
-    Two fixtures pin both ends exactly. On the identity map every level-0
-    triangle passes the other tests, so each is checked once and converges.
-    On a ``kappa == 1`` sheet none ever passes the deviation test, so the
-    Jacobian never runs below ``max_level`` and its one call is the forced
-    pass there. Either way that is one batch, and exactly six points per leaf:
-    unlike raytraced points, Jacobian samples are not deduplicated between
-    triangles that share them.
+    Two fixtures pin both ends exactly, each in one batch. On the identity map
+    every level-0 triangle passes the other tests, so each is checked once,
+    below ``max_level``, on its own six points: there, unlike raytraced
+    points, Jacobian samples are not deduplicated between triangles that
+    share them. On a ``kappa == 1`` sheet none ever passes the deviation test,
+    so the Jacobian never runs below ``max_level``, and its one call is the
+    forced pass there -- which evaluates each distinct lattice sample once.
+    That is 1089 points, the whole widened lattice, where six per leaf would
+    be 3072.
     """
-    for fn, jac in ((_identity, _identity_jacobian), (_collapse, _collapse_jacobian)):
-        cache, active, store, counters, lat, calls, max_level = _refine_with(
-            fn, jac, min_img_sep=0.5
-        )
-        v, _, _, _ = new.store_compact(store)
-        assert calls["jacobian_batches"] == 1, fn.__name__
-        assert calls["jacobian_points"] == 6 * v.shape[0], fn.__name__
+    cache, active, store, counters, lat, calls, max_level = _refine_with(
+        _identity, _identity_jacobian, min_img_sep=0.5
+    )
+    v, level, _, _ = new.store_compact(store)
+    assert bool(backend.all(level < max_level))
+    assert calls["jacobian_batches"] == 1
+    assert calls["jacobian_points"] == 6 * v.shape[0]
+
+    cache, active, store, counters, lat, calls, max_level = _refine_with(
+        _collapse, _collapse_jacobian, min_img_sep=0.5
+    )
+    v, level, _, _ = new.store_compact(store)
+    assert v.shape[0] == 512
+    assert bool(backend.all(level == max_level))
+    assert calls["jacobian_batches"] == 1
+    assert calls["jacobian_points"] == _distinct_samples(cache, v, lat) == 1089
 
 
 def _sis_raytrace(p, b=1.0):
@@ -523,7 +541,8 @@ def test_forced_jacobian_skips_every_triangle_with_a_nonfinite_sample():
     `_broken` makes the Jacobian NaN over the same half-plane as the raytrace,
     so a non-finite triangle that reached the Jacobian would come back
     ``LEAF_JACOBIAN_NONFINITE`` as well. None may: ``max_level == 0`` here, so
-    every finite level-0 triangle is checked exactly once and no other is.
+    the distinct samples of the finite level-0 triangles are each checked
+    exactly once, and no other point is.
     """
     fn, jac = _broken(_identity, _identity_jacobian, lambda p: p[:, 0] > 0.5)
     cache, active, store, counters, lat, calls, max_level = _refine_with(
@@ -531,9 +550,9 @@ def test_forced_jacobian_skips_every_triangle_with_a_nonfinite_sample():
     )
     assert max_level == 0
     v, level, _, status = new.store_compact(store)
-    finite = int(backend.to_numpy(backend.sum(status != new.LEAF_RAYTRACE_NONFINITE)))
-    assert 0 < finite < v.shape[0]
-    assert calls["jacobian_points"] == 6 * finite
+    finite = backend.flatnonzero(status != new.LEAF_RAYTRACE_NONFINITE)
+    assert 0 < finite.shape[0] < v.shape[0]
+    assert calls["jacobian_points"] == _distinct_samples(cache, v[finite], lat)
     assert not bool(backend.any((status & new.LEAF_JACOBIAN_NONFINITE) != 0))
 
 
