@@ -3839,17 +3839,30 @@ def extend_adaptive_mesh(
     lattice's corner and spacing from that fov. Those match this mesh's --
     anchored at the original build, see :func:`extend_lattice` -- exactly
     when the arithmetic is exact, as with a dyadic fov, ``init_res`` and
-    centre. Otherwise positions differ by rounding, which can in rare cases
-    flip a verdict sitting at a threshold.
+    centre. Otherwise positions differ in the last bit, and the visible
+    effect is in closure: :func:`close` picks the diagonal of a leaf with two
+    hanging nodes by comparing minimum angles computed from those positions,
+    the two candidates often tie, and the rounding decides. On a cored
+    isothermal lens extended from fov 3 to 4.2, the refinement itself -- every
+    pre-closure leaf, with its level, status and class -- matched the fresh
+    build's, while roughly 0.5-1% of the closed leaves were split along the
+    other diagonal, which reaches ``leaves``, ``leaf_area2`` and ``index``.
+    Critical-band leaves have no hanging node, so critical curves are
+    unaffected. A verdict flipped by the rounding is possible in principle
+    but was not observed.
 
-    Both statements assume the lens gives the same value at a point whatever
-    batch the point arrives in -- the assumption :func:`trace_keys` makes
-    for ``batch_size``. The extension traces its points in different batches
-    from a fresh build, so a lens whose vectorized kernels differ in the last
-    bit between batches, as an EPL ``SinglePlane`` has been measured to, gives
-    the same leaves, statuses and index with a handful of images and
-    determinants one ulp apart -- no more than two fresh builds with different
-    ``raytrace_batch_size`` differ by.
+    Both paragraphs assume the lens gives the same value at a point whatever
+    batch it arrives in -- the assumption :func:`trace_keys` makes for
+    ``batch_size``. The extension traces its points in other batches than a
+    fresh build does, so with a lens whose vectorized kernels differ in the
+    last bit between batches it differs from a fresh build much as two fresh
+    builds with different ``raytrace_batch_size`` differ from each other. On
+    an EPL ``SinglePlane`` extended from fov 2.5 to 5, the leaves, statuses
+    and index came out identical and 13 of about 640,000 image coordinates
+    differed by at most two ulp; two fresh builds there differed in 11. That
+    is a measurement, not a guarantee: a last-bit difference in an image can
+    flip a verdict at a threshold or move a bounding box across an index
+    cell.
 
     Lens calls: the ring's own refinement, exactly what a fresh build spends
     there; midpoints inside old leaves the balance force-splits; and, for a

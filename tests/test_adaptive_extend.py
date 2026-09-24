@@ -984,16 +984,25 @@ def test_an_extension_of_a_mesh_on_a_device_stays_on_it(device):
     assert_meshes_equal(got, want)
 
 
-def test_batch_size_and_index_cells_reach_the_extension():
-    fn, jac = seam_fold(2.0)
+def test_batch_size_and_index_cells_reach_every_path_an_extension_traces():
+    """``raytrace_batch_size`` caps every raytrace an extension makes: the
+    ring's own, `seed_from_mesh`'s re-trace of a float32 mesh's boundary, and
+    the midpoints `force_split` fetches for the leaves `balance` splits --
+    `edge_bump` at float32 needs all three. The mesh still equals the fresh
+    build given the same ``index_cells``."""
     kw = dict(
-        fov=4.0, init_res=4, min_img_sep=0.05, raytrace_batch_size=7, index_cells=16
+        fov=4.0,
+        init_res=4,
+        min_img_sep=0.05,
+        dtype=backend.float32,
+        raytrace_batch_size=5,
+        index_cells=16,
     )
-    mesh, lens, calls = build(fn, jac, **kw)
+    mesh, lens, calls = build(edge_bump, edge_bump_jacobian, **kw)
     calls["raytrace"].clear()
     got = new.extend_adaptive_mesh(
-        mesh, lens, 6.0, raytrace_batch_size=7, index_cells=16
+        mesh, lens, 6.0, raytrace_batch_size=5, index_cells=16
     )
-    assert calls["raytrace"] and max(len(xy) for xy in calls["raytrace"]) <= 7
-    want, _, _ = build(fn, jac, **fresh_equivalent(kw, 6.0))
+    assert calls["raytrace"] and max(len(xy) for xy in calls["raytrace"]) <= 5
+    want, _, _ = build(edge_bump, edge_bump_jacobian, **fresh_equivalent(kw, 6.0))
     assert_meshes_equal(got, want)
