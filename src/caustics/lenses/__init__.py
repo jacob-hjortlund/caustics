@@ -18,6 +18,7 @@ from .multipole import Multipole
 from .enclosed_mass import EnclosedMass
 from .func import (
     build_adaptive_mesh,
+    extend_adaptive_mesh,
     mesh_query,
     mesh_seeds,
     mesh_forward_raytrace,
@@ -49,6 +50,7 @@ __all__ = [
     "Multipole",
     "EnclosedMass",
     "build_adaptive_mesh",
+    "extend_adaptive_mesh",
     "mesh_query",
     "mesh_seeds",
     "mesh_forward_raytrace",

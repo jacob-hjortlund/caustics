@@ -6,6 +6,7 @@ lattice. The fixtures use dyadic fovs, centres and cell sizes, where a fresh
 build's own lattice coincides with the extended one exactly.
 """
 
+import warnings
 from types import SimpleNamespace
 
 import numpy as np
@@ -13,6 +14,7 @@ import pytest
 
 from caustics.backend_obj import backend
 from caustics.lenses.func import adaptive as new
+from caustics.lenses.func import adaptive_critical as crit
 
 
 def to_np(x):
@@ -290,6 +292,39 @@ def ring_fold(seam):
     `seam_fold`, whose old leaves are the deep ones.
     """
     return mirrored(*seam_fold(seam), seam)
+
+
+def edge_bump(p):
+    """A fold confined to the right edge of ``[-2, 2]**2``, exactly affine outside it.
+
+    ``x' = 0.6 x + g(x) h(y)`` with ``g = 60 (x - 1.4)**2 (2 - x)**2`` on
+    ``[1.4, 2]`` and ``h = (1 - y**2 / 4)**2`` on ``|y| < 2``, each zero
+    elsewhere and C1 where it stops. ``det A = 0.6 + g'(x) h(y)`` vanishes
+    within a few hundredths of ``x = 2``, so a fov-4 mesh is ``max_level``
+    deep along that edge, while every ring cell a fov-6 extension adds is
+    exactly affine and converges at level 0. The ring's own cascade ends with
+    it, so only `balance` can grade the ring down to the old leaves -- unlike
+    `seam_fold`, whose curved strip runs on into the ring and keeps the
+    ring's cascade going.
+    """
+    x, y = p[:, 0], p[:, 1]
+    g = np.where((x > 1.4) & (x < 2.0), 60.0 * (x - 1.4) ** 2 * (2.0 - x) ** 2, 0.0)
+    h = np.where(np.abs(y) < 2.0, (1.0 - y**2 / 4.0) ** 2, 0.0)
+    return np.stack([0.6 * x + g * h, y], axis=-1)
+
+
+def edge_bump_jacobian(p):
+    x, y = p[:, 0], p[:, 1]
+    inx, iny = (x > 1.4) & (x < 2.0), np.abs(y) < 2.0
+    g = np.where(inx, 60.0 * (x - 1.4) ** 2 * (2.0 - x) ** 2, 0.0)
+    h = np.where(iny, (1.0 - y**2 / 4.0) ** 2, 0.0)
+    dg = np.where(inx, 120.0 * (x - 1.4) * (2.0 - x) * (3.4 - 2.0 * x), 0.0)
+    dh = np.where(iny, -y * (1.0 - y**2 / 4.0), 0.0)
+    J = np.zeros((p.shape[0], 2, 2))
+    J[:, 0, 0] = 0.6 + dg * h
+    J[:, 0, 1] = g * dh
+    J[:, 1, 1] = 1.0
+    return J
 
 
 # ---------------------------------------------------------------------------
@@ -664,3 +699,301 @@ def test_seeding_a_float32_mesh_raytraces_its_outer_boundary_again():
     assert np.array_equal(
         beta[~edge], to_np(mesh.vertices_source)[~edge].astype(np.float64)
     )
+
+
+# ---------------------------------------------------------------------------
+# extend_adaptive_mesh
+# ---------------------------------------------------------------------------
+
+
+def fresh_equivalent(kw, target):
+    """``build`` arguments for a fresh build of ``target`` on the same cells."""
+    out = dict(kw)
+    out["init_res"] = round(kw["init_res"] * target / kw["fov"])
+    out["fov"] = target
+    return out
+
+
+EQUIVALENCE = {
+    "sie_like": (
+        sie_like,
+        sie_like_jacobian,
+        dict(fov=2.0, init_res=4, min_img_sep=0.05),
+        3.0,
+    ),
+    "localised_fold": (
+        localised_fold,
+        localised_fold_jacobian,
+        dict(fov=4.0, init_res=4, min_img_sep=0.05),
+        6.0,
+    ),
+    "row_fold": (
+        row_fold,
+        row_fold_jacobian,
+        dict(fov=4.0, init_res=8, min_img_sep=2e-2),
+        6.0,
+    ),
+    "nan_across_seam": (
+        *broken_where(localised_fold, localised_fold_jacobian, lambda p: p[:, 0] > 1.5),
+        dict(fov=4.0, init_res=4, min_img_sep=0.05),
+        6.0,
+    ),
+    "affine": (
+        affine,
+        affine_jacobian,
+        dict(fov=4.0, init_res=4, min_img_sep=0.05),
+        6.0,
+    ),
+    "seam_fold": (*seam_fold(2.0), dict(fov=4.0, init_res=4, min_img_sep=0.05), 6.0),
+    "ring_fold": (*ring_fold(2.0), dict(fov=4.0, init_res=4, min_img_sep=0.05), 6.0),
+    "edge_bump": (
+        edge_bump,
+        edge_bump_jacobian,
+        dict(fov=4.0, init_res=4, min_img_sep=0.05),
+        6.0,
+    ),
+    "off_centre": (
+        localised_fold,
+        localised_fold_jacobian,
+        dict(fov=4.0, init_res=8, min_img_sep=0.05, x0=0.5, y0=-0.25),
+        6.0,
+    ),
+    "depth_limited": (
+        localised_fold,
+        localised_fold_jacobian,
+        dict(fov=4.0, init_res=4, min_img_sep=0.05, max_depth=3),
+        6.0,
+    ),
+}
+
+
+@pytest.mark.filterwarnings("ignore:Adaptive mesh is depth-limited")
+@pytest.mark.parametrize("case", list(EQUIVALENCE))
+def test_an_extension_is_the_fresh_build_of_the_larger_fov(case):
+    fn, jac, kw, target = EQUIVALENCE[case]
+    mesh, lens, _ = build(fn, jac, **kw)
+    got = new.extend_adaptive_mesh(mesh, lens, target)
+    want, _, _ = build(fn, jac, **fresh_equivalent(kw, target))
+    assert got.init_res > mesh.init_res
+    assert_meshes_equal(got, want)
+
+
+def test_extensions_chain():
+    kw = dict(fov=4.0, init_res=8, min_img_sep=0.05)
+    mesh, lens, _ = build(localised_fold, localised_fold_jacobian, **kw)
+    twice = new.extend_adaptive_mesh(
+        new.extend_adaptive_mesh(mesh, lens, 6.0), lens, 8.0
+    )
+    once = new.extend_adaptive_mesh(mesh, lens, 8.0)
+    fresh, _, _ = build(
+        localised_fold, localised_fold_jacobian, **fresh_equivalent(kw, 8.0)
+    )
+    assert_meshes_equal(twice, fresh)
+    assert_meshes_equal(once, fresh)
+
+
+def test_extending_a_float32_mesh_matches_a_fresh_float32_build():
+    kw = dict(fov=4.0, init_res=4, min_img_sep=0.05, dtype=backend.float32)
+    mesh, lens, _ = build(localised_fold, localised_fold_jacobian, **kw)
+    got = new.extend_adaptive_mesh(mesh, lens, 6.0)
+    want, _, _ = build(
+        localised_fold, localised_fold_jacobian, **fresh_equivalent(kw, 6.0)
+    )
+    assert got.dtype == backend.float32
+    assert_meshes_equal(got, want)
+
+
+def _in_any_triangle(points, triangles):
+    """True where an integer point lies in or on some integer triangle."""
+    a, b, c = triangles[:, 0], triangles[:, 1], triangles[:, 2]
+    p = points[:, None, :]
+
+    def cross(u, v, w):
+        return (v[..., 0] - u[..., 0]) * (w[..., 1] - u[..., 1]) - (
+            v[..., 1] - u[..., 1]
+        ) * (w[..., 0] - u[..., 0])
+
+    d = np.stack((cross(a, b, p), cross(b, c, p), cross(c, a, p)), axis=-1)
+    return ((d >= 0).all(axis=-1) | (d <= 0).all(axis=-1)).any(axis=1)
+
+
+def test_an_extension_calls_the_lens_only_in_the_ring_and_in_old_leaves_it_splits():
+    """No Jacobian call strictly inside the old domain; no old vertex
+    raytraced again; and every raytraced point strictly inside lies in an old
+    leaf the extension split, which ``ring_fold(2.0)`` makes it do."""
+    fn, jac = ring_fold(2.0)
+    mesh, lens, calls = build(fn, jac, 4.0, 4, 0.05)
+    calls["raytrace"].clear()
+    calls["jacobian"].clear()
+    ext = new.extend_adaptive_mesh(mesh, lens, 6.0)
+    lat = ext.lattice
+    pad = lat.origin
+    lo, hi = pad, pad + mesh.lattice.n
+
+    def to_ij(xy):
+        return np.rint((xy - to_np(lat.lo)) / lat.scale).astype(np.int64) + lat.origin
+
+    def strictly_inside(ij):
+        return ((ij > lo) & (ij < hi)).all(axis=1)
+
+    jacobian_ij = to_ij(called_at(calls, "jacobian"))
+    assert jacobian_ij.shape[0] > 0
+    assert not strictly_inside(jacobian_ij).any()
+
+    raytrace_ij = to_ij(called_at(calls, "raytrace"))
+    old_vertices = to_np(mesh.vertices_ij) + pad
+    assert not set(map(tuple, raytrace_ij.tolist())) & set(
+        map(tuple, old_vertices.tolist())
+    )
+
+    inner = raytrace_ij[strictly_inside(raytrace_ij)]
+    kept = {
+        tuple(sorted(map(tuple, t)))
+        for t in to_np(ext.vertices_ij)[to_np(ext.origin_leaves)].tolist()
+    }
+    split = np.array(
+        [
+            t
+            for t in old_vertices[to_np(mesh.origin_leaves)].tolist()
+            if tuple(sorted(map(tuple, t))) not in kept
+        ]
+    )
+    assert inner.shape[0] > 0 and split.shape[0] > 0, "ring_fold must split old leaves"
+    assert _in_any_triangle(inner, split).all()
+
+
+@pytest.fixture
+def affine_mesh():
+    """``h0 = 0.5``: each ring adds ``1.0`` to the fov."""
+    return build(affine, affine_jacobian, 4.0, 8, 0.05)
+
+
+@pytest.mark.parametrize(
+    "fov, want",
+    [
+        (5.9, 6.0),
+        (6.0, 6.0),
+        (6, 6.0),
+        (float(np.nextafter(6.0, np.inf)), 6.0),
+        (4.2, 5.0),
+    ],
+)
+def test_the_requested_fov_rounds_up_to_whole_cells(affine_mesh, fov, want):
+    mesh, lens, _ = affine_mesh
+    ext = new.extend_adaptive_mesh(mesh, lens, fov)
+    assert ext.fov == want
+    assert ext.init_res == round(want / 0.5)
+
+
+@pytest.mark.parametrize("fov", [4.0, 4.0 - 1e-12])
+def test_a_fov_the_mesh_already_covers_returns_the_mesh_itself(affine_mesh, fov):
+    mesh, lens, calls = affine_mesh
+    calls["raytrace"].clear()
+    calls["jacobian"].clear()
+    assert new.extend_adaptive_mesh(mesh, lens, fov) is mesh
+    assert not calls["raytrace"] and not calls["jacobian"]
+
+
+def test_a_smaller_fov_raises(affine_mesh):
+    mesh, lens, _ = affine_mesh
+    with pytest.raises(ValueError, match="can only grow"):
+        new.extend_adaptive_mesh(mesh, lens, 3.9)
+
+
+@pytest.mark.parametrize("fov", [np.nan, np.inf])
+def test_a_non_finite_fov_raises(affine_mesh, fov):
+    mesh, lens, _ = affine_mesh
+    with pytest.raises(ValueError, match="finite"):
+        new.extend_adaptive_mesh(mesh, lens, fov)
+
+
+@pytest.mark.filterwarnings("ignore:raytrace returned")
+def test_an_extension_int64_keys_cannot_hold_raises():
+    """At ``max_level = 25`` the lattice keys in int64 up to ``init_res = 45``."""
+    mesh, lens, _ = build(affine, affine_jacobian, 1.0, 1, 1e-7)
+    assert mesh.max_level == 25
+    assert new.extend_adaptive_mesh(mesh, lens, 45.0).init_res == 45
+    with pytest.raises(ValueError, match="lattice too fine.*Extend by less"):
+        new.extend_adaptive_mesh(mesh, lens, 46.0)
+
+
+def _messages(record):
+    """The ``UserWarning`` messages recorded, in order."""
+    return [str(w.message) for w in record if issubclass(w.category, UserWarning)]
+
+
+def test_an_extension_warns_depth_limited_as_the_fresh_build_would():
+    kw = dict(fov=4.0, init_res=4, min_img_sep=0.05, max_depth=2)
+    with pytest.warns(UserWarning, match="depth-limited"):
+        mesh, lens, _ = build(localised_fold, localised_fold_jacobian, **kw)
+    with warnings.catch_warnings(record=True) as got:
+        warnings.simplefilter("always")
+        new.extend_adaptive_mesh(mesh, lens, 6.0)
+    with warnings.catch_warnings(record=True) as want:
+        warnings.simplefilter("always")
+        build(localised_fold, localised_fold_jacobian, **fresh_equivalent(kw, 6.0))
+    assert any("depth-limited" in m for m in _messages(got))
+    assert _messages(got) == _messages(want)
+
+
+def test_an_extension_checks_the_cancellation_floor_at_the_larger_fov():
+    """float32 resolves ``min_img_sep / 2 = 2e-3`` at fov 4 (floor 1.95e-3)
+    but not at fov 6 (floor 2.39e-3)."""
+    kw = dict(fov=4.0, init_res=4, min_img_sep=4e-3, out_dtype=np.float32)
+    with warnings.catch_warnings(record=True) as base:
+        warnings.simplefilter("always")
+        mesh, lens, _ = build(affine, affine_jacobian, **kw)
+    assert not any("cancellation floor" in m for m in _messages(base))
+    with warnings.catch_warnings(record=True) as got:
+        warnings.simplefilter("always")
+        new.extend_adaptive_mesh(mesh, lens, 6.0)
+    with warnings.catch_warnings(record=True) as want:
+        warnings.simplefilter("always")
+        build(affine, affine_jacobian, **fresh_equivalent(kw, 6.0))
+    assert any("cancellation floor" in m for m in _messages(got))
+    assert _messages(got) == _messages(want)
+
+
+def test_an_extension_closes_the_critical_curves_the_fov_cut():
+    """At fov 2 the tangential curve (radius ~1.18) crosses the domain's
+    edge; at fov 3 it lies inside."""
+    kw = dict(fov=2.0, init_res=4, min_img_sep=0.05)
+    mesh, lens, _ = build(sie_like, sie_like_jacobian, **kw)
+    assert not to_np(crit.mesh_critical_curves(mesh).closed).all()
+    ext = new.extend_adaptive_mesh(mesh, lens, 3.0)
+    got = crit.mesh_critical_curves(ext)
+    fresh, _, _ = build(sie_like, sie_like_jacobian, **fresh_equivalent(kw, 3.0))
+    assert got.closed.shape[0] > 0 and to_np(got.closed).all()
+    for field in crit.CriticalCurves._fields:
+        _assert_same(
+            getattr(got, field),
+            getattr(crit.mesh_critical_curves(fresh), field),
+            field,
+        )
+
+
+def test_an_extension_of_a_mesh_on_a_device_stays_on_it(device):
+    kw = dict(fov=4.0, init_res=4, min_img_sep=0.05, device=device)
+    mesh, lens, _ = build(localised_fold, localised_fold_jacobian, **kw)
+    got = new.extend_adaptive_mesh(mesh, lens, 6.0)
+    want, _, _ = build(
+        localised_fold, localised_fold_jacobian, **fresh_equivalent(kw, 6.0)
+    )
+    assert got.device == device
+    assert backend.device(got.leaves) == backend.device(want.leaves)
+    assert_meshes_equal(got, want)
+
+
+def test_batch_size_and_index_cells_reach_the_extension():
+    fn, jac = seam_fold(2.0)
+    kw = dict(
+        fov=4.0, init_res=4, min_img_sep=0.05, raytrace_batch_size=7, index_cells=16
+    )
+    mesh, lens, calls = build(fn, jac, **kw)
+    calls["raytrace"].clear()
+    got = new.extend_adaptive_mesh(
+        mesh, lens, 6.0, raytrace_batch_size=7, index_cells=16
+    )
+    assert calls["raytrace"] and max(len(xy) for xy in calls["raytrace"]) <= 7
+    want, _, _ = build(fn, jac, **fresh_equivalent(kw, 6.0))
+    assert_meshes_equal(got, want)

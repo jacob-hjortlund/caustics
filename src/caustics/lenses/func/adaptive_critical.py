@@ -359,6 +359,10 @@ def mesh_critical_curves(mesh) -> CriticalCurves:
     coarser converged leaf. Pseudo-caustics of lenses with a singular centre
     are not zero sets of ``det A`` and are not traced.
 
+    A curve the fov cuts can be closed by growing the mesh with
+    :func:`~caustics.lenses.func.adaptive.extend_adaptive_mesh`, which reuses
+    every lens evaluation already made.
+
     Where ``det A`` is exactly zero at a sample -- as it is at ``(1, 0)``,
     ``(-1, 0)``, ``(0, 1)`` and ``(0, -1)`` for an SIS with ``Rein = 1``
     centred on the origin, for instance -- several crossings can sit on that

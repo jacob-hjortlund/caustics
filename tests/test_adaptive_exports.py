@@ -11,6 +11,7 @@ from caustics.lenses import func
 def test_new_symbols_are_re_exported_at_every_package_level(package):
     for name in (
         "build_adaptive_mesh",
+        "extend_adaptive_mesh",
         "mesh_query",
         "mesh_seeds",
         "mesh_forward_raytrace",

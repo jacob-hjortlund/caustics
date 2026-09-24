@@ -7,6 +7,9 @@ This module has two clearly separated halves.
 host-side mesh build. Keeping them in one numerical world is what makes the
 ``NaN`` semantics of :func:`sigma_min_2x2` and :func:`converged_from_deviation`
 verifiable.
+:func:`build_adaptive_mesh` runs them as four stages -- seed, refine,
+balance, freeze -- and :func:`extend_adaptive_mesh` runs the same stages from
+a built mesh, growing it to a larger fov without repeating its lens calls.
 
 **Query kernels** operate on ``backend`` arrays. :func:`mesh_query` and
 :func:`mesh_seeds` return candidate regions and Newton seeds;
@@ -103,6 +106,7 @@ __all__ = (
     "freeze",
     "build_adaptive_mesh",
     "seed_from_mesh",
+    "extend_adaptive_mesh",
     "mesh_query",
     "mesh_seeds",
     "dedup_block_group",
@@ -3785,6 +3789,146 @@ def seed_from_mesh(
         det=_ambient(old_band.det),
     )
     return cache, active, store, band
+
+
+def _extension_cells(mesh, fov) -> int:
+    """
+    Level-0 cells per side that grow ``mesh`` to at least ``fov``.
+
+    The smallest ``k`` with ``mesh.fov + 2 * k * h0 >= fov``, less a
+    tolerance of ``1e-9`` cells, so an fov already on a cell boundary is not
+    pushed out a further ring by one ulp of rounding.
+
+    Raises
+    ------
+    ValueError
+        If ``fov`` is not finite, or is smaller than ``mesh.fov``.
+    """
+    fov = float(fov)
+    if not math.isfinite(fov):
+        raise ValueError(f"fov must be finite, got {fov}")
+    h0 = mesh.lattice.scale * (1 << mesh.lattice.level)
+    cells = (fov - mesh.fov) / (2.0 * h0)
+    if cells < -1e-9:
+        raise ValueError(
+            f"fov={fov:g} is smaller than the mesh's fov={mesh.fov:g}; an "
+            "adaptive mesh can only grow"
+        )
+    return max(0, math.ceil(cells - 1e-9))
+
+
+def extend_adaptive_mesh(
+    mesh, lens, fov, *, raytrace_batch_size=None, index_cells=None
+) -> AdaptiveMesh:
+    """
+    Grow an adaptive mesh to a larger fov about the same centre, reusing its refinement.
+
+    For a mesh whose critical curves the fov cuts open -- see
+    :func:`~caustics.lenses.func.adaptive_critical.mesh_critical_curves` --
+    this adds whole level-0 cells around it instead of rebuilding. The result
+    is bit for bit the mesh :func:`build_adaptive_mesh` produces on the same
+    lattice: both run the same seed, refine, balance and freeze stages, a
+    fresh build seeding from nothing and refining every cell, this seeding
+    from ``mesh`` and refining only the new ring. The refinement criterion
+    reads only a triangle's own samples, so every verdict inside the old
+    domain still holds; only the 2:1 balance reaches across the seam, and
+    :func:`balance` settles it to the same coarsest balanced refinement a
+    fresh build's cascade reaches.
+
+    A fresh :func:`build_adaptive_mesh` at the new fov computes its
+    lattice's corner and spacing from that fov. Those match this mesh's --
+    anchored at the original build, see :func:`extend_lattice` -- exactly
+    when the arithmetic is exact, as with a dyadic fov, ``init_res`` and
+    centre. Otherwise positions differ by rounding, which can in rare cases
+    flip a verdict sitting at a threshold.
+
+    Lens calls: the ring's own refinement, exactly what a fresh build spends
+    there; midpoints inside old leaves the balance force-splits; and, for a
+    mesh not stored at float64, the vertices on its outer boundary, raytraced
+    again so the ring's criterion reads float64 values. No Jacobian call
+    lands strictly inside the old domain. Closure, ordering and indexing
+    still run over the whole mesh, without a lens call.
+
+    Parameters
+    ----------
+    mesh: AdaptiveMesh
+        The mesh to grow. It is not modified.
+    lens:
+        The lens ``mesh`` was built from, with the contract of
+        :func:`build_adaptive_mesh`. Nothing can check that it is the same
+        lens: the mesh deliberately stores none.
+    fov: float
+        Requested side length, about the mesh's own centre. Rounded up to the
+        smallest ``mesh.fov + 2 * k * h0`` reaching it, ``h0`` being the
+        level-0 cell size, within ``1e-9`` cells; the fov meshed is the
+        result's ``fov``.
+
+        *Unit: arcsec*
+    raytrace_batch_size: Optional[int]
+        As for :func:`build_adaptive_mesh`.
+    index_cells: Optional[int]
+        As for :func:`build_adaptive_mesh`. Not stored on the mesh, so pass
+        the build's value again to match a fresh build.
+
+    Returns
+    -------
+    AdaptiveMesh
+        ``mesh`` itself when ``fov`` needs no new cell. Otherwise a new mesh
+        with ``mesh``'s ``min_img_sep``, ``max_level``, ``d_floor``,
+        ``dtype``, ``device`` and centre, and ``init_res`` grown by ``2 * k``.
+
+    Raises
+    ------
+    ValueError
+        If ``fov`` is not finite or is smaller than ``mesh.fov``, or if the
+        grown lattice would overflow int64 keys.
+
+    Warns
+    -----
+    UserWarning
+        Exactly as :func:`build_adaptive_mesh` of the grown fov would: when
+        ``max_depth`` limited the build, and when ``raytrace`` returns a
+        dtype whose cancellation floor at the grown fov exceeds
+        ``min_img_sep``.
+    """
+    k = _extension_cells(mesh, fov)
+    if k == 0:
+        return mesh
+    h0 = mesh.lattice.scale * (1 << mesh.lattice.level)
+    init_res = mesh.init_res + 2 * k
+    fov = mesh.fov + 2 * k * h0
+    check_lattice_keys(
+        init_res,
+        mesh.max_level,
+        "Extend by less, or rebuild with a larger min_img_sep or a lower max_depth.",
+    )
+    warn_depth_limited(fov, init_res, mesh.min_img_sep, mesh.d_floor, mesh.max_level)
+
+    tables = child_matrix_tables()
+    lat = extend_lattice(mesh.lattice, k)._replace(lo=_ambient(mesh.lattice.lo))
+    raytrace_fn = make_raytrace(lens.raytrace, mesh.device)
+    cache, active, store, seed_band = seed_from_mesh(
+        mesh, lat, k, raytrace_fn, raytrace_batch_size
+    )
+    return _grow(
+        raytrace_fn,
+        lens.jacobian_lens_equation,
+        lat,
+        tables,
+        roots=ring_triangles(init_res, k, lat.level, tables[4]),
+        seed=(cache, active, store),
+        seed_band=seed_band,
+        fov=fov,
+        init_res=init_res,
+        h0=h0,
+        min_img_sep=mesh.min_img_sep,
+        d_floor=mesh.d_floor,
+        max_level=mesh.max_level,
+        device=mesh.device,
+        dtype=mesh.dtype,
+        raytrace_batch_size=raytrace_batch_size,
+        index_cells=index_cells,
+    )
 
 
 # ---------------------------------------------------------------------------
