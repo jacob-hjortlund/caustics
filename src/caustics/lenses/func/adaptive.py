@@ -85,6 +85,8 @@ __all__ = (
     "sample_jacobians",
     "band_from_samples",
     "band_leaf_index",
+    "band_sample_keys",
+    "merge_bands",
     "refine",
     "canonical_order",
     "min_angle",
@@ -93,6 +95,9 @@ __all__ = (
     "MeshIndex",
     "build_index",
     "AdaptiveMesh",
+    "warn_depth_limited",
+    "warn_cancellation_floor",
+    "freeze",
     "build_adaptive_mesh",
     "mesh_query",
     "mesh_seeds",
@@ -1878,11 +1883,13 @@ class CriticalBand(NamedTuple):
     leaves: ArrayLike
         Shape ``(F,)`` int64 index into ``AdaptiveMesh.leaves``. As
         :func:`refine` returns it, an index into the :class:`LeafStore`'s
-        rows instead; :func:`build_adaptive_mesh` maps it onto the mesh.
+        rows instead; :func:`freeze` maps it onto the mesh and sorts the
+        rows by it, so row order depends on the mesh alone.
     samples: ArrayLike
         Shape ``(F, 6)`` int64 index into ``lens``, ``source`` and ``det``:
         each leaf's ``theta_1, theta_2, theta_3, m_1, m_2, m_3``, the vertices
         in the leaf's own order and ``m_i`` opposite ``theta_i``.
+        Samples are numbered in ascending lattice-key order.
     lens: ArrayLike
         Lens-plane position of each sample, shape ``(S, 2)``, at the mesh
         dtype.
@@ -2072,6 +2079,91 @@ def band_leaf_index(valid, order, origin, rows) -> ArrayLike:
     compact = backend.cumsum(backend.long(valid), dim=0)[rows] - 1
     canonical = backend.argsort(order)[compact]
     return backend.searchsorted(origin, canonical)
+
+
+def band_sample_keys(lat, cache, store, rows) -> ArrayLike:
+    """
+    Lattice keys of the six samples of each store row, shape ``(F, 6)``.
+
+    In :class:`CriticalBand` order, ``theta_1, theta_2, theta_3, m_1, m_2,
+    m_3``: the vertices through the vertex cache, the midpoints exact on the
+    lattice through :func:`midpoint_ij`.
+    """
+    ij = cache.ij[store.v[rows]]
+    return lattice_key(lat, backend.concatenate((ij, midpoint_ij(ij)), dim=1))
+
+
+def merge_bands(lat, cache, store, first, second) -> CriticalBand:
+    """
+    One :class:`CriticalBand` from two whose ``leaves`` are disjoint store rows.
+
+    A band's samples are its distinct sample keys in ascending order -- true
+    of every band :func:`band_from_samples` returns and of every band this
+    returns -- so each band's own keys follow from its rows alone. The merged
+    band has one sample per distinct key over both, ascending again. A key
+    both hold -- a sample on the seam between an old mesh and the ring an
+    extension adds -- takes ``first``'s ``det`` and ``source``, so every
+    sample has one value, which is what
+    :func:`~caustics.lenses.func.adaptive_critical.trace_band` chains on.
+    ``lens`` is recomputed from the keys by :func:`lattice_xy`.
+
+    Every scatter writes distinct indices: all of ``first``'s positions, and
+    only those of ``second``'s that ``first`` lacks.
+
+    Parameters
+    ----------
+    lat: Lattice
+    cache: VertexCache
+    store: LeafStore
+    first, second: CriticalBand
+        ``leaves`` index ``store``'s rows; ``source`` and ``det`` float64.
+
+    Returns
+    -------
+    CriticalBand
+        ``leaves`` is ``first.leaves`` then ``second.leaves``, still store
+        rows; ``lens`` and ``source`` float64.
+
+    Raises
+    ------
+    AssertionError
+        If a band's rows do not hold exactly its samples.
+    """
+    if first.leaves.shape[0] + second.leaves.shape[0] == 0:
+        return empty_band()
+    k1 = band_sample_keys(lat, cache, store, first.leaves)
+    k2 = band_sample_keys(lat, cache, store, second.leaves)
+    own1 = backend.unique(k1.reshape(-1))
+    own2 = backend.unique(k2.reshape(-1))
+    # `raise AssertionError` rather than a bare `assert`: `python -O` strips
+    # bare asserts, and a band read off the wrong keys would pair samples
+    # with another point's values.
+    if own1.shape[0] != first.det.shape[0] or own2.shape[0] != second.det.shape[0]:
+        raise AssertionError("a band's rows do not hold exactly its samples")
+    keys, samples = backend.unique(
+        backend.concatenate((k1, k2), dim=0).reshape(-1), return_inverse=True
+    )
+    at1 = backend.searchsorted(keys, own1)
+    at2 = backend.searchsorted(keys, own2)
+    if own1.shape[0]:
+        pos = backend.clamp(backend.searchsorted(own1, own2), 0, own1.shape[0] - 1)
+        only2 = backend.flatnonzero(own1[pos] != own2)
+    else:
+        only2 = backend.arange(own2.shape[0], dtype=backend.int64)
+    n = keys.shape[0]
+    det = backend.zeros((n,), dtype=backend.float64)
+    det = backend.fill_at_indices(det, at2[only2], second.det[only2])
+    det = backend.fill_at_indices(det, at1, first.det)
+    source = backend.zeros((n, 2), dtype=backend.float64)
+    source = backend.fill_at_indices(source, at2[only2], second.source[only2])
+    source = backend.fill_at_indices(source, at1, first.source)
+    return CriticalBand(
+        leaves=backend.concatenate((first.leaves, second.leaves), dim=0),
+        samples=samples.reshape(-1, 6),
+        lens=lattice_xy(lat, lattice_ij_from_key(lat, keys)),
+        source=source,
+        det=det,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2909,6 +3001,10 @@ class AdaptiveMesh(NamedTuple):
         Source-plane image of every vertex, shape ``(V, 2)``, at ``dtype``.
 
         *Unit: arcsec*
+    vertices_ij: ArrayLike
+        Lattice coordinates of every vertex, shape ``(V, 2)`` int64 -- the
+        integer pair ``vertices_lens`` is computed from, exact at any
+        ``dtype``. Vertices are in ascending lattice-key order.
     leaves: ArrayLike
         Terminal-triangle vertex indices, shape ``(L, 3)`` int64 into both
         vertex arrays, positively oriented.
@@ -2935,6 +3031,11 @@ class AdaptiveMesh(NamedTuple):
     origin_leaves: ArrayLike
         Shape ``(N, 3)`` int64, the pre-closure leaves' own vertex slots --
         what ``leaf_origin`` indexes into.
+    origin_cls: ArrayLike
+        Shape ``(N,)`` int64 orientation class of each pre-closure leaf, as
+        :func:`child_matrix_tables` defines it. With ``origin_leaves``,
+        ``leaf_level`` and ``leaf_status`` it is the whole pre-closure leaf
+        store, which :func:`seed_from_mesh` rebuilds from.
     index: MeshIndex
         Spatial index over the source-plane bounding boxes of the
         ``LEAF_CONVERGED`` leaves, and of no other.
@@ -2945,6 +3046,16 @@ class AdaptiveMesh(NamedTuple):
         :func:`~caustics.lenses.func.adaptive_critical.mesh_critical_curves`
         needs no lens. A superset of the ``LEAF_JACOBIAN_PARITY_UNRESOLVED``
         leaves; see :class:`CriticalBand`.
+    lattice: Lattice
+        The lattice the mesh lives on, ``lo`` on ``device``. An extended
+        mesh keeps its original build's ``lo`` and ``scale`` with
+        ``origin > 0``; see :func:`extend_lattice`.
+    fov: float
+        Side length of the square domain actually meshed.
+
+        *Unit: arcsec*
+    init_res: int
+        Level-0 cells per axis actually meshed.
     d_floor: int
         Level at which the level-0 hypotenuse first falls to ``min_img_sep``,
         uncapped by ``max_depth``.
@@ -2963,12 +3074,14 @@ class AdaptiveMesh(NamedTuple):
 
     vertices_lens: ArrayLike
     vertices_source: ArrayLike
+    vertices_ij: ArrayLike
     leaves: ArrayLike
     leaf_area2: ArrayLike
     leaf_origin: ArrayLike
     leaf_status: ArrayLike
     leaf_level: ArrayLike
     origin_leaves: ArrayLike
+    origin_cls: ArrayLike
     # `index` shadows `tuple.index` (the element-lookup method) by name --
     # deliberately, per the interface this task specifies -- which mypy
     # flags as incompatible with the inherited method's type. Runtime is
@@ -2977,11 +3090,236 @@ class AdaptiveMesh(NamedTuple):
     # calls the shadowed `.index(value)` lookup method.
     index: MeshIndex  # type: ignore[assignment]
     critical_band: CriticalBand
+    lattice: Lattice
+    fov: float
+    init_res: int
     d_floor: int
     max_level: int
     min_img_sep: float
     dtype: Any
     device: Any
+
+
+def warn_depth_limited(fov, init_res, min_img_sep, d_floor, max_level) -> None:
+    """
+    Warn when ``max_depth`` stopped refinement short of the size floor.
+
+    Shared by :func:`build_adaptive_mesh` and :func:`extend_adaptive_mesh`, so
+    an extension warns exactly as a fresh build of its fov would. Refinement
+    is depth-limited exactly when ``d_floor > max_level``, and ``max_level``
+    is then ``max_depth``, so the message names ``max_depth`` without being
+    given it. ``min_img_sep`` is the halved tolerance; the caller's request
+    is ``2 * min_img_sep`` exactly, since halving is exact.
+    """
+    if d_floor <= max_level:
+        return
+    l_max_final = float(math.sqrt(2.0) * fov / (init_res * 2**max_level))
+    warn(
+        f"Adaptive mesh is depth-limited: max_depth={max_level} is below "
+        f"d_floor={d_floor}, the depth required to reach "
+        f"min_img_sep={2 * min_img_sep:g} arcsec (refined internally "
+        f"to {min_img_sep:g}). Refinement stops at level {max_level}, "
+        f"where the maximum leaf edge is {l_max_final:.3g} arcsec. Set "
+        f"max_depth >= {d_floor} to restore the size-floor guarantee, or "
+        f"raise init_res / min_img_sep."
+    )
+
+
+def warn_cancellation_floor(raytrace_fn, fov, min_img_sep) -> None:
+    """
+    Warn when the dtype ``raytrace`` returned cannot resolve ``min_img_sep``.
+
+    The midpoint deviation compares ``O(fov)`` quantities, so its roundoff
+    floor is ``sqrt(8 * eps * fov)`` (see :func:`make_raytrace`). ``fov`` is
+    the fov being meshed, so an extension checks the larger one.
+    ``min_img_sep`` is the halved tolerance, as for
+    :func:`warn_depth_limited`.
+    """
+    # `.info` is attached dynamically by `make_raytrace` (documented on its
+    # own `# type: ignore[attr-defined]` there); mypy has no way to see it on
+    # the `Callable[[ArrayLike], ArrayLike]` return annotation.
+    raytrace_dtype = raytrace_fn.info["dtype"]  # type: ignore[attr-defined]
+    eps = float(backend.finfo(raytrace_dtype).eps)
+    cancellation_floor = float(math.sqrt(8.0 * eps * fov))
+    if cancellation_floor > min_img_sep:
+        warn(
+            f"raytrace returned {raytrace_dtype}, whose "
+            f"cancellation floor sqrt(8*eps*fov) = {cancellation_floor:.3g} "
+            f"arcsec exceeds min_img_sep={2 * min_img_sep:g} (refined "
+            f"internally to {min_img_sep:g}). Below that scale the midpoint "
+            "deviation cancels to zero, which the criterion reads as "
+            "'affine' and converges. Supply a raytrace that preserves "
+            "float64."
+        )
+
+
+def freeze(
+    lat,
+    cache,
+    active,
+    store,
+    band,
+    seed_band,
+    *,
+    fov,
+    init_res,
+    min_img_sep,
+    d_floor,
+    max_level,
+    dtype,
+    device,
+    index_cells,
+) -> AdaptiveMesh:
+    """
+    Close, order, index and freeze a balanced refinement.
+
+    The last stage of every build: canonical ordering and closure, the
+    critical band merged and mapped onto the closed leaves, vertex
+    compaction, freeze-time invalidation, and the spatial index. It makes no
+    lens call. :func:`build_adaptive_mesh` and :func:`extend_adaptive_mesh`
+    both end here, so the frozen mesh is a function of the refinement alone,
+    never of the order it was produced in.
+
+    Parameters
+    ----------
+    lat: Lattice
+    cache: VertexCache
+    active: ArrayLike
+    store: LeafStore
+        Balanced, so :func:`balance` has run.
+    band: CriticalBand
+        :func:`refine`'s own, ``leaves`` indexing ``store``'s rows.
+    seed_band: CriticalBand
+        The band carried over from a seeding mesh, ``leaves`` indexing
+        ``store``'s rows too; :func:`empty_band` for a fresh build. It wins
+        :func:`merge_bands`' tie on a shared sample.
+    fov: float
+        *Unit: arcsec*
+    init_res: int
+    min_img_sep: float
+        The halved tolerance the build refined to.
+
+        *Unit: arcsec*
+    d_floor, max_level: int
+    dtype: Optional
+        Frozen-mesh dtype, ``backend.float64`` when ``None``.
+    device: Optional
+    index_cells: Optional[int]
+        Forwarded to :func:`build_index`.
+
+    Returns
+    -------
+    AdaptiveMesh
+    """
+    pre_v, pre_level, pre_cls, pre_status = store_compact(store)
+    order = canonical_order(lat, cache, pre_v)
+    pre_v, pre_level = pre_v[order], pre_level[order]
+    pre_cls, pre_status = pre_cls[order], pre_status[order]
+    leaf_v, origin, leaf_level, leaf_status = close(
+        lat, cache, active, pre_v, pre_level, pre_status
+    )
+    band = merge_bands(lat, cache, store, seed_band, band)
+    band_leaves = band_leaf_index(store.valid, order, origin, band.leaves)
+    # Trip-wire for the index chase above: a band row that landed on any leaf
+    # but its own would pair one leaf's samples with another's vertices.
+    if not bool(backend.all(leaf_v[band_leaves] == store.v[band.leaves])):
+        raise AssertionError("a critical-band row did not map onto its own leaf")
+    # Rows in leaf order, so band row order depends on the mesh alone, not on
+    # the order refinement met the leaves in. One band row per leaf: no ties.
+    rows = backend.argsort(band_leaves)
+    band_leaves, band_samples = band_leaves[rows], band.samples[rows]
+
+    # Compaction: sorting by lattice key makes vertex order a function of the
+    # geometry alone and gives row-major locality for query-time gathers.
+    # `leaf_v` alone: every closure pattern re-emits all three of its origin's
+    # vertices, so `pre_v`'s slots are a subset of `leaf_v`'s and unioning them
+    # would sort in millions of redundant entries on a large build. Guarded by
+    # `test_closure_re_emits_every_origin_vertex`, which is what makes this a
+    # checked property rather than an argument.
+    used = backend.unique(leaf_v.reshape(-1))
+    used = used[backend.argsort(lattice_key(lat, cache.ij[used]))]
+    remap = backend.fill_at_indices(
+        backend.zeros((cache_size(cache),), dtype=backend.int64),
+        used,
+        backend.arange(used.shape[0], dtype=backend.int64),
+    )
+    leaves = remap[leaf_v]
+    origin_leaves = remap[pre_v]
+
+    if dtype is None:
+        dtype = backend.float64
+    # Kept on the ambient (pre-`device`) array world here, deliberately: the
+    # gathers and the freeze-time re-check just below index `vs` with
+    # `leaves`/`origin`, which are still on that same ambient world, so moving
+    # `vs` to `device` before them would risk indexing a `device` array with
+    # an off-`device` index array. `device` is applied uniformly to every
+    # returned field in one pass at the very end instead, once nothing further
+    # indexes across them.
+    vl = backend.to(lattice_xy(lat, cache.ij[used]), dtype=dtype)
+    vs = backend.to(cache.beta[used], dtype=dtype)
+
+    # Re-check finiteness at freeze. A LEAF_CONVERGED leaf produced by the
+    # balance cascade inherits vertices from a parent whose midpoints were
+    # never finiteness-tested, and a closure triangle can pick up a midpoint
+    # no criterion ever saw, so a non-finite vertex can reach here on a leaf
+    # not already flagged. Without this it would enter the index and swallow
+    # every query in its cell.
+    #
+    # `LEAF_RAYTRACE_NONFINITE` is propagated UP to the origin and then back
+    # DOWN to every leaf, rather than being applied to the leaf alone: the
+    # termination-reason counts are pre-closure, so marking only the leaf
+    # would leave them disagreeing with the pre-closure leaf count. It is
+    # also the conservative direction -- if one triangle of a region has a
+    # bad vertex, the region is not trustworthy.
+    pre_status = invalidate_nonfinite_origins(vs, leaves, origin, pre_status)
+    leaf_status = pre_status[origin]
+
+    P = shape_matrix(vs[leaves])
+    leaf_area2 = P[:, 0, 0] * P[:, 1, 1] - P[:, 0, 1] * P[:, 1, 0]
+    valid_rows = backend.flatnonzero(leaf_status == LEAF_CONVERGED)
+    index = build_index(vs, leaves, valid_rows, index_cells)
+
+    def to_device(array):
+        return backend.to(array, device=device)
+
+    critical_band = CriticalBand(
+        leaves=to_device(band_leaves),
+        samples=to_device(band_samples),
+        lens=to_device(backend.to(band.lens, dtype=dtype)),
+        source=to_device(backend.to(band.source, dtype=dtype)),
+        det=to_device(band.det),
+    )
+
+    return AdaptiveMesh(
+        vertices_lens=to_device(vl),
+        vertices_source=to_device(vs),
+        vertices_ij=to_device(cache.ij[used]),
+        leaves=to_device(leaves),
+        leaf_area2=to_device(leaf_area2),
+        leaf_origin=to_device(origin),
+        leaf_status=to_device(leaf_status),
+        leaf_level=to_device(leaf_level),
+        origin_leaves=to_device(origin_leaves),
+        origin_cls=to_device(pre_cls),
+        index=MeshIndex(
+            lo=to_device(index.lo),
+            hi=to_device(index.hi),
+            cell=to_device(index.cell),
+            nx=index.nx,
+            ny=index.ny,
+            cell_offsets=to_device(index.cell_offsets),
+            cell_leaves=to_device(index.cell_leaves),
+        ),
+        critical_band=critical_band,
+        lattice=lat._replace(lo=to_device(lat.lo)),
+        fov=float(fov),
+        init_res=int(init_res),
+        d_floor=d_floor,
+        max_level=max_level,
+        min_img_sep=float(min_img_sep),
+        dtype=dtype,
+        device=device,
+    )
 
 
 def build_adaptive_mesh(
@@ -3075,30 +3413,18 @@ def build_adaptive_mesh(
 
     # The parity-condemned band at max_level is model-dependent. Refining to
     # half the requested separation narrows it, without implying a universal
-    # bound on its width. Halved once, here, before any use, so
-    # every computation below -- validation, the depth floor, max_level,
-    # l_max_final and its depth-limited warning, the refine call, the
-    # cancellation-floor check, and the value stored on the returned mesh --
-    # sees this one halved value and never the caller's original.
-    # `requested_min_img_sep` is kept alongside purely so the messages
-    # below can name what the caller actually passed, rather than quoting them
-    # a number they never supplied.
+    # bound on its width. Halved once, here, before any use, so every stage
+    # below -- validation, the depth floor, max_level, both warnings, refine,
+    # and the value stored on the returned mesh -- sees this one halved value
+    # and never the caller's original. `requested_min_img_sep` is kept so
+    # `validate_build_args` can name what the caller actually passed; the
+    # warning helpers recover it as `2 * min_img_sep`, exact since halving is.
     requested_min_img_sep = min_img_sep
     min_img_sep = min_img_sep / 2
     validate_build_args(fov, init_res, min_img_sep, max_depth, requested_min_img_sep)
     d_floor = depth_floor(fov, init_res, min_img_sep)
     max_level = min(int(max_depth), d_floor)
-    l_max_final = float(math.sqrt(2.0) * fov / (init_res * 2**max_level))
-    if d_floor > max_depth:
-        warn(
-            f"Adaptive mesh is depth-limited: max_depth={max_depth} is below "
-            f"d_floor={d_floor}, the depth required to reach "
-            f"min_img_sep={requested_min_img_sep:g} arcsec (refined internally "
-            f"to {min_img_sep:g}). Refinement stops at level {max_level}, "
-            f"where the maximum leaf edge is {l_max_final:.3g} arcsec. Set "
-            f"max_depth >= {d_floor} to restore the size-floor guarantee, or "
-            f"raise init_res / min_img_sep."
-        )
+    warn_depth_limited(fov, init_res, min_img_sep, d_floor, max_level)
 
     tables = child_matrix_tables()
     lat = make_lattice(fov, x0, y0, init_res, max_level + 1)
@@ -3114,122 +3440,22 @@ def build_adaptive_mesh(
         tables,
         raytrace_batch_size,
     )
-
-    # `.info` is attached dynamically by `make_raytrace` (documented on its
-    # own `# type: ignore[attr-defined]` there); mypy has no way to see it on
-    # the `Callable[[ArrayLike], ArrayLike]` return annotation, so the one
-    # read here is ignored too rather than repeating it at every use below.
-    raytrace_dtype = raytrace_fn.info["dtype"]  # type: ignore[attr-defined]
-    eps = float(backend.finfo(raytrace_dtype).eps)
-    cancellation_floor = float(math.sqrt(8.0 * eps * fov))
-    if cancellation_floor > min_img_sep:
-        warn(
-            f"raytrace returned {raytrace_dtype}, whose "
-            f"cancellation floor sqrt(8*eps*fov) = {cancellation_floor:.3g} "
-            f"arcsec exceeds min_img_sep={requested_min_img_sep:g} (refined "
-            f"internally to {min_img_sep:g}). Below that scale the midpoint "
-            "deviation cancels to zero, which the criterion reads as "
-            "'affine' and converges. Supply a raytrace that preserves "
-            "float64."
-        )
-
-    pre_v, pre_level, _pre_cls, pre_status = store_compact(store)
-    order = canonical_order(lat, cache, pre_v)
-    pre_v, pre_level, pre_status = pre_v[order], pre_level[order], pre_status[order]
-    leaf_v, origin, leaf_level, leaf_status = close(
-        lat, cache, active, pre_v, pre_level, pre_status
-    )
-    band_leaves = band_leaf_index(store.valid, order, origin, band.leaves)
-    # Trip-wire for the index chase above: a band row that landed on any leaf
-    # but its own would pair one leaf's samples with another's vertices.
-    if not bool(backend.all(leaf_v[band_leaves] == store.v[band.leaves])):
-        raise AssertionError("a critical-band row did not map onto its own leaf")
-
-    # Compaction: sorting by lattice key makes vertex order a function of the
-    # geometry alone and gives row-major locality for query-time gathers.
-    # `leaf_v` alone: every closure pattern re-emits all three of its origin's
-    # vertices, so `pre_v`'s slots are a subset of `leaf_v`'s and unioning them
-    # would sort in millions of redundant entries on a large build. Guarded by
-    # `test_closure_re_emits_every_origin_vertex`, which is what makes this a
-    # checked property rather than an argument.
-    used = backend.unique(leaf_v.reshape(-1))
-    used = used[backend.argsort(lattice_key(lat, cache.ij[used]))]
-    remap = backend.fill_at_indices(
-        backend.zeros((cache_size(cache),), dtype=backend.int64),
-        used,
-        backend.arange(used.shape[0], dtype=backend.int64),
-    )
-    leaves = remap[leaf_v]
-    origin_leaves = remap[pre_v]
-
-    if dtype is None:
-        dtype = backend.float64
-    # Kept on the ambient (pre-`device`) array world here, deliberately: the
-    # gathers and the freeze-time re-check just below index `vs` with
-    # `leaves`/`origin`, which are still on that same ambient world, so moving
-    # `vs` to `device` before them would risk indexing a `device` array with
-    # an off-`device` index array. `device` is applied uniformly to every
-    # returned field in one pass at the very end instead, once nothing further
-    # indexes across them.
-    vl = backend.to(lattice_xy(lat, cache.ij[used]), dtype=dtype)
-    vs = backend.to(cache.beta[used], dtype=dtype)
-
-    # Re-check finiteness at freeze. A LEAF_CONVERGED leaf produced by the
-    # balance cascade inherits vertices from a parent whose midpoints were
-    # never finiteness-tested, and a closure triangle can pick up a midpoint
-    # no criterion ever saw, so a non-finite vertex can reach here on a leaf
-    # not already flagged. Without this it would enter the index and swallow
-    # every query in its cell.
-    #
-    # `LEAF_RAYTRACE_NONFINITE` is propagated UP to the origin and then back
-    # DOWN to every leaf, rather than being applied to the leaf alone: the
-    # termination-reason counts are pre-closure, so marking only the leaf
-    # would leave them disagreeing with the pre-closure leaf count. It is
-    # also the conservative direction -- if one triangle of a region has a
-    # bad vertex, the region is not trustworthy.
-    pre_status = invalidate_nonfinite_origins(vs, leaves, origin, pre_status)
-    leaf_status = pre_status[origin]
-
-    P = shape_matrix(vs[leaves])
-    leaf_area2 = P[:, 0, 0] * P[:, 1, 1] - P[:, 0, 1] * P[:, 1, 0]
-    valid_rows = backend.flatnonzero(leaf_status == LEAF_CONVERGED)
-    index = build_index(vs, leaves, valid_rows, index_cells)
-
-    def to_device(array):
-        return backend.to(array, device=device)
-
-    critical_band = CriticalBand(
-        leaves=to_device(band_leaves),
-        samples=to_device(band.samples),
-        lens=to_device(backend.to(band.lens, dtype=dtype)),
-        source=to_device(backend.to(band.source, dtype=dtype)),
-        det=to_device(band.det),
-    )
-
-    return AdaptiveMesh(
-        vertices_lens=to_device(vl),
-        vertices_source=to_device(vs),
-        leaves=to_device(leaves),
-        leaf_area2=to_device(leaf_area2),
-        leaf_origin=to_device(origin),
-        leaf_status=to_device(leaf_status),
-        leaf_level=to_device(leaf_level),
-        origin_leaves=to_device(origin_leaves),
-        index=MeshIndex(
-            lo=to_device(index.lo),
-            hi=to_device(index.hi),
-            cell=to_device(index.cell),
-            nx=index.nx,
-            ny=index.ny,
-            cell_offsets=to_device(index.cell_offsets),
-            cell_leaves=to_device(index.cell_leaves),
-        ),
-        critical_band=critical_band,
+    warn_cancellation_floor(raytrace_fn, fov, min_img_sep)
+    return freeze(
+        lat,
+        cache,
+        active,
+        store,
+        band,
+        empty_band(),
+        fov=fov,
+        init_res=init_res,
+        min_img_sep=min_img_sep,
         d_floor=d_floor,
         max_level=max_level,
-        min_img_sep=float(min_img_sep),
         dtype=dtype,
         device=device,
+        index_cells=index_cells,
     )
 
 
