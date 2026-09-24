@@ -3842,6 +3842,15 @@ def extend_adaptive_mesh(
     centre. Otherwise positions differ by rounding, which can in rare cases
     flip a verdict sitting at a threshold.
 
+    Both statements assume the lens gives the same value at a point whatever
+    batch the point arrives in -- the assumption :func:`trace_keys` makes
+    for ``batch_size``. The extension traces its points in different batches
+    from a fresh build, so a lens whose vectorized kernels differ in the last
+    bit between batches, as an EPL ``SinglePlane`` has been measured to, gives
+    the same leaves, statuses and index with a handful of images and
+    determinants one ulp apart -- no more than two fresh builds with different
+    ``raytrace_batch_size`` differ by.
+
     Lens calls: the ring's own refinement, exactly what a fresh build spends
     there; midpoints inside old leaves the balance force-splits; and, for a
     mesh not stored at float64, the vertices on its outer boundary, raytraced
