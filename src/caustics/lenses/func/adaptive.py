@@ -73,6 +73,7 @@ __all__ = (
     "store_remove",
     "store_compact",
     "initial_triangles",
+    "ring_triangles",
     "midpoint_ij",
     "red_split",
     "edge_quarter_keys",
@@ -87,7 +88,9 @@ __all__ = (
     "band_leaf_index",
     "band_sample_keys",
     "merge_bands",
+    "force_split",
     "refine",
+    "balance",
     "canonical_order",
     "min_angle",
     "close",
@@ -1539,6 +1542,42 @@ def initial_triangles(
     return backend.concatenate(blocks, dim=0), backend.concatenate(classes, dim=0)
 
 
+def ring_triangles(
+    init_res, k, lattice_level, root_class
+) -> Tuple[ArrayLike, ArrayLike]:
+    """
+    Level-0 triangles of the cells within ``k`` cells of the domain's edge.
+
+    :func:`initial_triangles` of the whole ``init_res x init_res`` grid, less
+    the central ``(init_res - 2k) x (init_res - 2k)`` block of cells: the
+    ring an extension by ``k`` adds around an existing mesh. A row subset of
+    :func:`initial_triangles`, in its order.
+
+    Parameters
+    ----------
+    init_res: int
+        Level-0 cells per axis of the grown grid.
+    k: int
+        Width of the ring, in cells.
+    lattice_level: int
+    root_class: ArrayLike
+        ``ROOT_CLASS`` from :func:`child_matrix_tables`.
+
+    Returns
+    -------
+    ij: ArrayLike
+        ``(T, 3, 2)`` int64 lattice coordinates.
+    cls: ArrayLike
+        ``(T,)`` int64 orientation classes.
+    """
+    ij, cls = initial_triangles(init_res, lattice_level, root_class)
+    # Both root shapes put theta_1 at their cell's (0, 0) corner.
+    cell = ij[:, 0, :] // (1 << int(lattice_level))
+    inner = (cell >= k) & (cell < init_res - k)
+    keep = backend.flatnonzero(~(inner[:, 0] & inner[:, 1]))
+    return ij[keep], cls[keep]
+
+
 def midpoint_ij(ij) -> ArrayLike:
     """
     Edge midpoints ``m1, m2, m3``, with ``m_i`` opposite ``theta_i``.
@@ -2171,6 +2210,84 @@ def merge_bands(lat, cache, store, first, second) -> CriticalBand:
 # ---------------------------------------------------------------------------
 
 
+def force_split(
+    store, cache, lat, active, violators, compose, raytrace_fn, batch_size
+) -> Tuple[LeafStore, VertexCache, ArrayLike, ArrayLike, ArrayLike]:
+    """
+    Split balance violators into auto-converged children.
+
+    The body of every balance cascade, shared by :func:`refine`'s per-level
+    one and :func:`balance`'s fixed point. A forced child is auto-converged
+    -- steps 3-7 are skipped so the cascade cannot re-enter the split
+    machinery from inside itself -- and has no flag of its own: it inherits
+    its parent's status. A violator is bounded to ``level <= max_level - 2``
+    by :func:`find_unbalanced`, and only ``max_level`` rows carry a stored
+    flag, so that status is always ``LEAF_CONVERGED``, transitively. A forced
+    child can still reach freeze with a non-finite vertex;
+    :func:`invalidate_nonfinite_origins` is left to catch that.
+
+    The violators' midpoints are evaluated here when not yet cached. In a
+    fresh build they always are -- every tested triangle cached its
+    midpoints, and a forced child's are drained from ``deferred`` at the top
+    of the next level, before any later cascade can re-force it -- so
+    :func:`evaluate` finds nothing missing and makes no raytrace call. A leaf
+    seeded from a frozen mesh has only its vertices cached, so an extension
+    that forces one traces its midpoints here.
+
+    Parameters
+    ----------
+    store: LeafStore
+    cache: VertexCache
+    lat: Lattice
+    active: ArrayLike
+    violators: ArrayLike
+        Store rows to split, from :func:`find_unbalanced`.
+    compose: ArrayLike
+        ``COMPOSE`` from :func:`child_matrix_tables`.
+    raytrace_fn: Callable[[ArrayLike], ArrayLike]
+        From :func:`make_raytrace`, for midpoints not yet cached.
+    batch_size: Optional[int]
+        Forwarded to :func:`evaluate`.
+
+    Returns
+    -------
+    store: LeafStore
+        ``violators`` removed and their children added.
+    cache: VertexCache
+        With every violator midpoint evaluated.
+    active: ArrayLike
+        With the children's vertices activated.
+    kid_mid: ArrayLike
+        ``(12k,)`` int64 lattice keys of the children's edge midpoints, for
+        the caller to defer or drop.
+    kid_level: ArrayLike
+        ``(4k,)`` int64 level of each child.
+
+    Raises
+    ------
+    AssertionError
+        "cascade hit an unevaluated midpoint" if a midpoint is uncached even
+        after evaluation, where a ``-1`` slot would silently negative-index
+        ``cache.ij`` into wrong geometry.
+    """
+    vv = store.v[violators]
+    mid_keys = lattice_key(lat, midpoint_ij(cache.ij[vv]))
+    cache = evaluate(cache, lat, mid_keys.reshape(-1), raytrace_fn, batch_size)
+    vm = cache_lookup(cache, mid_keys)
+    # `raise AssertionError` rather than a bare `assert`: `python -O` strips
+    # bare asserts, and this one guards against silent geometric corruption.
+    if not bool(backend.all(vm >= 0)):
+        raise AssertionError("cascade hit an unevaluated midpoint")
+    kid_v, kid_cls = red_split(vv, vm, store.cls[violators], compose)
+    kid_level = backend.repeat(store.level[violators] + 1, 4, axis=0)
+    kid_status = backend.repeat(store.status[violators], 4, axis=0)
+    store = store_remove(store, violators)
+    store, _ = store_add(store, kid_v, kid_level, kid_cls, kid_status)
+    active = active_add_slots(active, cache_size(cache), kid_v.reshape(-1))
+    kid_mid = lattice_key(lat, midpoint_ij(cache.ij[kid_v])).reshape(-1)
+    return store, cache, active, kid_mid, kid_level
+
+
 def refine(
     raytrace_fn,
     jacobian_fn,
@@ -2181,6 +2298,9 @@ def refine(
     max_level,
     tables,
     batch_size,
+    *,
+    roots=None,
+    seed=None,
 ):
     """
     Level-synchronous refinement.
@@ -2275,6 +2395,19 @@ def refine(
         ``(M, G, COMPOSE, PINV0, ROOT_CLASS)`` from :func:`child_matrix_tables`.
     batch_size: Optional[int]
         Forwarded to :func:`evaluate` and :func:`trace_keys`.
+    roots: Optional[Tuple[ArrayLike, ArrayLike]]
+        Level-0 triangles to refine, ``(ij, cls)`` as
+        :func:`initial_triangles` returns them. ``None`` refines every cell of
+        the ``init_res x init_res`` grid; an extension passes only its ring,
+        from :func:`ring_triangles`.
+    seed: Optional[Tuple[VertexCache, ArrayLike, LeafStore]]
+        ``(cache, active, store)`` to continue from, as
+        :func:`seed_from_mesh` rebuilds them; ``None`` starts empty. Seeded
+        rows take part in the balance cascade like any other, but only
+        ``roots`` and their descendants are tested. The cascade's frontier
+        bound assumes the leaves were balanced before each level, which a
+        seed need not be, so a seeded run must be followed by
+        :func:`balance`.
 
     Returns
     -------
@@ -2305,9 +2438,10 @@ def refine(
         when the loop ends before ``max_level``.
     """
     M, G, COMPOSE, PINV0, ROOT_CLASS = tables
-    cache = empty_cache()
-    active = empty_active()
-    store = empty_store()
+    if seed is None:
+        cache, active, store = empty_cache(), empty_active(), empty_store()
+    else:
+        cache, active, store = seed
     counters = {
         "converged_level0": 0,
         "parity_splits": 0,
@@ -2320,7 +2454,10 @@ def refine(
         "cascade_rounds": 0,
     }
 
-    active_ij, active_cls = initial_triangles(init_res, lat.level, ROOT_CLASS)
+    if roots is None:
+        active_ij, active_cls = initial_triangles(init_res, lat.level, ROOT_CLASS)
+    else:
+        active_ij, active_cls = roots
     deferred = backend.empty((0,), dtype=backend.int64)
     band = empty_band()
 
@@ -2479,51 +2616,17 @@ def refine(
             if violators.shape[0] == 0:
                 break
             counters["cascade_rounds"] += 1
-            store = store_remove(store, violators)
-            vv = store.v[violators]
-            vij = cache.ij[vv]
-            vm = cache_lookup(cache, lattice_key(lat, midpoint_ij(vij)))
-            # Trip-wire for the re-forcing invariant. A violator's midpoints are
-            # normally already cached, but a forced child re-forced within the
-            # same cascade would still have its midpoints sitting in `deferred`,
-            # and a -1 slot here would silently negative-index `cache.ij` into
-            # wrong geometry rather than raising. See spec section 2.3.
-            #
-            # `raise AssertionError` rather than a bare `assert`: `python -O`
-            # strips bare asserts, and this one guards against silent geometric
-            # corruption, not just a debugging convenience. `active_add_slots`
-            # uses `raise AssertionError` for the same class of guard.
-            if not bool(backend.all(vm >= 0)):
-                raise AssertionError("cascade hit an unevaluated midpoint")
-            kid_v, kid_cls = red_split(vv, vm, store.cls[violators], COMPOSE)
-            kid_level = backend.repeat(store.level[violators] + 1, 4, axis=0)
-            # A forced child is auto-converged: steps 3-7 are skipped so the
-            # cascade cannot re-enter the split machinery from inside itself.
-            #
-            # No flag of its own: a forced child inherits its parent's status
-            # instead. A violator is bounded to `level <= max_level - 2` by
-            # `find_unbalanced`, and the only leaves stored with a nonzero
-            # status sit at `max_level` -- the branch above adds them and
-            # breaks out of the loop before any cascade runs. So every violator
-            # is `LEAF_CONVERGED`, and so is every forced child, transitively,
-            # all the way down the cascade. A forced child can still reach
-            # freeze with a non-finite vertex, via a deferred midpoint the
-            # criterion never saw; `invalidate_nonfinite_origins` is left to
-            # catch that.
-            kid_status = backend.repeat(store.status[violators], 4, axis=0)
-            store, _ = store_add(store, kid_v, kid_level, kid_cls, kid_status)
-            counters["forced"] += int(kid_v.shape[0])
-            kid_ij = cache.ij[kid_v]
-            active = active_add_slots(active, cache_size(cache), kid_v.reshape(-1))
+            store, cache, active, kid_mid, kid_level = force_split(
+                store, cache, lat, active, violators, COMPOSE, raytrace_fn, batch_size
+            )
+            counters["forced"] += int(kid_level.shape[0])
             # Forced children are produced after this level's raytrace call has
             # gone out, and land at levels the loop will never revisit. Queue
             # their midpoints and drain at the top of the next level, so the
             # one-batch-per-level structure survives. A forced child cannot be
             # re-forced within the same cascade, because the frontier only moves
             # coarser -- so the deferral is never more than one level deep.
-            deferred = backend.concatenate(
-                (deferred, lattice_key(lat, midpoint_ij(kid_ij)).reshape(-1)), dim=0
-            )
+            deferred = backend.concatenate((deferred, kid_mid), dim=0)
             # The MAXIMUM kid level, not the minimum: a kid at level L invalidates
             # neighbours at level <= L-2, so the minimum would skip violators.
             # The maximum strictly decreases each round, which terminates the loop.
@@ -2534,6 +2637,63 @@ def refine(
             break
 
     return cache, active, store, counters, band
+
+
+def balance(
+    store, cache, lat, active, max_level, compose, raytrace_fn, batch_size
+) -> Tuple[LeafStore, VertexCache, ArrayLike, int]:
+    """
+    Force-split until no leaf is unbalanced: the coarsest 2:1-balanced refinement.
+
+    :func:`refine`'s cascade scans only rows at ``level <= frontier_level -
+    2``, which is complete only when the leaves were balanced before each
+    level. That holds in a fresh build, whose new vertices only ever appear
+    at the frontier, and fails in an extension, whose ring starts at level 0
+    beside old leaves as deep as ``max_level``. This scans every valid row at
+    ``level <= max_level - 2`` instead, splits what it finds with
+    :func:`force_split`, and repeats until a scan finds nothing.
+
+    Every row split has an active quarter point, and active vertices are only
+    ever added, so every balanced refinement containing the current leaves
+    splits that row too. The fixed point is therefore the coarsest balanced
+    refinement of the leaves it started from -- the unique mesh a fresh
+    build's incremental cascade reaches -- whatever order rows are met in.
+    Rounds are bounded by the largest level gap between neighbours, at most
+    about ``max_level``, each one scan of the store. After a fresh
+    :func:`refine` the first scan finds nothing. ``max_level`` rows are never
+    split, so every critical-band row stays a leaf.
+
+    Parameters
+    ----------
+    store: LeafStore
+    cache: VertexCache
+    lat: Lattice
+    active: ArrayLike
+    max_level: int
+    compose: ArrayLike
+        ``COMPOSE`` from :func:`child_matrix_tables`.
+    raytrace_fn: Callable[[ArrayLike], ArrayLike]
+        Forwarded to :func:`force_split`, for midpoints not yet cached.
+    batch_size: Optional[int]
+        Forwarded to :func:`force_split`.
+
+    Returns
+    -------
+    store: LeafStore
+    cache: VertexCache
+    active: ArrayLike
+    forced: int
+        Children created; zero when the leaves were already balanced.
+    """
+    forced = 0
+    while True:
+        violators = find_unbalanced(store, cache, lat, active, max_level, max_level)
+        if violators.shape[0] == 0:
+            return store, cache, active, forced
+        store, cache, active, _, kid_level = force_split(
+            store, cache, lat, active, violators, compose, raytrace_fn, batch_size
+        )
+        forced += int(kid_level.shape[0])
 
 
 # ---------------------------------------------------------------------------
@@ -3322,6 +3482,76 @@ def freeze(
     )
 
 
+def _grow(
+    raytrace_fn,
+    jacobian_fn,
+    lat,
+    tables,
+    *,
+    roots,
+    seed,
+    seed_band,
+    fov,
+    init_res,
+    h0,
+    min_img_sep,
+    d_floor,
+    max_level,
+    device,
+    dtype,
+    raytrace_batch_size,
+    index_cells,
+) -> AdaptiveMesh:
+    """
+    Refine ``roots`` over ``seed``, balance, and freeze: the stages both builds share.
+
+    :func:`build_adaptive_mesh` passes every cell and no seed;
+    :func:`extend_adaptive_mesh` passes the ring and the old mesh. Running
+    both through here is what makes an extension a fresh build of the larger
+    fov, rather than a second algorithm that happens to agree with one.
+    """
+    cache, active, store, _counters, band = refine(
+        raytrace_fn,
+        jacobian_fn,
+        lat,
+        init_res,
+        h0,
+        min_img_sep,
+        max_level,
+        tables,
+        raytrace_batch_size,
+        roots=roots,
+        seed=seed,
+    )
+    warn_cancellation_floor(raytrace_fn, fov, min_img_sep)
+    store, cache, active, _forced = balance(
+        store,
+        cache,
+        lat,
+        active,
+        max_level,
+        tables[2],
+        raytrace_fn,
+        raytrace_batch_size,
+    )
+    return freeze(
+        lat,
+        cache,
+        active,
+        store,
+        band,
+        seed_band,
+        fov=fov,
+        init_res=init_res,
+        min_img_sep=min_img_sep,
+        d_floor=d_floor,
+        max_level=max_level,
+        dtype=dtype,
+        device=device,
+        index_cells=index_cells,
+    )
+
+
 def build_adaptive_mesh(
     lens,
     fov,
@@ -3340,11 +3570,12 @@ def build_adaptive_mesh(
     Build an adaptively refined triangular mesh of the lens plane.
 
     The mesh is built once and reused across many queries; it does not depend
-    on any query point. This assembles every earlier stage of the module --
-    the lattice, the vertex cache, the refinement loop, canonical ordering and
-    closure, and freeze-time invalidation and indexing -- in the same order
-    the frozen oracle (``old_adaptive.build_adaptive_mesh``) uses, entirely on
-    ``backend`` arrays.
+    on any query point. The build runs four stages, all on ``backend``
+    arrays: :func:`refine` over every level-0 cell, :func:`balance`, and
+    :func:`freeze` -- canonical ordering and closure, the critical band,
+    freeze-time invalidation and the spatial index. :func:`extend_adaptive_mesh`
+    runs the same stages from a built mesh, seeded by :func:`seed_from_mesh`,
+    which is what makes an extension a fresh build of the larger fov.
 
     Parameters
     ----------
@@ -3429,32 +3660,23 @@ def build_adaptive_mesh(
     tables = child_matrix_tables()
     lat = make_lattice(fov, x0, y0, init_res, max_level + 1)
     raytrace_fn = make_raytrace(raytrace, device)
-    cache, active, store, _counters, band = refine(
+    return _grow(
         raytrace_fn,
         jacobian,
         lat,
-        init_res,
-        fov / init_res,
-        min_img_sep,
-        max_level,
         tables,
-        raytrace_batch_size,
-    )
-    warn_cancellation_floor(raytrace_fn, fov, min_img_sep)
-    return freeze(
-        lat,
-        cache,
-        active,
-        store,
-        band,
-        empty_band(),
+        roots=None,
+        seed=None,
+        seed_band=empty_band(),
         fov=fov,
         init_res=init_res,
+        h0=fov / init_res,
         min_img_sep=min_img_sep,
         d_floor=d_floor,
         max_level=max_level,
-        dtype=dtype,
         device=device,
+        dtype=dtype,
+        raytrace_batch_size=raytrace_batch_size,
         index_cells=index_cells,
     )
 

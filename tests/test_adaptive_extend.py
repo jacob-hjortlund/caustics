@@ -411,3 +411,140 @@ def test_merge_bands_rejects_a_band_whose_rows_do_not_hold_its_samples():
     bad = good._replace(det=good.det[:-1], source=good.source[:-1])
     with pytest.raises(AssertionError, match="rows do not hold exactly its samples"):
         new.merge_bands(lat, cache, store, bad, new.empty_band())
+
+
+# ---------------------------------------------------------------------------
+# Seeded refinement and balance
+# ---------------------------------------------------------------------------
+
+
+def refine_setup(fn, jac, fov, init_res, min_img_sep):
+    """Everything `refine` takes for a fresh build of these parameters."""
+    sep = min_img_sep / 2
+    max_level = new.depth_floor(fov, init_res, sep)
+    lens, calls = recording_lens(fn, jac)
+    return SimpleNamespace(
+        lat=new.make_lattice(fov, 0.0, 0.0, init_res, max_level + 1),
+        max_level=max_level,
+        sep=sep,
+        h0=fov / init_res,
+        init_res=init_res,
+        tables=new.child_matrix_tables(),
+        raytrace_fn=new.make_raytrace(lens.raytrace, None),
+        jacobian=lens.jacobian_lens_equation,
+        calls=calls,
+    )
+
+
+def refine_with(ctx, roots=None, seed=None):
+    cache, active, store, _, band = new.refine(
+        ctx.raytrace_fn,
+        ctx.jacobian,
+        ctx.lat,
+        ctx.init_res,
+        ctx.h0,
+        ctx.sep,
+        ctx.max_level,
+        ctx.tables,
+        None,
+        roots=roots,
+        seed=seed,
+    )
+    return cache, active, store, band
+
+
+def balance_with(ctx, cache, active, store):
+    return new.balance(
+        store,
+        cache,
+        ctx.lat,
+        active,
+        ctx.max_level,
+        ctx.tables[2],
+        ctx.raytrace_fn,
+        None,
+    )
+
+
+def leaf_set(lat, cache, store):
+    """Every valid leaf as ``(sorted vertex keys, level, status)``, as a set."""
+    v, level, _, status = new.store_compact(store)
+    keys = np.sort(to_np(new.lattice_key(lat, cache.ij[v])), axis=1)
+    return set(
+        zip(map(tuple, keys.tolist()), to_np(level).tolist(), to_np(status).tolist())
+    )
+
+
+def assert_balanced(lat, cache, active, store, max_level):
+    """No leaf at ``level <= max_level - 2`` has an active quarter point.
+
+    Reads `edge_quarter_keys`, the reference `find_unbalanced` is itself
+    tested against, so `balance` is not judged by its own scan.
+    """
+    v, level, _, _ = new.store_compact(store)
+    rows = backend.flatnonzero(level <= max_level - 2)
+    keys = new.edge_quarter_keys(lat, cache.ij[v[rows]])
+    assert not bool(backend.any(new.active_contains(active, cache, keys)))
+
+
+def test_ring_triangles_are_the_level0_triangles_outside_the_central_block():
+    level = 3
+    root_class = new.child_matrix_tables()[4]
+    every_ij, every_cls = new.initial_triangles(6, level, root_class)
+    ring_ij, ring_cls = new.ring_triangles(6, 1, level, root_class)
+
+    def cells(ij):
+        return to_np(ij)[:, 0, :] // (1 << level)
+
+    def inner(ij):
+        c = cells(ij)
+        return ((c >= 1) & (c < 5)).all(axis=1)
+
+    def as_set(ij, cls):
+        return {(tuple(t.reshape(-1)), c) for t, c in zip(to_np(ij), to_np(cls))}
+
+    assert ring_ij.shape[0] == 2 * (6 * 6 - 4 * 4)
+    assert not inner(ring_ij).any()
+    ring = as_set(ring_ij, ring_cls)
+    every = as_set(every_ij, every_cls)
+    assert ring <= every
+    assert len(every - ring) == int(inner(every_ij).sum())
+
+
+def test_a_fresh_refinement_is_already_balanced_so_balance_forces_nothing():
+    ctx = refine_setup(localised_fold, localised_fold_jacobian, 4.0, 4, 0.05)
+    cache, active, store, _ = refine_with(ctx)
+    before = leaf_set(ctx.lat, cache, store)
+    store, cache, active, forced = balance_with(ctx, cache, active, store)
+    assert forced == 0
+    assert leaf_set(ctx.lat, cache, store) == before
+
+
+def test_refining_in_two_seeded_passes_then_balancing_matches_one_pass():
+    """The extension's mechanics, without the mesh around them.
+
+    The left half of the cells is refined first; the right half is refined
+    seeded with that result and given only its own cells as roots.
+    ``seam_fold(0.0)`` folds just left of ``x = 0`` and is affine right of
+    it, so the second pass converges at level 0 beside deep first-pass leaves
+    and its own cascade never sees them: only `balance` can make the two
+    passes agree with one.
+    """
+    fn, jac = seam_fold(0.0)
+    ctx = refine_setup(fn, jac, 4.0, 4, 0.05)
+    ij, cls = new.initial_triangles(4, ctx.lat.level, ctx.tables[4])
+    half = 2 << ctx.lat.level  # cells with i < 2 lie at x < 0
+    left = backend.flatnonzero(ij[:, 0, 0] < half)
+    right = backend.flatnonzero(ij[:, 0, 0] >= half)
+    cache, active, store, _ = refine_with(ctx, roots=(ij[left], cls[left]))
+    cache, active, store, _ = refine_with(
+        ctx, roots=(ij[right], cls[right]), seed=(cache, active, store)
+    )
+    store, cache, active, forced = balance_with(ctx, cache, active, store)
+
+    one = refine_setup(fn, jac, 4.0, 4, 0.05)
+    cache1, active1, store1, _ = refine_with(one)
+
+    assert forced > 0
+    assert_balanced(ctx.lat, cache, active, store, ctx.max_level)
+    assert leaf_set(ctx.lat, cache, store) == leaf_set(one.lat, cache1, store1)
