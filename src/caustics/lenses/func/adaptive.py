@@ -102,6 +102,7 @@ __all__ = (
     "warn_cancellation_floor",
     "freeze",
     "build_adaptive_mesh",
+    "seed_from_mesh",
     "mesh_query",
     "mesh_seeds",
     "dedup_block_group",
@@ -3679,6 +3680,111 @@ def build_adaptive_mesh(
         raytrace_batch_size=raytrace_batch_size,
         index_cells=index_cells,
     )
+
+
+def _ambient(array) -> ArrayLike:
+    """``array`` on the build's ambient device, where :func:`refine` makes its arrays."""
+    return backend.to(array, device=backend.device(backend.zeros((0,))))
+
+
+def seed_from_mesh(
+    mesh, lat, k, raytrace_fn, batch_size
+) -> Tuple[VertexCache, ArrayLike, LeafStore, CriticalBand]:
+    """
+    Rebuild :func:`refine`'s state from a frozen mesh, on its lattice grown by ``k``.
+
+    A frozen mesh keeps every leaf vertex with its lattice coordinates, and
+    every pre-closure leaf with its level, status and orientation class --
+    everything :func:`refine`, :func:`balance` and :func:`freeze` read, but
+    the midpoints of leaves that never split. :func:`force_split` evaluates
+    those on demand, for the few leaves an extension forces.
+
+    - The cache holds the mesh's vertices at their shifted coordinates, slot
+      ``i`` being mesh vertex ``i``. The vertices are in lattice-key order and
+      the shift keeps it, so the key index is already sorted. ``beta`` is
+      ``vertices_source`` at float64. For a mesh not stored at float64 the
+      vertices on its outer boundary are raytraced again: they are the only
+      old points the ring's criterion reads, and it must read float64 values
+      straight from ``raytrace``, as :func:`make_raytrace` explains.
+    - Every vertex is active: a mesh's vertices are exactly its leaves'.
+    - The store has one row per origin, in ``origin_leaves`` order, with the
+      level and status of its first leaf: ``leaf_origin`` is non-decreasing
+      and every origin has a leaf, so ``searchsorted`` finds it with no
+      scatter. Below ``max_level`` the only flag a status can carry is the
+      freeze-time ``LEAF_RAYTRACE_NONFINITE``, which :func:`freeze` derives
+      again, so those rows are reset to ``LEAF_CONVERGED`` -- which is also
+      what a forced child must inherit, as in a fresh build.
+    - The band is the mesh's own, its ``leaves`` mapped to store rows, with
+      ``lens`` and ``source`` at float64.
+
+    Parameters
+    ----------
+    mesh: AdaptiveMesh
+    lat: Lattice
+        ``extend_lattice(mesh.lattice, k)``, ``lo`` on the ambient device.
+    k: int
+        Level-0 cells added on each side.
+    raytrace_fn: Callable[[ArrayLike], ArrayLike]
+        From :func:`make_raytrace`, for the boundary of a non-float64 mesh.
+    batch_size: Optional[int]
+        Forwarded to :func:`trace_keys`.
+
+    Returns
+    -------
+    cache: VertexCache
+    active: ArrayLike
+    store: LeafStore
+    band: CriticalBand
+        ``leaves`` indexing ``store``'s rows.
+    """
+    pad = int(k) << lat.level
+    ij = _ambient(mesh.vertices_ij) + pad
+    n_vertices = ij.shape[0]
+    beta = backend.to(_ambient(mesh.vertices_source), dtype=backend.float64)
+    if mesh.vertices_source.dtype != backend.float64:
+        old = ij - pad
+        n_old = lat.n - 2 * pad
+        edge = backend.flatnonzero(backend.any((old == 0) | (old == n_old), dim=1))
+        if edge.shape[0]:
+            beta = backend.fill_at_indices(
+                backend.copy(beta),
+                edge,
+                trace_keys(lat, ij[edge], raytrace_fn, batch_size),
+            )
+    cache = VertexCache(
+        keys=lattice_key(lat, ij),
+        slots=backend.arange(n_vertices, dtype=backend.int64),
+        ij=ij,
+        beta=beta,
+    )
+    active = backend.ones((n_vertices,), dtype=backend.bool)
+
+    n_origins = mesh.origin_leaves.shape[0]
+    leaf_origin = _ambient(mesh.leaf_origin)
+    first = backend.searchsorted(
+        leaf_origin, backend.arange(n_origins, dtype=backend.int64)
+    )
+    level = _ambient(mesh.leaf_level)[first]
+    status = backend.where(
+        level == mesh.max_level, _ambient(mesh.leaf_status)[first], LEAF_CONVERGED
+    )
+    store = LeafStore(
+        v=_ambient(mesh.origin_leaves),
+        level=level,
+        cls=_ambient(mesh.origin_cls),
+        status=status,
+        valid=backend.ones((n_origins,), dtype=backend.bool),
+    )
+
+    old_band = mesh.critical_band
+    band = CriticalBand(
+        leaves=leaf_origin[_ambient(old_band.leaves)],
+        samples=_ambient(old_band.samples),
+        lens=backend.to(_ambient(old_band.lens), dtype=backend.float64),
+        source=backend.to(_ambient(old_band.source), dtype=backend.float64),
+        det=_ambient(old_band.det),
+    )
+    return cache, active, store, band
 
 
 # ---------------------------------------------------------------------------

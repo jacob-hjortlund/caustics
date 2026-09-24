@@ -548,3 +548,119 @@ def test_refining_in_two_seeded_passes_then_balancing_matches_one_pass():
     assert forced > 0
     assert_balanced(ctx.lat, cache, active, store, ctx.max_level)
     assert leaf_set(ctx.lat, cache, store) == leaf_set(one.lat, cache1, store1)
+
+
+# ---------------------------------------------------------------------------
+# Seeding from a frozen mesh
+# ---------------------------------------------------------------------------
+
+
+def _assert_same(a, b, name):
+    if hasattr(a, "shape"):
+        a, b = to_np(a), to_np(b)
+        assert (a.dtype, a.shape) == (b.dtype, b.shape), name
+        assert np.array_equal(a, b, equal_nan=a.dtype.kind == "f"), name
+    else:
+        assert a == b, name
+
+
+def assert_meshes_equal(got, want):
+    """Every field equal, arrays bit for bit, NaN matching NaN.
+
+    ``lattice`` is compared as the map it defines -- level, extent, spacing
+    and the positions of its corners -- because an extension keeps its
+    build's anchor (``origin > 0``) where a fresh lattice anchors at its own
+    corner. Every vertex and band position is compared anyway, through
+    ``vertices_lens`` and ``critical_band.lens``.
+    """
+    for name in new.AdaptiveMesh._fields:
+        a, b = getattr(got, name), getattr(want, name)
+        if name == "lattice":
+            assert (a.level, a.n, a.stride, a.scale) == (
+                b.level,
+                b.n,
+                b.stride,
+                b.scale,
+            )
+            corners = backend.to(i64([[0, 0], [a.n, a.n]]), device=backend.device(a.lo))
+            _assert_same(new.lattice_xy(a, corners), new.lattice_xy(b, corners), name)
+        elif name in ("index", "critical_band"):
+            for field in type(a)._fields:
+                _assert_same(getattr(a, field), getattr(b, field), f"{name}.{field}")
+        else:
+            _assert_same(a, b, name)
+
+
+def seed_of(mesh, lens, k):
+    lat = new.extend_lattice(mesh.lattice, k)
+    raytrace_fn = new.make_raytrace(lens.raytrace, None)
+    return (lat, *new.seed_from_mesh(mesh, lat, k, raytrace_fn, None))
+
+
+def test_seeding_a_mesh_and_freezing_it_again_reproduces_it():
+    """With nothing added, seed then freeze is the identity -- non-finite
+    leaves and the band included -- and a float64 mesh costs no lens call."""
+    fn, jac = broken_where(
+        localised_fold, localised_fold_jacobian, lambda p: p[:, 0] > 1.5
+    )
+    mesh, lens, calls = build(fn, jac, 4.0, 4, 0.05)
+    assert mesh.critical_band.leaves.shape[0] > 0
+    assert ((to_np(mesh.leaf_status) & new.LEAF_RAYTRACE_NONFINITE) != 0).any()
+    calls["raytrace"].clear()
+    lat, cache, active, store, band = seed_of(mesh, lens, 0)
+    again = new.freeze(
+        lat,
+        cache,
+        active,
+        store,
+        new.empty_band(),
+        band,
+        fov=mesh.fov,
+        init_res=mesh.init_res,
+        min_img_sep=mesh.min_img_sep,
+        d_floor=mesh.d_floor,
+        max_level=mesh.max_level,
+        dtype=mesh.dtype,
+        device=mesh.device,
+        index_cells=None,
+    )
+    assert_meshes_equal(again, mesh)
+    assert not calls["raytrace"]
+
+
+def test_seeding_drops_the_freeze_time_flag_below_max_level():
+    """Below ``max_level`` a stored flag can only be freeze's
+    ``LEAF_RAYTRACE_NONFINITE``, which freeze derives again and a forced child
+    must not inherit; ``max_level`` rows keep their whole record."""
+    mesh, lens, _ = build(localised_fold, localised_fold_jacobian, 4.0, 4, 0.05)
+    status = to_np(mesh.leaf_status).copy()
+    status[to_np(mesh.leaf_level) < mesh.max_level] |= new.LEAF_RAYTRACE_NONFINITE
+    flagged = mesh._replace(leaf_status=i64(status))
+    _, _, _, store, _ = seed_of(flagged, lens, 0)
+    level, got = to_np(store.level), to_np(store.status)
+    low, top = level < mesh.max_level, level == mesh.max_level
+    assert low.any() and top.any()
+    assert (got[low] == new.LEAF_CONVERGED).all()
+    first = np.searchsorted(to_np(mesh.leaf_origin), np.arange(level.size))
+    assert np.array_equal(got[top], status[first][top])
+
+
+def test_seeding_a_float32_mesh_raytraces_its_outer_boundary_again():
+    """Only the old boundary is re-traced -- the only old points the ring's
+    criterion reads -- and those values come straight from raytrace."""
+    mesh, lens, calls = build(
+        localised_fold, localised_fold_jacobian, 4.0, 4, 0.05, dtype=backend.float32
+    )
+    calls["raytrace"].clear()
+    lat, cache, _, _, _ = seed_of(mesh, lens, 1)
+    old = to_np(mesh.vertices_ij)
+    edge = ((old == 0) | (old == mesh.lattice.n)).any(axis=1)
+    pad = 1 << lat.level
+    xy = to_np(lat.lo) + (old[edge] + pad - lat.origin) * lat.scale
+    assert edge.any() and (~edge).any()
+    assert np.array_equal(called_at(calls, "raytrace"), xy)
+    beta = to_np(cache.beta)
+    assert np.array_equal(beta[edge], localised_fold(xy))
+    assert np.array_equal(
+        beta[~edge], to_np(mesh.vertices_source)[~edge].astype(np.float64)
+    )
