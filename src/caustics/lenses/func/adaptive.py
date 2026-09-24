@@ -43,11 +43,13 @@ __all__ = (
     "MAX_KEY",
     "Lattice",
     "make_lattice",
+    "extend_lattice",
     "lattice_key",
     "lattice_ij_from_key",
     "lattice_xy",
     "lattice_on_boundary",
     "depth_floor",
+    "check_lattice_keys",
     "validate_build_args",
     "VertexCache",
     "empty_cache",
@@ -961,6 +963,24 @@ def depth_floor(fov, init_res, min_img_sep) -> int:
     return int(math.ceil(math.log2(l_max0 / min_img_sep)))
 
 
+def check_lattice_keys(init_res, max_level, remedy) -> None:
+    """
+    Raise if the lattice for ``init_res`` cells at ``max_level`` overflows int64 keys.
+
+    The lattice is built one level finer than ``max_level`` (see
+    :class:`Lattice`), so that is the one sized here. ``remedy`` ends the
+    message: what the caller can change.
+    """
+    n = init_res * (1 << (max_level + 1))
+    if (n + 1) ** 2 >= MAX_KEY:
+        raise ValueError(
+            f"lattice too fine to key in int64: init_res={init_res} at level "
+            f"{max_level} needs a lattice of {n + 1} points per axis, one level "
+            f"finer than max_level so that max_level edge midpoints are lattice "
+            f"points. {remedy}"
+        )
+
+
 def validate_build_args(
     fov, init_res, min_img_sep, max_depth, requested_min_img_sep=None
 ) -> None:
@@ -984,16 +1004,9 @@ def validate_build_args(
     if max_depth < 0:
         raise ValueError(f"max_depth must be non-negative, got {max_depth}")
     max_level = min(max_depth, depth_floor(fov, init_res, min_img_sep))
-    # One level finer than max_level: see `Lattice`. The guard has to size the
-    # lattice actually built, not the finest triangle level.
-    n = init_res * (1 << (max_level + 1))
-    if (n + 1) ** 2 >= MAX_KEY:
-        raise ValueError(
-            f"lattice too fine to key in int64: init_res={init_res} at level "
-            f"{max_level} needs a lattice of {n + 1} points per axis, one level "
-            f"finer than max_level so that max_level edge midpoints are lattice "
-            f"points. Raise min_img_sep, lower max_depth, or lower init_res."
-        )
+    check_lattice_keys(
+        init_res, max_level, "Raise min_img_sep, lower max_depth, or lower init_res."
+    )
 
 
 class Lattice(NamedTuple):
@@ -1022,6 +1035,13 @@ class Lattice(NamedTuple):
     and ``(2 * ij) * (scale / 2)`` rounds the same exact real as ``ij * scale``,
     so every pre-existing point keeps a bit-identical position. Keys scale
     uniformly, so :func:`_canonical_order` is unchanged too.
+
+    ``origin`` is the lattice index ``lo`` belongs to: :func:`lattice_xy`
+    places ``ij`` at ``lo + (ij - origin) * scale``. A fresh lattice has
+    ``origin == 0``, ``lo`` at its corner. :func:`extend_lattice` grows the
+    lattice by shifting every index and ``origin`` together, never ``lo`` or
+    ``scale``, so growth keeps every existing point bit-identical, as
+    widening does.
     """
 
     level: int
@@ -1029,6 +1049,7 @@ class Lattice(NamedTuple):
     stride: int
     scale: float
     lo: ArrayLike
+    origin: int = 0
 
 
 def make_lattice(fov, x0, y0, init_res, lattice_level) -> Lattice:
@@ -1061,13 +1082,49 @@ def make_lattice(fov, x0, y0, init_res, lattice_level) -> Lattice:
     Returns
     -------
     Lattice
+        With origin 0: lo is the lattice's own corner.
     """
     level = int(lattice_level)
     n = int(init_res) * (1 << level)
     stride = n + 1
     scale = float(fov) / n
     lo = backend.as_array([x0 - fov / 2.0, y0 - fov / 2.0], dtype=backend.float64)
-    return Lattice(level=level, n=n, stride=stride, scale=scale, lo=lo)
+    return Lattice(level=level, n=n, stride=stride, scale=scale, lo=lo, origin=0)
+
+
+def extend_lattice(lat, k) -> Lattice:
+    """
+    ``lat`` grown by ``k`` level-0 cells on every side, every old point in place.
+
+    A point at ``ij`` on ``lat`` is at ``ij + (k << lat.level)`` on the
+    result, and ``origin`` moves by the same amount, so ``ij - origin`` -- and
+    with it :func:`lattice_xy` -- is unchanged bit for bit. ``lo`` and
+    ``scale`` are never recomputed: a fresh lattice over the larger fov
+    computes both from that fov and can round differently. The stride grows,
+    so keys change, but a uniform shift keeps their ``(i, j)`` lexicographic
+    order, and with it every key-sorted array.
+
+    Parameters
+    ----------
+    lat: Lattice
+    k: int
+        Level-0 cells added on each side, at least zero.
+
+    Returns
+    -------
+    Lattice
+
+    Raises
+    ------
+    ValueError
+        If ``k`` is negative.
+    """
+    k = int(k)
+    if k < 0:
+        raise ValueError(f"k must be non-negative, got {k}")
+    pad = k << lat.level
+    n = lat.n + 2 * pad
+    return lat._replace(n=n, stride=n + 1, origin=lat.origin + pad)
 
 
 def lattice_key(lat, ij):
@@ -1083,9 +1140,13 @@ def lattice_ij_from_key(lat, key):
 def lattice_xy(lat, ij):
     """Lens-plane position, shape ``(..., 2) -> (..., 2)``.
 
+    ``lo + (ij - origin) * scale``. For a fresh lattice ``origin == 0``, and
+    subtracting zero from an integer is exact, so positions are what they were
+    before the anchor existed.
+
     *Unit: arcsec*
     """
-    return lat.lo + backend.to(ij, dtype=backend.float64) * lat.scale
+    return lat.lo + backend.to(ij - lat.origin, dtype=backend.float64) * lat.scale
 
 
 def lattice_on_boundary(lat, ij):
