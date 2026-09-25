@@ -377,7 +377,9 @@ def join_at_holes(curves, holes) -> CriticalCurves:
     there -- interpolated across the jump -- mean nothing. They are replaced:
 
     1. Every point strictly inside a hole's disk is dropped, which cuts each
-       curve into segments; a curve with no point left is dropped whole.
+       curve into segments; a curve with no point left is dropped whole. A
+       lone point between two points of the same hole counts as inside it
+       too.
     2. A segment that starts right after a dropped point departs from that
        hole's circle; one that ends right before a dropped point arrives at
        it. Other curve ends -- the fov, or a band gap outside every hole --
@@ -389,8 +391,13 @@ def join_at_holes(curves, holes) -> CriticalCurves:
        through a ``det A > 0`` wedge. The join inserts the hole's stored
        samples strictly inside that clockwise interval, their ``lens`` on the
        circle and their ``source`` on the hole curve, with ``hole`` set to the
-       hole's index. A hole whose ends do not alternate -- one the fov cuts,
-       say -- is left unjoined, and its curves stay open.
+       hole's index. A hole whose ends do not alternate is left unjoined, and
+       its curves stay open. A hole the fov cuts may be left unjoined, or may
+       be joined across the part of its circle outside the fov, where
+       branches the mesh never traced can end. Its curves are therefore
+       reliable only once the fov contains the whole hole, which
+       :func:`~caustics.lenses.func.adaptive.extend_adaptive_mesh` can
+       arrange.
     4. The segments are chained through their joins by :func:`chain_order`,
        numbered by their first traced point, so the curves keep
        :func:`trace_band`'s order.
@@ -438,8 +445,8 @@ def join_at_holes(curves, holes) -> CriticalCurves:
         backend.any(inside, dim=1), backend.argmax(backend.long(inside), 1), -1
     )
 
-    # 2. Rotate each closed curve that enters a hole to start right after a
-    # tagged run, so that no run of untagged points wraps round its end.
+    # Per-point curve bookkeeping, shared by the retag below and the rotation
+    # that follows it.
     counts = curves.offsets[1:] - curves.offsets[:-1]
     curve = backend.repeat(
         backend.arange(counts.shape[0], dtype=int64, device=device), counts, axis=0
@@ -447,9 +454,25 @@ def join_at_holes(curves, holes) -> CriticalCurves:
     first = curves.offsets[:-1][curve]
     last = curves.offsets[1:][curve] - 1
     point = backend.arange(n_points, dtype=int64, device=device)
-    tagged = tag >= 0
+    curve_closed = curves.closed[curve]
     prev = backend.where(point == first, last, point - 1)
-    after_run = backend.flatnonzero(~tagged & tagged[prev] & curves.closed[curve])
+    nxt = backend.where(point == last, first, point + 1)
+
+    # 1b. The tracer's zigzag along a circle can leave a lone crossing point
+    # just outside the disk, within a leaf edge of it; untagged, its two ends
+    # would sit at one angle and break the alternation below. Count it as
+    # inside the hole too: an open curve's first or last point, missing one
+    # of the two neighbours this needs, is never retagged this way.
+    tagged = tag >= 0
+    has_prev = (point != first) | curve_closed
+    has_next = (point != last) | curve_closed
+    lone = ~tagged & has_prev & has_next & (tag[prev] >= 0) & (tag[prev] == tag[nxt])
+    tag = backend.where(lone, tag[prev], tag)
+    tagged = tag >= 0
+
+    # 2. Rotate each closed curve that enters a hole to start right after a
+    # tagged run, so that no run of untagged points wraps round its end.
+    after_run = backend.flatnonzero(~tagged & tagged[prev] & curve_closed)
     start = backend.copy(curves.offsets[:-1])
     if after_run.shape[0]:
         run_curve = curve[after_run]

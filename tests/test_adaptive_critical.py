@@ -423,6 +423,40 @@ def test_a_curve_wholly_inside_a_hole_is_dropped():
     assert len(parts) == 1 and np.array_equal(parts[0][0], np.array(far))
 
 
+# A single traced point just outside a hole's circle, within a leaf edge of
+# it, sandwiched between two points inside the same hole: the tracer's zigzag
+# can leave one, and it must count as inside the hole too, or its two ends --
+# arriving and departing at the same angle -- break the alternation below.
+_POKE_WEST = [(-1.0, -0.3), (-0.3, -0.15), (-0.03, -0.09)]
+_POKE_EAST = [(0.03, -0.09), (0.3, -0.15), (1.0, -0.3)]
+_POKE_POINT = (0.0, -0.105)
+
+
+@pytest.mark.parametrize("reverse", [False, True], ids=["ccw", "cw"])
+def test_a_lone_point_just_outside_a_hole_counts_as_inside_it(reverse):
+    without = _POKE_WEST + _POKE_EAST
+    poked = _POKE_WEST + [_POKE_POINT] + _POKE_EAST
+    if reverse:
+        without, poked = without[::-1], poked[::-1]
+    holes = _one_hole()
+    got = crit.join_at_holes(_traced((poked, False)), holes)
+    want = crit.join_at_holes(_traced((without, False)), holes)
+    for field in ("lens", "source", "offsets", "closed", "hole"):
+        assert np.array_equal(
+            to_np(getattr(got, field)), to_np(getattr(want, field))
+        ), field
+    parts = _parts(got)
+    assert len(parts) == 1
+    assert (parts[0][2] >= 0).any()
+
+
+def test_a_closed_curve_with_one_point_outside_a_hole_is_dropped():
+    poked = [(0.02, 0.0), (0.0, 0.02), (-0.02, 0.0), (0.0, -0.105)]
+    far = [(2.0, 0.0), (2.0, 1.0), (3.0, 1.0)]
+    parts = _parts(crit.join_at_holes(_traced((poked, True), (far, True)), _one_hole()))
+    assert len(parts) == 1 and np.array_equal(parts[0][0], np.array(far))
+
+
 def test_curves_that_never_enter_a_hole_are_left_bit_for_bit():
     before = _traced(
         ([(2.0, 0.0), (2.0, 1.0), (3.0, 1.0)], True),
