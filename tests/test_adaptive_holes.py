@@ -1,5 +1,7 @@
 """Holes around lens centres: merging centres, sampling hole curves, storing them on the mesh."""
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
@@ -251,3 +253,137 @@ def test_holes_sampled_together_match_holes_sampled_alone():
                 to_np(getattr(alone, field)),
             ), field
         assert np.array_equal(to_np(both.growth)[h], to_np(alone.growth)[0])
+
+
+# ---------------------------------------------------------------------------
+# Holes on the mesh
+# ---------------------------------------------------------------------------
+
+
+def sis_lens(c, b):
+    """A lens-like object: the SIS of ``sis_raytrace`` and its Jacobian."""
+
+    def jacobian(x, y):
+        dx, dy = x - c[0], y - c[1]
+        r = backend.sqrt(dx * dx + dy * dy)
+        k = b / r**3
+        a00 = 1.0 - b / r + k * dx * dx
+        a01 = k * dx * dy
+        a11 = 1.0 - b / r + k * dy * dy
+        return backend.stack(
+            (backend.stack((a00, a01), dim=-1), backend.stack((a01, a11), dim=-1)),
+            dim=-2,
+        )
+
+    return SimpleNamespace(raytrace=sis_raytrace(c, b), jacobian_lens_equation=jacobian)
+
+
+def recording_lens(lens):
+    """``lens`` with every point each method is called on recorded."""
+    calls = {"raytrace": [], "jacobian": []}
+
+    def raytrace(x, y):
+        calls["raytrace"].append(np.stack([to_np(x), to_np(y)], axis=-1))
+        return lens.raytrace(x, y)
+
+    def jacobian(x, y):
+        calls["jacobian"].append(np.stack([to_np(x), to_np(y)], axis=-1))
+        return lens.jacobian_lens_equation(x, y)
+
+    return SimpleNamespace(raytrace=raytrace, jacobian_lens_equation=jacobian), calls
+
+
+def _same(a, b):
+    """Equal field by field, arrays bit for bit, NaN matching NaN."""
+    if hasattr(a, "_fields"):
+        return all(_same(getattr(a, f), getattr(b, f)) for f in a._fields)
+    if hasattr(a, "shape"):
+        a, b = to_np(a), to_np(b)
+        return (
+            a.dtype == b.dtype
+            and a.shape == b.shape
+            and np.array_equal(a, b, equal_nan=a.dtype.kind == "f")
+        )
+    return a == b
+
+
+SIS_C = (0.3001, -0.2003)  # off every lattice point of BUILD
+BUILD = dict(fov=4.0, init_res=8, min_img_sep=0.02)
+
+
+def test_a_build_without_centres_stores_empty_holes():
+    mesh = new.build_adaptive_mesh(sis_lens(SIS_C, 1.0), **BUILD)
+    assert mesh.holes.centres.shape[0] == 0
+    assert to_np(mesh.holes.offsets).tolist() == [0]
+
+
+def test_a_build_stores_the_merged_and_sampled_holes():
+    lens = sis_lens(SIS_C, 1.0)
+    centres = [SIS_C, SIS_C, (1.5, 1.5)]
+    mesh = new.build_adaptive_mesh(lens, **BUILD, centres=centres)
+    want = new.sample_holes(
+        new.make_raytrace(lens.raytrace, None),
+        *new.merge_centres(centres, mesh.min_img_sep),
+        mesh.min_img_sep,
+        None,
+    )
+    assert mesh.holes.centres.shape[0] == 2
+    assert to_np(mesh.holes.radius).tolist() == [mesh.min_img_sep] * 2
+    assert _same(mesh.holes, want)
+
+
+def test_two_builds_with_centres_are_identical_holes_included():
+    lens = sis_lens(SIS_C, 1.0)
+    a = new.build_adaptive_mesh(lens, **BUILD, centres=[SIS_C])
+    b = new.build_adaptive_mesh(lens, **BUILD, centres=[SIS_C])
+    assert _same(a, b)
+
+
+def test_centres_change_nothing_but_the_holes_even_outside_the_fov():
+    lens = sis_lens(SIS_C, 1.0)
+    plain = new.build_adaptive_mesh(lens, **BUILD)
+    holed = new.build_adaptive_mesh(lens, **BUILD, centres=[SIS_C, (5.0, 5.0)])
+    assert holed.holes.centres.shape[0] == 2
+    for name in new.AdaptiveMesh._fields:
+        if name != "holes":
+            assert _same(getattr(holed, name), getattr(plain, name)), name
+
+
+def test_holes_cost_raytraces_on_their_circles_only_and_no_jacobian():
+    plain_lens, plain = recording_lens(sis_lens(SIS_C, 1.0))
+    holed_lens, holed = recording_lens(sis_lens(SIS_C, 1.0))
+    new.build_adaptive_mesh(plain_lens, **BUILD)
+    mesh = new.build_adaptive_mesh(holed_lens, **BUILD, centres=[SIS_C])
+    base = np.concatenate(plain["raytrace"])
+    extra = np.concatenate(holed["raytrace"])
+    n_samples = int(to_np(mesh.holes.offsets)[-1])
+    assert len(extra) - len(base) == n_samples + 2 * new.HOLE_GROWTH_SAMPLES
+    added = extra[
+        ~np.isin(extra[:, 0] + 1j * extra[:, 1], base[:, 0] + 1j * base[:, 1])
+    ]
+    d = np.hypot(*(added - np.array(SIS_C)).T)
+    r = mesh.min_img_sep
+    assert (
+        np.isclose(d, r, rtol=0, atol=1e-12) | np.isclose(d, r / 4, rtol=0, atol=1e-12)
+    ).all()
+    assert sum(map(len, holed["jacobian"])) == sum(map(len, plain["jacobian"]))
+
+
+def test_holes_follow_the_mesh_dtype_where_the_band_does():
+    mesh = new.build_adaptive_mesh(
+        sis_lens(SIS_C, 1.0), **BUILD, centres=[SIS_C], dtype=backend.float32
+    )
+    h = mesh.holes
+    assert (h.centres.dtype, h.lens.dtype, h.source.dtype) == (backend.float32,) * 3
+    assert (h.radius.dtype, h.angle.dtype, h.growth.dtype) == (backend.float64,) * 3
+    assert h.offsets.dtype == backend.int64
+
+
+def test_holes_land_on_the_mesh_device(device):
+    mesh = new.build_adaptive_mesh(
+        sis_lens(SIS_C, 1.0), **BUILD, centres=[SIS_C], device=device
+    )
+    for field in new.CentreHoles._fields:
+        assert backend.device(getattr(mesh.holes, field)) == backend.device(
+            mesh.vertices_lens
+        ), field

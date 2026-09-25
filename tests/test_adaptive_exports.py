@@ -18,6 +18,7 @@ def test_new_symbols_are_re_exported_at_every_package_level(package):
         "AdaptiveMesh",
         "MeshIndex",
         "CriticalBand",
+        "CentreHoles",
         "CriticalCurves",
         "mesh_critical_curves",
     ):

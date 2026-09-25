@@ -3610,6 +3610,12 @@ class AdaptiveMesh(NamedTuple):
         :func:`~caustics.lenses.func.adaptive_critical.mesh_critical_curves`
         needs no lens. A superset of the ``LEAF_JACOBIAN_PARITY_UNRESOLVED``
         leaves; see :class:`CriticalBand`.
+    holes: CentreHoles
+        Holes of radius ``min_img_sep`` around the centres passed to the
+        build, with the images of their boundary circles, so that
+        :func:`~caustics.lenses.func.adaptive_critical.mesh_critical_curves`
+        can repair curves through lens centres without a lens call. Empty
+        when no centres were given. See :class:`CentreHoles`.
     lattice: Lattice
         The lattice the mesh lives on, ``lo`` on ``device``. An extended
         mesh keeps its original build's ``lo`` and ``scale`` with
@@ -3654,6 +3660,7 @@ class AdaptiveMesh(NamedTuple):
     # calls the shadowed `.index(value)` lookup method.
     index: MeshIndex  # type: ignore[assignment]
     critical_band: CriticalBand
+    holes: CentreHoles
     lattice: Lattice
     fov: float
     init_res: int
@@ -3733,6 +3740,7 @@ def freeze(
     dtype,
     device,
     index_cells,
+    holes=None,
 ) -> AdaptiveMesh:
     """
     Close, order, index and freeze a balanced refinement.
@@ -3770,6 +3778,9 @@ def freeze(
     device: Optional
     index_cells: Optional[int]
         Forwarded to :func:`build_index`.
+    holes: Optional[CentreHoles]
+        Stored on the mesh with ``centres``, ``lens`` and ``source`` at
+        ``dtype``; :func:`empty_holes` when ``None``.
 
     Returns
     -------
@@ -3854,6 +3865,18 @@ def freeze(
         det=to_device(band.det),
     )
 
+    if holes is None:
+        holes = empty_holes()
+    centre_holes = CentreHoles(
+        centres=to_device(backend.to(holes.centres, dtype=dtype)),
+        radius=to_device(holes.radius),
+        offsets=to_device(holes.offsets),
+        angle=to_device(holes.angle),
+        lens=to_device(backend.to(holes.lens, dtype=dtype)),
+        source=to_device(backend.to(holes.source, dtype=dtype)),
+        growth=to_device(holes.growth),
+    )
+
     return AdaptiveMesh(
         vertices_lens=to_device(vl),
         vertices_source=to_device(vs),
@@ -3875,6 +3898,7 @@ def freeze(
             cell_leaves=to_device(index.cell_leaves),
         ),
         critical_band=critical_band,
+        holes=centre_holes,
         lattice=lat._replace(lo=to_device(lat.lo)),
         fov=float(fov),
         init_res=int(init_res),
@@ -3905,6 +3929,7 @@ def _grow(
     dtype,
     raytrace_batch_size,
     index_cells,
+    holes=None,
 ) -> AdaptiveMesh:
     """
     Refine ``roots`` over ``seed``, balance, and freeze: the stages both builds share.
@@ -3953,6 +3978,7 @@ def _grow(
         dtype=dtype,
         device=device,
         index_cells=index_cells,
+        holes=holes,
     )
 
 
@@ -3969,6 +3995,7 @@ def build_adaptive_mesh(
     dtype=None,
     raytrace_batch_size=None,
     index_cells=None,
+    centres=None,
 ) -> AdaptiveMesh:
     """
     Build an adaptively refined triangular mesh of the lens plane.
@@ -4037,6 +4064,19 @@ def build_adaptive_mesh(
     index_cells: Optional[int]
         Spatial-index cells along the longer axis of the source-plane
         bounding box. Forwarded to :func:`build_index`.
+    centres: Optional[ArrayLike]
+        Lens-plane positions of the lens's centres, shape ``(S, 2)``: every
+        point where the lens map may jump, such as the centre of an SIE or
+        SIS without a core, or a point mass. Each gets a hole of radius
+        ``min_img_sep`` -- the halved value -- and centres closer than twice
+        that share one (:func:`merge_centres`). The image of each hole's
+        boundary is traced and stored as ``AdaptiveMesh.holes``
+        (:func:`sample_holes`), at a few hundred to a few thousand raytraces
+        per hole and no Jacobian call. Centres that are not singular are
+        harmless, so every lens component's centre may be passed. ``None``
+        stores no hole.
+
+        *Unit: arcsec*
 
     Returns
     -------
@@ -4064,6 +4104,10 @@ def build_adaptive_mesh(
     tables = child_matrix_tables()
     lat = make_lattice(fov, x0, y0, init_res, max_level + 1)
     raytrace_fn = make_raytrace(raytrace, device)
+    hole_centres, hole_radius = merge_centres(centres, min_img_sep)
+    holes = sample_holes(
+        raytrace_fn, hole_centres, hole_radius, min_img_sep, raytrace_batch_size
+    )
     return _grow(
         raytrace_fn,
         jacobian,
@@ -4082,6 +4126,7 @@ def build_adaptive_mesh(
         dtype=dtype,
         raytrace_batch_size=raytrace_batch_size,
         index_cells=index_cells,
+        holes=holes,
     )
 
 
@@ -4268,7 +4313,8 @@ def extend_adaptive_mesh(
     mesh not stored at float64, the vertices on its outer boundary, raytraced
     again so the ring's criterion reads float64 values. No Jacobian call
     lands strictly inside the old domain. Closure, ordering and indexing
-    still run over the whole mesh, without a lens call.
+    still run over the whole mesh, without a lens call. The holes are carried
+    over from ``mesh`` unchanged and cost no lens call.
 
     Parameters
     ----------
@@ -4295,7 +4341,7 @@ def extend_adaptive_mesh(
     -------
     AdaptiveMesh
         ``mesh`` itself when ``fov`` needs no new cell. Otherwise a new mesh
-        with ``mesh``'s ``min_img_sep``, ``max_level``, ``d_floor``,
+        with ``mesh``'s ``min_img_sep``, ``holes``, ``max_level``, ``d_floor``,
         ``dtype``, ``device`` and centre, and ``init_res`` grown by ``2 * k``.
 
     Raises
@@ -4349,6 +4395,7 @@ def extend_adaptive_mesh(
         dtype=mesh.dtype,
         raytrace_batch_size=raytrace_batch_size,
         index_cells=index_cells,
+        holes=mesh.holes,
     )
 
 

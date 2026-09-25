@@ -25,6 +25,7 @@ from .func import (
     AdaptiveMesh,
     MeshIndex,
     CriticalBand,
+    CentreHoles,
     CriticalCurves,
     mesh_critical_curves,
 )
@@ -57,6 +58,7 @@ __all__ = [
     "AdaptiveMesh",
     "MeshIndex",
     "CriticalBand",
+    "CentreHoles",
     "CriticalCurves",
     "mesh_critical_curves",
 ]

@@ -235,6 +235,27 @@ def broken_where(fn, jac, where, value=np.nan):
     return broken, broken_jacobian
 
 
+def sis(c, b):
+    """A singular isothermal sphere of Einstein radius ``b`` at ``c``, and its Jacobian."""
+    c = np.asarray(c, dtype=np.float64)
+
+    def fn(p):
+        d = p - c
+        return p - b * d / np.hypot(d[:, 0], d[:, 1])[:, None]
+
+    def jac(p):
+        d = p - c
+        r = np.hypot(d[:, 0], d[:, 1])
+        k = b / r**3
+        J = np.empty((p.shape[0], 2, 2))
+        J[:, 0, 0] = 1.0 - b / r + k * d[:, 0] ** 2
+        J[:, 0, 1] = J[:, 1, 0] = k * d[:, 0] * d[:, 1]
+        J[:, 1, 1] = 1.0 - b / r + k * d[:, 1] ** 2
+        return J
+
+    return fn, jac
+
+
 def seam_fold(seam):
     """Curved, with a fold, just left of ``x = seam``; affine from ``seam`` on.
 
@@ -619,7 +640,7 @@ def assert_meshes_equal(got, want):
             )
             corners = backend.to(i64([[0, 0], [a.n, a.n]]), device=backend.device(a.lo))
             _assert_same(new.lattice_xy(a, corners), new.lattice_xy(b, corners), name)
-        elif name in ("index", "critical_band"):
+        elif name in ("index", "critical_band", "holes"):
             for field in type(a)._fields:
                 _assert_same(getattr(a, field), getattr(b, field), f"{name}.{field}")
         else:
@@ -638,8 +659,9 @@ def test_seeding_a_mesh_and_freezing_it_again_reproduces_it():
     fn, jac = broken_where(
         localised_fold, localised_fold_jacobian, lambda p: p[:, 0] > 1.5
     )
-    mesh, lens, calls = build(fn, jac, 4.0, 4, 0.05)
+    mesh, lens, calls = build(fn, jac, 4.0, 4, 0.05, centres=[(1.0001, 0.1003)])
     assert mesh.critical_band.leaves.shape[0] > 0
+    assert mesh.holes.centres.shape[0] == 1
     assert ((to_np(mesh.leaf_status) & new.LEAF_RAYTRACE_NONFINITE) != 0).any()
     calls["raytrace"].clear()
     lat, cache, active, store, band = seed_of(mesh, lens, 0)
@@ -658,6 +680,7 @@ def test_seeding_a_mesh_and_freezing_it_again_reproduces_it():
         dtype=mesh.dtype,
         device=mesh.device,
         index_cells=None,
+        holes=mesh.holes,
     )
     assert_meshes_equal(again, mesh)
     assert not calls["raytrace"]
@@ -790,6 +813,24 @@ def test_extensions_chain():
     )
     assert_meshes_equal(twice, fresh)
     assert_meshes_equal(once, fresh)
+
+
+def test_an_extension_carries_its_holes_and_traces_none_of_them_again():
+    """One centre lies outside the original fov, so its hole exists from the start."""
+    c_in, c_out = (0.3001, -0.2003), (1.8001, 0.2003)
+    fn, jac = sis(c_in, 0.6)
+    kw = dict(fov=2.0, init_res=4, min_img_sep=0.05, centres=[c_in, c_out])
+    mesh, lens, calls = build(fn, jac, **kw)
+    assert mesh.holes.centres.shape[0] == 2
+    calls["raytrace"].clear()
+    got = new.extend_adaptive_mesh(mesh, lens, 4.0)
+    want, _, _ = build(fn, jac, **fresh_equivalent(kw, 4.0))
+    assert_meshes_equal(got, want)
+    traced = called_at(calls, "raytrace")
+    for c in (c_in, c_out):
+        d = np.hypot(*(traced - np.array(c)).T)
+        for r in (mesh.min_img_sep, mesh.min_img_sep / 4):
+            assert not np.isclose(d, r, rtol=0, atol=1e-12).any()
 
 
 def test_extending_a_float32_mesh_matches_a_fresh_float32_build():
