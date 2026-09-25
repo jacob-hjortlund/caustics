@@ -19,7 +19,7 @@ import math
 from typing import NamedTuple, Tuple
 
 from ...backend_obj import ArrayLike, backend
-from .adaptive import CHILD_VERTEX_INDICES
+from .adaptive import CHILD_VERTEX_INDICES, CentreHoles, empty_holes
 
 __all__ = (
     "CriticalCurves",
@@ -75,12 +75,22 @@ class CriticalCurves(NamedTuple):
         ``(C + 1,)`` int64 CSR offsets, ``offsets[0] == 0``.
     closed: ArrayLike
         ``(C,)`` bool, True where the curve is a loop.
+    hole: ArrayLike
+        ``(P,)`` int64: -1 where the point is a crossing of ``det A = 0``,
+        otherwise the index into ``holes`` of the hole whose circle the curve
+        follows there. Such a point lies on that circle, not on a critical
+        curve, and its ``source`` lies on the hole curve.
+    holes: CentreHoles
+        The holes the curves were cut and re-joined at: the mesh's own, or
+        an empty one.
     """
 
     lens: ArrayLike
     source: ArrayLike
     offsets: ArrayLike
     closed: ArrayLike
+    hole: ArrayLike
+    holes: CentreHoles
 
 
 def _sorted_pair(a, b) -> ArrayLike:
@@ -277,6 +287,8 @@ def _no_curves(band) -> CriticalCurves:
         source=backend.zeros((0, 2), dtype=band.source.dtype, device=device),
         offsets=backend.zeros((1,), dtype=backend.int64, device=device),
         closed=backend.zeros((0,), dtype=backend.bool, device=device),
+        hole=backend.zeros((0,), dtype=backend.int64, device=device),
+        holes=empty_holes(device),
     )
 
 
@@ -296,6 +308,8 @@ def trace_band(band) -> CriticalCurves:
     Returns
     -------
     CriticalCurves
+        ``hole`` is -1 at every point and ``holes`` is empty: tracing knows
+        nothing of holes; :func:`join_at_holes` applies them.
 
     Raises
     ------
@@ -337,7 +351,13 @@ def trace_band(band) -> CriticalCurves:
         edges, band.lens, band.source, band.det
     )
     return CriticalCurves(
-        lens=lens_points, source=source_points, offsets=offsets, closed=closed
+        lens=lens_points,
+        source=source_points,
+        offsets=offsets,
+        closed=closed,
+        hole=backend.zeros((lens_points.shape[0],), dtype=backend.int64, device=device)
+        - 1,
+        holes=empty_holes(device),
     )
 
 
@@ -382,4 +402,4 @@ def mesh_critical_curves(mesh) -> CriticalCurves:
     -------
     CriticalCurves
     """
-    return trace_band(mesh.critical_band)
+    return trace_band(mesh.critical_band)._replace(holes=mesh.holes)

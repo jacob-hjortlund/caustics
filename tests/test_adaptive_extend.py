@@ -1005,12 +1005,14 @@ def test_an_extension_closes_the_critical_curves_the_fov_cut():
     got = crit.mesh_critical_curves(ext)
     fresh, _, _ = build(sie_like, sie_like_jacobian, **fresh_equivalent(kw, 3.0))
     assert got.closed.shape[0] > 0 and to_np(got.closed).all()
+    want = crit.mesh_critical_curves(fresh)
     for field in crit.CriticalCurves._fields:
-        _assert_same(
-            getattr(got, field),
-            getattr(crit.mesh_critical_curves(fresh), field),
-            field,
-        )
+        a, b = getattr(got, field), getattr(want, field)
+        if field == "holes":
+            for sub in type(a)._fields:
+                _assert_same(getattr(a, sub), getattr(b, sub), f"holes.{sub}")
+        else:
+            _assert_same(a, b, field)
 
 
 def test_an_extension_of_a_mesh_on_a_device_stays_on_it(device):

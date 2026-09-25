@@ -291,6 +291,8 @@ def test_a_band_without_crossings_has_no_curves(band):
     assert tuple(curves.lens.shape) == (0, 2)
     assert tuple(curves.source.shape) == (0, 2)
     assert tuple(curves.closed.shape) == (0,)
+    assert tuple(curves.hole.shape) == (0,)
+    assert curves.holes.centres.shape[0] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -406,6 +408,21 @@ def test_cored_isothermal_curves_match_the_analytic_answers():
     assert _signed_area(t_lens) < 0 < _signed_area(r_lens)
     assert np.hypot(*t_src.T).max() < 1e-4
     assert np.abs(np.hypot(*r_src.T) - RADIAL_CAUSTIC).max() < 1e-4
+
+
+def test_without_holes_the_curves_are_trace_band_s_and_follow_no_hole():
+    mesh = new.build_adaptive_mesh(CORED, fov=4.0, init_res=16, min_img_sep=1e-2)
+    got = crit.mesh_critical_curves(mesh)
+    raw = crit.trace_band(mesh.critical_band)
+    for field in ("lens", "source", "offsets", "closed"):
+        assert np.array_equal(
+            to_np(getattr(got, field)), to_np(getattr(raw, field))
+        ), field
+    hole = to_np(got.hole)
+    assert hole.dtype == np.int64 and hole.shape == (got.lens.shape[0],)
+    assert (hole == -1).all()
+    assert got.holes.centres.shape[0] == 0
+    assert to_np(got.holes.offsets).tolist() == [0]
 
 
 def test_the_fov_cuts_the_tangential_circle_into_four_open_arcs():
