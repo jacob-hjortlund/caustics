@@ -387,14 +387,15 @@ def test_a_loop_through_a_centre_twice_splits_into_two_loops_joined_clockwise():
 
 
 def test_joined_arms_keep_their_direction_of_travel():
+    """Each arm's points outside the hole lie in one curve, consecutive and in order."""
     parts = _parts(crit.join_at_holes(_traced((FIGURE_EIGHT, True)), _one_hole()))
-    for lens, _, hole, _ in parts:
-        traced = lens[hole == -1].tolist()
-        for arm in (WEST_IN, EAST_IN, SOUTH_OUT, NORTH_OUT):
-            kept = [list(p) for p in arm if np.hypot(*p) >= 0.1]
-            if kept[0] in traced:
-                at = [traced.index(p) for p in kept]
-                assert at == list(range(at[0], at[0] + len(kept)))
+    traced = [lens[hole == -1].tolist() for lens, _, hole, _ in parts]
+    for arm in (WEST_IN, EAST_IN, SOUTH_OUT, NORTH_OUT):
+        kept = [list(p) for p in arm if np.hypot(*p) >= 0.1]
+        holding = [t for t in traced if any(p in t for p in kept)]
+        assert len(holding) == 1 and all(p in holding[0] for p in kept)
+        at = [holding[0].index(p) for p in kept]
+        assert at == list(range(at[0], at[0] + len(kept)))
 
 
 def test_a_curve_whose_ends_stop_inside_a_hole_is_closed_along_it():

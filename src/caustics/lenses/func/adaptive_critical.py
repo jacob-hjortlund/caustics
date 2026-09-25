@@ -52,9 +52,11 @@ class CriticalCurves(NamedTuple):
     ``source``. Travel keeps ``det A > 0`` on the left -- which runs a
     tangential curve clockwise and a radial one counter-clockwise on a typical
     lens. A curve the fov or missing data cuts is open; ``closed`` marks the
-    loops, whose last point joins back to their first. Curves are ordered by
-    their lowest-indexed crossing, deterministically but with no physical
-    meaning, and a loop starts there.
+    loops, whose last point joins back to their first. Curves are ordered
+    deterministically but with no physical meaning, and so is where a loop
+    starts: :func:`trace_band` orders curves by their lowest-indexed crossing
+    and starts each loop there, and a loop :func:`join_at_holes` re-joined at
+    a hole starts right after one of its joins instead.
 
     When ``det A`` is exactly zero at a sample, several crossings sit on
     that sample -- which happens whenever a curve runs through lattice
@@ -69,11 +71,12 @@ class CriticalCurves(NamedTuple):
     of it at that one sample.
 
     On a mesh built with ``centres``, a curve that reaches a hole does not run
-    into it: it follows the hole's circle, clockwise, to the next curve leaving
-    it, so every loop bounds a ``det A > 0`` region with the holes cut out, and
-    its caustic follows the hole curve -- the pseudo-caustic at an isothermal
-    centre -- instead of cutting straight across it. Those points carry their
-    hole's index in ``hole``. A hole curve is a pseudo-caustic only where its
+    into it. Within the limits :func:`join_at_holes` states, it follows the
+    hole's circle, clockwise, to the next curve leaving it, so every loop
+    bounds a ``det A > 0`` region with the holes cut out, and its caustic
+    follows the hole curve -- the pseudo-caustic at an isothermal centre --
+    instead of cutting straight across it. Those points carry their hole's
+    index in ``hole``. A hole curve is a pseudo-caustic only where its
     ``holes.growth`` is about 0; see
     :class:`~caustics.lenses.func.adaptive.CentreHoles`.
 
@@ -419,17 +422,26 @@ def join_at_holes(curves, holes) -> CriticalCurves:
        :func:`~caustics.lenses.func.adaptive.extend_adaptive_mesh` can
        arrange.
     4. The segments are chained through their joins by :func:`chain_order`,
-       numbered by their first traced point, and the bridges after them, so
-       the curves keep :func:`trace_band`'s order. A curve of bridges alone
-       that its joins leave without a point is dropped.
+       numbered by their first traced point, and the bridges after them. The
+       curves come out in the order of their first segments, so those that
+       never reach a hole keep :func:`trace_band`'s order, and a re-joined
+       loop starts at its lowest-numbered segment, right after one of its
+       joins. A curve of bridges alone that its joins leave without a point
+       is dropped.
 
     Every returned loop is then the boundary of a ``det A > 0`` region with
     the holes cut out, whatever pairing the tracer made inside a hole, and no
-    caustic runs straight across a hole curve. A curve through a centre on a
-    lattice point, whose band has a gap there, comes out closed.
+    caustic runs straight across a hole curve; a curve through a centre on a
+    lattice point, whose band has a gap there, comes out closed. Those
+    guarantees hold except in these limits:
 
-    A traced segment that clips a disk with neither end inside it is not
-    seen; the error is within a leaf edge of the hole.
+    - A hole whose ends do not alternate, or that the fov cuts, as step 3
+      says.
+    - A mesh whose ``max_depth`` bound refinement before the size floor. The
+      leaves around a centre can then be larger than its hole, and curves
+      through it can stay open or keep chords.
+    - A traced segment that clips a disk with neither end inside it. It is
+      not seen; the error is within a leaf edge of the hole.
 
     Parameters
     ----------
@@ -681,16 +693,16 @@ def mesh_critical_curves(mesh) -> CriticalCurves:
     A curve ends where the band does: at the fov boundary, or next to a leaf
     whose samples or Jacobian are non-finite, or, in principle, next to a
     coarser converged leaf -- unless that happens inside a hole, where the
-    curve is joined instead.
+    curve is joined instead, within the limits :func:`join_at_holes` states.
 
     A mesh built with ``centres`` has holes around them, and the traced
     curves are cut at each hole's circle and re-joined along the stored hole
-    curve by :func:`join_at_holes`; the hole curves -- the pseudo-caustics,
-    where ``holes.growth`` is about 0 -- come back as ``holes``. Without
-    them, a curve through a singular centre, where the lens map jumps, gets
-    a caustic that cuts straight across the pseudo-caustic, and one through
-    a centre on a lattice point comes out open. Either way this function
-    makes no lens call.
+    curve by :func:`join_at_holes`, within the limits it states; the hole
+    curves -- the pseudo-caustics, where ``holes.growth`` is about 0 -- come
+    back as ``holes``. Without them, a curve through a singular centre, where
+    the lens map jumps, gets a caustic that cuts straight across the
+    pseudo-caustic, and one through a centre on a lattice point comes out
+    open. Either way this function makes no lens call.
 
     A curve the fov cuts can be closed by growing the mesh with
     :func:`~caustics.lenses.func.adaptive.extend_adaptive_mesh`, which reuses

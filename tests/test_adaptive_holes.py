@@ -199,9 +199,24 @@ def test_a_hole_curve_too_large_to_resolve_stops_at_the_cap_and_warns():
     """A 1" point mass maps a 0.005" circle to a loop of radius about 200":
     ``2**16`` samples cannot bring its chords down to 0.005"."""
     c = (0.0, 0.0)
-    with pytest.warns(UserWarning, match="reached 65536 samples"):
+    with pytest.warns(UserWarning, match=r"stopped at \d+ samples \(cap 65536\)"):
         holes, _ = sample(point_mass_raytrace(c, 1.0), [c], [0.005], 0.005)
     assert to_np(holes.offsets)[-1] <= new.HOLE_MAX_SAMPLES
+
+
+def test_a_hole_frozen_below_the_cap_warns_with_its_own_sample_count():
+    """A point mass off the hole's centre makes the hole curve uneven.
+
+    Refinement then bisects only some intervals, so a round can stop short
+    of the cap because the next one would pass it. The warning states the
+    count the hole kept, not the cap.
+    """
+    c = (0.0, 0.0)
+    with pytest.warns(UserWarning, match=r"\(cap 65536\)") as got:
+        holes, _ = sample(point_mass_raytrace((0.004, 0.0), 0.3), [c], [0.005], 0.005)
+    n = int(to_np(holes.offsets)[-1])
+    assert n < new.HOLE_MAX_SAMPLES
+    assert any(f"stopped at {n} samples (cap 65536)" in str(w.message) for w in got)
 
 
 def test_a_lens_not_finite_on_a_hole_circle_raises_naming_the_centre():

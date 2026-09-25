@@ -2574,10 +2574,12 @@ def sample_holes(raytrace_fn, centres, radius, min_img_sep, batch_size) -> Centr
         hole, angle, source = hole[order], angle[order], source[order]
     for h in backend.to_numpy(backend.flatnonzero(capped)).tolist():
         x, y = backend.to_numpy(centres[h]).tolist()
+        n = int(backend.to_numpy(backend.bincount(hole, minlength=n_holes)[h]))
         warn(
-            f"the hole curve around ({x:g}, {y:g}) reached {HOLE_MAX_SAMPLES} "
-            f"samples before every chord fell below min_img_sep={min_img_sep:g}; "
-            "it is exact at its samples but coarser than min_img_sep between them"
+            f"the hole curve around ({x:g}, {y:g}) stopped at {n} samples "
+            f"(cap {HOLE_MAX_SAMPLES}) before every chord fell below "
+            f"min_img_sep={min_img_sep:g}; it is exact at its samples but "
+            "coarser than min_img_sep between them"
         )
 
     g_hole = backend.repeat(ids, HOLE_GROWTH_SAMPLES, axis=0)
@@ -4071,14 +4073,27 @@ def build_adaptive_mesh(
         ``min_img_sep`` -- the halved value -- and centres closer than twice
         that share one (:func:`merge_centres`). The image of each hole's
         boundary is traced and stored as ``AdaptiveMesh.holes``
-        (:func:`sample_holes`), at a few hundred to a few thousand raytraces
-        per hole and no Jacobian call. A ``UserWarning`` is raised for each
-        hole whose refinement is capped at :data:`HOLE_MAX_SAMPLES` samples
-        before every chord falls below ``min_img_sep``; such a hole curve is
-        exact at its samples but coarser than ``min_img_sep`` between them,
-        and only an enormous hole curve, such as a point mass's, reaches the
-        cap. Centres that are not singular are harmless, so every lens
-        component's centre may be passed. ``None`` stores no hole.
+        (:func:`sample_holes`), with no Jacobian call and at least 2304
+        raytraces per hole: 256 initial samples and two growth circles of
+        1024. A hole that reaches the cap costs up to
+        :data:`HOLE_MAX_SAMPLES` + 2048 raytraces and stores up to
+        :data:`HOLE_MAX_SAMPLES` samples. A ``UserWarning`` is raised for
+        each hole whose refinement is capped at :data:`HOLE_MAX_SAMPLES`
+        samples before every chord falls below ``min_img_sep``; such a hole
+        curve is exact at its samples but coarser than ``min_img_sep``
+        between them, and only an enormous hole curve, such as a point
+        mass's, reaches the cap.
+
+        :func:`~caustics.lenses.func.adaptive_critical.mesh_critical_curves`
+        cuts every hole, singular centre or not, out of the curves it traces
+        and re-joins them along the hole curves: a critical curve lying
+        wholly inside a hole is dropped, with only the hole curve standing in
+        for it, and anything that relies on the curves cannot see what lies
+        inside a hole. Pass every centre where the lens map may jump. The
+        re-joining assumes the mesh reaches its size floor: when
+        ``max_depth`` binds, the leaves around a centre can be larger than
+        its hole, and curves through it can stay open or keep chords.
+        ``None`` stores no hole.
 
         *Unit: arcsec*
 
