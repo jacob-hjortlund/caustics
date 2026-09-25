@@ -27,6 +27,7 @@ __all__ = (
     "crossing_points",
     "chain_order",
     "trace_band",
+    "join_at_holes",
     "mesh_critical_curves",
 )
 
@@ -358,6 +359,235 @@ def trace_band(band) -> CriticalCurves:
         hole=backend.zeros((lens_points.shape[0],), dtype=backend.int64, device=device)
         - 1,
         holes=empty_holes(device),
+    )
+
+
+def _turn(angle) -> ArrayLike:
+    """``angle`` wrapped into ``[0, 2 pi)``."""
+    two_pi = 2.0 * math.pi
+    return angle - two_pi * backend.floor(angle / two_pi)
+
+
+def join_at_holes(curves, holes) -> CriticalCurves:
+    """
+    Cut traced curves at hole circles and re-join them along the hole curves.
+
+    Inside a hole the lens map can jump: the image of the hole's boundary
+    circle is a whole curve, the hole curve, so a traced curve's points
+    there -- interpolated across the jump -- mean nothing. They are replaced:
+
+    1. Every point strictly inside a hole's disk is dropped, which cuts each
+       curve into segments; a curve with no point left is dropped whole.
+    2. A segment that starts right after a dropped point departs from that
+       hole's circle; one that ends right before a dropped point arrives at
+       it. Other curve ends -- the fov, or a band gap outside every hole --
+       stay ends.
+    3. Around each circle the ends, sorted by angle, alternate between
+       arriving and departing. Each arriving end is joined to the next end
+       clockwise, always a departing one: an arriving curve keeps
+       ``det A > 0`` on its left, which is clockwise of it, so the join runs
+       through a ``det A > 0`` wedge. The join inserts the hole's stored
+       samples strictly inside that clockwise interval, their ``lens`` on the
+       circle and their ``source`` on the hole curve, with ``hole`` set to the
+       hole's index. A hole whose ends do not alternate -- one the fov cuts,
+       say -- is left unjoined, and its curves stay open.
+    4. The segments are chained through their joins by :func:`chain_order`,
+       numbered by their first traced point, so the curves keep
+       :func:`trace_band`'s order.
+
+    Every returned loop is then the boundary of a ``det A > 0`` region with
+    the holes cut out, whatever pairing the tracer made inside a hole, and no
+    caustic runs straight across a hole curve. A curve through a centre on a
+    lattice point, whose band has a gap there, comes out closed.
+
+    A traced segment that clips a disk with neither end inside it is not
+    seen; the error is within a leaf edge of the hole.
+
+    Parameters
+    ----------
+    curves: CriticalCurves
+        As :func:`trace_band` returns them.
+    holes: CentreHoles
+
+    Returns
+    -------
+    CriticalCurves
+        With ``holes`` set to ``holes``.
+
+    Raises
+    ------
+    AssertionError
+        "a segment has two predecessors" if two arriving ends were joined to
+        one departing end, which alternation rules out; it guards against
+        silent corruption rather than a reachable input.
+    """
+    n_points = curves.lens.shape[0]
+    n_holes = holes.centres.shape[0]
+    if n_points == 0 or n_holes == 0:
+        return curves._replace(holes=holes)
+    device = backend.device(curves.lens)
+    int64, f64 = backend.int64, backend.float64
+    lens = backend.to(curves.lens, dtype=f64)
+    centres = backend.to(holes.centres, dtype=f64)
+
+    # 1. Tag every point strictly inside a hole's disk; disks are disjoint.
+    inside = backend.norm(
+        backend.unsqueeze(lens, 1) - backend.unsqueeze(centres, 0), dim=-1
+    ) < backend.unsqueeze(holes.radius, 0)
+    tag = backend.where(
+        backend.any(inside, dim=1), backend.argmax(backend.long(inside), 1), -1
+    )
+
+    # 2. Rotate each closed curve that enters a hole to start right after a
+    # tagged run, so that no run of untagged points wraps round its end.
+    counts = curves.offsets[1:] - curves.offsets[:-1]
+    curve = backend.repeat(
+        backend.arange(counts.shape[0], dtype=int64, device=device), counts, axis=0
+    )
+    first = curves.offsets[:-1][curve]
+    last = curves.offsets[1:][curve] - 1
+    point = backend.arange(n_points, dtype=int64, device=device)
+    tagged = tag >= 0
+    prev = backend.where(point == first, last, point - 1)
+    after_run = backend.flatnonzero(~tagged & tagged[prev] & curves.closed[curve])
+    start = backend.copy(curves.offsets[:-1])
+    if after_run.shape[0]:
+        run_curve = curve[after_run]
+        lead = backend.concatenate(
+            (
+                backend.ones((1,), dtype=backend.bool, device=device),
+                run_curve[1:] != run_curve[:-1],
+            ),
+            dim=0,
+        )
+        start = backend.fill_at_indices(start, run_curve[lead], after_run[lead])
+    perm = first + (start[curve] - first + point - first) % counts[curve]
+    tag = tag[perm]
+    tagged = tag >= 0
+
+    # 3. Segments: the maximal runs of untagged points of each curve, numbered
+    # by their first traced point.
+    is_first = ~tagged & ((point == first) | tagged[backend.clamp(point - 1, 0, None)])
+    is_last = ~tagged & (
+        (point == last) | tagged[backend.clamp(point + 1, None, n_points - 1)]
+    )
+    seg_first = backend.flatnonzero(is_first)
+    seg_last = backend.flatnonzero(is_last)
+    if seg_first.shape[0] == 0:
+        return CriticalCurves(
+            lens=curves.lens[:0],
+            source=curves.source[:0],
+            offsets=backend.zeros((1,), dtype=int64, device=device),
+            closed=curves.closed[:0],
+            hole=curves.hole[:0],
+            holes=holes,
+        )
+    renumber = backend.argsort(perm[seg_first])
+    seg_first, seg_last = seg_first[renumber], seg_last[renumber]
+    n_seg = seg_first.shape[0]
+    seg_closed = curves.closed[curve[seg_first]]
+    starts_curve = seg_first == first[seg_first]
+    ends_curve = seg_last == last[seg_last]
+    before = backend.where(starts_curve, last[seg_first], seg_first - 1)
+    after = backend.where(ends_curve, first[seg_last], seg_last + 1)
+    departs = backend.where(starts_curve & ~seg_closed, -1, tag[before])
+    arrives = backend.where(ends_curve & ~seg_closed, -1, tag[after])
+    # A closed curve that never enters a hole is one segment, its own successor.
+    whole = seg_closed & starts_curve & ends_curve
+    succ = backend.where(whole, backend.arange(n_seg, dtype=int64, device=device), -1)
+
+    # 4. On each circle, join every arriving end to the next end clockwise.
+    lens_rot = lens[perm]
+    hole_offsets = backend.to_numpy(holes.offsets).tolist()
+    arcs = {}
+    for h in range(n_holes):
+        arr = backend.flatnonzero(arrives == h)
+        dep = backend.flatnonzero(departs == h)
+        m = arr.shape[0] + dep.shape[0]
+        if m == 0:
+            continue
+        seg = backend.concatenate((arr, dep), dim=0)
+        arriving = backend.concatenate(
+            (
+                backend.ones((arr.shape[0],), dtype=backend.bool, device=device),
+                backend.zeros((dep.shape[0],), dtype=backend.bool, device=device),
+            ),
+            dim=0,
+        )
+        rel = lens_rot[backend.concatenate((seg_last[arr], seg_first[dep]), dim=0)]
+        rel = rel - centres[h]
+        phi = _turn(backend.arctan2(rel[:, 1], rel[:, 0]))
+        o = backend.argsort(phi)
+        seg, arriving, phi = seg[o], arriving[o], phi[o]
+        if m % 2 or bool(backend.any(arriving == backend.roll(arriving, 1, 0))):
+            continue
+        k_arr = backend.flatnonzero(arriving)
+        k_dep = (k_arr - 1) % m
+        succ = backend.fill_at_indices(succ, seg[k_arr], seg[k_dep])
+        lo, hi = hole_offsets[h], hole_offsets[h + 1]
+        angle = holes.angle[lo:hi]
+        for ka, kd in zip(
+            backend.to_numpy(k_arr).tolist(), backend.to_numpy(k_dep).tolist()
+        ):
+            span = _turn(phi[ka] - phi[kd])
+            delta = _turn(phi[ka] - angle)
+            pick = backend.flatnonzero((delta > 0) & (delta < span))
+            pick = pick[backend.argsort(delta[pick])]
+            arcs[int(backend.to_numpy(seg[ka]))] = lo + pick
+    # `raise AssertionError` rather than a bare `assert`, as elsewhere here:
+    # `python -O` strips bare asserts.
+    joined = backend.flatnonzero(succ >= 0)
+    if bool(backend.any(backend.bincount(succ[joined], minlength=n_seg) > 1)):
+        raise AssertionError("a segment has two predecessors")
+
+    # 5. Chain the segments through their joins into curves.
+    order, seg_offsets, closed = chain_order(succ)
+
+    # 6. Assemble: every segment's points, then its join's arc.
+    pool_lens = backend.concatenate(
+        (curves.lens[perm], backend.to(holes.lens, dtype=curves.lens.dtype)), dim=0
+    )
+    pool_source = backend.concatenate(
+        (curves.source[perm], backend.to(holes.source, dtype=curves.source.dtype)),
+        dim=0,
+    )
+    samples = holes.offsets[1:] - holes.offsets[:-1]
+    pool_hole = backend.concatenate(
+        (
+            backend.zeros((n_points,), dtype=int64, device=device) - 1,
+            backend.repeat(
+                backend.arange(n_holes, dtype=int64, device=device), samples, axis=0
+            ),
+        ),
+        dim=0,
+    )
+    first_host = backend.to_numpy(seg_first).tolist()
+    last_host = backend.to_numpy(seg_last).tolist()
+    pieces, sizes = [], []
+    for s in backend.to_numpy(order).tolist():
+        pieces.append(
+            backend.arange(first_host[s], last_host[s] + 1, dtype=int64, device=device)
+        )
+        size = last_host[s] + 1 - first_host[s]
+        if s in arcs:
+            pieces.append(n_points + arcs[s])
+            size += int(arcs[s].shape[0])
+        sizes.append(size)
+    gather = backend.concatenate(pieces, dim=0)
+    csum = backend.concatenate(
+        (
+            backend.zeros((1,), dtype=int64, device=device),
+            backend.cumsum(backend.as_array(sizes, dtype=int64, device=device), dim=0),
+        ),
+        dim=0,
+    )
+    return CriticalCurves(
+        lens=pool_lens[gather],
+        source=pool_source[gather],
+        offsets=csum[seg_offsets],
+        closed=closed,
+        hole=pool_hole[gather],
+        holes=holes,
     )
 
 

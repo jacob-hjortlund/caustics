@@ -296,6 +296,156 @@ def test_a_band_without_crossings_has_no_curves(band):
 
 
 # ---------------------------------------------------------------------------
+# join_at_holes: cutting at hole circles and re-joining clockwise
+# ---------------------------------------------------------------------------
+
+
+def _one_hole(radius=0.1, n=64, shift=(5.0, 0.0)):
+    """A hand-built hole at the origin: ``n`` even samples; source = lens + shift."""
+    angle = 2.0 * np.pi * np.arange(n) / n
+    lens = radius * np.stack([np.cos(angle), np.sin(angle)], axis=-1)
+    return new.CentreHoles(
+        centres=_arr([[0.0, 0.0]]),
+        radius=_arr([radius]),
+        offsets=backend.as_array(np.array([0, n]), dtype=backend.int64),
+        angle=_arr(angle),
+        lens=_arr(lens),
+        source=_arr(lens + np.array(shift)),
+        growth=_arr([0.0]),
+    )
+
+
+def _traced(*curves):
+    """Hand-built ``CriticalCurves`` from ``(points, closed)`` pairs; source = 2 * lens."""
+    pts = np.concatenate([np.asarray(p, dtype=np.float64) for p, _ in curves])
+    offsets = np.cumsum([0] + [len(p) for p, _ in curves])
+    return crit.CriticalCurves(
+        lens=_arr(pts),
+        source=_arr(2.0 * pts),
+        offsets=backend.as_array(offsets, dtype=backend.int64),
+        closed=backend.as_array(np.array([c for _, c in curves]), dtype=backend.bool),
+        hole=backend.as_array(np.full(len(pts), -1), dtype=backend.int64),
+        holes=new.empty_holes(),
+    )
+
+
+def _parts(curves):
+    """``[(lens, source, hole, closed), ...]`` per curve, as numpy."""
+    off = to_np(curves.offsets)
+    lens, source, hole = to_np(curves.lens), to_np(curves.source), to_np(curves.hole)
+    closed = to_np(curves.closed)
+    return [
+        (lens[a:b], source[a:b], hole[a:b], bool(c))
+        for a, b, c in zip(off[:-1], off[1:], closed)
+    ]
+
+
+def _sample_index(points, n=64):
+    """Which of ``_one_hole``'s ``n`` even samples each circle point is."""
+    angle = np.arctan2(points[:, 1], points[:, 0]) % (2 * np.pi)
+    return np.rint(angle / (2 * np.pi / n)).astype(int) % n
+
+
+# Arms into the origin from the west and east, out to the south and north.
+# ``det A > 0`` is on the left of travel, so the ends around a small circle
+# alternate: east arrives (0), north departs (pi/2), west arrives (pi), south
+# departs (3 pi / 2). Points within 0.1 of the origin lie inside the hole.
+WEST_IN = [(-1.0, 0.0), (-0.5, 0.0), (-0.2, 0.0), (-0.05, 0.0)]
+EAST_IN = [(1.0, 0.0), (0.5, 0.0), (0.2, 0.0), (0.05, 0.0)]
+SOUTH_OUT = [(0.0, -0.05), (0.0, -0.2), (0.0, -0.5), (0.0, -1.0)]
+NORTH_OUT = [(0.0, 0.05), (0.0, 0.2), (0.0, 0.5), (0.0, 1.0)]
+# One closed loop through the origin twice: west -> south, then east -> north.
+FIGURE_EIGHT = (
+    WEST_IN
+    + [(0.0, 0.0)]
+    + SOUTH_OUT
+    + [(0.7, -0.7)]
+    + EAST_IN
+    + [(0.0, 0.0)]
+    + NORTH_OUT
+    + [(-0.7, 0.7)]
+)
+
+
+def test_a_loop_through_a_centre_twice_splits_into_two_loops_joined_clockwise():
+    holes = _one_hole()
+    parts = _parts(crit.join_at_holes(_traced((FIGURE_EIGHT, True)), holes))
+    assert len(parts) == 2 and all(closed for *_, closed in parts)
+    arcs = []
+    for lens, source, hole, _ in parts:
+        on = hole == 0
+        k = _sample_index(lens[on])
+        assert np.array_equal(lens[on], to_np(holes.lens)[k])
+        assert np.array_equal(source[on], to_np(holes.source)[k])
+        assert (np.diff(k) == -1).all()
+        assert (np.hypot(*lens[~on].T) >= 0.1).all()
+        assert np.array_equal(source[~on], 2.0 * lens[~on])
+        arcs.append(sorted(k.tolist()))
+    # west (pi) joins north (pi/2); east (0) joins south (3 pi / 2)
+    assert sorted(arcs) == [list(range(17, 32)), list(range(49, 64))]
+
+
+def test_joined_arms_keep_their_direction_of_travel():
+    parts = _parts(crit.join_at_holes(_traced((FIGURE_EIGHT, True)), _one_hole()))
+    for lens, _, hole, _ in parts:
+        traced = lens[hole == -1].tolist()
+        for arm in (WEST_IN, EAST_IN, SOUTH_OUT, NORTH_OUT):
+            kept = [list(p) for p in arm if np.hypot(*p) >= 0.1]
+            if kept[0] in traced:
+                at = [traced.index(p) for p in kept]
+                assert at == list(range(at[0], at[0] + len(kept)))
+
+
+def test_a_curve_whose_ends_stop_inside_a_hole_is_closed_along_it():
+    """Both ends inside the hole, as at a band gap: out north, back from the west."""
+    broken = NORTH_OUT + [(-0.7, 0.7)] + WEST_IN
+    parts = _parts(crit.join_at_holes(_traced((broken, False)), _one_hole()))
+    assert len(parts) == 1
+    lens, _, hole, closed = parts[0]
+    assert closed
+    assert sorted(_sample_index(lens[hole == 0]).tolist()) == list(range(17, 32))
+
+
+def test_ends_that_do_not_alternate_stay_open():
+    """Two arms that both arrive: nothing departs to pair them with."""
+    parts = _parts(
+        crit.join_at_holes(_traced((WEST_IN, False), (EAST_IN, False)), _one_hole())
+    )
+    assert len(parts) == 2 and not any(closed for *_, closed in parts)
+    assert all((hole == -1).all() for _, _, hole, _ in parts)
+    assert sorted(len(lens) for lens, *_ in parts) == [3, 3]
+
+
+def test_a_curve_wholly_inside_a_hole_is_dropped():
+    tiny = [(0.01, 0.0), (0.0, 0.01), (-0.01, 0.0), (0.0, -0.01)]
+    far = [(2.0, 0.0), (2.0, 1.0), (3.0, 1.0)]
+    parts = _parts(crit.join_at_holes(_traced((tiny, True), (far, True)), _one_hole()))
+    assert len(parts) == 1 and np.array_equal(parts[0][0], np.array(far))
+
+
+def test_curves_that_never_enter_a_hole_are_left_bit_for_bit():
+    before = _traced(
+        ([(2.0, 0.0), (2.0, 1.0), (3.0, 1.0)], True),
+        ([(-2.0, 0.0), (-2.0, 1.0), (-3.0, 1.0), (-3.0, 0.5)], False),
+    )
+    after = crit.join_at_holes(before, _one_hole())
+    for field in ("lens", "source", "offsets", "closed", "hole"):
+        assert np.array_equal(
+            to_np(getattr(after, field)), to_np(getattr(before, field))
+        ), field
+    assert after.holes.centres.shape[0] == 1
+
+
+def test_joining_at_no_hole_changes_nothing():
+    before = _traced((FIGURE_EIGHT, True))
+    after = crit.join_at_holes(before, new.empty_holes())
+    for field in ("lens", "source", "offsets", "closed", "hole"):
+        assert np.array_equal(
+            to_np(getattr(after, field)), to_np(getattr(before, field))
+        ), field
+
+
+# ---------------------------------------------------------------------------
 # End to end, against known answers
 # ---------------------------------------------------------------------------
 
