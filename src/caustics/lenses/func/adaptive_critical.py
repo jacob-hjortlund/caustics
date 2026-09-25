@@ -398,7 +398,12 @@ def join_at_holes(curves, holes) -> CriticalCurves:
     2. A segment that starts right after a dropped point departs from that
        hole's circle; one that ends right before a dropped point arrives at
        it. Other curve ends -- the fov, or a band gap outside every hole --
-       stay ends.
+       stay ends. Disks need only not overlap, so a traced step can go from
+       a point of one hole straight to a point of another. That step is a
+       *bridge*: a segment with no point of its own, which departs the
+       first hole, at the angle of the step's point past its circle, and
+       arrives at the second, at the angle of the step's point before its
+       circle.
     3. Around each circle the ends, sorted by angle, alternate between
        arriving and departing. Each arriving end is joined to the next end
        clockwise, always a departing one: an arriving curve keeps
@@ -414,8 +419,9 @@ def join_at_holes(curves, holes) -> CriticalCurves:
        :func:`~caustics.lenses.func.adaptive.extend_adaptive_mesh` can
        arrange.
     4. The segments are chained through their joins by :func:`chain_order`,
-       numbered by their first traced point, so the curves keep
-       :func:`trace_band`'s order.
+       numbered by their first traced point, and the bridges after them, so
+       the curves keep :func:`trace_band`'s order. A curve of bridges alone
+       that its joins leave without a point is dropped.
 
     Every returned loop is then the boundary of a ``det A > 0`` region with
     the holes cut out, whatever pairing the tracer made inside a hole, and no
@@ -503,8 +509,10 @@ def join_at_holes(curves, holes) -> CriticalCurves:
     tag = tag[perm]
     tagged = tag >= 0
 
-    # 3. Segments: the maximal runs of untagged points of each curve, numbered
-    # by their first traced point.
+    # 3. Segments: the maximal runs of untagged points of each curve. Found in
+    # rotated order, they are already numbered by their first traced point: a
+    # closed curve now starts at its first point after a tagged run, and every
+    # segment of it starts after one, so none starts before that point.
     is_first = ~tagged & ((point == first) | tagged[backend.clamp(point - 1, 0, None)])
     is_last = ~tagged & (
         (point == last) | tagged[backend.clamp(point + 1, None, n_points - 1)]
@@ -520,8 +528,28 @@ def join_at_holes(curves, holes) -> CriticalCurves:
             hole=curves.hole[:0],
             holes=holes,
         )
-    renumber = backend.argsort(perm[seg_first])
-    seg_first, seg_last = seg_first[renumber], seg_last[renumber]
+
+    # 3b. Bridges. Disks need only not overlap, so a traced step can go from
+    # a point of one hole straight to a point of another. That step is a
+    # segment with no traced point, which departs the first hole and arrives
+    # at the second: it runs from the step's second point back to its first,
+    # so its departure takes the angle of the point past the first circle, its
+    # arrival that of the point before the second, and it assembles to nothing
+    # but its join's arc. Only a curve with a segment has bridges, and after
+    # the rotation none of them crosses a curve's wrap. Bridges are numbered
+    # after every real segment, in order along the curves, so a cycle holding
+    # a real segment still starts at one.
+    tag_next = tag[backend.clamp(point + 1, None, n_points - 1)]
+    has_segment = backend.bincount(curve[seg_first], minlength=counts.shape[0]) > 0
+    bridge = backend.flatnonzero(
+        (point != last)
+        & tagged
+        & (tag_next >= 0)
+        & (tag_next != tag)
+        & has_segment[curve]
+    )
+    seg_first = backend.concatenate((seg_first, bridge + 1), dim=0)
+    seg_last = backend.concatenate((seg_last, bridge), dim=0)
     n_seg = seg_first.shape[0]
     seg_closed = curves.closed[curve[seg_first]]
     starts_curve = seg_first == first[seg_first]
@@ -619,10 +647,18 @@ def join_at_holes(curves, holes) -> CriticalCurves:
         ),
         dim=0,
     )
+    offsets = csum[seg_offsets]
+    # A curve of bridges alone, whose joins inserted no sample, has no point:
+    # it is dropped, as a curve wholly inside a hole is. Every other curve
+    # holds a segment's traced points or an arc's samples.
+    kept = backend.flatnonzero(offsets[1:] > offsets[:-1])
+    if kept.shape[0] < closed.shape[0]:
+        offsets = backend.concatenate((offsets[:1], offsets[1:][kept]), dim=0)
+        closed = closed[kept]
     return CriticalCurves(
         lens=pool_lens[gather],
         source=pool_source[gather],
-        offsets=csum[seg_offsets],
+        offsets=offsets,
         closed=closed,
         hole=pool_hole[gather],
         holes=holes,

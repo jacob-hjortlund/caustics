@@ -480,6 +480,172 @@ def test_joining_at_no_hole_changes_nothing():
         ), field
 
 
+# Two holes of radius 0.1 on the x axis with a 0.005 gap between their disks:
+# A, hole 0, to the west and B, hole 1, to the east. One traced step can cross
+# the gap, from a point inside A straight to a point inside B.
+_A, _B = (-0.1025, 0.0), (0.1025, 0.0)
+
+
+def _hole_pair(n=64):
+    """Hand-built holes at ``_A`` and ``_B``: ``n`` even samples each.
+
+    Their sources are ``lens + (5, 0)`` and ``lens + (0, 5)``, so a sample of
+    one hole cannot pass for a sample of the other.
+    """
+    angle = 2.0 * np.pi * np.arange(n) / n
+    u = 0.1 * np.stack([np.cos(angle), np.sin(angle)], axis=-1)
+    lens = np.concatenate([np.asarray(_A) + u, np.asarray(_B) + u])
+    shift = np.repeat([[5.0, 0.0], [0.0, 5.0]], n, axis=0)
+    return new.CentreHoles(
+        centres=_arr([_A, _B]),
+        radius=_arr([0.1, 0.1]),
+        offsets=backend.as_array(np.array([0, n, 2 * n]), dtype=backend.int64),
+        angle=_arr(np.concatenate([angle, angle])),
+        lens=_arr(lens),
+        source=_arr(lens + shift),
+        growth=_arr([0.0, 0.0]),
+    )
+
+
+def _arm(centre, degrees, radii):
+    """Points at distances ``radii`` from ``centre``, in the direction ``degrees``."""
+    t = math.radians(degrees)
+    return [(centre[0] + r * math.cos(t), centre[1] + r * math.sin(t)) for r in radii]
+
+
+# Steps across the gap: east above the axis, and west below it. A step's
+# departure from its first hole takes the angle of its second point, and its
+# arrival at the second hole the angle of its first: 0.0907 rad about A and
+# pi - 0.0907 about B above the axis, pi + 0.0907 about B and 2 pi - 0.0907
+# about A below it. No end angle here lies within 0.0075 rad of a sample.
+_STEP_EAST = [(-0.0075, 0.01), (0.0075, 0.01)]
+_STEP_WEST = [(0.0075, -0.01), (-0.0075, -0.01)]
+# In from the north-west into A at 130 degrees, across to B, out to the
+# north-east at 50 degrees, and back over the top: one loop, travelling
+# counter-clockwise, which bridges the two holes once.
+BRIDGED_ONCE = (
+    _arm(_A, 130, [0.6, 0.3, 0.15, 0.05])
+    + _STEP_EAST
+    + _arm(_B, 50, [0.05, 0.15, 0.3, 0.6])
+    + [(0.6, 0.9), (0.0, 1.0), (-0.6, 0.9)]
+)
+# One clockwise loop that crosses the gap twice: round the west from A's
+# south-west (230 degrees) to its north-west (130), across to B above the
+# axis, round the east from B's north-east (50) to its south-east (310), and
+# back across to A below the axis.
+_WEST = (
+    _arm(_A, 230, [0.15, 0.3, 0.6])
+    + [(-0.9, -0.3), (-0.9, 0.3)]
+    + _arm(_A, 130, [0.6, 0.3, 0.15])
+)
+_EAST = (
+    _arm(_B, 50, [0.15, 0.3, 0.6])
+    + [(0.9, 0.3), (0.9, -0.3)]
+    + _arm(_B, -50, [0.6, 0.3, 0.15])
+)
+BRIDGED_TWICE = (
+    _WEST
+    + _arm(_A, 130, [0.05])
+    + _STEP_EAST
+    + _arm(_B, 50, [0.05])
+    + _EAST
+    + _arm(_B, -50, [0.05])
+    + _STEP_WEST
+    + _arm(_A, 230, [0.05])
+)
+
+
+def test_a_bridge_from_one_hole_to_another_is_joined_along_both_circles():
+    """Without the bridge A sees only an arrival and B only a departure.
+
+    Neither alternates, and the loop would stay open. With it, the arm into
+    A follows A clockwise, over the top, to the step, and the step follows
+    B clockwise, over the top, to the arm out of B.
+    """
+    holes = _hole_pair()
+    parts = _parts(crit.join_at_holes(_traced((BRIDGED_ONCE, True)), holes))
+    assert len(parts) == 1
+    lens, source, hole, closed = parts[0]
+    assert closed
+    traced = hole == -1
+    for c in (_A, _B):
+        assert (np.hypot(*(lens[traced] - np.asarray(c)).T) >= 0.1).all()
+    assert np.array_equal(source[traced], 2.0 * lens[traced])
+    stored_lens, stored_source = to_np(holes.lens), to_np(holes.source)
+    arcs = []
+    for h, c in enumerate((_A, _B)):
+        on = hole == h
+        k = _sample_index(lens[on] - np.asarray(c))
+        assert np.array_equal(lens[on], stored_lens[64 * h + k])
+        assert np.array_equal(source[on], stored_source[64 * h + k])
+        arcs.append(k.tolist())
+    # A from 130 degrees down to 0.0907 rad; B from pi - 0.0907 down to 50.
+    assert arcs == [list(range(23, 0, -1)), list(range(31, 8, -1))]
+    assert hole.tolist() == [-1] * 9 + [0] * 23 + [1] * 23
+
+
+def test_two_bridges_between_two_holes_join_into_one_loop_through_the_neck():
+    """The canonical output, derived by hand from the clockwise rule.
+
+    Segments are numbered by their first traced point, and bridges after
+    them: 0 is the west arc, 1 the east arc, 2 the step east and 3 the step
+    west. About A the ends lie at 0.0907 (2 departs), 130 degrees (0
+    arrives), 230 degrees (0 departs) and 2 pi - 0.0907 (3 arrives), so 0
+    joins 2 over A's top and 3 joins 0 under its bottom. About B, at 50
+    degrees (1 departs), pi - 0.0907 (2 arrives), pi + 0.0907 (3 departs)
+    and 310 degrees (1 arrives), so 2 joins 1 over B's top and 1 joins 3
+    under its bottom. That is one cycle, 0 -> 2 -> 1 -> 3, which starts at
+    0. Without the bridges each hole would join its own arc to itself the
+    long way round, through the gap: two loops, each wrapping 260 degrees
+    round one circle.
+    """
+    holes = _hole_pair()
+    got = crit.join_at_holes(_traced((BRIDGED_TWICE, True)), holes)
+    stored_lens, stored_source = to_np(holes.lens), to_np(holes.source)
+
+    def traced(points):
+        p = np.asarray(points)
+        return p, 2.0 * p, np.full(len(p), -1)
+
+    def arc(h, first, last):
+        rows = 64 * h + np.arange(first, last - 1, -1)
+        return stored_lens[rows], stored_source[rows], np.full(len(rows), h)
+
+    want = [
+        traced(_WEST),
+        arc(0, 23, 1),  # A, over the top: 130 degrees down to the step east
+        arc(1, 31, 9),  # B, over the top: the step east down to 50 degrees
+        traced(_EAST),
+        arc(1, 55, 33),  # B, underneath: 310 degrees down to the step west
+        arc(0, 63, 41),  # A, underneath: the step west down to 230 degrees
+    ]
+    want_lens, want_source, want_hole = (
+        np.concatenate([piece[i] for piece in want]) for i in range(3)
+    )
+    assert to_np(got.offsets).tolist() == [0, len(want_lens)]
+    assert to_np(got.closed).tolist() == [True]
+    assert np.array_equal(to_np(got.lens), want_lens)
+    assert np.array_equal(to_np(got.source), want_source)
+    assert np.array_equal(to_np(got.hole), want_hole)
+
+
+def test_a_bridge_left_unjoined_at_both_holes_adds_no_empty_curve():
+    """Two arms end inside A, and one of them first crosses into B.
+
+    That leaves three ends about A and one about B, so neither hole
+    alternates and nothing is joined. The bridge, with no point of its own,
+    would be a curve with no point at all.
+    """
+    across = _arm(_A, 130, [0.6, 0.3, 0.15, 0.05]) + _STEP_EAST
+    into = _arm(_A, 230, [0.6, 0.3, 0.15, 0.05])
+    parts = _parts(
+        crit.join_at_holes(_traced((across, False), (into, False)), _hole_pair())
+    )
+    assert [len(lens) for lens, *_ in parts] == [3, 3]
+    assert not any(closed for *_, closed in parts)
+    assert all((hole == -1).all() for _, _, hole, _ in parts)
+
+
 # ---------------------------------------------------------------------------
 # End to end, against known answers
 # ---------------------------------------------------------------------------
@@ -684,26 +850,35 @@ TWO_SIS = [(0.0, 0.0), (0.6, 0.0)]
 TWO_SIS_BUILD = dict(fov=5.0, init_res=10, min_img_sep=2e-2)
 
 
+def _einstein_radii(centres, b):
+    """``b`` for every centre: one radius for all, or one per centre."""
+    return [b] * len(centres) if np.isscalar(b) else list(b)
+
+
 def _sis_pair(centres, b=1.0):
-    """A lens-like object: singular isothermal spheres of Einstein radius ``b``."""
+    """A lens-like object: singular isothermal spheres of Einstein radius ``b``.
+
+    ``b`` is one radius for every centre, or a sequence of one per centre.
+    """
+    radii = _einstein_radii(centres, b)
 
     def raytrace(x, y):
         bx, by = x * 1.0, y * 1.0
-        for cx, cy in centres:
+        for (cx, cy), rein in zip(centres, radii):
             dx, dy = x - cx, y - cy
             r = (dx * dx + dy * dy) ** 0.5
-            bx, by = bx - b * dx / r, by - b * dy / r
+            bx, by = bx - rein * dx / r, by - rein * dy / r
         return bx, by
 
     def jacobian(x, y):
         a00, a01, a11 = x * 0.0 + 1.0, x * 0.0, x * 0.0 + 1.0
-        for cx, cy in centres:
+        for (cx, cy), rein in zip(centres, radii):
             dx, dy = x - cx, y - cy
             r = (dx * dx + dy * dy) ** 0.5
-            k = b / r**3
-            a00 = a00 - b / r + k * dx * dx
+            k = rein / r**3
+            a00 = a00 - rein / r + k * dx * dx
             a01 = a01 + k * dx * dy
-            a11 = a11 - b / r + k * dy * dy
+            a11 = a11 - rein / r + k * dy * dy
         return _stack_2x2(a00, a01, a01, a11)
 
     return SimpleNamespace(raytrace=raytrace, jacobian_lens_equation=jacobian)
@@ -712,9 +887,9 @@ def _sis_pair(centres, b=1.0):
 def _sis_pair_map(p, centres, b=1.0):
     """``_sis_pair`` on numpy points ``(N, 2)``."""
     out = p.copy()
-    for c in centres:
+    for c, rein in zip(centres, _einstein_radii(centres, b)):
         d = p - np.asarray(c)
-        out -= b * d / np.hypot(d[:, 0], d[:, 1])[:, None]
+        out -= rein * d / np.hypot(d[:, 0], d[:, 1])[:, None]
     return out
 
 
@@ -888,3 +1063,133 @@ def test_a_float32_mesh_repairs_its_curves_at_the_mesh_dtype():
     assert {tuple(row) for row in got.tolist()} <= {
         tuple(row) for row in stored.tolist()
     }
+
+
+# ---------------------------------------------------------------------------
+# End to end: a traced step from one hole's disk straight into another's
+# ---------------------------------------------------------------------------
+
+# Disks only need not overlap, and at the size floor a traced step can be as
+# long as half the stored min_img_sep, so a step can cross the gap between two
+# holes. Here an SIS of Einstein radius 0.02 sits beside TWO_SIS's centre on
+# the lattice origin, 0.0203" from it at 40 degrees: the two holes, of radius
+# 0.01, are 0.0003" apart.
+_COMPANION = (
+    0.0203 * math.cos(math.radians(40.0)),
+    0.0203 * math.sin(math.radians(40.0)),
+)
+WITH_COMPANION = TWO_SIS + [_COMPANION]
+WITH_COMPANION_B = [1.0, 1.0, 0.02]
+
+
+def _hole_to_hole_steps(mesh):
+    """How many traced steps of ``mesh``'s band go from one hole's disk straight into another's."""
+    raw = crit.trace_band(mesh.critical_band)
+    lens, off = to_np(raw.lens), to_np(raw.offsets)
+    centres, radius = to_np(mesh.holes.centres), to_np(mesh.holes.radius)
+    inside = np.hypot(*(lens[:, None, :] - centres[None]).transpose(2, 0, 1)) < radius
+    tag = np.where(inside.any(axis=1), inside.argmax(axis=1), -1)
+    steps = 0
+    for a, b in zip(off[:-1], off[1:]):
+        t = tag[a:b]
+        steps += int(((t[:-1] >= 0) & (t[1:] >= 0) & (t[:-1] != t[1:])).sum())
+    return steps
+
+
+def _traced_steps(curves):
+    """Every step between two consecutive traced points, a loop's closing step included.
+
+    Returns the steps' lens-plane ends, ``(K, 2)`` each, and their
+    source-plane lengths, ``(K,)``.
+    """
+    p, q, length = [], [], []
+    for lens, source, hole, closed in _parts(curves):
+        i = np.arange(len(lens))
+        j = (i + 1) % len(lens)
+        step = (hole[i] == -1) & (hole[j] == -1) & (closed | (j > 0))
+        p.append(lens[i[step]])
+        q.append(lens[j[step]])
+        length.append(np.hypot(*(source[j[step]] - source[i[step]]).T))
+    return np.concatenate(p), np.concatenate(q), np.concatenate(length)
+
+
+def _steps_entering_holes(mesh, curves):
+    """How many traced lens-plane steps come closer to a hole's centre than its radius."""
+    p, q, _ = _traced_steps(curves)
+    d = q - p
+    entering = 0
+    for c, r in zip(to_np(mesh.holes.centres), to_np(mesh.holes.radius)):
+        t = ((c - p) * d).sum(axis=1) / np.maximum((d * d).sum(axis=1), 1e-300)
+        closest = p + np.clip(t, 0.0, 1.0)[:, None] * d
+        entering += int((np.hypot(*(closest - c).T) < r).sum())
+    return entering
+
+
+def _assert_closed_off_the_holes(mesh, curves):
+    """Every curve closed, its hole points on their circles, and no traced point in a hole."""
+    parts = _parts(curves)
+    assert parts and all(closed for *_, closed in parts)
+    centres, radius = to_np(mesh.holes.centres), to_np(mesh.holes.radius)
+    for lens, _, hole, _ in parts:
+        for h in range(centres.shape[0]):
+            d = np.hypot(*(lens - centres[h]).T)
+            assert np.allclose(d[hole == h], radius[h], rtol=0, atol=1e-12)
+            assert (d[hole == -1] >= radius[h]).all()
+
+
+def _assert_closed_and_chord_free(mesh, curves):
+    """``_assert_closed_off_the_holes``, and no traced step above 0.05"."""
+    _assert_closed_off_the_holes(mesh, curves)
+    assert (_traced_steps(curves)[2] < 0.05).all()
+
+
+@pytest.fixture(scope="module")
+def bridged_sis():
+    mesh = new.build_adaptive_mesh(
+        _sis_pair(WITH_COMPANION, b=WITH_COMPANION_B),
+        **TWO_SIS_BUILD,
+        centres=WITH_COMPANION,
+    )
+    return mesh, crit.mesh_critical_curves(mesh)
+
+
+def test_curves_bridged_to_a_singular_companion_come_out_closed_and_chord_free(
+    bridged_sis,
+):
+    mesh, curves = bridged_sis
+    assert _hole_to_hole_steps(mesh) > 0
+    _assert_closed_off_the_holes(mesh, curves)
+    # No 0.05" bound on the caustic's steps here: the companion's curve runs
+    # where the origin's SIS stretches the caustic 37-94 times, so resolved
+    # steps there reach about 0.12". A chord is an interpolation across a
+    # hole, and that is what this checks directly.
+    assert _steps_entering_holes(mesh, curves) == 0
+
+
+def test_the_count_through_a_bridged_hole_matches_a_brute_force_count(bridged_sis):
+    _, curves = bridged_sis
+    grid = _grid_of(curves)
+    truth = _brute_counts(
+        lambda p: _sis_pair_map(p, WITH_COMPANION, b=WITH_COMPANION_B),
+        grid,
+        lo=-4.0,
+        hi=4.6,
+        h=0.005,
+        singular=WITH_COMPANION,
+        excl=0.02,
+    )
+    band = _curve_mask(curves, grid, 0.06)
+    assert (~band).mean() > 0.75
+    assert np.array_equal(_count(curves, grid)[~band], truth[~band])
+
+
+def test_curves_bridged_to_a_regular_centre_come_out_closed_and_chord_free():
+    """A third centre where the lens is regular, 0.02095" from the origin.
+
+    Its hole lies 0.00095" from the origin's, and one traced step of 0.00123"
+    goes from it straight into the origin's.
+    """
+    centres = TWO_SIS + [(-0.01241, 0.01688)]
+    mesh = new.build_adaptive_mesh(_sis_pair(TWO_SIS), **TWO_SIS_BUILD, centres=centres)
+    assert _hole_to_hole_steps(mesh) > 0
+    _assert_closed_and_chord_free(mesh, crit.mesh_critical_curves(mesh))
