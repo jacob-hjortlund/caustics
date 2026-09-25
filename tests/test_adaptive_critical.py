@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from scipy.spatial import cKDTree
 
 from caustics.backend_obj import backend
 from caustics.lenses.func import adaptive as new
@@ -669,3 +670,221 @@ def test_a_curve_ends_where_the_lens_turns_nonfinite():
     left, right = sorted([lens[0, 0], lens[-1, 0]])
     assert left == -2.0
     assert 1.0 - min_img_sep < right <= 1.0
+
+
+# ---------------------------------------------------------------------------
+# End to end: curves through singular centres, repaired at their holes
+# ---------------------------------------------------------------------------
+
+# Two singular isothermal spheres of Einstein radius 1, 0.6" apart: each sits
+# in the other's field with kappa = shear = 1/1.2 > 1/2, so four branches of
+# det A = 0 end at each centre. The first is on the lattice origin, where the
+# lens is NaN, so the band has a gap there and trace_band's curves are open.
+TWO_SIS = [(0.0, 0.0), (0.6, 0.0)]
+TWO_SIS_BUILD = dict(fov=5.0, init_res=10, min_img_sep=2e-2)
+
+
+def _sis_pair(centres, b=1.0):
+    """A lens-like object: singular isothermal spheres of Einstein radius ``b``."""
+
+    def raytrace(x, y):
+        bx, by = x * 1.0, y * 1.0
+        for cx, cy in centres:
+            dx, dy = x - cx, y - cy
+            r = (dx * dx + dy * dy) ** 0.5
+            bx, by = bx - b * dx / r, by - b * dy / r
+        return bx, by
+
+    def jacobian(x, y):
+        a00, a01, a11 = x * 0.0 + 1.0, x * 0.0, x * 0.0 + 1.0
+        for cx, cy in centres:
+            dx, dy = x - cx, y - cy
+            r = (dx * dx + dy * dy) ** 0.5
+            k = b / r**3
+            a00 = a00 - b / r + k * dx * dx
+            a01 = a01 + k * dx * dy
+            a11 = a11 - b / r + k * dy * dy
+        return _stack_2x2(a00, a01, a01, a11)
+
+    return SimpleNamespace(raytrace=raytrace, jacobian_lens_equation=jacobian)
+
+
+def _sis_pair_map(p, centres, b=1.0):
+    """``_sis_pair`` on numpy points ``(N, 2)``."""
+    out = p.copy()
+    for c in centres:
+        d = p - np.asarray(c)
+        out -= b * d / np.hypot(d[:, 0], d[:, 1])[:, None]
+    return out
+
+
+def _grid_of(curves, dx=0.02, margin=0.2):
+    """A pixel grid ``(x0, y0, dx, nx, ny)`` over every caustic and hole curve."""
+    pts = np.concatenate([to_np(curves.source), to_np(curves.holes.source)])
+    lo, hi = pts.min(axis=0) - margin, pts.max(axis=0) + margin
+    nx, ny = np.ceil((hi - lo) / dx).astype(int)
+    return float(lo[0]), float(lo[1]), dx, int(nx), int(ny)
+
+
+def _pixels(grid):
+    x0, y0, dx, nx, ny = grid
+    X, Y = np.meshgrid(x0 + (np.arange(nx) + 0.5) * dx, y0 + (np.arange(ny) + 0.5) * dx)
+    return np.stack([X.ravel(), Y.ravel()], axis=-1)
+
+
+def _winding(poly, grid):
+    """Winding number of a closed polyline round every pixel centre, by signed crossings of a rightward ray."""
+    x0, y0, dx, nx, ny = grid
+    a, b = poly, np.roll(poly, -1, axis=0)
+    lo, hi = np.minimum(a[:, 1], b[:, 1]), np.maximum(a[:, 1], b[:, 1])
+    sgn = np.where(b[:, 1] > a[:, 1], 1, -1)
+    r_lo = np.maximum(np.ceil((lo - y0) / dx - 0.5).astype(np.int64), 0)
+    r_hi = np.minimum(np.ceil((hi - y0) / dx - 0.5).astype(np.int64) - 1, ny - 1)
+    nr = np.maximum(r_hi - r_lo + 1, 0)
+    e = np.repeat(np.arange(len(a)), nr)
+    r = r_lo[e] + (np.arange(nr.sum()) - np.repeat(np.cumsum(nr) - nr, nr))
+    py = y0 + (r + 0.5) * dx
+    xcr = a[e, 0] + (py - a[e, 1]) / (b[e, 1] - a[e, 1]) * (b[e, 0] - a[e, 0])
+    k = np.clip(np.ceil((xcr - x0) / dx - 0.5).astype(np.int64), 0, nx)
+    diff = np.zeros((ny, nx + 1), dtype=np.int64)
+    np.add.at(diff, (r, np.zeros_like(r)), sgn[e])
+    np.add.at(diff, (r, k), -sgn[e])
+    return np.cumsum(diff, axis=1)[:, :nx]
+
+
+def _lens_winding(loop, s):
+    """Winding number of a closed lens-plane polyline round the point ``s``."""
+    v = loop - np.asarray(s)
+    a, b = v, np.roll(v, -1, axis=0)
+    turns = np.arctan2(a[:, 0] * b[:, 1] - a[:, 1] * b[:, 0], (a * b).sum(axis=1))
+    return int(np.rint(turns.sum() / (2 * np.pi)))
+
+
+def _count(curves, grid):
+    """``N = 1 + 2 sum_c w(K_c) + sum_s sigma_s w(h_s)``, ``sigma_s = -1 - 2 sum_c w(loop_c, s)``."""
+    x0, y0, dx, nx, ny = grid
+    parts = _parts(curves)
+    N = np.ones((ny, nx), dtype=np.int64)
+    for _, source, _, closed in parts:
+        assert closed
+        N += 2 * _winding(source, grid)
+    offsets = to_np(curves.holes.offsets)
+    centres, hole_source = to_np(curves.holes.centres), to_np(curves.holes.source)
+    for h, s in enumerate(centres):
+        sigma = -1 - 2 * sum(_lens_winding(lens, s) for lens, *_ in parts)
+        N += sigma * _winding(hole_source[offsets[h] : offsets[h + 1]], grid)
+    return N
+
+
+def _curve_mask(curves, grid, width):
+    """Pixels within ``width`` of a caustic or hole curve, where either count is at its resolution."""
+    x0, y0, dx, nx, ny = grid
+    pts = np.concatenate([to_np(curves.source), to_np(curves.holes.source)])
+    return (cKDTree(pts).query(_pixels(grid))[0] < width).reshape(ny, nx)
+
+
+def _brute_counts(fn, grid, lo, hi, h, singular, excl):
+    """Images per pixel centre: lens-plane triangles whose piecewise-linear image covers it."""
+    x0, y0, dx, nx, ny = grid
+    g = np.arange(lo, hi + h / 2, h) + 3.3e-5
+    X, Y = np.meshgrid(g, g)
+    B = fn(np.stack([X.ravel(), Y.ravel()], axis=-1)).reshape(*X.shape, 2)
+    cx = 0.5 * (g[:-1] + g[1:])
+    CX, CY = np.meshgrid(cx, cx)
+    keep = np.ones(CX.shape, dtype=bool)
+    for s in singular:
+        keep &= np.hypot(CX - s[0], CY - s[1]) > excl
+    p00, p10, p01, p11 = B[:-1, :-1], B[:-1, 1:], B[1:, :-1], B[1:, 1:]
+    counts = np.zeros(ny * nx, dtype=np.int64)
+    for A_, B_, C_ in ((p00, p10, p11), (p00, p11, p01)):
+        a, b, c = A_[keep], B_[keep], C_[keep]
+        xs = np.stack([a[:, 0], b[:, 0], c[:, 0]])
+        ys = np.stack([a[:, 1], b[:, 1], c[:, 1]])
+        i0 = np.maximum(np.ceil((xs.min(0) - x0) / dx - 0.5), 0).astype(np.int64)
+        i1 = np.minimum(np.floor((xs.max(0) - x0) / dx - 0.5), nx - 1).astype(np.int64)
+        j0 = np.maximum(np.ceil((ys.min(0) - y0) / dx - 0.5), 0).astype(np.int64)
+        j1 = np.minimum(np.floor((ys.max(0) - y0) / dx - 0.5), ny - 1).astype(np.int64)
+        ni, nj = np.maximum(i1 - i0 + 1, 0), np.maximum(j1 - j0 + 1, 0)
+        tot = ni * nj
+        sel = np.flatnonzero(tot > 0)
+        tt = np.repeat(sel, tot[sel])
+        w = np.arange(tt.size) - np.repeat(np.cumsum(tot[sel]) - tot[sel], tot[sel])
+        ii, jj = i0[tt] + w % ni[tt], j0[tt] + w // ni[tt]
+        px, py = x0 + (ii + 0.5) * dx, y0 + (jj + 0.5) * dx
+        ax, ay = a[tt, 0] - px, a[tt, 1] - py
+        bx, by = b[tt, 0] - px, b[tt, 1] - py
+        qx, qy = c[tt, 0] - px, c[tt, 1] - py
+        w1 = bx * qy - by * qx
+        w2 = qx * ay - qy * ax
+        w3 = ax * by - ay * bx
+        ins = ((w1 >= 0) & (w2 >= 0) & (w3 >= 0)) | ((w1 <= 0) & (w2 <= 0) & (w3 <= 0))
+        np.add.at(counts, (jj * nx + ii)[ins], 1)
+    return counts.reshape(ny, nx)
+
+
+@pytest.fixture(scope="module")
+def two_sis():
+    mesh = new.build_adaptive_mesh(_sis_pair(TWO_SIS), **TWO_SIS_BUILD, centres=TWO_SIS)
+    return mesh, crit.mesh_critical_curves(mesh)
+
+
+def test_curves_through_singular_centres_come_out_closed_and_chord_free(two_sis):
+    """Without holes a chord crosses a cut of radius ~1"; traced steps are below 0.01"."""
+    mesh, curves = two_sis
+    assert not to_np(crit.trace_band(mesh.critical_band).closed).all()
+    parts = _parts(curves)
+    assert parts and all(closed for *_, closed in parts)
+    centres, radius = to_np(mesh.holes.centres), to_np(mesh.holes.radius)
+    for lens, source, hole, _ in parts:
+        traced = (hole == -1) & (np.roll(hole, -1) == -1)
+        step = np.hypot(*(np.roll(source, -1, axis=0) - source).T)
+        assert step[traced].max() < 0.05
+        for h in range(centres.shape[0]):
+            d = np.hypot(*(lens - centres[h]).T)
+            assert np.allclose(d[hole == h], radius[h], rtol=0, atol=1e-12)
+            assert (d[hole == -1] >= radius[h]).all()
+
+
+def test_the_count_from_the_repaired_curves_matches_a_brute_force_count(two_sis):
+    _, curves = two_sis
+    grid = _grid_of(curves)
+    truth = _brute_counts(
+        lambda p: _sis_pair_map(p, TWO_SIS),
+        grid,
+        lo=-4.0,
+        hi=4.6,
+        h=0.005,
+        singular=TWO_SIS,
+        excl=0.02,
+    )
+    band = _curve_mask(curves, grid, 0.06)
+    assert (~band).mean() > 0.75
+    assert np.array_equal(_count(curves, grid)[~band], truth[~band])
+
+
+def test_moving_a_centre_off_the_lattice_leaves_the_count_unchanged(two_sis):
+    _, curves = two_sis
+    shifted = [(0.0003, 0.0002), TWO_SIS[1]]
+    mesh = new.build_adaptive_mesh(_sis_pair(shifted), **TWO_SIS_BUILD, centres=shifted)
+    moved = crit.mesh_critical_curves(mesh)
+    grid = _grid_of(curves)
+    band = _curve_mask(curves, grid, 0.06) | _curve_mask(moved, grid, 0.06)
+    assert np.array_equal(_count(moved, grid)[~band], _count(curves, grid)[~band])
+
+
+def test_a_float32_mesh_repairs_its_curves_at_the_mesh_dtype():
+    mesh = new.build_adaptive_mesh(
+        _sis_pair(TWO_SIS), **TWO_SIS_BUILD, centres=TWO_SIS, dtype=backend.float32
+    )
+    curves = crit.mesh_critical_curves(mesh)
+    assert (
+        curves.lens.dtype == backend.float32 and curves.source.dtype == backend.float32
+    )
+    assert to_np(curves.closed).all()
+    on = to_np(curves.hole) >= 0
+    assert on.any()
+    got = np.concatenate([to_np(curves.lens)[on], to_np(curves.source)[on]], axis=1)
+    stored = np.concatenate([to_np(mesh.holes.lens), to_np(mesh.holes.source)], axis=1)
+    assert {tuple(row) for row in got.tolist()} <= {
+        tuple(row) for row in stored.tolist()
+    }

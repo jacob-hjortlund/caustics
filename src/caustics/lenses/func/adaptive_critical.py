@@ -13,6 +13,12 @@ Every crossing lies on a child edge whose two ends have opposite classes, so
 where ``det A`` is continuous the true critical curve crosses the same edge:
 each lens-plane point is within one child edge, half a leaf edge, of the
 curve.
+
+A mesh built with ``centres`` also holds holes around them
+(:class:`~caustics.lenses.func.adaptive.CentreHoles`): the lens map can jump
+at a lens centre, so the curves are cut at each hole's circle and re-joined
+along the stored hole curve (:func:`join_at_holes`). That too is a function
+of the mesh alone.
 """
 
 import math
@@ -61,6 +67,15 @@ class CriticalCurves(NamedTuple):
     without changing sign -- an isolated degenerate critical point -- the
     zero-is-positive rule yields a closed curve of zero extent, every point
     of it at that one sample.
+
+    On a mesh built with ``centres``, a curve that reaches a hole does not run
+    into it: it follows the hole's circle, clockwise, to the next curve leaving
+    it, so every loop bounds a ``det A > 0`` region with the holes cut out, and
+    its caustic follows the hole curve -- the pseudo-caustic at an isothermal
+    centre -- instead of cutting straight across it. Those points carry their
+    hole's index in ``hole``. A hole curve is a pseudo-caustic only where its
+    ``holes.growth`` is about 0; see
+    :class:`~caustics.lenses.func.adaptive.CentreHoles`.
 
     Parameters
     ----------
@@ -618,19 +633,28 @@ def mesh_critical_curves(mesh) -> CriticalCurves:
     """
     Critical curves and caustics of the lens an adaptive mesh was built from.
 
-    A pure function of ``mesh.critical_band``: no raytrace and no Jacobian
-    call. Each lens-plane point lies on a child edge whose ends straddle the
-    curve, so where ``det A`` is continuous it is within one child edge of
-    the true critical curve -- at most ``mesh.min_img_sep / 2``, a quarter of
-    the ``min_img_sep`` passed to the build, unless ``max_depth`` bound, when
-    it is half the actual ``max_level`` leaf edge. Each caustic point is the
-    image interpolated along the same edge; for exact images, raytrace
-    ``lens`` directly.
+    A pure function of ``mesh.critical_band`` and ``mesh.holes``: no raytrace
+    and no Jacobian call. Each lens-plane point lies on a child edge whose
+    ends straddle the curve, so where ``det A`` is continuous it is within
+    one child edge of the true critical curve -- at most
+    ``mesh.min_img_sep / 2``, a quarter of the ``min_img_sep`` passed to the
+    build, unless ``max_depth`` bound, when it is half the actual
+    ``max_level`` leaf edge. Each caustic point is the image interpolated
+    along the same edge; for exact images, raytrace ``lens`` directly.
 
     A curve ends where the band does: at the fov boundary, or next to a leaf
     whose samples or Jacobian are non-finite, or, in principle, next to a
-    coarser converged leaf. Pseudo-caustics of lenses with a singular centre
-    are not zero sets of ``det A`` and are not traced.
+    coarser converged leaf -- unless that happens inside a hole, where the
+    curve is joined instead.
+
+    A mesh built with ``centres`` has holes around them, and the traced
+    curves are cut at each hole's circle and re-joined along the stored hole
+    curve by :func:`join_at_holes`; the hole curves -- the pseudo-caustics,
+    where ``holes.growth`` is about 0 -- come back as ``holes``. Without
+    them, a curve through a singular centre, where the lens map jumps, gets
+    a caustic that cuts straight across the pseudo-caustic, and one through
+    a centre on a lattice point comes out open. Either way this function
+    makes no lens call.
 
     A curve the fov cuts can be closed by growing the mesh with
     :func:`~caustics.lenses.func.adaptive.extend_adaptive_mesh`, which reuses
@@ -654,5 +678,9 @@ def mesh_critical_curves(mesh) -> CriticalCurves:
     Returns
     -------
     CriticalCurves
+        With ``holes`` set to ``mesh.holes``.
     """
-    return trace_band(mesh.critical_band)._replace(holes=mesh.holes)
+    curves = trace_band(mesh.critical_band)
+    if mesh.holes.centres.shape[0] == 0:
+        return curves._replace(holes=mesh.holes)
+    return join_at_holes(curves, mesh.holes)
