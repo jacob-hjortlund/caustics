@@ -4072,9 +4072,13 @@ def build_adaptive_mesh(
         that share one (:func:`merge_centres`). The image of each hole's
         boundary is traced and stored as ``AdaptiveMesh.holes``
         (:func:`sample_holes`), at a few hundred to a few thousand raytraces
-        per hole and no Jacobian call. Centres that are not singular are
-        harmless, so every lens component's centre may be passed. ``None``
-        stores no hole.
+        per hole and no Jacobian call. A ``UserWarning`` is raised for each
+        hole whose refinement is capped at :data:`HOLE_MAX_SAMPLES` samples
+        before every chord falls below ``min_img_sep``; such a hole curve is
+        exact at its samples but coarser than ``min_img_sep`` between them,
+        and only an enormous hole curve, such as a point mass's, reaches the
+        cap. Centres that are not singular are harmless, so every lens
+        component's centre may be passed. ``None`` stores no hole.
 
         *Unit: arcsec*
 
