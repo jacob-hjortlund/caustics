@@ -83,6 +83,7 @@ __all__ = (
     "find_unbalanced",
     "make_raytrace",
     "trace_keys",
+    "trace_points",
     "evaluate",
     "CriticalBand",
     "empty_band",
@@ -94,6 +95,11 @@ __all__ = (
     "CentreHoles",
     "empty_holes",
     "merge_centres",
+    "HOLE_INITIAL_SAMPLES",
+    "HOLE_MAX_SAMPLES",
+    "HOLE_GROWTH_SAMPLES",
+    "hole_circle",
+    "sample_holes",
     "force_split",
     "refine",
     "balance",
@@ -1812,6 +1818,41 @@ def make_raytrace(raytrace, device) -> Callable[[ArrayLike], ArrayLike]:
     return call
 
 
+def trace_points(xy, raytrace_fn, batch_size) -> ArrayLike:
+    """
+    ``raytrace_fn`` on float64 lens-plane points ``(N, 2)``, chunked only for memory.
+
+    The whole-array path is used whenever ``batch_size`` is ``None`` or the
+    input already fits in one batch. ``raytrace_fn`` acts on each row
+    independently and concatenation keeps row order, so the result is
+    bit-identical for every ``batch_size``.
+
+    Parameters
+    ----------
+    xy: ArrayLike
+        ``(N, 2)`` float64 points.
+
+        *Unit: arcsec*
+    raytrace_fn: Callable[[ArrayLike], ArrayLike]
+        From :func:`make_raytrace`.
+    batch_size: Optional[int]
+        Maximum rows per ``raytrace_fn`` call, or ``None`` for a single call.
+
+    Returns
+    -------
+    ArrayLike
+        ``(N, 2)`` float64 images.
+
+        *Unit: arcsec*
+    """
+    if batch_size is None or xy.shape[0] <= batch_size:
+        return raytrace_fn(xy)
+    n_chunks = math.ceil(xy.shape[0] / batch_size)
+    return backend.concatenate(
+        [raytrace_fn(chunk) for chunk in backend.chunk(xy, n_chunks, dim=0)], dim=0
+    )
+
+
 def trace_keys(lat, ij, raytrace_fn, batch_size) -> ArrayLike:
     """
     Raytrace lattice points as one logical batch, chunked only for memory.
@@ -1846,13 +1887,7 @@ def trace_keys(lat, ij, raytrace_fn, batch_size) -> ArrayLike:
 
         *Unit: arcsec*
     """
-    xy = lattice_xy(lat, ij)
-    if batch_size is None or xy.shape[0] <= batch_size:
-        return raytrace_fn(xy)
-    n_chunks = math.ceil(xy.shape[0] / batch_size)
-    return backend.concatenate(
-        [raytrace_fn(chunk) for chunk in backend.chunk(xy, n_chunks, dim=0)], dim=0
-    )
+    return trace_points(lattice_xy(lat, ij), raytrace_fn, batch_size)
 
 
 def evaluate(cache, lat, keys, raytrace_fn, batch_size) -> VertexCache:
@@ -2392,6 +2427,186 @@ def merge_centres(centres, min_img_sep) -> Tuple[ArrayLike, ArrayLike]:
         link = link | overlap[member][:, member]
     order = backend.lexsort([mean[:, 1], mean[:, 0]])
     return mean[order], radius[order]
+
+
+# Hole sampling: the first even pass, the refinement cap, and the circles the
+# growth exponent is measured on.
+HOLE_INITIAL_SAMPLES = 256
+HOLE_MAX_SAMPLES = 1 << 16
+HOLE_GROWTH_SAMPLES = 1024
+
+
+def hole_circle(centres, radius, hole, angle) -> ArrayLike:
+    """
+    Points ``centres[hole] + radius[hole] * (cos, sin)(angle)``, shape ``(K, 2)``.
+
+    *Unit: arcsec*
+    """
+    c, r = centres[hole], radius[hole]
+    return backend.stack(
+        (c[:, 0] + r * backend.cos(angle), c[:, 1] + r * backend.sin(angle)), dim=-1
+    )
+
+
+def _trace_hole_points(
+    raytrace_fn, centres, radius, hole, angle, batch_size, scale=1.0
+):
+    """
+    Images of points on the hole circles scaled by ``scale``, shape ``(K, 2)``.
+
+    Raises
+    ------
+    ValueError
+        If any image is non-finite, naming the first such hole's centre and
+        the radius of the circle traced.
+    """
+    source = trace_points(
+        hole_circle(centres, radius * scale, hole, angle), raytrace_fn, batch_size
+    )
+    bad = backend.flatnonzero(~backend.all(backend.isfinite(source), dim=1))
+    if bad.shape[0]:
+        h = int(backend.to_numpy(hole[bad[0]]))
+        x, y = backend.to_numpy(centres[h]).tolist()
+        r = float(backend.to_numpy(radius[h])) * scale
+        raise ValueError(
+            f"the lens is not finite on the hole circle of radius {r:g} around "
+            f"({x:g}, {y:g}); a hole's boundary must lie where the lens is finite"
+        )
+    return source
+
+
+def _extent(points) -> ArrayLike:
+    """Diagonal of each row's bounding box, ``(H, K, 2) -> (H,)``."""
+    return backend.norm(backend.max(points, dim=1) - backend.min(points, dim=1), dim=-1)
+
+
+def sample_holes(raytrace_fn, centres, radius, min_img_sep, batch_size) -> CentreHoles:
+    """
+    Trace every hole's boundary circle and its image, the hole curve.
+
+    Each circle starts with :data:`HOLE_INITIAL_SAMPLES` evenly spaced angles.
+    Every angular interval whose source-plane chord exceeds ``min_img_sep``
+    -- the wrap-around one included -- is then bisected, round after round,
+    one ``raytrace_fn`` call per round for all holes together, until no chord
+    exceeds ``min_img_sep`` or a hole would pass :data:`HOLE_MAX_SAMPLES`
+    samples. A hole stopped by the cap stays exact at its samples but coarser
+    between them, and is warned about; only enormous hole curves, such as a
+    point mass's, reach it.
+
+    ``growth`` compares the hole curve's size -- its bounding box's diagonal
+    -- on :data:`HOLE_GROWTH_SAMPLES` even samples at ``radius`` and at
+    ``radius / 4``: ``log(size(r) / size(r / 4)) / log(4)``. No Jacobian is
+    called.
+
+    Parameters
+    ----------
+    raytrace_fn: Callable[[ArrayLike], ArrayLike]
+        From :func:`make_raytrace`.
+    centres: ArrayLike
+        ``(H, 2)`` float64 hole centres, from :func:`merge_centres`.
+
+        *Unit: arcsec*
+    radius: ArrayLike
+        ``(H,)`` float64 hole radii, from :func:`merge_centres`.
+
+        *Unit: arcsec*
+    min_img_sep: float
+        Largest source-plane chord left between neighbouring samples.
+
+        *Unit: arcsec*
+    batch_size: Optional[int]
+        Forwarded to :func:`trace_points`.
+
+    Returns
+    -------
+    CentreHoles
+        Every array float64 but ``offsets``, on the ambient device.
+
+    Raises
+    ------
+    ValueError
+        If the lens is not finite somewhere on a circle at ``radius`` or at
+        ``radius / 4``.
+
+    Warns
+    -----
+    UserWarning
+        For each hole whose refinement stopped at :data:`HOLE_MAX_SAMPLES`.
+    """
+    n_holes = centres.shape[0]
+    if n_holes == 0:
+        return empty_holes()
+    int64, f64 = backend.int64, backend.float64
+    two_pi = 2.0 * math.pi
+    ids = backend.arange(n_holes, dtype=int64)
+
+    hole = backend.repeat(ids, HOLE_INITIAL_SAMPLES, axis=0)
+    step = backend.arange(n_holes * HOLE_INITIAL_SAMPLES, dtype=int64)
+    angle = backend.to(step % HOLE_INITIAL_SAMPLES, dtype=f64) * (
+        two_pi / HOLE_INITIAL_SAMPLES
+    )
+    source = _trace_hole_points(raytrace_fn, centres, radius, hole, angle, batch_size)
+    capped = backend.zeros((n_holes,), dtype=backend.bool)
+    while True:
+        counts = backend.bincount(hole, minlength=n_holes)
+        starts = backend.cumsum(counts, dim=0) - counts
+        i = backend.arange(hole.shape[0], dtype=int64)
+        wrap = i == starts[hole] + counts[hole] - 1
+        nxt = backend.where(wrap, starts[hole], i + 1)
+        chord = backend.norm(source[nxt] - source, dim=-1)
+        bad = backend.flatnonzero(chord > min_img_sep)
+        wanted = backend.bincount(hole[bad], minlength=n_holes)
+        capped = capped | ((wanted > 0) & (counts + wanted > HOLE_MAX_SAMPLES))
+        rows = bad[backend.flatnonzero(~capped[hole[bad]])]
+        if rows.shape[0] == 0:
+            break
+        upper = backend.where(wrap[rows], angle[nxt[rows]] + two_pi, angle[nxt[rows]])
+        mid = 0.5 * (angle[rows] + upper)
+        mid = backend.where(mid >= two_pi, mid - two_pi, mid)
+        new_hole = hole[rows]
+        new_source = _trace_hole_points(
+            raytrace_fn, centres, radius, new_hole, mid, batch_size
+        )
+        hole = backend.concatenate((hole, new_hole), dim=0)
+        angle = backend.concatenate((angle, mid), dim=0)
+        source = backend.concatenate((source, new_source), dim=0)
+        order = backend.lexsort([angle, hole])
+        hole, angle, source = hole[order], angle[order], source[order]
+    for h in backend.to_numpy(backend.flatnonzero(capped)).tolist():
+        x, y = backend.to_numpy(centres[h]).tolist()
+        warn(
+            f"the hole curve around ({x:g}, {y:g}) reached {HOLE_MAX_SAMPLES} "
+            f"samples before every chord fell below min_img_sep={min_img_sep:g}; "
+            "it is exact at its samples but coarser than min_img_sep between them"
+        )
+
+    g_hole = backend.repeat(ids, HOLE_GROWTH_SAMPLES, axis=0)
+    g_step = backend.arange(n_holes * HOLE_GROWTH_SAMPLES, dtype=int64)
+    g_angle = backend.to(g_step % HOLE_GROWTH_SAMPLES, dtype=f64) * (
+        two_pi / HOLE_GROWTH_SAMPLES
+    )
+    shape = (n_holes, HOLE_GROWTH_SAMPLES, 2)
+    outer = _trace_hole_points(
+        raytrace_fn, centres, radius, g_hole, g_angle, batch_size
+    ).reshape(shape)
+    inner = _trace_hole_points(
+        raytrace_fn, centres, radius, g_hole, g_angle, batch_size, scale=0.25
+    ).reshape(shape)
+    growth = backend.log(_extent(outer) / _extent(inner)) / math.log(4.0)
+
+    counts = backend.bincount(hole, minlength=n_holes)
+    offsets = backend.concatenate(
+        (backend.zeros((1,), dtype=int64), backend.cumsum(counts, dim=0)), dim=0
+    )
+    return CentreHoles(
+        centres=centres,
+        radius=radius,
+        offsets=offsets,
+        angle=angle,
+        lens=hole_circle(centres, radius, hole, angle),
+        source=source,
+        growth=growth,
+    )
 
 
 # ---------------------------------------------------------------------------
