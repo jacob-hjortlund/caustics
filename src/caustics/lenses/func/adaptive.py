@@ -91,6 +91,9 @@ __all__ = (
     "band_leaf_index",
     "band_sample_keys",
     "merge_bands",
+    "CentreHoles",
+    "empty_holes",
+    "merge_centres",
     "force_split",
     "refine",
     "balance",
@@ -2208,6 +2211,187 @@ def merge_bands(lat, cache, store, first, second) -> CriticalBand:
         source=source,
         det=det,
     )
+
+
+# ---------------------------------------------------------------------------
+# Holes around lens centres
+# ---------------------------------------------------------------------------
+
+
+class CentreHoles(NamedTuple):
+    """
+    Small disks cut around lens centres, and the images of their boundaries.
+
+    The lens map can jump at a lens centre -- an isothermal profile's
+    deflection depends only on the direction from its centre -- so no curve
+    of ``det A = 0`` describes what happens to images there. A hole of radius
+    ``radius`` around each centre is left out of the lens plane instead, and
+    the image of its boundary circle, the *hole curve*, is kept. At an
+    isothermal centre the hole curve is the pseudo-caustic to within about
+    ``radius``; at a point mass, or a cusp steeper than isothermal, it is a
+    huge loop; at a regular point, or a profile whose deflection vanishes at
+    its centre, it is a speck. ``growth`` tells these apart: the hole curve's
+    size scales as ``radius**growth`` there, so ``growth`` is about 0 for a
+    pseudo-caustic, negative for a loop that runs off to infinity as the hole
+    shrinks, and positive for a speck -- exactly ``1 - t`` for a power law of
+    slope ``t``.
+
+    Samples are stored CSR per hole: hole ``h`` is rows
+    ``offsets[h]:offsets[h + 1]`` of ``angle``, ``lens`` and ``source``, in
+    strictly ascending ``angle``.
+
+    Parameters
+    ----------
+    centres: ArrayLike
+        ``(H, 2)`` hole centres after merging, at the mesh dtype.
+
+        *Unit: arcsec*
+    radius: ArrayLike
+        ``(H,)`` float64 hole radii: the mesh's ``min_img_sep``, plus the
+        spread of the centres a hole merged.
+
+        *Unit: arcsec*
+    offsets: ArrayLike
+        ``(H + 1,)`` int64 CSR offsets, ``offsets[0] == 0``.
+    angle: ArrayLike
+        ``(P,)`` float64 sample angles in ``[0, 2 pi)``.
+
+        *Unit: radians*
+    lens: ArrayLike
+        ``(P, 2)`` circle points ``centre + radius * (cos, sin)(angle)``, at
+        the mesh dtype.
+
+        *Unit: arcsec*
+    source: ArrayLike
+        ``(P, 2)`` their images -- the hole curve -- at the mesh dtype.
+
+        *Unit: arcsec*
+    growth: ArrayLike
+        ``(H,)`` float64 log-slope of the hole curve's size against the hole
+        radius, from circles at ``radius`` and ``radius / 4``. NaN when both
+        circles map to a single point.
+    """
+
+    centres: ArrayLike
+    radius: ArrayLike
+    offsets: ArrayLike
+    angle: ArrayLike
+    lens: ArrayLike
+    source: ArrayLike
+    growth: ArrayLike
+
+
+def empty_holes(device=None) -> CentreHoles:
+    """A :class:`CentreHoles` with no hole."""
+    return CentreHoles(
+        centres=backend.zeros((0, 2), dtype=backend.float64, device=device),
+        radius=backend.zeros((0,), dtype=backend.float64, device=device),
+        offsets=backend.zeros((1,), dtype=backend.int64, device=device),
+        angle=backend.zeros((0,), dtype=backend.float64, device=device),
+        lens=backend.zeros((0, 2), dtype=backend.float64, device=device),
+        source=backend.zeros((0, 2), dtype=backend.float64, device=device),
+        growth=backend.zeros((0,), dtype=backend.float64, device=device),
+    )
+
+
+def _components(link) -> ArrayLike:
+    """
+    Connected-component label of every node of a symmetric adjacency matrix.
+
+    Min-label propagation, as in :func:`dedup_block_group`: each node takes
+    the smallest label among itself and its neighbours until nothing
+    changes, so every node ends labelled with the smallest index in its
+    component.
+    """
+    n = link.shape[0]
+    label = backend.arange(n, dtype=backend.int64)
+    reach = link | backend.eye(n, dtype=backend.bool)
+    while True:
+        new = backend.min(backend.where(reach, backend.unsqueeze(label, 0), n), dim=1)
+        if bool(backend.all(new == label)):
+            return label
+        label = new
+
+
+def merge_centres(centres, min_img_sep) -> Tuple[ArrayLike, ArrayLike]:
+    """
+    Merge lens centres into holes whose disks do not overlap.
+
+    Centres closer than ``2 * min_img_sep`` share a hole. A hole sits at its
+    members' mean, with radius ``min_img_sep`` plus the members' largest
+    distance from that mean, so a lone centre gets exactly ``min_img_sep``.
+    A merged hole is larger than ``min_img_sep``, so it can reach another
+    hole's disk; merging repeats until no two disks overlap. The centres are
+    put in lexicographic order first and the holes are returned in it, so
+    the result -- sums included -- depends on the set of centres, not on the
+    order they were given in.
+
+    Parameters
+    ----------
+    centres: Optional[ArrayLike]
+        ``(S, 2)`` lens-plane positions, any array-like. ``None`` or an empty
+        array gives no hole.
+
+        *Unit: arcsec*
+    min_img_sep: float
+        The mesh's own tolerance, already halved.
+
+        *Unit: arcsec*
+
+    Returns
+    -------
+    centres: ArrayLike
+        ``(H, 2)`` float64 hole centres, in lexicographic ``(x, y)`` order.
+
+        *Unit: arcsec*
+    radius: ArrayLike
+        ``(H,)`` float64 hole radii.
+
+        *Unit: arcsec*
+
+    Raises
+    ------
+    ValueError
+        If ``centres`` is not ``(S, 2)``, or is not finite.
+    """
+    f64 = backend.float64
+    if centres is None:
+        return backend.zeros((0, 2), dtype=f64), backend.zeros((0,), dtype=f64)
+    c = _ambient(backend.as_array(centres, dtype=f64))
+    if c.reshape(-1).shape[0] == 0:
+        return backend.zeros((0, 2), dtype=f64), backend.zeros((0,), dtype=f64)
+    if len(c.shape) != 2 or c.shape[1] != 2:
+        raise ValueError(f"centres must have shape (S, 2), got {tuple(c.shape)}")
+    if not bool(backend.all(backend.isfinite(c))):
+        raise ValueError("centres must be finite")
+    c = c[backend.lexsort([c[:, 1], c[:, 0]])]
+    link = (
+        backend.norm(backend.unsqueeze(c, 1) - backend.unsqueeze(c, 0), dim=-1)
+        < 2.0 * min_img_sep
+    )
+    while True:
+        _, member = backend.unique(_components(link), return_inverse=True)
+        k = int(backend.to_numpy(backend.max(member))) + 1
+        onehot = backend.unsqueeze(
+            backend.arange(k, dtype=backend.int64), 1
+        ) == backend.unsqueeze(member, 0)
+        weight = backend.to(onehot, dtype=f64)
+        mean = (weight @ c) / backend.unsqueeze(backend.sum(weight, dim=1), 1)
+        spread = backend.norm(
+            backend.unsqueeze(c, 0) - backend.unsqueeze(mean, 1), dim=-1
+        )
+        radius = min_img_sep + backend.max(backend.where(onehot, spread, 0.0), dim=1)
+        gap = backend.norm(
+            backend.unsqueeze(mean, 1) - backend.unsqueeze(mean, 0), dim=-1
+        )
+        overlap = (
+            gap < backend.unsqueeze(radius, 1) + backend.unsqueeze(radius, 0)
+        ) & ~backend.eye(k, dtype=backend.bool)
+        if not bool(backend.any(overlap)):
+            break
+        link = link | overlap[member][:, member]
+    order = backend.lexsort([mean[:, 1], mean[:, 0]])
+    return mean[order], radius[order]
 
 
 # ---------------------------------------------------------------------------
