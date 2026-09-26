@@ -22,7 +22,6 @@ __all__ = (
     "converged_from_deviation",
     "child_shape_matrices",
     "parity_from_children",
-    "quadratic_vertex_parity_ok",
     "jacobian_parity_ok",
     "parity_from_jacobians",
     "evaluate_criterion",
@@ -208,42 +207,6 @@ def parity_from_children(Q):
     det_q = Q[..., 0, 0] * Q[..., 1, 1] - Q[..., 0, 1] * Q[..., 1, 0]
     sign_q = backend.sign(det_q)
     return backend.all(sign_q == sign_q[:, :1], dim=1)
-
-
-def quadratic_vertex_parity_ok(beta_v, beta_m):
-    """Check parity agreement at the quadratic interpolant's vertices.
-
-    Parameters
-    ----------
-    beta_v : ndarray, shape (n, 3, 2)
-        Mapped triangle vertices.
-    beta_m : ndarray, shape (n, 3, 2)
-        Mapped edge midpoints, each opposite its corresponding vertex.
-
-    Returns
-    -------
-    ndarray, shape (n,)
-        True when all three estimated vertex determinants are finite
-        and have the same strictly nonzero sign.
-
-    Notes
-    -----
-    Uses the existing six samples; no additional raytracing.
-    This checks the interpolant at vertices, not the entire true mapping.
-    """
-    # At each vertex, estimate derivatives toward the next and
-    # previous vertices in cyclic order. Using differences avoids
-    # combining large absolute source-plane coordinates directly.
-    d_next = 4.0 * (beta_m[:, [2, 0, 1]] - beta_v) - (beta_v[:, [1, 2, 0]] - beta_v)
-    d_prev = 4.0 * (beta_m[:, [1, 2, 0]] - beta_v) - (beta_v[:, [2, 0, 1]] - beta_v)
-
-    det = d_next[..., 0] * d_prev[..., 1] - d_next[..., 1] * d_prev[..., 0]
-
-    # Cyclic lens-plane edge pairs have the same determinant.
-    # Its common factor can be omitted when checking sign agreement.
-    return backend.all(backend.isfinite(det), dim=1) & (
-        backend.all(det > 0, dim=1) | backend.all(det < 0, dim=1)
-    )
 
 
 def jacobian_parity_ok(jacobian_fn, theta_v, theta_m, *, return_details=False):

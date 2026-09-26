@@ -28,7 +28,6 @@ from caustics.lenses.func.adaptive.criterion import (
     jacobian_parity_ok,
     parity_from_children,
     parity_from_jacobians,
-    quadratic_vertex_parity_ok,
 )
 from caustics.lenses.func.adaptive.geometry import CHILD_VERTEX_INDICES, ROOT_SHAPES
 from caustics.lenses.func.adaptive.lattice import (
@@ -218,14 +217,6 @@ def test_parity_from_children_fails_closed_on_a_nonfinite_child():
     Q = np.tile(np.eye(2), (1, 4, 1, 1)).reshape(1, 4, 2, 2)
     Q[0, 2, 0, 0] = np.nan
     assert not bool(backend.to_numpy(parity_from_children(_arr(Q)))[0])
-
-
-def test_quadratic_vertex_parity_matches_the_oracle(oracle_module):
-    beta_v, beta_m = _samples()
-    assert (
-        backend.to_numpy(quadratic_vertex_parity_ok(_arr(beta_v), _arr(beta_m)))
-        == oracle_module.quadratic_vertex_parity_ok(beta_v, beta_m)
-    ).all()
 
 
 @pytest.mark.parametrize("level", [0, 2, 5])
