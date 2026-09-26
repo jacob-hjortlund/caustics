@@ -117,12 +117,45 @@ def test_the_package_holds_exactly_the_layered_modules():
     assert {p.stem for p in _modules()} == {"__init__", *LAYERS}
 
 
+PACKAGE = "caustics.lenses.func.adaptive"
+
+
+def _module_of(name):
+    """The package module ``name`` is or lies in; ``"__init__"`` for the package."""
+    if name == PACKAGE:
+        return "__init__"
+    if name.startswith(PACKAGE + "."):
+        return name[len(PACKAGE) + 1 :].split(".")[0]
+    return None
+
+
+def _package_imports(tree):
+    """The package modules every import in ``tree`` reaches, relative or absolute."""
+    parts = PACKAGE.split(".")
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            reached = [_module_of(alias.name) for alias in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            base = parts[: len(parts) - node.level + 1] if node.level else []
+            source = ".".join(base + ([node.module] if node.module else []))
+            # `from X import name` reaches submodule `X.name` when there is
+            # one, and `X` itself otherwise.
+            reached = []
+            for alias in node.names:
+                sub = _module_of(f"{source}.{alias.name}")
+                reached.append(
+                    sub if sub in (*LAYERS, "__init__") else _module_of(source)
+                )
+        else:
+            continue
+        yield from (module for module in reached if module is not None)
+
+
 def test_modules_import_only_from_lower_layers():
     for i, name in enumerate(LAYERS):
         tree = ast.parse((PACKAGE_DIR / f"{name}.py").read_text())
-        for node in tree.body:
-            if isinstance(node, ast.ImportFrom) and node.level == 1:
-                assert node.module in LAYERS[:i], f"{name} imports .{node.module}"
+        for target in _package_imports(tree):
+            assert target in LAYERS[:i], f"{name} imports {target}"
 
 
 def test_no_deferred_imports():
