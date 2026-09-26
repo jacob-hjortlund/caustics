@@ -10,6 +10,8 @@ verifiable.
 :func:`build_adaptive_mesh` runs them as four stages -- seed, refine,
 balance, freeze -- and :func:`extend_adaptive_mesh` runs the same stages from
 a built mesh, growing it to a larger fov without repeating its lens calls.
+:func:`build_closed_adaptive_mesh` builds, then extends until the fov cuts no
+critical curve.
 
 **Query kernels** operate on ``backend`` arrays. :func:`mesh_query` and
 :func:`mesh_seeds` return candidate regions and Newton seeds;
@@ -21,11 +23,15 @@ through the mesh's :class:`CriticalBand` are traced by
 """
 
 import math
-from typing import Any, Callable, NamedTuple, Optional, Tuple
+import operator
+from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Optional, Tuple
 from warnings import warn
 
 from ...backend_obj import ArrayLike, backend
 from ...utils import batch_lm
+
+if TYPE_CHECKING:
+    from .adaptive_critical import CriticalCurves
 
 __all__ = (
     "CHILD_VERTEX_INDICES",
@@ -116,6 +122,7 @@ __all__ = (
     "build_adaptive_mesh",
     "seed_from_mesh",
     "extend_adaptive_mesh",
+    "build_closed_adaptive_mesh",
     "mesh_query",
     "mesh_seeds",
     "dedup_block_group",
@@ -4460,6 +4467,224 @@ def extend_adaptive_mesh(
         index_cells=index_cells,
         holes=mesh.holes,
     )
+
+
+def _hole_rings(fov, init_res, x0, y0, centres, min_img_sep) -> Tuple[int, int]:
+    """
+    Level-0 cells per side that put every centre's hole strictly inside the fov.
+
+    The holes are :func:`merge_centres`'s, at the halved ``min_img_sep`` the
+    build gives it, so a merged hole reaches as far as its own radius. The
+    smallest ``k`` with ``fov / 2 + k * h0`` beyond every hole's reach --
+    its centre's larger offset from ``(x0, y0)``, plus its radius.
+
+    Returns
+    -------
+    k: int
+        Zero when every hole already lies strictly inside.
+    outside: int
+        How many holes did not.
+    """
+    hole_centres, radius = merge_centres(centres, min_img_sep)
+    if hole_centres.shape[0] == 0:
+        return 0, 0
+    centre = backend.as_array([x0, y0], dtype=backend.float64)
+    reach = backend.max(backend.abs(hole_centres - centre), dim=1) + radius
+    outside = int(backend.to_numpy(backend.sum(reach >= fov / 2)))
+    if outside == 0:
+        return 0, 0
+    excess = float(backend.to_numpy(backend.max(reach))) - fov / 2
+    return math.floor(excess / (fov / init_res)) + 1, outside
+
+
+def _curves_cut_by_fov(mesh, curves) -> int:
+    """
+    How many open curves have an end on ``mesh``'s fov boundary.
+
+    Exact, with no tolerance: every vertex and band sample is placed by
+    :func:`lattice_xy` and cast to the mesh dtype alike, so the boundary is
+    the vertices' own extreme coordinates, and a crossing on a boundary child
+    edge, both of whose samples share that coordinate, reproduces it bit for
+    bit (:func:`~caustics.lenses.func.adaptive_critical.crossing_points`). An
+    end at a band gap inside the fov does not count.
+    """
+    open_curves = backend.flatnonzero(~curves.closed)
+    n_open = open_curves.shape[0]
+    if n_open == 0:
+        return 0
+    ends = backend.concatenate(
+        (curves.offsets[open_curves], curves.offsets[open_curves + 1] - 1)
+    )
+    xy = curves.lens[ends]
+    lo = backend.min(mesh.vertices_lens, dim=0)
+    hi = backend.max(mesh.vertices_lens, dim=0)
+    on_boundary = backend.any((xy == lo) | (xy == hi), dim=1)
+    cut = on_boundary[:n_open] | on_boundary[n_open:]
+    return int(backend.to_numpy(backend.sum(cut)))
+
+
+def build_closed_adaptive_mesh(
+    lens,
+    fov,
+    init_res,
+    min_img_sep,
+    max_depth=25,
+    *,
+    growth=1.5,
+    max_iters=10,
+    x0=0.0,
+    y0=0.0,
+    device=None,
+    dtype=None,
+    raytrace_batch_size=None,
+    index_cells=None,
+    centres=None,
+) -> Tuple[AdaptiveMesh, "CriticalCurves"]:
+    """
+    Build an adaptive mesh, then grow its fov until it cuts no critical curve.
+
+    Three stages:
+
+    1. When a hole around one of ``centres`` does not lie strictly inside
+       ``fov`` -- its centre outside the fov, or within its own radius of the
+       edge -- the fov is widened first, by the fewest whole level-0 cells
+       per side that take every hole inside, keeping the level-0 cell size
+       ``fov / init_res``, and a ``UserWarning`` names the fov and
+       ``init_res`` built instead. A hole the fov cuts leaves the curves
+       joined there unreliable (see
+       :func:`~caustics.lenses.func.adaptive_critical.join_at_holes`), and
+       the fov only grows, so from here on every hole stays inside.
+    2. :func:`build_adaptive_mesh` builds the mesh, and
+       :func:`~caustics.lenses.func.adaptive_critical.mesh_critical_curves`
+       traces its curves.
+    3. While an open curve has an end on the fov boundary, and fewer than
+       ``max_iters`` extensions have run, :func:`extend_adaptive_mesh` grows
+       the mesh to ``growth`` times its fov -- rounded up to whole level-0
+       cells, so each step adds at least one per side -- and the curves are
+       traced again. Each extension reuses every lens evaluation already
+       made, so the result is exactly the mesh the build and that chain of
+       extensions give.
+
+    Only the fov is ever grown for. A curve can end inside the fov too --
+    next to a leaf whose samples or Jacobian are non-finite, at a hole whose
+    ends do not alternate, or where ``max_depth`` bound refinement -- and no
+    growth closes it, so such a curve stops no loop and triggers none; the
+    returned ``curves`` still mark it open. Nor can a critical curve that
+    never reaches the fov be found: the loop grows only towards curves the
+    fov already cuts.
+
+    Growth compounds: ``max_iters`` steps of ``growth`` can reach
+    ``growth**max_iters`` times the fov -- about 58 for the defaults -- and
+    the mesh's level-0 cells with its square. A lattice too large for int64
+    keys raises :func:`extend_adaptive_mesh`'s ``ValueError``.
+
+    Parameters
+    ----------
+    lens, fov, init_res, min_img_sep, max_depth, x0, y0, device, dtype,
+    raytrace_batch_size, index_cells, centres:
+        As for :func:`build_adaptive_mesh`, which receives all of them, with
+        ``fov`` and ``init_res`` widened over the holes as stage 1 says.
+        ``lens``, ``raytrace_batch_size`` and ``index_cells`` reach every
+        extension too.
+    growth: float
+        Factor each extension asks to multiply the fov by, before rounding
+        up to whole cells. Finite and greater than 1.
+    max_iters: int
+        Most extensions to run, at least zero. Widening over the holes is not
+        one of them. Zero builds once and only checks.
+
+    Returns
+    -------
+    mesh: AdaptiveMesh
+        The last mesh built or extended.
+    curves: CriticalCurves
+        ``mesh_critical_curves(mesh)``, as the last check traced it.
+
+    Raises
+    ------
+    ValueError
+        Before any lens call, if ``growth`` is not finite and greater than 1,
+        if ``max_iters`` is not a non-negative integer, or if the build's own
+        arguments are invalid; later, as :func:`build_adaptive_mesh` and
+        :func:`extend_adaptive_mesh` raise.
+
+    Warns
+    -----
+    UserWarning
+        When the fov is widened over the holes, and when the fov still cuts
+        a curve after ``max_iters`` extensions -- the last mesh is returned
+        anyway, every lens evaluation kept. Also whatever
+        :func:`build_adaptive_mesh` and :func:`extend_adaptive_mesh` warn.
+    """
+    # `adaptive_critical` imports this module, so importing it at the top
+    # would be circular.
+    from .adaptive_critical import mesh_critical_curves
+
+    growth = float(growth)
+    if not (math.isfinite(growth) and growth > 1.0):
+        raise ValueError(f"growth must be finite and greater than 1, got {growth}")
+    try:
+        iters = operator.index(max_iters)
+    except TypeError:
+        raise ValueError(
+            f"max_iters must be a non-negative integer, got {max_iters!r}"
+        ) from None
+    if iters < 0:
+        raise ValueError(f"max_iters must be a non-negative integer, got {iters}")
+    # The build halves min_img_sep, and gives its holes that halved radius;
+    # the holes are widened over, and the arguments checked, at the same value.
+    half_sep = min_img_sep / 2
+    validate_build_args(fov, init_res, half_sep, max_depth, min_img_sep)
+
+    k, outside = _hole_rings(fov, init_res, x0, y0, centres, half_sep)
+    if k:
+        widened = fov + 2 * k * (fov / init_res)
+        warn(
+            f"{outside} hole(s) around centres reach outside fov={fov:g}; "
+            f"building at fov={widened:g}, init_res={init_res + 2 * k} so that "
+            "every hole lies inside it.",
+            UserWarning,
+            stacklevel=2,
+        )
+        fov, init_res = widened, init_res + 2 * k
+
+    mesh = build_adaptive_mesh(
+        lens,
+        fov,
+        init_res,
+        min_img_sep,
+        max_depth,
+        x0=x0,
+        y0=y0,
+        device=device,
+        dtype=dtype,
+        raytrace_batch_size=raytrace_batch_size,
+        index_cells=index_cells,
+        centres=centres,
+    )
+    curves = mesh_critical_curves(mesh)
+    cut = _curves_cut_by_fov(mesh, curves)
+    for _ in range(iters):
+        if cut == 0:
+            break
+        mesh = extend_adaptive_mesh(
+            mesh,
+            lens,
+            growth * mesh.fov,
+            raytrace_batch_size=raytrace_batch_size,
+            index_cells=index_cells,
+        )
+        curves = mesh_critical_curves(mesh)
+        cut = _curves_cut_by_fov(mesh, curves)
+    if cut:
+        warn(
+            f"The fov still cuts {cut} critical curve(s) after {iters} "
+            f"extension(s), at fov={mesh.fov:g}; raise max_iters or growth "
+            "to grow it further.",
+            UserWarning,
+            stacklevel=2,
+        )
+    return mesh, curves
 
 
 # ---------------------------------------------------------------------------

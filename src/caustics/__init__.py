@@ -27,6 +27,7 @@ from .lenses import (
 from .lenses.func import (
     build_adaptive_mesh,
     extend_adaptive_mesh,
+    build_closed_adaptive_mesh,
     mesh_query,
     mesh_seeds,
     mesh_forward_raytrace,
@@ -83,6 +84,7 @@ __all__ = [
     "EnclosedMass",
     "build_adaptive_mesh",
     "extend_adaptive_mesh",
+    "build_closed_adaptive_mesh",
     "mesh_query",
     "mesh_seeds",
     "mesh_forward_raytrace",
