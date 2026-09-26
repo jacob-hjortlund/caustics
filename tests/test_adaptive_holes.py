@@ -8,7 +8,15 @@ import pytest
 from caustics.backend_obj import backend
 from caustics.cosmology import FlatLambdaCDM
 from caustics.lenses import SIE, SinglePlane
-from caustics.lenses.func import adaptive as new
+from caustics.lenses.func.adaptive import AdaptiveMesh, CentreHoles, build_adaptive_mesh
+from caustics.lenses.func.adaptive.holes import (
+    HOLE_GROWTH_SAMPLES,
+    HOLE_MAX_SAMPLES,
+    empty_holes,
+    merge_centres,
+    sample_holes,
+)
+from caustics.lenses.func.adaptive.sampling import make_raytrace
 
 
 def to_np(x):
@@ -25,7 +33,7 @@ def f64(x):
 
 
 def test_empty_holes_has_no_hole():
-    holes = new.empty_holes()
+    holes = empty_holes()
     assert tuple(holes.centres.shape) == (0, 2)
     assert tuple(holes.lens.shape) == (0, 2) and tuple(holes.source.shape) == (0, 2)
     for field in ("radius", "angle", "growth", "growth_err", "pseudo_caustic"):
@@ -38,7 +46,7 @@ def test_empty_holes_has_no_hole():
     "centres", [None, [], np.zeros((0, 2))], ids=["None", "empty list", "(0, 2)"]
 )
 def test_merge_centres_of_nothing_is_empty(centres):
-    got, radius = new.merge_centres(centres, 0.01)
+    got, radius = merge_centres(centres, 0.01)
     assert tuple(got.shape) == (0, 2) and tuple(radius.shape) == (0,)
 
 
@@ -48,25 +56,25 @@ def test_merge_centres_of_nothing_is_empty(centres):
     ids=["list", "tuple", "numpy", "backend"],
 )
 def test_a_lone_centre_of_any_array_like_keeps_its_exact_position(centres):
-    got, radius = new.merge_centres(centres, 0.01)
+    got, radius = merge_centres(centres, 0.01)
     assert to_np(got).tolist() == [[0.3, -0.2]]
     assert to_np(radius).tolist() == [0.01]
 
 
 def test_coincident_centres_share_one_hole_at_their_common_position():
-    got, radius = new.merge_centres([(2.0, 2.0), (0.3, 0.1), (0.3, 0.1)], 0.01)
+    got, radius = merge_centres([(2.0, 2.0), (0.3, 0.1), (0.3, 0.1)], 0.01)
     assert to_np(got).tolist() == [[0.3, 0.1], [2.0, 2.0]]
     assert to_np(radius).tolist() == [0.01, 0.01]
 
 
 def test_centres_closer_than_twice_min_img_sep_merge_at_their_mean():
-    got, radius = new.merge_centres([(0.0, 0.0), (0.015, 0.0)], 0.01)
+    got, radius = merge_centres([(0.0, 0.0), (0.015, 0.0)], 0.01)
     assert np.allclose(to_np(got), [[0.0075, 0.0]], rtol=0, atol=1e-15)
     assert np.allclose(to_np(radius), [0.0175], rtol=0, atol=1e-15)
 
 
 def test_centres_exactly_twice_min_img_sep_apart_keep_their_own_holes():
-    got, _ = new.merge_centres([(0.0, 0.0), (0.02, 0.0)], 0.01)
+    got, _ = merge_centres([(0.0, 0.0), (0.02, 0.0)], 0.01)
     assert got.shape[0] == 2
 
 
@@ -74,7 +82,7 @@ def test_merging_repeats_until_no_two_disks_overlap():
     """``a`` and ``b`` link; ``c`` is farther than 2 * min_img_sep from both,
     yet its disk overlaps theirs once they merge, so all three share a hole."""
     pts = np.array([(0.0, 0.0), (0.019, 0.0), (0.0095, 0.025)])
-    got, radius = new.merge_centres(pts, 0.01)
+    got, radius = merge_centres(pts, 0.01)
     mean = pts.mean(axis=0)
     assert got.shape[0] == 1
     assert np.allclose(to_np(got)[0], mean, rtol=0, atol=1e-15)
@@ -87,7 +95,7 @@ def test_merged_holes_are_disjoint_hold_their_centres_and_ignore_input_order():
     pts = np.concatenate(
         [rng.uniform(-1.0, 1.0, (20, 2)), rng.uniform(0.0, 0.03, (10, 2))]
     )
-    got, radius = new.merge_centres(pts, 0.01)
+    got, radius = merge_centres(pts, 0.01)
     g, r = to_np(got), to_np(radius)
     gap = np.hypot(*(g[:, None, :] - g[None, :, :]).transpose(2, 0, 1))
     np.fill_diagonal(gap, np.inf)
@@ -96,7 +104,7 @@ def test_merged_holes_are_disjoint_hold_their_centres_and_ignore_input_order():
     assert (held.sum(axis=1) == 1).all()
     for seed in range(3):
         perm = np.random.default_rng(seed).permutation(len(pts))
-        again, again_radius = new.merge_centres(pts[perm], 0.01)
+        again, again_radius = merge_centres(pts[perm], 0.01)
         assert np.array_equal(to_np(again), g)
         assert np.array_equal(to_np(again_radius), r)
 
@@ -108,7 +116,7 @@ def test_merged_holes_are_disjoint_hold_their_centres_and_ignore_input_order():
 )
 def test_merge_centres_rejects_malformed_centres(centres):
     with pytest.raises(ValueError, match="centres must"):
-        new.merge_centres(centres, 0.01)
+        merge_centres(centres, 0.01)
 
 
 # ---------------------------------------------------------------------------
@@ -191,8 +199,8 @@ def sample(raytrace, centres, radius, min_img_sep, batch_size=None):
         calls.append(np.stack([to_np(x), to_np(y)], axis=-1))
         return raytrace(x, y)
 
-    holes = new.sample_holes(
-        new.make_raytrace(recorded, None),
+    holes = sample_holes(
+        make_raytrace(recorded, None),
         f64(centres),
         f64(radius),
         min_img_sep,
@@ -287,7 +295,7 @@ def test_a_hole_curve_too_large_to_resolve_stops_at_the_cap_and_warns():
     c = (0.0, 0.0)
     with pytest.warns(UserWarning, match=r"stopped at \d+ samples \(cap 65536\)"):
         holes, _ = sample(point_mass_raytrace(c, 1.0), [c], [0.005], 0.005)
-    assert to_np(holes.offsets)[-1] <= new.HOLE_MAX_SAMPLES
+    assert to_np(holes.offsets)[-1] <= HOLE_MAX_SAMPLES
 
 
 def test_a_hole_frozen_below_the_cap_warns_with_its_own_sample_count():
@@ -301,7 +309,7 @@ def test_a_hole_frozen_below_the_cap_warns_with_its_own_sample_count():
     with pytest.warns(UserWarning, match=r"\(cap 65536\)") as got:
         holes, _ = sample(point_mass_raytrace((0.004, 0.0), 0.3), [c], [0.005], 0.005)
     n = int(to_np(holes.offsets)[-1])
-    assert n < new.HOLE_MAX_SAMPLES
+    assert n < HOLE_MAX_SAMPLES
     assert any(f"stopped at {n} samples (cap 65536)" in str(w.message) for w in got)
 
 
@@ -340,7 +348,7 @@ def test_holes_raytrace_only_their_circles_and_batching_changes_nothing():
     assert np.isclose(d[:, None], radii, rtol=0, atol=1e-14).any(axis=1).all()
     batched, batched_calls = sample(sis_raytrace(c, 1.0), [c], [r], r, batch_size=100)
     assert max(len(x) for x in batched_calls) <= 100
-    for field in new.CentreHoles._fields:
+    for field in CentreHoles._fields:
         assert np.array_equal(
             to_np(getattr(batched, field)), to_np(getattr(holes, field))
         ), field
@@ -422,7 +430,7 @@ BUILD = dict(fov=4.0, init_res=8, min_img_sep=0.02)
 
 
 def test_a_build_without_centres_stores_empty_holes():
-    mesh = new.build_adaptive_mesh(sis_lens(SIS_C, 1.0), **BUILD)
+    mesh = build_adaptive_mesh(sis_lens(SIS_C, 1.0), **BUILD)
     assert mesh.holes.centres.shape[0] == 0
     assert to_np(mesh.holes.offsets).tolist() == [0]
 
@@ -430,10 +438,10 @@ def test_a_build_without_centres_stores_empty_holes():
 def test_a_build_stores_the_merged_and_sampled_holes():
     lens = sis_lens(SIS_C, 1.0)
     centres = [SIS_C, SIS_C, (1.5, 1.5)]
-    mesh = new.build_adaptive_mesh(lens, **BUILD, centres=centres)
-    want = new.sample_holes(
-        new.make_raytrace(lens.raytrace, None),
-        *new.merge_centres(centres, mesh.min_img_sep),
+    mesh = build_adaptive_mesh(lens, **BUILD, centres=centres)
+    want = sample_holes(
+        make_raytrace(lens.raytrace, None),
+        *merge_centres(centres, mesh.min_img_sep),
         mesh.min_img_sep,
         None,
     )
@@ -444,17 +452,17 @@ def test_a_build_stores_the_merged_and_sampled_holes():
 
 def test_two_builds_with_centres_are_identical_holes_included():
     lens = sis_lens(SIS_C, 1.0)
-    a = new.build_adaptive_mesh(lens, **BUILD, centres=[SIS_C])
-    b = new.build_adaptive_mesh(lens, **BUILD, centres=[SIS_C])
+    a = build_adaptive_mesh(lens, **BUILD, centres=[SIS_C])
+    b = build_adaptive_mesh(lens, **BUILD, centres=[SIS_C])
     assert _same(a, b)
 
 
 def test_centres_change_nothing_but_the_holes_even_outside_the_fov():
     lens = sis_lens(SIS_C, 1.0)
-    plain = new.build_adaptive_mesh(lens, **BUILD)
-    holed = new.build_adaptive_mesh(lens, **BUILD, centres=[SIS_C, (5.0, 5.0)])
+    plain = build_adaptive_mesh(lens, **BUILD)
+    holed = build_adaptive_mesh(lens, **BUILD, centres=[SIS_C, (5.0, 5.0)])
     assert holed.holes.centres.shape[0] == 2
-    for name in new.AdaptiveMesh._fields:
+    for name in AdaptiveMesh._fields:
         if name != "holes":
             assert _same(getattr(holed, name), getattr(plain, name)), name
 
@@ -462,12 +470,12 @@ def test_centres_change_nothing_but_the_holes_even_outside_the_fov():
 def test_holes_cost_raytraces_on_their_circles_only_and_no_jacobian():
     plain_lens, plain = recording_lens(sis_lens(SIS_C, 1.0))
     holed_lens, holed = recording_lens(sis_lens(SIS_C, 1.0))
-    new.build_adaptive_mesh(plain_lens, **BUILD)
-    mesh = new.build_adaptive_mesh(holed_lens, **BUILD, centres=[SIS_C])
+    build_adaptive_mesh(plain_lens, **BUILD)
+    mesh = build_adaptive_mesh(holed_lens, **BUILD, centres=[SIS_C])
     base = np.concatenate(plain["raytrace"])
     extra = np.concatenate(holed["raytrace"])
     n_samples = int(to_np(mesh.holes.offsets)[-1])
-    assert len(extra) - len(base) == n_samples + 4 * new.HOLE_GROWTH_SAMPLES
+    assert len(extra) - len(base) == n_samples + 4 * HOLE_GROWTH_SAMPLES
     added = extra[
         ~np.isin(extra[:, 0] + 1j * extra[:, 1], base[:, 0] + 1j * base[:, 1])
     ]
@@ -478,7 +486,7 @@ def test_holes_cost_raytraces_on_their_circles_only_and_no_jacobian():
 
 
 def test_holes_follow_the_mesh_dtype_where_the_band_does():
-    mesh = new.build_adaptive_mesh(
+    mesh = build_adaptive_mesh(
         sis_lens(SIS_C, 1.0), **BUILD, centres=[SIS_C], dtype=backend.float32
     )
     h = mesh.holes
@@ -490,10 +498,10 @@ def test_holes_follow_the_mesh_dtype_where_the_band_does():
 
 
 def test_holes_land_on_the_mesh_device(device):
-    mesh = new.build_adaptive_mesh(
+    mesh = build_adaptive_mesh(
         sis_lens(SIS_C, 1.0), **BUILD, centres=[SIS_C], device=device
     )
-    for field in new.CentreHoles._fields:
+    for field in CentreHoles._fields:
         assert backend.device(getattr(mesh.holes, field)) == backend.device(
             mesh.vertices_lens
         ), field

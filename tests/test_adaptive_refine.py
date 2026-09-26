@@ -12,7 +12,39 @@ import numpy as np
 import pytest
 
 from caustics.backend_obj import backend
-from caustics.lenses.func import adaptive as new
+from caustics.lenses.func.adaptive import refinement
+from caustics.lenses.func.adaptive import (
+    LEAF_APPROX_PARITY_UNRESOLVED,
+    LEAF_CONVERGED,
+    LEAF_CONVERGENCE_FAILED,
+    LEAF_JACOBIAN_NONFINITE,
+    LEAF_JACOBIAN_PARITY_UNRESOLVED,
+    LEAF_RAYTRACE_NONFINITE,
+    child_matrix_tables,
+    shape_matrix,
+)
+from caustics.lenses.func.adaptive.closure import canonical_order, close
+from caustics.lenses.func.adaptive.criterion import (
+    child_shape_matrices,
+    jacobian_parity_ok,
+    parity_from_children,
+)
+from caustics.lenses.func.adaptive.geometry import min_angle
+from caustics.lenses.func.adaptive.lattice import (
+    depth_floor,
+    edge_quarter_keys,
+    lattice_key,
+    lattice_xy,
+    make_lattice,
+    midpoint_ij,
+)
+from caustics.lenses.func.adaptive.refinement import find_unbalanced, refine
+from caustics.lenses.func.adaptive.sampling import make_raytrace
+from caustics.lenses.func.adaptive.state import (
+    active_contains,
+    cache_size,
+    store_compact,
+)
 
 
 @pytest.fixture
@@ -72,10 +104,10 @@ def _fold_free_jacobian(x, y):
 
 
 def _run_new(raytrace, jacobian, fov, init_res, min_img_sep, max_level):
-    tables = new.child_matrix_tables()
-    lat = new.make_lattice(fov, 0.0, 0.0, init_res, max_level + 1)
-    fn = new.make_raytrace(raytrace, None)
-    cache, active, store, counters, _band = new.refine(
+    tables = child_matrix_tables()
+    lat = make_lattice(fov, 0.0, 0.0, init_res, max_level + 1)
+    fn = make_raytrace(raytrace, None)
+    cache, active, store, counters, _band = refine(
         fn,
         jacobian,
         lat,
@@ -140,7 +172,7 @@ def test_refine_reproduces_the_oracle_leaf_set_where_no_fold_exists(
     )
     ref = _run_old(oracle_module, raytrace, fov, init_res, min_img_sep, max_level)
 
-    v_new, lvl_new, cls_new, st_new = new.store_compact(store)
+    v_new, lvl_new, cls_new, st_new = store_compact(store)
     v_old, lvl_old, cls_old, st_old = ref.store.compact()
 
     lat_old = oracle_module._Lattice(fov, 0.0, 0.0, init_res, max_level + 1)
@@ -149,7 +181,7 @@ def test_refine_reproduces_the_oracle_leaf_set_where_no_fold_exists(
         backend.to_numpy(v_new),
         backend.to_numpy(lvl_new),
         backend.to_numpy(cls_new),
-        backend.to_numpy(st_new) == new.LEAF_CONVERGED,
+        backend.to_numpy(st_new) == LEAF_CONVERGED,
         ij_new,
         lat_old.key,
     )
@@ -194,10 +226,10 @@ def test_refine_counters_match_the_oracle_where_no_fold_exists(
 
 def test_refine_converges_everywhere_at_level_zero_for_an_affine_map():
     _, _, store, counters = _run_new(_affine, _affine_jacobian, 4.0, 2, 0.5, 3)
-    v, level, _, status = new.store_compact(store)
+    v, level, _, status = store_compact(store)
     assert (backend.to_numpy(level) == 0).all()
     assert counters["converged_level0"] == 2 * 2**2
-    assert bool(backend.all(status == new.LEAF_CONVERGED))
+    assert bool(backend.all(status == LEAF_CONVERGED))
     assert counters["parity_splits"] == 0
     assert counters["deviation_splits"] == 0
 
@@ -248,14 +280,14 @@ def _make_counting_lens(fn, jac):
 
 
 def _refine_with(fn, jac, fov=4.0, init_res=4, min_img_sep=0.5, max_depth=25):
-    """Run `new.refine` on a numpy ``p -> out`` map and its Jacobian, mirroring
+    """Run `refine` on a numpy ``p -> out`` map and its Jacobian, mirroring
     the legacy ``refine_with`` helper but built on the backend interfaces."""
-    tables = new.child_matrix_tables()
-    max_level = min(max_depth, new.depth_floor(fov, init_res, min_img_sep))
-    lat = new.make_lattice(fov, 0.0, 0.0, init_res, max_level + 1)
+    tables = child_matrix_tables()
+    max_level = min(max_depth, depth_floor(fov, init_res, min_img_sep))
+    lat = make_lattice(fov, 0.0, 0.0, init_res, max_level + 1)
     lens, calls = _make_counting_lens(fn, jac)
-    cache, active, store, counters, _band = new.refine(
-        new.make_raytrace(lens.raytrace, None),
+    cache, active, store, counters, _band = refine(
+        make_raytrace(lens.raytrace, None),
         lens.jacobian_lens_equation,
         lat,
         init_res,
@@ -271,8 +303,8 @@ def _refine_with(fn, jac, fov=4.0, init_res=4, min_img_sep=0.5, max_depth=25):
 def _distinct_samples(cache, v, lat):
     """How many distinct lattice points the six samples of leaves ``v`` hold."""
     ij = cache.ij[v]
-    six = backend.concatenate((ij, new.midpoint_ij(ij)), dim=1)
-    return int(backend.unique(new.lattice_key(lat, six).reshape(-1)).shape[0])
+    six = backend.concatenate((ij, midpoint_ij(ij)), dim=1)
+    return int(backend.unique(lattice_key(lat, six).reshape(-1)).shape[0])
 
 
 def _broken(fn, jac, where, value=np.nan):
@@ -326,20 +358,20 @@ def _collapse_jacobian(p):
 
 def _signed_area(tri):
     """Twice the signed area of a (..., 3, 2) triangle."""
-    P = new.shape_matrix(tri)
+    P = shape_matrix(tri)
     return P[..., 0, 0] * P[..., 1, 1] - P[..., 0, 1] * P[..., 1, 0]
 
 
 def _assert_balanced(cache, active, store, lat, max_level):
     """No leaf edge carries an active quarter point."""
-    v, level, _, _ = new.store_compact(store)
+    v, level, _, _ = store_compact(store)
     for lv in sorted(set(backend.to_numpy(level).tolist())):
         if lv > max_level - 2:
             continue
         sel = level == lv
-        keys = new.edge_quarter_keys(lat, cache.ij[v[sel]])
+        keys = edge_quarter_keys(lat, cache.ij[v[sel]])
         assert not bool(
-            backend.any(new.active_contains(active, cache, keys))
+            backend.any(active_contains(active, cache, keys))
         ), f"unbalanced at level {lv}"
 
 
@@ -347,9 +379,9 @@ def test_refine_never_evaluates_a_point_twice():
     cache, active, store, counters, lat, calls, max_level = _refine_with(
         _fold, _fold_jacobian, min_img_sep=0.05
     )
-    assert calls["points"] == new.cache_size(cache) + counters["max_level_midpoints"]
-    keys = backend.to_numpy(new.lattice_key(lat, cache.ij))
-    assert len(np.unique(keys)) == new.cache_size(cache)
+    assert calls["points"] == cache_size(cache) + counters["max_level_midpoints"]
+    keys = backend.to_numpy(lattice_key(lat, cache.ij))
+    assert len(np.unique(keys)) == cache_size(cache)
 
 
 def test_refine_terminates_at_max_level_on_a_kappa_one_sheet():
@@ -368,9 +400,9 @@ def test_refine_terminates_at_max_level_on_a_kappa_one_sheet():
     cache, active, store, counters, lat, calls, max_level = _refine_with(
         _collapse, _collapse_jacobian, min_img_sep=0.5
     )
-    v, level, _, status = new.store_compact(store)
+    v, level, _, status = store_compact(store)
     assert bool(backend.all(level == max_level))
-    want = new.LEAF_CONVERGENCE_FAILED | new.LEAF_JACOBIAN_NONFINITE
+    want = LEAF_CONVERGENCE_FAILED | LEAF_JACOBIAN_NONFINITE
     assert bool(backend.all(status == want))
     assert counters["sigma_zero"] > 0
     assert bool(backend.all(backend.isfinite(cache.beta)))
@@ -404,7 +436,7 @@ def test_refine_evaluates_the_jacobian_only_where_it_can_withhold_convergence():
     cache, active, store, counters, lat, calls, max_level = _refine_with(
         _identity, _identity_jacobian, min_img_sep=0.5
     )
-    v, level, _, _ = new.store_compact(store)
+    v, level, _, _ = store_compact(store)
     assert bool(backend.all(level < max_level))
     assert calls["jacobian_batches"] == 1
     assert calls["jacobian_points"] == 6 * v.shape[0]
@@ -412,7 +444,7 @@ def test_refine_evaluates_the_jacobian_only_where_it_can_withhold_convergence():
     cache, active, store, counters, lat, calls, max_level = _refine_with(
         _collapse, _collapse_jacobian, min_img_sep=0.5
     )
-    v, level, _, _ = new.store_compact(store)
+    v, level, _, _ = store_compact(store)
     assert v.shape[0] == 512
     assert bool(backend.all(level == max_level))
     assert calls["jacobian_batches"] == 1
@@ -463,13 +495,13 @@ def test_refine_splits_a_nonfinite_subregion_down_to_max_level():
         fn, jac, min_img_sep=0.5
     )
     assert max_level > 0, "fixture must allow at least one split"
-    v, level, _, status = new.store_compact(store)
-    nonfinite = status == new.LEAF_RAYTRACE_NONFINITE
+    v, level, _, status = store_compact(store)
+    nonfinite = status == LEAF_RAYTRACE_NONFINITE
     assert bool(backend.any(nonfinite))
     assert bool(backend.all(level[nonfinite] == max_level))
     assert not bool(backend.all(backend.isfinite(cache.beta[v[nonfinite]])))
     # a triangle wholly in the good half is untouched
-    good = status == new.LEAF_CONVERGED
+    good = status == LEAF_CONVERGED
     assert bool(backend.any(good))
     assert bool(backend.all(backend.isfinite(cache.beta[v[good]])))
     assert bool(backend.all(good | nonfinite)), "no other status can occur here"
@@ -517,22 +549,20 @@ def test_refine_flags_nonfinite_vertices_even_at_max_level():
         fn, jac, min_img_sep=2.0
     )
     assert max_level == 0
-    v, level, _, status = new.store_compact(store)
-    assert bool(backend.any(status == new.LEAF_RAYTRACE_NONFINITE))
+    v, level, _, status = store_compact(store)
+    assert bool(backend.any(status == LEAF_RAYTRACE_NONFINITE))
     # Without this, a run producing zero CONVERGED rows would make the loop
     # below vacuously true.
-    assert bool(backend.any(status == new.LEAF_CONVERGED))
+    assert bool(backend.any(status == LEAF_CONVERGED))
     # Every vertex sits on an integer coordinate and the NaN half-plane starts
     # at x > 0.5, so no all-finite-vertex triangle here has a NaN midpoint, and
     # the map is the identity where it is finite, so parity never changes.
     # LEAF_RAYTRACE_NONFINITE is therefore non-finiteness alone -- which is what
     # the loop below is entitled to assume.
     assert counters["parity_invalid"] == 0
-    for row in backend.to_numpy(backend.flatnonzero(status == new.LEAF_CONVERGED)):
+    for row in backend.to_numpy(backend.flatnonzero(status == LEAF_CONVERGED)):
         assert bool(backend.all(backend.isfinite(cache.beta[v[row]])))
-    for row in backend.to_numpy(
-        backend.flatnonzero(status == new.LEAF_RAYTRACE_NONFINITE)
-    ):
+    for row in backend.to_numpy(backend.flatnonzero(status == LEAF_RAYTRACE_NONFINITE)):
         assert not bool(backend.all(backend.isfinite(cache.beta[v[row]])))
 
 
@@ -550,11 +580,11 @@ def test_forced_jacobian_skips_every_triangle_with_a_nonfinite_sample():
         fn, jac, min_img_sep=2.0
     )
     assert max_level == 0
-    v, level, _, status = new.store_compact(store)
-    finite = backend.flatnonzero(status != new.LEAF_RAYTRACE_NONFINITE)
+    v, level, _, status = store_compact(store)
+    finite = backend.flatnonzero(status != LEAF_RAYTRACE_NONFINITE)
     assert 0 < finite.shape[0] < v.shape[0]
     assert calls["jacobian_points"] == _distinct_samples(cache, v[finite], lat)
-    assert not bool(backend.any((status & new.LEAF_JACOBIAN_NONFINITE) != 0))
+    assert not bool(backend.any((status & LEAF_JACOBIAN_NONFINITE) != 0))
 
 
 def _localised_fold(p):
@@ -612,43 +642,41 @@ def test_max_level_flags_match_both_parity_tests_row_for_row():
     cache, active, store, counters, lat, calls, max_level = _refine_with(
         _localised_fold, _localised_fold_jacobian, min_img_sep=0.05
     )
-    v, level, _, status = new.store_compact(store)
+    v, level, _, status = store_compact(store)
     sel = backend.flatnonzero(level == max_level)
     assert sel.shape[0] > 0, "fixture must reach max_level"
 
     ij = cache.ij[v[sel]]
-    theta_v = new.lattice_xy(lat, ij)
-    theta_m = new.lattice_xy(lat, new.midpoint_ij(ij))
+    theta_v = lattice_xy(lat, ij)
+    theta_m = lattice_xy(lat, midpoint_ij(ij))
     beta_m_np = _localised_fold(backend.to_numpy(theta_m).reshape(-1, 2)).reshape(
         -1, 3, 2
     )
     beta_m = backend.as_array(beta_m_np, dtype=backend.float64)
     child_ok = backend.to_numpy(
-        new.parity_from_children(new.child_shape_matrices(cache.beta[v[sel]], beta_m))
+        parity_from_children(child_shape_matrices(cache.beta[v[sel]], beta_m))
     )
     lens, _ = _make_counting_lens(_localised_fold, _localised_fold_jacobian)
     jac_ok, jac_bad = (
         backend.to_numpy(x)
-        for x in new.jacobian_parity_ok(
+        for x in jacobian_parity_ok(
             lens.jacobian_lens_equation, theta_v, theta_m, return_details=True
         )
     )
 
     st = backend.to_numpy(status[sel])
-    approx = (st & new.LEAF_APPROX_PARITY_UNRESOLVED) != 0
-    jacobian = (st & new.LEAF_JACOBIAN_PARITY_UNRESOLVED) != 0
+    approx = (st & LEAF_APPROX_PARITY_UNRESOLVED) != 0
+    jacobian = (st & LEAF_JACOBIAN_PARITY_UNRESOLVED) != 0
     for name, flag in (("approximate", approx), ("Jacobian", jacobian)):
         assert flag.any(), f"fixture must raise the {name} parity flag somewhere"
         assert not flag.all(), f"fixture must spare something of {name} parity"
     assert approx.tolist() == (~child_ok).tolist()
     assert jacobian.tolist() == (~jac_ok & ~jac_bad).tolist()
-    parity_flags = (
-        new.LEAF_APPROX_PARITY_UNRESOLVED | new.LEAF_JACOBIAN_PARITY_UNRESOLVED
-    )
+    parity_flags = LEAF_APPROX_PARITY_UNRESOLVED | LEAF_JACOBIAN_PARITY_UNRESOLVED
     assert not (st & ~parity_flags).any(), "no other flag occurs on this fixture"
     assert counters["parity_invalid"] == int((approx | jacobian).sum())
     # Flags are stored only at the size floor; nothing coarser is touched.
-    assert bool(backend.all(level[status != new.LEAF_CONVERGED] == max_level))
+    assert bool(backend.all(level[status != LEAF_CONVERGED] == max_level))
 
 
 def test_max_level_condemns_a_nonfinite_midpoint_with_finite_vertices():
@@ -677,13 +705,13 @@ def test_max_level_condemns_a_nonfinite_midpoint_with_finite_vertices():
         fn, jac, min_img_sep=2.0
     )
     assert max_level == 0
-    v, level, _, status = new.store_compact(store)
-    nonfinite = backend.flatnonzero(status == new.LEAF_RAYTRACE_NONFINITE)
+    v, level, _, status = store_compact(store)
+    nonfinite = backend.flatnonzero(status == LEAF_RAYTRACE_NONFINITE)
     assert nonfinite.shape[0] == 8
     assert counters["parity_invalid"] == 0
     for row in backend.to_numpy(nonfinite):
         assert bool(backend.all(backend.isfinite(cache.beta[v[row]])))
-    assert bool(backend.any(status == new.LEAF_CONVERGED))
+    assert bool(backend.any(status == LEAF_CONVERGED))
 
 
 def test_refine_makes_one_batch_per_level_and_exits_early_when_affine():
@@ -697,7 +725,7 @@ def test_refine_makes_one_batch_per_level_and_exits_early_when_affine():
     cache, active, store, counters, lat, calls, max_level = _refine_with(
         _identity, _identity_jacobian, min_img_sep=0.5
     )
-    v, level, _, status = new.store_compact(store)
+    v, level, _, status = store_compact(store)
     assert (
         max_level > 0
     ), "fixture must allow deeper levels for early exit to mean anything"
@@ -709,8 +737,8 @@ def test_refine_all_leaves_are_positively_oriented():
     cache, active, store, counters, lat, calls, max_level = _refine_with(
         _fold, _fold_jacobian, min_img_sep=0.05
     )
-    v, level, _, status = new.store_compact(store)
-    tri = new.lattice_xy(lat, cache.ij[v])
+    v, level, _, status = store_compact(store)
+    tri = lattice_xy(lat, cache.ij[v])
     assert bool(backend.all(_signed_area(tri) > 0))
 
 
@@ -763,16 +791,16 @@ def test_converged_leaves_pass_jacobian_parity_at_their_own_samples(fn, jac, kw)
     principle surface in a child.
     """
     cache, active, store, counters, lat, calls, max_level = _refine_with(fn, jac, **kw)
-    v, level, _, status = new.store_compact(store)
-    rows = backend.flatnonzero(status == new.LEAF_CONVERGED)
+    v, level, _, status = store_compact(store)
+    rows = backend.flatnonzero(status == LEAF_CONVERGED)
     assert bool(backend.any(level[rows] < max_level)), "fixture must converge early"
     assert counters["forced"] > 0, "fixture must exercise the cascade too"
     ij = cache.ij[v[rows]]
     lens, _ = _make_counting_lens(fn, jac)
-    ok = new.jacobian_parity_ok(
+    ok = jacobian_parity_ok(
         lens.jacobian_lens_equation,
-        new.lattice_xy(lat, ij),
-        new.lattice_xy(lat, new.midpoint_ij(ij)),
+        lattice_xy(lat, ij),
+        lattice_xy(lat, midpoint_ij(ij)),
     )
     assert bool(backend.all(ok))
 
@@ -799,7 +827,7 @@ def test_find_unbalanced_matches_the_six_quarter_key_reference_during_the_cascad
     actively running, which is where non-empty violator sets exist, and
     requires that at least one such non-empty comparison happened.
     """
-    real_find_unbalanced = new.find_unbalanced
+    real_find_unbalanced = find_unbalanced
     seen_nonempty = False
 
     def shim(store, cache, lat, active, max_level, frontier_level):
@@ -808,8 +836,8 @@ def test_find_unbalanced_matches_the_six_quarter_key_reference_during_the_cascad
         bound = min(frontier_level - 2, max_level - 2)
         cand = backend.flatnonzero(store.valid & (store.level <= bound))
         if cand.shape[0]:
-            keys = new.edge_quarter_keys(lat, cache.ij[store.v[cand]])
-            want = cand[backend.any(new.active_contains(active, cache, keys), dim=1)]
+            keys = edge_quarter_keys(lat, cache.ij[store.v[cand]])
+            want = cand[backend.any(active_contains(active, cache, keys), dim=1)]
         else:
             want = cand
         assert (
@@ -819,7 +847,7 @@ def test_find_unbalanced_matches_the_six_quarter_key_reference_during_the_cascad
             seen_nonempty = True
         return got
 
-    monkeypatch.setattr(new, "find_unbalanced", shim)
+    monkeypatch.setattr(refinement, "find_unbalanced", shim)
     _refine_with(_localised_fold, _localised_fold_jacobian, min_img_sep=0.02)
 
     assert seen_nonempty, "shim never observed a non-empty violator set"
@@ -830,7 +858,7 @@ def test_mesh_is_edge_balanced_after_refinement():
         _localised_fold, _localised_fold_jacobian, fov=4.0, init_res=4, min_img_sep=0.05
     )
     assert max_level >= 4, "fixture must allow several levels"
-    v, level, _, status = new.store_compact(store)
+    v, level, _, status = store_compact(store)
     assert (
         len(np.unique(backend.to_numpy(level))) > 1
     ), "fixture must produce level transitions"
@@ -880,18 +908,17 @@ def test_failure_flags_are_mutually_consistent():
     cache, active, store, counters, lat, calls, max_level = _refine_with(
         fn, jac, fov=4.0, init_res=4, min_img_sep=0.05
     )
-    v, level, _, status = new.store_compact(store)
-    raytrace_bad = (status & new.LEAF_RAYTRACE_NONFINITE) != 0
+    v, level, _, status = store_compact(store)
+    raytrace_bad = (status & LEAF_RAYTRACE_NONFINITE) != 0
     parity_bad = (
-        status
-        & (new.LEAF_APPROX_PARITY_UNRESOLVED | new.LEAF_JACOBIAN_PARITY_UNRESOLVED)
+        status & (LEAF_APPROX_PARITY_UNRESOLVED | LEAF_JACOBIAN_PARITY_UNRESOLVED)
     ) != 0
     assert bool(backend.any(raytrace_bad))
     assert bool(backend.any(parity_bad))
 
     all_finite = backend.all(backend.isfinite(cache.beta[v]), dim=(1, 2))
     assert bool(
-        backend.all(status[raytrace_bad] == new.LEAF_RAYTRACE_NONFINITE)
+        backend.all(status[raytrace_bad] == LEAF_RAYTRACE_NONFINITE)
     ), "a non-finite leaf must carry no other flag"
     assert not bool(
         backend.any(all_finite[raytrace_bad])
@@ -901,14 +928,14 @@ def test_failure_flags_are_mutually_consistent():
     ), "every other leaf's samples must be finite"
     # Flags are unreachable below max_level, which is what makes the
     # unconditional status inheritance in `refine` exact here, not lucky.
-    assert bool(backend.all(level[status != new.LEAF_CONVERGED] == max_level))
+    assert bool(backend.all(level[status != LEAF_CONVERGED] == max_level))
 
 
 def test_cascade_still_evaluates_every_point_exactly_once():
     cache, active, store, counters, lat, calls, max_level = _refine_with(
         _localised_fold, _localised_fold_jacobian, fov=4.0, init_res=4, min_img_sep=0.05
     )
-    assert calls["points"] == new.cache_size(cache) + counters["max_level_midpoints"]
+    assert calls["points"] == cache_size(cache) + counters["max_level_midpoints"]
 
 
 def test_min_angle_of_an_equilateral_triangle():
@@ -916,28 +943,28 @@ def test_min_angle_of_an_equilateral_triangle():
         np.array([[[0.0, 0.0], [1.0, 0.0], [0.5, np.sqrt(3) / 2]]]),
         dtype=backend.float64,
     )
-    assert backend.to_numpy(new.min_angle(tri))[0] == pytest.approx(np.pi / 3)
+    assert backend.to_numpy(min_angle(tri))[0] == pytest.approx(np.pi / 3)
 
 
 def test_min_angle_of_a_degenerate_triangle_is_zero_not_nan():
     tri = backend.as_array(
         np.array([[[0.0, 0.0], [0.0, 0.0], [0.0, 0.0]]]), dtype=backend.float64
     )
-    assert backend.to_numpy(new.min_angle(tri))[0] == 0.0
+    assert backend.to_numpy(min_angle(tri))[0] == 0.0
 
 
 def test_canonical_order_is_independent_of_input_order():
     cache, active, store, _ = _run_new(_sie_like, _sie_like_jacobian, 4.0, 3, 0.25, 3)
-    lat = new.make_lattice(4.0, 0.0, 0.0, 3, 4)
-    v, _, _, _ = new.store_compact(store)
+    lat = make_lattice(4.0, 0.0, 0.0, 3, 4)
+    v, _, _, _ = store_compact(store)
 
-    order = backend.to_numpy(new.canonical_order(lat, cache, v))
+    order = backend.to_numpy(canonical_order(lat, cache, v))
     v_np = backend.to_numpy(v)
 
     rng = np.random.default_rng(3)
     perm = rng.permutation(v_np.shape[0])
     v_shuf = backend.as_array(v_np[perm], dtype=backend.int64)
-    order_shuf = backend.to_numpy(new.canonical_order(lat, cache, v_shuf))
+    order_shuf = backend.to_numpy(canonical_order(lat, cache, v_shuf))
 
     assert v_np[order].tolist() == v_np[perm][order_shuf].tolist()
 
@@ -972,16 +999,14 @@ def test_closure_matches_the_oracle(oracle_module):
     deliberately differ.
     """
     cache, active, store, _ = _run_new(_sie_like, _sie_like_jacobian, 4.0, 3, 0.25, 3)
-    lat = new.make_lattice(4.0, 0.0, 0.0, 3, 4)
+    lat = make_lattice(4.0, 0.0, 0.0, 3, 4)
     lat_old = oracle_module._Lattice(4.0, 0.0, 0.0, 3, 4)
     cache_o, active_o, remap = _oracle_cache_and_active(oracle_module, cache, active)
 
-    v, level, _, status = new.store_compact(store)
-    order = new.canonical_order(lat, cache, v)
+    v, level, _, status = store_compact(store)
+    order = canonical_order(lat, cache, v)
     v, level, status = v[order], level[order], status[order]
-    leaves, origin, out_level, out_status = new.close(
-        lat, cache, active, v, level, status
-    )
+    leaves, origin, out_level, out_status = close(lat, cache, active, v, level, status)
     leaves_o, origin_o, lvl_out_o, st_out_o = oracle_module._close(
         lat_old,
         cache_o,
@@ -1000,12 +1025,10 @@ def test_closure_matches_the_oracle(oracle_module):
 
 def test_closure_origin_is_non_decreasing():
     cache, active, store, _ = _run_new(_sie_like, _sie_like_jacobian, 4.0, 3, 0.25, 3)
-    lat = new.make_lattice(4.0, 0.0, 0.0, 3, 4)
-    v, level, _, status = new.store_compact(store)
-    order = new.canonical_order(lat, cache, v)
-    _, origin, _, _ = new.close(
-        lat, cache, active, v[order], level[order], status[order]
-    )
+    lat = make_lattice(4.0, 0.0, 0.0, 3, 4)
+    v, level, _, status = store_compact(store)
+    order = canonical_order(lat, cache, v)
+    _, origin, _, _ = close(lat, cache, active, v[order], level[order], status[order])
     o = backend.to_numpy(origin)
     assert (
         np.diff(o) >= 0
@@ -1029,17 +1052,15 @@ def test_closure_origin_is_non_decreasing():
 def _closed_mesh(fn, jac, **kw):
     """Backend port of the legacy ``closed_mesh`` helper."""
     cache, active, store, counters, lat, calls, max_level = _refine_with(fn, jac, **kw)
-    v, level, _, status = new.store_compact(store)
-    order = new.canonical_order(lat, cache, v)
+    v, level, _, status = store_compact(store)
+    order = canonical_order(lat, cache, v)
     v, level, status = v[order], level[order], status[order]
     # Captured BEFORE closure. `close` must add no vertices, so a test checking
     # `leaves` against the cache size has to use a bound that predates the call;
     # reading `cache_size` afterwards would silently absorb any growth into the
     # bound and the check could never fail.
-    n_cache_pre = new.cache_size(cache)
-    leaves, origin, out_level, out_status = new.close(
-        lat, cache, active, v, level, status
-    )
+    n_cache_pre = cache_size(cache)
+    leaves, origin, out_level, out_status = close(lat, cache, active, v, level, status)
     return (
         cache,
         active,
@@ -1056,7 +1077,7 @@ def _closed_mesh(fn, jac, **kw):
 
 
 def _undirected_edges(lat, cache, leaves):
-    k = backend.to_numpy(new.lattice_key(lat, cache.ij[leaves]))  # (L, 3)
+    k = backend.to_numpy(lattice_key(lat, cache.ij[leaves]))  # (L, 3)
     e = np.stack([k[:, [0, 1]], k[:, [1, 2]], k[:, [2, 0]]], axis=1)
     return np.sort(e, axis=-1).reshape(-1, 2)
 
@@ -1070,8 +1091,8 @@ def _hanging_nodes(lat, cache, active, slots):
     cached, so `active_contains` reads it as absent -- which is correct, not
     an artifact.
     """
-    mid_keys = new.lattice_key(lat, new.midpoint_ij(cache.ij[slots]))
-    return new.active_contains(active, cache, mid_keys)
+    mid_keys = lattice_key(lat, midpoint_ij(cache.ij[slots]))
+    return active_contains(active, cache, mid_keys)
 
 
 def test_closure_makes_every_edge_appear_once_or_twice():
@@ -1118,7 +1139,7 @@ def test_pre_closure_mesh_is_not_already_conforming():
     cache, active, store, counters, lat, calls, max_level = _refine_with(
         _localised_fold, _localised_fold_jacobian, min_img_sep=0.05
     )
-    v, level, _, status = new.store_compact(store)
+    v, level, _, status = store_compact(store)
     assert bool(
         backend.any(_hanging_nodes(lat, cache, active, v))
     ), "fixture has no hanging nodes"
@@ -1128,7 +1149,7 @@ def test_closure_preserves_orientation_and_inherits_level_and_status():
     cache, active, lat, v, pre_lvl, pre_st, leaves, origin, lvl, st, n_pre = (
         _closed_mesh(_localised_fold, _localised_fold_jacobian, min_img_sep=0.05)
     )
-    tri = new.lattice_xy(lat, cache.ij[leaves])
+    tri = lattice_xy(lat, cache.ij[leaves])
     assert bool(backend.all(_signed_area(tri) > 0))
     assert backend.to_numpy(lvl).tolist() == backend.to_numpy(pre_lvl[origin]).tolist()
     assert backend.to_numpy(st).tolist() == backend.to_numpy(pre_st[origin]).tolist()
@@ -1141,8 +1162,8 @@ def test_leaf_origin_groups_are_contiguous_and_tile_their_origin():
     )
     origin_np = backend.to_numpy(origin)
     assert (np.diff(origin_np) >= 0).all(), "origin must be non-decreasing"
-    child_area = backend.to_numpy(_signed_area(new.lattice_xy(lat, cache.ij[leaves])))
-    origin_area = backend.to_numpy(_signed_area(new.lattice_xy(lat, cache.ij[v])))
+    child_area = backend.to_numpy(_signed_area(lattice_xy(lat, cache.ij[leaves])))
+    origin_area = backend.to_numpy(_signed_area(lattice_xy(lat, cache.ij[v])))
     summed = np.zeros_like(origin_area)
     np.add.at(summed, origin_np, child_area)
     assert np.allclose(summed, origin_area, rtol=1e-12)
@@ -1201,10 +1222,10 @@ def test_closure_re_emits_every_origin_vertex():
         cache, active, store, counters, lat, calls, max_level = _refine_with(
             fn, jac, **kw
         )
-        v, level, _, status = new.store_compact(store)
-        order = new.canonical_order(lat, cache, v)
+        v, level, _, status = store_compact(store)
+        order = canonical_order(lat, cache, v)
         v, level, status = v[order], level[order], status[order]
-        leaves, origin, _, _ = new.close(lat, cache, active, v, level, status)
+        leaves, origin, _, _ = close(lat, cache, active, v, level, status)
         v_np = backend.to_numpy(v)
         leaves_np = backend.to_numpy(leaves)
         origin_np = backend.to_numpy(origin)
@@ -1250,12 +1271,12 @@ def test_close_reaches_the_count_equals_3_branch_via_a_gaussian_bump():
     assert pattern[2] > 0, f"fixture must reach the count == 3 branch, got {pattern}"
     assert pattern == (248, 39, 6), f"measured n_closure_by_pattern={pattern}"
 
-    tri = new.lattice_xy(lat, cache.ij[leaves])
+    tri = lattice_xy(lat, cache.ij[leaves])
     assert bool(
         backend.all(_signed_area(tri) > 0)
     ), "every leaf must be positively oriented"
 
-    origin_area = backend.to_numpy(_signed_area(new.lattice_xy(lat, cache.ij[v])))
+    origin_area = backend.to_numpy(_signed_area(lattice_xy(lat, cache.ij[v])))
     summed = np.zeros_like(origin_area)
     np.add.at(summed, origin_np, backend.to_numpy(_signed_area(tri)))
     assert np.allclose(

@@ -14,8 +14,15 @@ import numpy as np
 import pytest
 
 from caustics.backend_obj import backend
-from caustics.lenses.func import adaptive as new
-from caustics.lenses.func import adaptive_critical as crit
+from caustics.lenses.func.adaptive import (
+    AdaptiveMesh,
+    CriticalCurves,
+    build_adaptive_mesh,
+    build_closed_adaptive_mesh,
+    extend_adaptive_mesh,
+    mesh_critical_curves,
+)
+from caustics.lenses.func.adaptive.lattice import lattice_xy
 
 
 def to_np(x):
@@ -135,7 +142,7 @@ def _assert_same(a, b, name):
 
 def assert_meshes_equal(got, want):
     """Every field equal, arrays bit for bit; the lattice as the map it defines."""
-    for name in new.AdaptiveMesh._fields:
+    for name in AdaptiveMesh._fields:
         a, b = getattr(got, name), getattr(want, name)
         if name == "lattice":
             assert (a.level, a.n, a.stride, a.scale) == (
@@ -148,7 +155,7 @@ def assert_meshes_equal(got, want):
                 backend.as_array([[0, 0], [a.n, a.n]], dtype=backend.int64),
                 device=backend.device(a.lo),
             )
-            _assert_same(new.lattice_xy(a, corners), new.lattice_xy(b, corners), name)
+            _assert_same(lattice_xy(a, corners), lattice_xy(b, corners), name)
         elif name in ("index", "critical_band", "holes"):
             for field in type(a)._fields:
                 _assert_same(getattr(a, field), getattr(b, field), f"{name}.{field}")
@@ -157,7 +164,7 @@ def assert_meshes_equal(got, want):
 
 
 def assert_curves_equal(got, want):
-    for field in crit.CriticalCurves._fields:
+    for field in CriticalCurves._fields:
         a, b = getattr(got, field), getattr(want, field)
         if field == "holes":
             for sub in type(a)._fields:
@@ -171,7 +178,7 @@ def closed_build(fn, jac, fov, init_res, min_img_sep, **kw):
     lens, calls = recording_lens(fn, jac)
     with warnings.catch_warnings(record=True) as record:
         warnings.simplefilter("always")
-        mesh, curves = new.build_closed_adaptive_mesh(
+        mesh, curves = build_closed_adaptive_mesh(
             lens, fov, init_res, min_img_sep, **kw
         )
     messages = [str(w.message) for w in record]
@@ -180,7 +187,7 @@ def closed_build(fn, jac, fov, init_res, min_img_sep, **kw):
 
 def plain_build(fn, jac, fov, init_res, min_img_sep, **kw):
     lens, _ = recording_lens(fn, jac)
-    return new.build_adaptive_mesh(lens, fov, init_res, min_img_sep, **kw), lens
+    return build_adaptive_mesh(lens, fov, init_res, min_img_sep, **kw), lens
 
 
 # ---------------------------------------------------------------------------
@@ -201,8 +208,8 @@ def test_a_curve_the_fov_cuts_is_grown_until_it_closes():
     assert curves.closed.shape[0] > 0 and to_np(curves.closed).all()
     assert messages == []
     start, lens = plain_build(sie_like, sie_like_jacobian, **kw)
-    assert_meshes_equal(mesh, new.extend_adaptive_mesh(start, lens, 2.5))
-    assert_curves_equal(curves, crit.mesh_critical_curves(mesh))
+    assert_meshes_equal(mesh, extend_adaptive_mesh(start, lens, 2.5))
+    assert_curves_equal(curves, mesh_critical_curves(mesh))
 
 
 @pytest.mark.parametrize("x0, y0", [(0.5, 0.0), (-0.5, 0.0), (0.0, 0.5), (0.0, -0.5)])
@@ -225,7 +232,7 @@ def test_a_mesh_whose_fov_cuts_no_curve_is_the_plain_build():
     assert messages == []
     want, _ = plain_build(sie_like, sie_like_jacobian, **kw)
     assert_meshes_equal(mesh, want)
-    assert_curves_equal(curves, crit.mesh_critical_curves(want))
+    assert_curves_equal(curves, mesh_critical_curves(want))
 
 
 def test_a_curve_open_inside_the_fov_does_not_grow_it():
@@ -260,7 +267,7 @@ def test_running_out_of_iterations_warns_and_returns_the_last_mesh(
     assert (mesh.fov, mesh.init_res) == (fov, init_res)
     assert not to_np(curves.closed).all()
     assert len(messages) == 1 and "still cuts" in messages[0]
-    assert_curves_equal(curves, crit.mesh_critical_curves(mesh))
+    assert_curves_equal(curves, mesh_critical_curves(mesh))
 
 
 def test_build_options_reach_the_build_and_every_extension():
@@ -279,9 +286,7 @@ def test_build_options_reach_the_build_and_every_extension():
     assert messages == []
     assert max(len(xy) for xy in calls["raytrace"]) <= 5
     start, lens = plain_build(sie_like, sie_like_jacobian, **kw)
-    want = new.extend_adaptive_mesh(
-        start, lens, 3.0, raytrace_batch_size=5, index_cells=16
-    )
+    want = extend_adaptive_mesh(start, lens, 3.0, raytrace_batch_size=5, index_cells=16)
     assert mesh.dtype == backend.float32
     assert_meshes_equal(mesh, want)
 
@@ -362,5 +367,5 @@ def test_bad_arguments_raise_before_any_lens_call(kw, match):
     args.update(kw)
     lens, calls = recording_lens(affine, affine_jacobian)
     with pytest.raises(ValueError, match=match):
-        new.build_closed_adaptive_mesh(lens, **args)
+        build_closed_adaptive_mesh(lens, **args)
     assert calls == {"raytrace": [], "jacobian": []}

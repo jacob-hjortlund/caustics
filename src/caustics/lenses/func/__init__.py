@@ -109,8 +109,9 @@ from .adaptive import (
     LEAF_JACOBIAN_PARITY_UNRESOLVED,
     LEAF_RAYTRACE_NONFINITE,
     LEAF_JACOBIAN_NONFINITE,
+    CriticalCurves,
+    mesh_critical_curves,
 )
-from .adaptive_critical import CriticalCurves, mesh_critical_curves
 
 __all__ = (
     "forward_raytrace",

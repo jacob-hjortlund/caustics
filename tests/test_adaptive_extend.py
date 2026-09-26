@@ -13,8 +13,40 @@ import numpy as np
 import pytest
 
 from caustics.backend_obj import backend
-from caustics.lenses.func import adaptive as new
-from caustics.lenses.func import adaptive_critical as crit
+from caustics.lenses.func.adaptive import (
+    AdaptiveMesh,
+    CriticalBand,
+    CriticalCurves,
+    LEAF_CONVERGED,
+    LEAF_RAYTRACE_NONFINITE,
+    build_adaptive_mesh,
+    child_matrix_tables,
+    extend_adaptive_mesh,
+    mesh_critical_curves,
+)
+from caustics.lenses.func.adaptive.band import band_sample_keys, empty_band, merge_bands
+from caustics.lenses.func.adaptive.build import seed_from_mesh
+from caustics.lenses.func.adaptive.lattice import (
+    check_lattice_keys,
+    depth_floor,
+    edge_quarter_keys,
+    extend_lattice,
+    initial_triangles,
+    lattice_key,
+    lattice_xy,
+    make_lattice,
+    ring_triangles,
+)
+from caustics.lenses.func.adaptive.mesh import freeze
+from caustics.lenses.func.adaptive.refinement import balance, refine
+from caustics.lenses.func.adaptive.sampling import make_raytrace
+from caustics.lenses.func.adaptive.state import (
+    VertexCache,
+    active_contains,
+    empty_store,
+    store_add,
+    store_compact,
+)
 
 
 def to_np(x):
@@ -51,28 +83,28 @@ def _same_lattice(a, b):
 
 
 def test_a_fresh_lattice_places_points_exactly_as_before():
-    lat = new.make_lattice(4.0, 0.3, -0.1, 3, 4)
+    lat = make_lattice(4.0, 0.3, -0.1, 3, 4)
     ij = _grid(lat.n)
     assert lat.origin == 0
     want = to_np(lat.lo) + ij.astype(np.float64) * lat.scale
-    assert np.array_equal(to_np(new.lattice_xy(lat, i64(ij))), want)
+    assert np.array_equal(to_np(lattice_xy(lat, i64(ij))), want)
 
 
 def test_extend_lattice_keeps_every_old_position_bit_for_bit():
     """A non-dyadic centre on purpose: nothing may be recomputed from a new fov."""
-    lat = new.make_lattice(4.0, 0.3, -0.1, 3, 4)
-    ext = new.extend_lattice(lat, 2)
+    lat = make_lattice(4.0, 0.3, -0.1, 3, 4)
+    ext = extend_lattice(lat, 2)
     pad = 2 << lat.level
     ij = _grid(lat.n)
     assert np.array_equal(
-        to_np(new.lattice_xy(ext, i64(ij + pad))),
-        to_np(new.lattice_xy(lat, i64(ij))),
+        to_np(lattice_xy(ext, i64(ij + pad))),
+        to_np(lattice_xy(lat, i64(ij))),
     )
 
 
 def test_extend_lattice_grows_the_extent_and_keeps_key_order():
-    lat = new.make_lattice(4.0, 0.3, -0.1, 3, 4)
-    ext = new.extend_lattice(lat, 2)
+    lat = make_lattice(4.0, 0.3, -0.1, 3, 4)
+    ext = extend_lattice(lat, 2)
     pad = 2 << lat.level
     assert (ext.level, ext.scale) == (lat.level, lat.scale)
     assert ext.n == lat.n + 2 * pad
@@ -80,8 +112,8 @@ def test_extend_lattice_grows_the_extent_and_keeps_key_order():
     assert ext.origin == pad
     assert np.array_equal(to_np(ext.lo), to_np(lat.lo))
     ij = _grid(lat.n)
-    old = to_np(new.lattice_key(lat, i64(ij)))
-    got = to_np(new.lattice_key(ext, i64(ij + pad)))
+    old = to_np(lattice_key(lat, i64(ij)))
+    got = to_np(lattice_key(ext, i64(ij + pad)))
     assert np.array_equal(np.argsort(old), np.argsort(got))
 
 
@@ -91,34 +123,32 @@ def test_an_extended_dyadic_lattice_is_the_fresh_lattice_of_the_larger_fov():
     With a dyadic fov, centre and cell size, a fresh lattice over the larger
     fov places every point exactly where the extended one does.
     """
-    lat = new.make_lattice(4.0, 0.5, -0.25, 8, 3)
-    ext = new.extend_lattice(lat, 2)
-    fresh = new.make_lattice(6.0, 0.5, -0.25, 12, 3)
+    lat = make_lattice(4.0, 0.5, -0.25, 8, 3)
+    ext = extend_lattice(lat, 2)
+    fresh = make_lattice(6.0, 0.5, -0.25, 12, 3)
     assert (ext.n, ext.stride, ext.scale) == (fresh.n, fresh.stride, fresh.scale)
     ij = i64(_grid(ext.n))
-    assert np.array_equal(
-        to_np(new.lattice_xy(ext, ij)), to_np(new.lattice_xy(fresh, ij))
-    )
+    assert np.array_equal(to_np(lattice_xy(ext, ij)), to_np(lattice_xy(fresh, ij)))
 
 
 def test_extend_lattice_chains_and_accepts_zero():
-    lat = new.make_lattice(4.0, 0.0, 0.0, 2, 3)
-    assert _same_lattice(new.extend_lattice(lat, 0), lat)
+    lat = make_lattice(4.0, 0.0, 0.0, 2, 3)
+    assert _same_lattice(extend_lattice(lat, 0), lat)
     assert _same_lattice(
-        new.extend_lattice(new.extend_lattice(lat, 1), 2), new.extend_lattice(lat, 3)
+        extend_lattice(extend_lattice(lat, 1), 2), extend_lattice(lat, 3)
     )
 
 
 def test_extend_lattice_rejects_a_negative_k():
     with pytest.raises(ValueError, match="non-negative"):
-        new.extend_lattice(new.make_lattice(4.0, 0.0, 0.0, 2, 3), -1)
+        extend_lattice(make_lattice(4.0, 0.0, 0.0, 2, 3), -1)
 
 
 def test_check_lattice_keys_rejects_exactly_the_lattices_int64_cannot_key():
     """``45 * 2**26 + 1`` points per axis still key in int64; ``46 * 2**26 + 1`` do not."""
-    new.check_lattice_keys(45, 25, "unused")
+    check_lattice_keys(45, 25, "unused")
     with pytest.raises(ValueError, match="lattice too fine.*Rebuild coarser"):
-        new.check_lattice_keys(46, 25, "Rebuild coarser.")
+        check_lattice_keys(46, 25, "Rebuild coarser.")
 
 
 # ---------------------------------------------------------------------------
@@ -159,7 +189,7 @@ def called_at(calls, method):
 
 def build(fn, jac, fov, init_res, min_img_sep, **kw):
     lens, calls = recording_lens(fn, jac, kw.pop("out_dtype", np.float64))
-    mesh = new.build_adaptive_mesh(lens, fov, init_res, min_img_sep, **kw)
+    mesh = build_adaptive_mesh(lens, fov, init_res, min_img_sep, **kw)
     return mesh, lens, calls
 
 
@@ -361,9 +391,9 @@ def test_a_mesh_records_its_lattice_and_the_lattice_coordinates_of_its_vertices(
     assert (mesh.fov, mesh.init_res) == (4.0, 4)
     assert to_np(mesh.vertices_ij).dtype == np.int64
     assert np.array_equal(
-        to_np(mesh.vertices_lens), to_np(new.lattice_xy(lat, mesh.vertices_ij))
+        to_np(mesh.vertices_lens), to_np(lattice_xy(lat, mesh.vertices_ij))
     )
-    keys = to_np(new.lattice_key(lat, mesh.vertices_ij))
+    keys = to_np(lattice_key(lat, mesh.vertices_ij))
     assert (np.diff(keys) > 0).all()
 
 
@@ -374,7 +404,7 @@ def test_origin_cls_is_the_orientation_class_of_each_origin_leaf():
     ``P = 2**-d * h0 * R @ G[c]``, and ``h0`` is ``2**L`` lattice units.
     """
     mesh, _, _ = build(localised_fold, localised_fold_jacobian, 4.0, 4, 0.05)
-    _, G, _, _, _ = new.child_matrix_tables()
+    _, G, _, _, _ = child_matrix_tables()
     ij = to_np(mesh.vertices_ij)[to_np(mesh.origin_leaves)]
     P = np.stack((ij[:, 1] - ij[:, 0], ij[:, 2] - ij[:, 0]), axis=-1)
     first = np.searchsorted(to_np(mesh.leaf_origin), np.arange(ij.shape[0]))
@@ -407,25 +437,25 @@ def _two_triangle_state():
     ``A = (0,0),(4,4),(0,4)`` and ``B = (0,0),(4,0),(4,4)``: their six samples
     share ``(0,0)``, ``(4,4)`` and the diagonal's midpoint ``(2,2)``.
     """
-    lat = new.make_lattice(4.0, 0.0, 0.0, 1, 2)
+    lat = make_lattice(4.0, 0.0, 0.0, 1, 2)
     vertices = np.array([[0, 0], [0, 4], [4, 0], [4, 4]])  # ascending key order
-    cache = new.VertexCache(
+    cache = VertexCache(
         keys=i64(vertices[:, 0] * lat.stride + vertices[:, 1]),
         slots=i64(np.arange(4)),
         ij=i64(vertices),
         beta=f64(vertices * 1.0),
     )
-    store, _ = new.store_add(
-        new.empty_store(), i64([[0, 3, 1], [0, 2, 3]]), 0, 0, new.LEAF_CONVERGED
+    store, _ = store_add(
+        empty_store(), i64([[0, 3, 1], [0, 2, 3]]), 0, 0, LEAF_CONVERGED
     )
     return lat, cache, store
 
 
 def _band_over(lat, cache, store, rows, value):
     """A band on store ``rows`` whose sample with key ``k`` carries ``value(k)``."""
-    keys = to_np(new.band_sample_keys(lat, cache, store, i64(rows)))
+    keys = to_np(band_sample_keys(lat, cache, store, i64(rows)))
     own, samples = np.unique(keys.reshape(-1), return_inverse=True)
-    return new.CriticalBand(
+    return CriticalBand(
         leaves=i64(rows),
         samples=i64(samples.reshape(-1, 6)),
         lens=f64(np.zeros((own.size, 2))),
@@ -438,9 +468,9 @@ def test_merge_bands_keeps_one_sample_per_key_and_the_first_band_s_value():
     lat, cache, store = _two_triangle_state()
     first = _band_over(lat, cache, store, [0], lambda k: k * 1.0)
     second = _band_over(lat, cache, store, [1], lambda k: k * 10.0 + 0.5)
-    merged = new.merge_bands(lat, cache, store, first, second)
+    merged = merge_bands(lat, cache, store, first, second)
 
-    row_keys = to_np(new.band_sample_keys(lat, cache, store, i64([0, 1])))
+    row_keys = to_np(band_sample_keys(lat, cache, store, i64([0, 1])))
     keys = np.unique(row_keys)
     first_keys = set(row_keys[0].tolist())
     det = np.array([k * 1.0 if k in first_keys else k * 10.0 + 0.5 for k in keys])
@@ -455,7 +485,7 @@ def test_merge_bands_keeps_one_sample_per_key_and_the_first_band_s_value():
 
 def test_merge_bands_of_two_empty_bands_is_empty():
     lat, cache, store = _two_triangle_state()
-    merged = new.merge_bands(lat, cache, store, new.empty_band(), new.empty_band())
+    merged = merge_bands(lat, cache, store, empty_band(), empty_band())
     assert tuple(merged.leaves.shape) == (0,)
     assert tuple(merged.samples.shape) == (0, 6)
     assert tuple(merged.det.shape) == (0,)
@@ -466,7 +496,7 @@ def test_merge_bands_rejects_a_band_whose_rows_do_not_hold_its_samples():
     good = _band_over(lat, cache, store, [0], lambda k: k * 1.0)
     bad = good._replace(det=good.det[:-1], source=good.source[:-1])
     with pytest.raises(AssertionError, match="rows do not hold exactly its samples"):
-        new.merge_bands(lat, cache, store, bad, new.empty_band())
+        merge_bands(lat, cache, store, bad, empty_band())
 
 
 # ---------------------------------------------------------------------------
@@ -477,23 +507,23 @@ def test_merge_bands_rejects_a_band_whose_rows_do_not_hold_its_samples():
 def refine_setup(fn, jac, fov, init_res, min_img_sep):
     """Everything `refine` takes for a fresh build of these parameters."""
     sep = min_img_sep / 2
-    max_level = new.depth_floor(fov, init_res, sep)
+    max_level = depth_floor(fov, init_res, sep)
     lens, calls = recording_lens(fn, jac)
     return SimpleNamespace(
-        lat=new.make_lattice(fov, 0.0, 0.0, init_res, max_level + 1),
+        lat=make_lattice(fov, 0.0, 0.0, init_res, max_level + 1),
         max_level=max_level,
         sep=sep,
         h0=fov / init_res,
         init_res=init_res,
-        tables=new.child_matrix_tables(),
-        raytrace_fn=new.make_raytrace(lens.raytrace, None),
+        tables=child_matrix_tables(),
+        raytrace_fn=make_raytrace(lens.raytrace, None),
         jacobian=lens.jacobian_lens_equation,
         calls=calls,
     )
 
 
 def refine_with(ctx, roots=None, seed=None):
-    cache, active, store, _, band = new.refine(
+    cache, active, store, _, band = refine(
         ctx.raytrace_fn,
         ctx.jacobian,
         ctx.lat,
@@ -510,7 +540,7 @@ def refine_with(ctx, roots=None, seed=None):
 
 
 def balance_with(ctx, cache, active, store):
-    return new.balance(
+    return balance(
         store,
         cache,
         ctx.lat,
@@ -524,8 +554,8 @@ def balance_with(ctx, cache, active, store):
 
 def leaf_set(lat, cache, store):
     """Every valid leaf as ``(sorted vertex keys, level, status)``, as a set."""
-    v, level, _, status = new.store_compact(store)
-    keys = np.sort(to_np(new.lattice_key(lat, cache.ij[v])), axis=1)
+    v, level, _, status = store_compact(store)
+    keys = np.sort(to_np(lattice_key(lat, cache.ij[v])), axis=1)
     return set(
         zip(map(tuple, keys.tolist()), to_np(level).tolist(), to_np(status).tolist())
     )
@@ -537,17 +567,17 @@ def assert_balanced(lat, cache, active, store, max_level):
     Reads `edge_quarter_keys`, the reference `find_unbalanced` is itself
     tested against, so `balance` is not judged by its own scan.
     """
-    v, level, _, _ = new.store_compact(store)
+    v, level, _, _ = store_compact(store)
     rows = backend.flatnonzero(level <= max_level - 2)
-    keys = new.edge_quarter_keys(lat, cache.ij[v[rows]])
-    assert not bool(backend.any(new.active_contains(active, cache, keys)))
+    keys = edge_quarter_keys(lat, cache.ij[v[rows]])
+    assert not bool(backend.any(active_contains(active, cache, keys)))
 
 
 def test_ring_triangles_are_the_level0_triangles_outside_the_central_block():
     level = 3
-    root_class = new.child_matrix_tables()[4]
-    every_ij, every_cls = new.initial_triangles(6, level, root_class)
-    ring_ij, ring_cls = new.ring_triangles(6, 1, level, root_class)
+    root_class = child_matrix_tables()[4]
+    every_ij, every_cls = initial_triangles(6, level, root_class)
+    ring_ij, ring_cls = ring_triangles(6, 1, level, root_class)
 
     def cells(ij):
         return to_np(ij)[:, 0, :] // (1 << level)
@@ -588,7 +618,7 @@ def test_refining_in_two_seeded_passes_then_balancing_matches_one_pass():
     """
     fn, jac = seam_fold(0.0)
     ctx = refine_setup(fn, jac, 4.0, 4, 0.05)
-    ij, cls = new.initial_triangles(4, ctx.lat.level, ctx.tables[4])
+    ij, cls = initial_triangles(4, ctx.lat.level, ctx.tables[4])
     half = 2 << ctx.lat.level  # cells with i < 2 lie at x < 0
     left = backend.flatnonzero(ij[:, 0, 0] < half)
     right = backend.flatnonzero(ij[:, 0, 0] >= half)
@@ -629,7 +659,7 @@ def assert_meshes_equal(got, want):
     corner. Every vertex and band position is compared anyway, through
     ``vertices_lens`` and ``critical_band.lens``.
     """
-    for name in new.AdaptiveMesh._fields:
+    for name in AdaptiveMesh._fields:
         a, b = getattr(got, name), getattr(want, name)
         if name == "lattice":
             assert (a.level, a.n, a.stride, a.scale) == (
@@ -639,7 +669,7 @@ def assert_meshes_equal(got, want):
                 b.scale,
             )
             corners = backend.to(i64([[0, 0], [a.n, a.n]]), device=backend.device(a.lo))
-            _assert_same(new.lattice_xy(a, corners), new.lattice_xy(b, corners), name)
+            _assert_same(lattice_xy(a, corners), lattice_xy(b, corners), name)
         elif name in ("index", "critical_band", "holes"):
             for field in type(a)._fields:
                 _assert_same(getattr(a, field), getattr(b, field), f"{name}.{field}")
@@ -648,9 +678,9 @@ def assert_meshes_equal(got, want):
 
 
 def seed_of(mesh, lens, k):
-    lat = new.extend_lattice(mesh.lattice, k)
-    raytrace_fn = new.make_raytrace(lens.raytrace, None)
-    return (lat, *new.seed_from_mesh(mesh, lat, k, raytrace_fn, None))
+    lat = extend_lattice(mesh.lattice, k)
+    raytrace_fn = make_raytrace(lens.raytrace, None)
+    return (lat, *seed_from_mesh(mesh, lat, k, raytrace_fn, None))
 
 
 def test_seeding_a_mesh_and_freezing_it_again_reproduces_it():
@@ -662,15 +692,15 @@ def test_seeding_a_mesh_and_freezing_it_again_reproduces_it():
     mesh, lens, calls = build(fn, jac, 4.0, 4, 0.05, centres=[(1.0001, 0.1003)])
     assert mesh.critical_band.leaves.shape[0] > 0
     assert mesh.holes.centres.shape[0] == 1
-    assert ((to_np(mesh.leaf_status) & new.LEAF_RAYTRACE_NONFINITE) != 0).any()
+    assert ((to_np(mesh.leaf_status) & LEAF_RAYTRACE_NONFINITE) != 0).any()
     calls["raytrace"].clear()
     lat, cache, active, store, band = seed_of(mesh, lens, 0)
-    again = new.freeze(
+    again = freeze(
         lat,
         cache,
         active,
         store,
-        new.empty_band(),
+        empty_band(),
         band,
         fov=mesh.fov,
         init_res=mesh.init_res,
@@ -692,13 +722,13 @@ def test_seeding_drops_the_freeze_time_flag_below_max_level():
     must not inherit; ``max_level`` rows keep their whole record."""
     mesh, lens, _ = build(localised_fold, localised_fold_jacobian, 4.0, 4, 0.05)
     status = to_np(mesh.leaf_status).copy()
-    status[to_np(mesh.leaf_level) < mesh.max_level] |= new.LEAF_RAYTRACE_NONFINITE
+    status[to_np(mesh.leaf_level) < mesh.max_level] |= LEAF_RAYTRACE_NONFINITE
     flagged = mesh._replace(leaf_status=i64(status))
     _, _, _, store, _ = seed_of(flagged, lens, 0)
     level, got = to_np(store.level), to_np(store.status)
     low, top = level < mesh.max_level, level == mesh.max_level
     assert low.any() and top.any()
-    assert (got[low] == new.LEAF_CONVERGED).all()
+    assert (got[low] == LEAF_CONVERGED).all()
     first = np.searchsorted(to_np(mesh.leaf_origin), np.arange(level.size))
     assert np.array_equal(got[top], status[first][top])
 
@@ -795,7 +825,7 @@ EQUIVALENCE = {
 def test_an_extension_is_the_fresh_build_of_the_larger_fov(case):
     fn, jac, kw, target = EQUIVALENCE[case]
     mesh, lens, _ = build(fn, jac, **kw)
-    got = new.extend_adaptive_mesh(mesh, lens, target)
+    got = extend_adaptive_mesh(mesh, lens, target)
     want, _, _ = build(fn, jac, **fresh_equivalent(kw, target))
     assert got.init_res > mesh.init_res
     assert_meshes_equal(got, want)
@@ -804,10 +834,8 @@ def test_an_extension_is_the_fresh_build_of_the_larger_fov(case):
 def test_extensions_chain():
     kw = dict(fov=4.0, init_res=8, min_img_sep=0.05)
     mesh, lens, _ = build(localised_fold, localised_fold_jacobian, **kw)
-    twice = new.extend_adaptive_mesh(
-        new.extend_adaptive_mesh(mesh, lens, 6.0), lens, 8.0
-    )
-    once = new.extend_adaptive_mesh(mesh, lens, 8.0)
+    twice = extend_adaptive_mesh(extend_adaptive_mesh(mesh, lens, 6.0), lens, 8.0)
+    once = extend_adaptive_mesh(mesh, lens, 8.0)
     fresh, _, _ = build(
         localised_fold, localised_fold_jacobian, **fresh_equivalent(kw, 8.0)
     )
@@ -823,7 +851,7 @@ def test_an_extension_carries_its_holes_and_traces_none_of_them_again():
     mesh, lens, calls = build(fn, jac, **kw)
     assert mesh.holes.centres.shape[0] == 2
     calls["raytrace"].clear()
-    got = new.extend_adaptive_mesh(mesh, lens, 4.0)
+    got = extend_adaptive_mesh(mesh, lens, 4.0)
     want, _, _ = build(fn, jac, **fresh_equivalent(kw, 4.0))
     assert_meshes_equal(got, want)
     traced = called_at(calls, "raytrace")
@@ -836,7 +864,7 @@ def test_an_extension_carries_its_holes_and_traces_none_of_them_again():
 def test_extending_a_float32_mesh_matches_a_fresh_float32_build():
     kw = dict(fov=4.0, init_res=4, min_img_sep=0.05, dtype=backend.float32)
     mesh, lens, _ = build(localised_fold, localised_fold_jacobian, **kw)
-    got = new.extend_adaptive_mesh(mesh, lens, 6.0)
+    got = extend_adaptive_mesh(mesh, lens, 6.0)
     want, _, _ = build(
         localised_fold, localised_fold_jacobian, **fresh_equivalent(kw, 6.0)
     )
@@ -866,7 +894,7 @@ def test_an_extension_calls_the_lens_only_in_the_ring_and_in_old_leaves_it_split
     mesh, lens, calls = build(fn, jac, 4.0, 4, 0.05)
     calls["raytrace"].clear()
     calls["jacobian"].clear()
-    ext = new.extend_adaptive_mesh(mesh, lens, 6.0)
+    ext = extend_adaptive_mesh(mesh, lens, 6.0)
     lat = ext.lattice
     pad = lat.origin
     lo, hi = pad, pad + mesh.lattice.n
@@ -921,7 +949,7 @@ def affine_mesh():
 )
 def test_the_requested_fov_rounds_up_to_whole_cells(affine_mesh, fov, want):
     mesh, lens, _ = affine_mesh
-    ext = new.extend_adaptive_mesh(mesh, lens, fov)
+    ext = extend_adaptive_mesh(mesh, lens, fov)
     assert ext.fov == want
     assert ext.init_res == round(want / 0.5)
 
@@ -931,21 +959,21 @@ def test_a_fov_the_mesh_already_covers_returns_the_mesh_itself(affine_mesh, fov)
     mesh, lens, calls = affine_mesh
     calls["raytrace"].clear()
     calls["jacobian"].clear()
-    assert new.extend_adaptive_mesh(mesh, lens, fov) is mesh
+    assert extend_adaptive_mesh(mesh, lens, fov) is mesh
     assert not calls["raytrace"] and not calls["jacobian"]
 
 
 def test_a_smaller_fov_raises(affine_mesh):
     mesh, lens, _ = affine_mesh
     with pytest.raises(ValueError, match="can only grow"):
-        new.extend_adaptive_mesh(mesh, lens, 3.9)
+        extend_adaptive_mesh(mesh, lens, 3.9)
 
 
 @pytest.mark.parametrize("fov", [np.nan, np.inf])
 def test_a_non_finite_fov_raises(affine_mesh, fov):
     mesh, lens, _ = affine_mesh
     with pytest.raises(ValueError, match="finite"):
-        new.extend_adaptive_mesh(mesh, lens, fov)
+        extend_adaptive_mesh(mesh, lens, fov)
 
 
 @pytest.mark.filterwarnings("ignore:raytrace returned")
@@ -953,9 +981,9 @@ def test_an_extension_int64_keys_cannot_hold_raises():
     """At ``max_level = 25`` the lattice keys in int64 up to ``init_res = 45``."""
     mesh, lens, _ = build(affine, affine_jacobian, 1.0, 1, 1e-7)
     assert mesh.max_level == 25
-    assert new.extend_adaptive_mesh(mesh, lens, 45.0).init_res == 45
+    assert extend_adaptive_mesh(mesh, lens, 45.0).init_res == 45
     with pytest.raises(ValueError, match="lattice too fine.*Extend by less"):
-        new.extend_adaptive_mesh(mesh, lens, 46.0)
+        extend_adaptive_mesh(mesh, lens, 46.0)
 
 
 def _messages(record):
@@ -969,7 +997,7 @@ def test_an_extension_warns_depth_limited_as_the_fresh_build_would():
         mesh, lens, _ = build(localised_fold, localised_fold_jacobian, **kw)
     with warnings.catch_warnings(record=True) as got:
         warnings.simplefilter("always")
-        new.extend_adaptive_mesh(mesh, lens, 6.0)
+        extend_adaptive_mesh(mesh, lens, 6.0)
     with warnings.catch_warnings(record=True) as want:
         warnings.simplefilter("always")
         build(localised_fold, localised_fold_jacobian, **fresh_equivalent(kw, 6.0))
@@ -987,7 +1015,7 @@ def test_an_extension_checks_the_cancellation_floor_at_the_larger_fov():
     assert not any("cancellation floor" in m for m in _messages(base))
     with warnings.catch_warnings(record=True) as got:
         warnings.simplefilter("always")
-        new.extend_adaptive_mesh(mesh, lens, 6.0)
+        extend_adaptive_mesh(mesh, lens, 6.0)
     with warnings.catch_warnings(record=True) as want:
         warnings.simplefilter("always")
         build(affine, affine_jacobian, **fresh_equivalent(kw, 6.0))
@@ -1000,13 +1028,13 @@ def test_an_extension_closes_the_critical_curves_the_fov_cut():
     edge; at fov 3 it lies inside."""
     kw = dict(fov=2.0, init_res=4, min_img_sep=0.05)
     mesh, lens, _ = build(sie_like, sie_like_jacobian, **kw)
-    assert not to_np(crit.mesh_critical_curves(mesh).closed).all()
-    ext = new.extend_adaptive_mesh(mesh, lens, 3.0)
-    got = crit.mesh_critical_curves(ext)
+    assert not to_np(mesh_critical_curves(mesh).closed).all()
+    ext = extend_adaptive_mesh(mesh, lens, 3.0)
+    got = mesh_critical_curves(ext)
     fresh, _, _ = build(sie_like, sie_like_jacobian, **fresh_equivalent(kw, 3.0))
     assert got.closed.shape[0] > 0 and to_np(got.closed).all()
-    want = crit.mesh_critical_curves(fresh)
-    for field in crit.CriticalCurves._fields:
+    want = mesh_critical_curves(fresh)
+    for field in CriticalCurves._fields:
         a, b = getattr(got, field), getattr(want, field)
         if field == "holes":
             for sub in type(a)._fields:
@@ -1018,7 +1046,7 @@ def test_an_extension_closes_the_critical_curves_the_fov_cut():
 def test_an_extension_of_a_mesh_on_a_device_stays_on_it(device):
     kw = dict(fov=4.0, init_res=4, min_img_sep=0.05, device=device)
     mesh, lens, _ = build(localised_fold, localised_fold_jacobian, **kw)
-    got = new.extend_adaptive_mesh(mesh, lens, 6.0)
+    got = extend_adaptive_mesh(mesh, lens, 6.0)
     want, _, _ = build(
         localised_fold, localised_fold_jacobian, **fresh_equivalent(kw, 6.0)
     )
@@ -1043,9 +1071,7 @@ def test_batch_size_and_index_cells_reach_every_path_an_extension_traces():
     )
     mesh, lens, calls = build(edge_bump, edge_bump_jacobian, **kw)
     calls["raytrace"].clear()
-    got = new.extend_adaptive_mesh(
-        mesh, lens, 6.0, raytrace_batch_size=5, index_cells=16
-    )
+    got = extend_adaptive_mesh(mesh, lens, 6.0, raytrace_batch_size=5, index_cells=16)
     assert calls["raytrace"] and max(len(xy) for xy in calls["raytrace"]) <= 5
     want, _, _ = build(edge_bump, edge_bump_jacobian, **fresh_equivalent(kw, 6.0))
     assert_meshes_equal(got, want)

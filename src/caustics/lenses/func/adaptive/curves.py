@@ -24,8 +24,9 @@ of the mesh alone.
 import math
 from typing import NamedTuple, Tuple
 
-from ...backend_obj import ArrayLike, backend
-from .adaptive import CHILD_VERTEX_INDICES, CentreHoles, empty_holes
+from ....backend_obj import ArrayLike, backend
+from .geometry import _CHILD_VERTEX_INDEX_TABLE
+from .holes import CentreHoles, empty_holes
 
 __all__ = (
     "CriticalCurves",
@@ -36,12 +37,6 @@ __all__ = (
     "join_at_holes",
     "mesh_critical_curves",
 )
-
-
-# `CHILD_VERTEX_INDICES` as one backend int64 array, so `child_segments`
-# gathers all four children of every leaf with one fancy-indexing op, as
-# `red_split` does.
-_CHILD_TABLE = backend.as_array(CHILD_VERTEX_INDICES, dtype=backend.int64)
 
 
 class CriticalCurves(NamedTuple):
@@ -150,7 +145,7 @@ def child_segments(samples, det) -> Tuple[ArrayLike, ArrayLike]:
     end: ArrayLike
         Their ending edges, shape ``(K, 2)``, in the same form.
     """
-    kids = samples[:, _CHILD_TABLE].reshape(-1, 3)
+    kids = samples[:, _CHILD_VERTEX_INDEX_TABLE].reshape(-1, 3)
     positive = det[kids] >= 0
     n_positive = backend.sum(backend.long(positive), dim=1)
     mixed = backend.flatnonzero((n_positive == 1) | (n_positive == 2))

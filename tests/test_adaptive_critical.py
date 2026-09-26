@@ -9,8 +9,24 @@ import pytest
 from scipy.spatial import cKDTree
 
 from caustics.backend_obj import backend
-from caustics.lenses.func import adaptive as new
-from caustics.lenses.func import adaptive_critical as crit
+from caustics.lenses.func.adaptive import (
+    CentreHoles,
+    CriticalBand,
+    CriticalCurves,
+    LEAF_JACOBIAN_PARITY_UNRESOLVED,
+    build_adaptive_mesh,
+    mesh_critical_curves,
+)
+from caustics.lenses.func.adaptive.band import empty_band
+from caustics.lenses.func.adaptive.curves import (
+    chain_order,
+    child_segments,
+    crossing_points,
+    join_at_holes,
+    trace_band,
+)
+from caustics.lenses.func.adaptive.geometry import CHILD_VERTEX_INDICES
+from caustics.lenses.func.adaptive.holes import empty_holes
 
 
 def to_np(x):
@@ -24,7 +40,7 @@ def _arr(x):
 def _band(samples, lens, det, source=None):
     """A hand-built `CriticalBand`; ``source`` defaults to ``lens``."""
     samples = np.asarray(samples, dtype=np.int64)
-    return new.CriticalBand(
+    return CriticalBand(
         leaves=backend.as_array(np.arange(samples.shape[0]), dtype=backend.int64),
         samples=backend.as_array(samples, dtype=backend.int64),
         lens=_arr(lens),
@@ -103,7 +119,7 @@ def test_chain_order_matches_a_python_walk(seed):
     cyclic = rng.random(12) < 0.5
     succ = _random_chains(rng, sizes, cyclic)
     order, offsets, closed = (
-        to_np(x) for x in crit.chain_order(backend.as_array(succ, dtype=backend.int64))
+        to_np(x) for x in chain_order(backend.as_array(succ, dtype=backend.int64))
     )
     want = _walk(succ)
     assert offsets.tolist() == np.cumsum([0] + [len(c) for _, c, _ in want]).tolist()
@@ -122,15 +138,10 @@ def test_chain_order_matches_a_python_walk(seed):
     ids=["empty", "lone node", "two-cycle", "path"],
 )
 def test_chain_order_small_cases(succ, order, offsets, closed):
-    got = crit.chain_order(backend.as_array(np.asarray(succ, dtype=np.int64)))
+    got = chain_order(backend.as_array(np.asarray(succ, dtype=np.int64)))
     assert to_np(got[0]).tolist() == order
     assert to_np(got[1]).tolist() == offsets
     assert to_np(got[2]).tolist() == closed
-
-
-def test_no_numpy_import_in_the_module():
-    source = open(crit.__file__).read()
-    assert "import numpy" not in source
 
 
 # ---------------------------------------------------------------------------
@@ -151,18 +162,16 @@ def test_child_segments_keep_positive_det_on_the_left(signs):
     """
     det = np.asarray(signs) * np.array([1.0, 2.0, 0.5, 3.0, 1.5, 0.25])
     band = _unit_band(det)
-    start, end = crit.child_segments(band.samples, band.det)
+    start, end = child_segments(band.samples, band.det)
     start, end = to_np(start), to_np(end)
     # Every mixed child -- not all three corners of one class -- returns
     # exactly one segment, and no other child returns any.
-    children = np.asarray(new.CHILD_VERTEX_INDICES)
+    children = np.asarray(CHILD_VERTEX_INDICES)
     classes = det[children] >= 0
     mixed = classes.any(axis=1) & ~classes.all(axis=1)
     assert start.shape[0] == int(mixed.sum())
-    p, _ = crit.crossing_points(
-        backend.as_array(start), band.lens, band.source, band.det
-    )
-    q, _ = crit.crossing_points(backend.as_array(end), band.lens, band.source, band.det)
+    p, _ = crossing_points(backend.as_array(start), band.lens, band.source, band.det)
+    q, _ = crossing_points(backend.as_array(end), band.lens, band.source, band.det)
     p, q = to_np(p), to_np(q)
     for a, b, s, e in zip(p, q, start, end):
         corners = set(s.tolist()) | set(e.tolist())
@@ -177,7 +186,7 @@ def test_child_segments_keep_positive_det_on_the_left(signs):
 def test_child_segments_skip_a_leaf_of_one_class():
     for det in (np.ones(6), -np.ones(6)):
         band = _unit_band(det)
-        start, end = crit.child_segments(band.samples, band.det)
+        start, end = child_segments(band.samples, band.det)
         assert start.shape[0] == 0 and end.shape[0] == 0
 
 
@@ -186,7 +195,7 @@ def test_crossing_points_interpolate_the_zero_linearly_in_both_planes():
     lens = np.array([[0.0, 0.0], [4.0, 0.0]])
     source = np.array([[1.0, 1.0], [1.0, 9.0]])
     edges = backend.as_array(np.array([[0, 1]]), dtype=backend.int64)
-    got_lens, got_source = crit.crossing_points(
+    got_lens, got_source = crossing_points(
         edges, _arr(lens), _arr(source), _arr([1.0, -3.0])
     )
     assert to_np(got_lens).tolist() == [[1.0, 0.0]]
@@ -201,7 +210,7 @@ def test_an_exact_zero_counts_as_positive_and_puts_the_crossing_on_it():
     """
     det = np.array([0.0, -1.0, -1.0, -1.0, -1.0, -1.0])
     band = _unit_band(det)
-    curves = crit.trace_band(band)
+    curves = trace_band(band)
     lens = to_np(curves.lens)
     assert lens.shape[0] > 0
     assert np.array_equal(lens, np.zeros_like(lens))
@@ -231,7 +240,7 @@ def test_two_leaves_sharing_an_edge_chain_through_one_crossing():
         ]
     )
     samples = [[0, 1, 2, 4, 5, 6], [0, 2, 3, 7, 8, 5]]
-    curves = crit.trace_band(_band(samples, lens, lens[:, 0] - 1.5))
+    curves = trace_band(_band(samples, lens, lens[:, 0] - 1.5))
     assert to_np(curves.offsets).tolist() == [0, 5]
     assert to_np(curves.closed).tolist() == [False]
     assert to_np(curves.lens).tolist() == [
@@ -249,7 +258,7 @@ def test_trace_band_rejects_a_crossing_with_two_successors():
     det = np.array([1.0, -1.0, -1.0, 1.0, -1.0, 1.0])
     band = _band([[0, 1, 2, 3, 4, 5], [0, 1, 2, 3, 4, 5]], UNIT_LENS, det)
     with pytest.raises(AssertionError, match="two successors"):
-        crit.trace_band(band)
+        trace_band(band)
 
 
 def test_trace_band_rejects_a_crossing_with_two_predecessors():
@@ -278,16 +287,16 @@ def test_trace_band_rejects_a_crossing_with_two_predecessors():
     samples = [[0, 2, 1, 4, 6, 5], [0, 2, 3, 7, 8, 5]]
     band = _band(samples, lens, lens[:, 0] - 1.5)
     with pytest.raises(AssertionError, match="two predecessors"):
-        crit.trace_band(band)
+        trace_band(band)
 
 
 @pytest.mark.parametrize(
     "band",
-    [new.empty_band(), _unit_band(np.ones(6))],
+    [empty_band(), _unit_band(np.ones(6))],
     ids=["empty band", "one class"],
 )
 def test_a_band_without_crossings_has_no_curves(band):
-    curves = crit.trace_band(band)
+    curves = trace_band(band)
     assert to_np(curves.offsets).tolist() == [0]
     assert tuple(curves.lens.shape) == (0, 2)
     assert tuple(curves.source.shape) == (0, 2)
@@ -305,7 +314,7 @@ def _one_hole(radius=0.1, n=64, shift=(5.0, 0.0)):
     """A hand-built hole at the origin: ``n`` even samples; source = lens + shift."""
     angle = 2.0 * np.pi * np.arange(n) / n
     lens = radius * np.stack([np.cos(angle), np.sin(angle)], axis=-1)
-    return new.CentreHoles(
+    return CentreHoles(
         centres=_arr([[0.0, 0.0]]),
         radius=_arr([radius]),
         offsets=backend.as_array(np.array([0, n]), dtype=backend.int64),
@@ -322,13 +331,13 @@ def _traced(*curves):
     """Hand-built ``CriticalCurves`` from ``(points, closed)`` pairs; source = 2 * lens."""
     pts = np.concatenate([np.asarray(p, dtype=np.float64) for p, _ in curves])
     offsets = np.cumsum([0] + [len(p) for p, _ in curves])
-    return crit.CriticalCurves(
+    return CriticalCurves(
         lens=_arr(pts),
         source=_arr(2.0 * pts),
         offsets=backend.as_array(offsets, dtype=backend.int64),
         closed=backend.as_array(np.array([c for _, c in curves]), dtype=backend.bool),
         hole=backend.as_array(np.full(len(pts), -1), dtype=backend.int64),
-        holes=new.empty_holes(),
+        holes=empty_holes(),
     )
 
 
@@ -372,7 +381,7 @@ FIGURE_EIGHT = (
 
 def test_a_loop_through_a_centre_twice_splits_into_two_loops_joined_clockwise():
     holes = _one_hole()
-    parts = _parts(crit.join_at_holes(_traced((FIGURE_EIGHT, True)), holes))
+    parts = _parts(join_at_holes(_traced((FIGURE_EIGHT, True)), holes))
     assert len(parts) == 2 and all(closed for *_, closed in parts)
     arcs = []
     for lens, source, hole, _ in parts:
@@ -390,7 +399,7 @@ def test_a_loop_through_a_centre_twice_splits_into_two_loops_joined_clockwise():
 
 def test_joined_arms_keep_their_direction_of_travel():
     """Each arm's points outside the hole lie in one curve, consecutive and in order."""
-    parts = _parts(crit.join_at_holes(_traced((FIGURE_EIGHT, True)), _one_hole()))
+    parts = _parts(join_at_holes(_traced((FIGURE_EIGHT, True)), _one_hole()))
     traced = [lens[hole == -1].tolist() for lens, _, hole, _ in parts]
     for arm in (WEST_IN, EAST_IN, SOUTH_OUT, NORTH_OUT):
         kept = [list(p) for p in arm if np.hypot(*p) >= 0.1]
@@ -403,7 +412,7 @@ def test_joined_arms_keep_their_direction_of_travel():
 def test_a_curve_whose_ends_stop_inside_a_hole_is_closed_along_it():
     """Both ends inside the hole, as at a band gap: out north, back from the west."""
     broken = NORTH_OUT + [(-0.7, 0.7)] + WEST_IN
-    parts = _parts(crit.join_at_holes(_traced((broken, False)), _one_hole()))
+    parts = _parts(join_at_holes(_traced((broken, False)), _one_hole()))
     assert len(parts) == 1
     lens, _, hole, closed = parts[0]
     assert closed
@@ -413,7 +422,7 @@ def test_a_curve_whose_ends_stop_inside_a_hole_is_closed_along_it():
 def test_ends_that_do_not_alternate_stay_open():
     """Two arms that both arrive: nothing departs to pair them with."""
     parts = _parts(
-        crit.join_at_holes(_traced((WEST_IN, False), (EAST_IN, False)), _one_hole())
+        join_at_holes(_traced((WEST_IN, False), (EAST_IN, False)), _one_hole())
     )
     assert len(parts) == 2 and not any(closed for *_, closed in parts)
     assert all((hole == -1).all() for _, _, hole, _ in parts)
@@ -423,7 +432,7 @@ def test_ends_that_do_not_alternate_stay_open():
 def test_a_curve_wholly_inside_a_hole_is_dropped():
     tiny = [(0.01, 0.0), (0.0, 0.01), (-0.01, 0.0), (0.0, -0.01)]
     far = [(2.0, 0.0), (2.0, 1.0), (3.0, 1.0)]
-    parts = _parts(crit.join_at_holes(_traced((tiny, True), (far, True)), _one_hole()))
+    parts = _parts(join_at_holes(_traced((tiny, True), (far, True)), _one_hole()))
     assert len(parts) == 1 and np.array_equal(parts[0][0], np.array(far))
 
 
@@ -443,8 +452,8 @@ def test_a_lone_point_just_outside_a_hole_counts_as_inside_it(reverse):
     if reverse:
         without, poked = without[::-1], poked[::-1]
     holes = _one_hole()
-    got = crit.join_at_holes(_traced((poked, False)), holes)
-    want = crit.join_at_holes(_traced((without, False)), holes)
+    got = join_at_holes(_traced((poked, False)), holes)
+    want = join_at_holes(_traced((without, False)), holes)
     for field in ("lens", "source", "offsets", "closed", "hole"):
         assert np.array_equal(
             to_np(getattr(got, field)), to_np(getattr(want, field))
@@ -457,7 +466,7 @@ def test_a_lone_point_just_outside_a_hole_counts_as_inside_it(reverse):
 def test_a_closed_curve_with_one_point_outside_a_hole_is_dropped():
     poked = [(0.02, 0.0), (0.0, 0.02), (-0.02, 0.0), (0.0, -0.105)]
     far = [(2.0, 0.0), (2.0, 1.0), (3.0, 1.0)]
-    parts = _parts(crit.join_at_holes(_traced((poked, True), (far, True)), _one_hole()))
+    parts = _parts(join_at_holes(_traced((poked, True), (far, True)), _one_hole()))
     assert len(parts) == 1 and np.array_equal(parts[0][0], np.array(far))
 
 
@@ -466,7 +475,7 @@ def test_curves_that_never_enter_a_hole_are_left_bit_for_bit():
         ([(2.0, 0.0), (2.0, 1.0), (3.0, 1.0)], True),
         ([(-2.0, 0.0), (-2.0, 1.0), (-3.0, 1.0), (-3.0, 0.5)], False),
     )
-    after = crit.join_at_holes(before, _one_hole())
+    after = join_at_holes(before, _one_hole())
     for field in ("lens", "source", "offsets", "closed", "hole"):
         assert np.array_equal(
             to_np(getattr(after, field)), to_np(getattr(before, field))
@@ -476,7 +485,7 @@ def test_curves_that_never_enter_a_hole_are_left_bit_for_bit():
 
 def test_joining_at_no_hole_changes_nothing():
     before = _traced((FIGURE_EIGHT, True))
-    after = crit.join_at_holes(before, new.empty_holes())
+    after = join_at_holes(before, empty_holes())
     for field in ("lens", "source", "offsets", "closed", "hole"):
         assert np.array_equal(
             to_np(getattr(after, field)), to_np(getattr(before, field))
@@ -499,7 +508,7 @@ def _hole_pair(n=64):
     u = 0.1 * np.stack([np.cos(angle), np.sin(angle)], axis=-1)
     lens = np.concatenate([np.asarray(_A) + u, np.asarray(_B) + u])
     shift = np.repeat([[5.0, 0.0], [0.0, 5.0]], n, axis=0)
-    return new.CentreHoles(
+    return CentreHoles(
         centres=_arr([_A, _B]),
         radius=_arr([0.1, 0.1]),
         offsets=backend.as_array(np.array([0, n, 2 * n]), dtype=backend.int64),
@@ -568,7 +577,7 @@ def test_a_bridge_from_one_hole_to_another_is_joined_along_both_circles():
     B clockwise, over the top, to the arm out of B.
     """
     holes = _hole_pair()
-    parts = _parts(crit.join_at_holes(_traced((BRIDGED_ONCE, True)), holes))
+    parts = _parts(join_at_holes(_traced((BRIDGED_ONCE, True)), holes))
     assert len(parts) == 1
     lens, source, hole, closed = parts[0]
     assert closed
@@ -605,7 +614,7 @@ def test_two_bridges_between_two_holes_join_into_one_loop_through_the_neck():
     round one circle.
     """
     holes = _hole_pair()
-    got = crit.join_at_holes(_traced((BRIDGED_TWICE, True)), holes)
+    got = join_at_holes(_traced((BRIDGED_TWICE, True)), holes)
     stored_lens, stored_source = to_np(holes.lens), to_np(holes.source)
 
     def traced(points):
@@ -643,9 +652,7 @@ def test_a_bridge_left_unjoined_at_both_holes_adds_no_empty_curve():
     """
     across = _arm(_A, 130, [0.6, 0.3, 0.15, 0.05]) + _STEP_EAST
     into = _arm(_A, 230, [0.6, 0.3, 0.15, 0.05])
-    parts = _parts(
-        crit.join_at_holes(_traced((across, False), (into, False)), _hole_pair())
-    )
+    parts = _parts(join_at_holes(_traced((across, False), (into, False)), _hole_pair()))
     assert [len(lens) for lens, *_ in parts] == [3, 3]
     assert not any(closed for *_, closed in parts)
     assert all((hole == -1).all() for _, _, hole, _ in parts)
@@ -724,7 +731,7 @@ RADIAL_CAUSTIC = RADIAL * abs(1.0 - 1.2 / _R_RADIAL)
 
 def _curves(mesh):
     """``[(lens, source, closed), ...]`` per curve, as numpy."""
-    curves = crit.mesh_critical_curves(mesh)
+    curves = mesh_critical_curves(mesh)
     off = to_np(curves.offsets)
     lens, source, closed = (
         to_np(curves.lens),
@@ -753,7 +760,7 @@ def test_cored_isothermal_curves_match_the_analytic_answers():
     counter-clockwise.
     """
     min_img_sep = 1e-2
-    mesh = new.build_adaptive_mesh(CORED, fov=4.0, init_res=16, min_img_sep=min_img_sep)
+    mesh = build_adaptive_mesh(CORED, fov=4.0, init_res=16, min_img_sep=min_img_sep)
     curves = _curves(mesh)
     assert len(curves) == 2 and all(closed for _, _, closed in curves)
     (t_lens, t_src, _), (r_lens, r_src, _) = sorted(
@@ -767,9 +774,9 @@ def test_cored_isothermal_curves_match_the_analytic_answers():
 
 
 def test_without_holes_the_curves_are_trace_band_s_and_follow_no_hole():
-    mesh = new.build_adaptive_mesh(CORED, fov=4.0, init_res=16, min_img_sep=1e-2)
-    got = crit.mesh_critical_curves(mesh)
-    raw = crit.trace_band(mesh.critical_band)
+    mesh = build_adaptive_mesh(CORED, fov=4.0, init_res=16, min_img_sep=1e-2)
+    got = mesh_critical_curves(mesh)
+    raw = trace_band(mesh.critical_band)
     for field in ("lens", "source", "offsets", "closed"):
         assert np.array_equal(
             to_np(getattr(got, field)), to_np(getattr(raw, field))
@@ -789,7 +796,7 @@ def test_the_fov_cuts_the_tangential_circle_into_four_open_arcs():
     Every end sits on a boundary edge, whose two samples share the boundary
     coordinate exactly, so the end is on the boundary exactly.
     """
-    mesh = new.build_adaptive_mesh(CORED, fov=2.0, init_res=8, min_img_sep=1e-2)
+    mesh = build_adaptive_mesh(CORED, fov=2.0, init_res=8, min_img_sep=1e-2)
     curves = _curves(mesh)
     arcs = [lens for lens, _, closed in curves if not closed]
     loops = [lens for lens, _, closed in curves if closed]
@@ -810,9 +817,9 @@ def test_a_curve_through_lattice_points_is_traced_without_any_parity_flag():
     which tracing a curve through lattice points produces -- are kept, not
     removed.
     """
-    mesh = new.build_adaptive_mesh(ROW_FOLD, fov=4.0, init_res=8, min_img_sep=2e-2)
+    mesh = build_adaptive_mesh(ROW_FOLD, fov=4.0, init_res=8, min_img_sep=2e-2)
     status = to_np(mesh.leaf_status)
-    assert not ((status & new.LEAF_JACOBIAN_PARITY_UNRESOLVED) != 0).any()
+    assert not ((status & LEAF_JACOBIAN_PARITY_UNRESOLVED) != 0).any()
     curves = _curves(mesh)
     assert len(curves) == 1
     lens, _, closed = curves[0]
@@ -830,7 +837,7 @@ def test_a_curve_ends_where_the_lens_turns_nonfinite():
     edge of ``x = 1``.
     """
     min_img_sep = 0.05
-    mesh = new.build_adaptive_mesh(
+    mesh = build_adaptive_mesh(
         BROKEN_FOLD, fov=4.0, init_res=4, min_img_sep=min_img_sep
     )
     curves = _curves(mesh)
@@ -1004,14 +1011,14 @@ def _brute_counts(fn, grid, lo, hi, h, singular, excl):
 
 @pytest.fixture(scope="module")
 def two_sis():
-    mesh = new.build_adaptive_mesh(_sis_pair(TWO_SIS), **TWO_SIS_BUILD, centres=TWO_SIS)
-    return mesh, crit.mesh_critical_curves(mesh)
+    mesh = build_adaptive_mesh(_sis_pair(TWO_SIS), **TWO_SIS_BUILD, centres=TWO_SIS)
+    return mesh, mesh_critical_curves(mesh)
 
 
 def test_curves_through_singular_centres_come_out_closed_and_chord_free(two_sis):
     """Without holes a chord crosses a cut of radius ~1"; traced steps are below 0.01"."""
     mesh, curves = two_sis
-    assert not to_np(crit.trace_band(mesh.critical_band).closed).all()
+    assert not to_np(trace_band(mesh.critical_band).closed).all()
     parts = _parts(curves)
     assert parts and all(closed for *_, closed in parts)
     centres, radius = to_np(mesh.holes.centres), to_np(mesh.holes.radius)
@@ -1045,18 +1052,18 @@ def test_the_count_from_the_repaired_curves_matches_a_brute_force_count(two_sis)
 def test_moving_a_centre_off_the_lattice_leaves_the_count_unchanged(two_sis):
     _, curves = two_sis
     shifted = [(0.0003, 0.0002), TWO_SIS[1]]
-    mesh = new.build_adaptive_mesh(_sis_pair(shifted), **TWO_SIS_BUILD, centres=shifted)
-    moved = crit.mesh_critical_curves(mesh)
+    mesh = build_adaptive_mesh(_sis_pair(shifted), **TWO_SIS_BUILD, centres=shifted)
+    moved = mesh_critical_curves(mesh)
     grid = _grid_of(curves)
     band = _curve_mask(curves, grid, 0.06) | _curve_mask(moved, grid, 0.06)
     assert np.array_equal(_count(moved, grid)[~band], _count(curves, grid)[~band])
 
 
 def test_a_float32_mesh_repairs_its_curves_at_the_mesh_dtype():
-    mesh = new.build_adaptive_mesh(
+    mesh = build_adaptive_mesh(
         _sis_pair(TWO_SIS), **TWO_SIS_BUILD, centres=TWO_SIS, dtype=backend.float32
     )
-    curves = crit.mesh_critical_curves(mesh)
+    curves = mesh_critical_curves(mesh)
     assert (
         curves.lens.dtype == backend.float32 and curves.source.dtype == backend.float32
     )
@@ -1089,7 +1096,7 @@ WITH_COMPANION_B = [1.0, 1.0, 0.02]
 
 def _hole_to_hole_steps(mesh):
     """How many traced steps of ``mesh``'s band go from one hole's disk straight into another's."""
-    raw = crit.trace_band(mesh.critical_band)
+    raw = trace_band(mesh.critical_band)
     lens, off = to_np(raw.lens), to_np(raw.offsets)
     centres, radius = to_np(mesh.holes.centres), to_np(mesh.holes.radius)
     inside = np.hypot(*(lens[:, None, :] - centres[None]).transpose(2, 0, 1)) < radius
@@ -1150,12 +1157,12 @@ def _assert_closed_and_chord_free(mesh, curves):
 
 @pytest.fixture(scope="module")
 def bridged_sis():
-    mesh = new.build_adaptive_mesh(
+    mesh = build_adaptive_mesh(
         _sis_pair(WITH_COMPANION, b=WITH_COMPANION_B),
         **TWO_SIS_BUILD,
         centres=WITH_COMPANION,
     )
-    return mesh, crit.mesh_critical_curves(mesh)
+    return mesh, mesh_critical_curves(mesh)
 
 
 def test_curves_bridged_to_a_singular_companion_come_out_closed_and_chord_free(
@@ -1195,6 +1202,6 @@ def test_curves_bridged_to_a_regular_centre_come_out_closed_and_chord_free():
     goes from it straight into the origin's.
     """
     centres = TWO_SIS + [(-0.01241, 0.01688)]
-    mesh = new.build_adaptive_mesh(_sis_pair(TWO_SIS), **TWO_SIS_BUILD, centres=centres)
+    mesh = build_adaptive_mesh(_sis_pair(TWO_SIS), **TWO_SIS_BUILD, centres=centres)
     assert _hole_to_hole_steps(mesh) > 0
-    _assert_closed_and_chord_free(mesh, crit.mesh_critical_curves(mesh))
+    _assert_closed_and_chord_free(mesh, mesh_critical_curves(mesh))

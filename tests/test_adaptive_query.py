@@ -5,7 +5,23 @@ import numpy as np
 import pytest
 
 from caustics.backend_obj import backend
-from caustics.lenses.func import adaptive as new
+from caustics.lenses.func.adaptive import (
+    LEAF_CONVERGED,
+    LEAF_CONVERGENCE_FAILED,
+    LEAF_JACOBIAN_NONFINITE,
+    build_adaptive_mesh,
+    child_matrix_tables,
+    contains,
+    mesh_query,
+    mesh_seeds,
+    triangle_weights,
+)
+from caustics.lenses.func.adaptive.build import validate_build_args
+from caustics.lenses.func.adaptive.images import dedup_representatives
+from caustics.lenses.func.adaptive.lattice import depth_floor, make_lattice
+from caustics.lenses.func.adaptive.refinement import refine
+from caustics.lenses.func.adaptive.sampling import make_raytrace
+from caustics.lenses.func.adaptive.state import store_compact
 
 
 @pytest.fixture
@@ -37,7 +53,7 @@ BUILD = dict(fov=4.0, init_res=3, min_img_sep=0.5, max_depth=3)
 
 @pytest.fixture(scope="module")
 def mesh():
-    return new.build_adaptive_mesh(SIE_LIKE, **BUILD)
+    return build_adaptive_mesh(SIE_LIKE, **BUILD)
 
 
 @pytest.fixture(scope="module")
@@ -84,7 +100,7 @@ def _oracle_mesh(oracle_module, mesh):
 
 def test_query_matches_the_oracle(mesh, beta, oracle_module):
     old_mesh = _oracle_mesh(oracle_module, mesh)
-    idx, offsets, bary = new.mesh_query(mesh, beta)
+    idx, offsets, bary = mesh_query(mesh, beta)
     idx_o, off_o, bary_o = old_mesh.query(beta)
 
     assert backend.to_numpy(offsets).tolist() == backend.to_numpy(off_o).tolist()
@@ -93,7 +109,7 @@ def test_query_matches_the_oracle(mesh, beta, oracle_module):
 
 
 def test_query_csr_is_well_formed(mesh, beta):
-    idx, offsets, bary = new.mesh_query(mesh, beta)
+    idx, offsets, bary = mesh_query(mesh, beta)
     off = backend.to_numpy(offsets)
     assert off[0] == 0
     assert off[-1] == backend.to_numpy(idx).size
@@ -103,7 +119,7 @@ def test_query_csr_is_well_formed(mesh, beta):
 
 
 def test_query_blocks_are_strictly_ascending(mesh, beta):
-    idx, offsets, _ = new.mesh_query(mesh, beta)
+    idx, offsets, _ = mesh_query(mesh, beta)
     idx_np, off = backend.to_numpy(idx), backend.to_numpy(offsets)
     for a, b in zip(off[:-1], off[1:]):
         block = idx_np[a:b]
@@ -112,16 +128,16 @@ def test_query_blocks_are_strictly_ascending(mesh, beta):
 
 
 def test_query_is_invariant_to_batch_size(mesh, beta):
-    whole = [backend.to_numpy(t) for t in new.mesh_query(mesh, beta)]
+    whole = [backend.to_numpy(t) for t in mesh_query(mesh, beta)]
     for size in (1, 5, 1000):
-        got = [backend.to_numpy(t) for t in new.mesh_query(mesh, beta, batch_size=size)]
+        got = [backend.to_numpy(t) for t in mesh_query(mesh, beta, batch_size=size)]
         for a, b in zip(whole, got):
             assert np.array_equal(a, b)
 
 
 def test_query_handles_empty_input(mesh):
     empty = backend.as_array(np.zeros((0, 2)), dtype=backend.float64)
-    idx, offsets, bary = new.mesh_query(mesh, empty)
+    idx, offsets, bary = mesh_query(mesh, empty)
     assert backend.to_numpy(idx).size == 0
     assert backend.to_numpy(offsets).tolist() == [0]
     assert backend.to_numpy(bary).shape == (0, 3)
@@ -129,20 +145,20 @@ def test_query_handles_empty_input(mesh):
 
 def test_query_rejects_wrong_shapes(mesh):
     with pytest.raises(ValueError, match=r"shape \(B, 2\)"):
-        new.mesh_query(mesh, backend.as_array(np.zeros(2), dtype=backend.float64))
+        mesh_query(mesh, backend.as_array(np.zeros(2), dtype=backend.float64))
     with pytest.raises(ValueError, match=r"shape \(B, 2\)"):
-        new.mesh_query(mesh, backend.as_array(np.zeros((3, 3)), dtype=backend.float64))
+        mesh_query(mesh, backend.as_array(np.zeros((3, 3)), dtype=backend.float64))
 
 
 def test_query_misses_return_empty_blocks(mesh):
     far = backend.as_array(np.array([[1e6, 1e6], [-1e6, 0.0]]), dtype=backend.float64)
-    idx, offsets, _ = new.mesh_query(mesh, far)
+    idx, offsets, _ = mesh_query(mesh, far)
     assert backend.to_numpy(idx).size == 0
     assert backend.to_numpy(offsets).tolist() == [0, 0, 0]
 
 
 def test_bary_is_in_the_simplex(mesh, beta):
-    _, _, bary = new.mesh_query(mesh, beta)
+    _, _, bary = mesh_query(mesh, beta)
     b = backend.to_numpy(bary)
     assert (b >= 0).all() and (b <= 1).all()
     assert np.allclose(b.sum(axis=1), 1.0)
@@ -256,12 +272,12 @@ def collapse_jacobian(p):
 
 def build(fn, jac, fov=4.0, init_res=4, min_img_sep=0.25, **kw):
     lens, calls = make_counting_lens(fn, jac)
-    mesh = new.build_adaptive_mesh(lens, fov, init_res, min_img_sep, **kw)
+    mesh = build_adaptive_mesh(lens, fov, init_res, min_img_sep, **kw)
     return mesh, calls
 
 
 def query_np(mesh, beta, batch_size=None):
-    idx, off, bary = new.mesh_query(mesh, beta, batch_size=batch_size)
+    idx, off, bary = mesh_query(mesh, beta, batch_size=batch_size)
     return backend.to_numpy(idx), backend.to_numpy(off), backend.to_numpy(bary)
 
 
@@ -287,7 +303,7 @@ def test_query_seeds_an_inner_image_that_runs_into_the_lens_centre():
     mesh, _ = build(sis_raytrace, sis_jacobian, min_img_sep=0.05)
     idx, offsets, bary = query_np(mesh, np.array([[0.8, 0.0]]))
     seed = backend.to_numpy(
-        new.mesh_seeds(mesh, backend.as_array(idx), backend.as_array(bary))
+        mesh_seeds(mesh, backend.as_array(idx), backend.as_array(bary))
     )
     assert offsets.shape[0] == 2 and seed.shape[0] > 0
     for image in ([-0.2, 0.0], [1.8, 0.0]):
@@ -315,10 +331,10 @@ def test_query_covers_points_on_the_source_bbox_upper_edge():
         beta = vs[v]
         tri = backend.as_array(vs[leaves])
         pts = backend.as_array(np.repeat(beta[None], leaves.shape[0], axis=0))
-        truth = backend.to_numpy(new.contains(new.triangle_weights(tri, pts)))
+        truth = backend.to_numpy(contains(triangle_weights(tri, pts)))
         # Only LEAF_CONVERGED leaves are indexed (see `AdaptiveMesh`'s
         # docstring): a leaf carrying any failure flag is never a candidate.
-        expected = set(np.flatnonzero(truth & (status == new.LEAF_CONVERGED)).tolist())
+        expected = set(np.flatnonzero(truth & (status == LEAF_CONVERGED)).tolist())
         idx, off, _ = query_np(mesh, beta[None])
         assert (
             set(idx[off[0] : off[1]].tolist()) >= expected
@@ -350,10 +366,10 @@ def test_query_matches_brute_force_containment_on_multi_cell_leaves():
     tri_b = backend.as_array(tri)
     for b in range(beta.shape[0]):
         pts = backend.as_array(np.repeat(beta[b][None], leaves.shape[0], axis=0))
-        truth = backend.to_numpy(new.contains(new.triangle_weights(tri_b, pts)))
+        truth = backend.to_numpy(contains(triangle_weights(tri_b, pts)))
         # Only LEAF_CONVERGED leaves are indexed, as in
         # test_query_covers_points_on_the_source_bbox_upper_edge above.
-        expected = set(np.flatnonzero(truth & (status == new.LEAF_CONVERGED)).tolist())
+        expected = set(np.flatnonzero(truth & (status == LEAF_CONVERGED)).tolist())
         assert set(idx[off[b] : off[b + 1]].tolist()) >= expected
 
 
@@ -381,9 +397,9 @@ def test_query_handles_empty_input_and_misses():
 def test_query_rejects_wrong_shapes_on_an_affine_mesh():
     mesh, _ = build(affine_np, affine_np_jacobian)
     with pytest.raises(ValueError):
-        new.mesh_query(mesh, np.array([0.0, 0.0]))
+        mesh_query(mesh, np.array([0.0, 0.0]))
     with pytest.raises(ValueError):
-        new.mesh_query(mesh, np.zeros((4, 3)))
+        mesh_query(mesh, np.zeros((4, 3)))
 
 
 def test_query_is_invariant_to_batch_size_and_point_order():
@@ -497,7 +513,7 @@ def test_bary_reconstructs_beta_on_every_hit_leaf():
 
 # Where a kappa == 1 sheet leaves every leaf: it fails the deviation test
 # (``s == 0``) and has ``det A == 0`` at every sample.
-DEGENERATE = new.LEAF_CONVERGENCE_FAILED | new.LEAF_JACOBIAN_NONFINITE
+DEGENERATE = LEAF_CONVERGENCE_FAILED | LEAF_JACOBIAN_NONFINITE
 
 
 def test_centroid_fallback_on_a_totally_degenerate_leaf():
@@ -573,15 +589,13 @@ def _build_with_counters(fn, jac, fov, init_res, min_img_sep, max_depth=25):
     lens, _ = make_counting_lens(fn, jac)
     requested_min_img_sep = min_img_sep
     min_img_sep = min_img_sep / 2
-    new.validate_build_args(
-        fov, init_res, min_img_sep, max_depth, requested_min_img_sep
-    )
-    d_floor = new.depth_floor(fov, init_res, min_img_sep)
+    validate_build_args(fov, init_res, min_img_sep, max_depth, requested_min_img_sep)
+    d_floor = depth_floor(fov, init_res, min_img_sep)
     max_level = min(int(max_depth), d_floor)
-    tables = new.child_matrix_tables()
-    lat = new.make_lattice(fov, 0.0, 0.0, init_res, max_level + 1)
-    raytrace_fn = new.make_raytrace(lens.raytrace, None)
-    _cache, _active, store, counters, _band = new.refine(
+    tables = child_matrix_tables()
+    lat = make_lattice(fov, 0.0, 0.0, init_res, max_level + 1)
+    raytrace_fn = make_raytrace(lens.raytrace, None)
+    _cache, _active, store, counters, _band = refine(
         raytrace_fn,
         lens.jacobian_lens_equation,
         lat,
@@ -592,7 +606,7 @@ def _build_with_counters(fn, jac, fov, init_res, min_img_sep, max_depth=25):
         tables,
         None,
     )
-    pre_v, _pre_level, _pre_cls, _pre_status = new.store_compact(store)
+    pre_v, _pre_level, _pre_cls, _pre_status = store_compact(store)
     return counters, int(pre_v.shape[0]), max_level
 
 
@@ -640,8 +654,8 @@ def test_criterion_is_blind_to_structure_below_the_sampling_scale():
 
 
 def test_seeds_lie_inside_their_lens_triangle(mesh, beta):
-    idx, _, bary = new.mesh_query(mesh, beta)
-    seeds = new.mesh_seeds(mesh, idx, bary)
+    idx, _, bary = mesh_query(mesh, beta)
+    seeds = mesh_seeds(mesh, idx, bary)
     tri = backend.to_numpy(mesh.vertices_lens)[
         backend.to_numpy(mesh.leaves)[backend.to_numpy(idx)]
     ]
@@ -653,10 +667,10 @@ def test_seeds_lie_inside_their_lens_triangle(mesh, beta):
 
 def test_seeds_match_the_oracle(mesh, beta, oracle_module):
     old_mesh = _oracle_mesh(oracle_module, mesh)
-    idx, _, bary = new.mesh_query(mesh, beta)
+    idx, _, bary = mesh_query(mesh, beta)
     idx_o, _, bary_o = old_mesh.query(beta)
     assert np.allclose(
-        backend.to_numpy(new.mesh_seeds(mesh, idx, bary)),
+        backend.to_numpy(mesh_seeds(mesh, idx, bary)),
         backend.to_numpy(old_mesh.seeds(leaf_indices=idx_o, bary=bary_o)),
     )
 
@@ -667,32 +681,32 @@ def _pts(x):
 
 def test_dedup_collapses_points_closer_than_the_tolerance():
     pts = _pts([[0.0, 0.0], [0.05, 0.0], [1.0, 0.0]])
-    keep = backend.to_numpy(new.dedup_representatives(pts, np.array([3]), 0.1))
+    keep = backend.to_numpy(dedup_representatives(pts, np.array([3]), 0.1))
     assert keep.tolist() == [True, False, True]
 
 
 def test_dedup_keeps_points_separated_by_exactly_the_tolerance():
     pts = _pts([[0.0, 0.0], [0.1, 0.0]])
-    keep = backend.to_numpy(new.dedup_representatives(pts, np.array([2]), 0.1))
+    keep = backend.to_numpy(dedup_representatives(pts, np.array([2]), 0.1))
     assert keep.tolist() == [True, True]
 
 
 def test_dedup_counts_connected_components_not_greedy_clusters():
     # three collinear points spaced 0.9 * tol: one component, one representative
     pts = _pts([[0.0, 0.0], [0.09, 0.0], [0.18, 0.0]])
-    keep = backend.to_numpy(new.dedup_representatives(pts, np.array([3]), 0.1))
+    keep = backend.to_numpy(dedup_representatives(pts, np.array([3]), 0.1))
     assert keep.tolist() == [True, False, False]
 
 
 def test_dedup_never_merges_across_blocks():
     pts = _pts([[0.0, 0.0], [0.0, 0.0]])
-    keep = backend.to_numpy(new.dedup_representatives(pts, np.array([1, 1]), 0.1))
+    keep = backend.to_numpy(dedup_representatives(pts, np.array([1, 1]), 0.1))
     assert keep.tolist() == [True, True]
 
 
 def test_dedup_handles_empty_and_singleton_blocks():
     pts = _pts([[0.0, 0.0], [0.01, 0.0], [5.0, 5.0]])
-    keep = backend.to_numpy(new.dedup_representatives(pts, np.array([0, 2, 0, 1]), 0.1))
+    keep = backend.to_numpy(dedup_representatives(pts, np.array([0, 2, 0, 1]), 0.1))
     assert keep.tolist() == [True, False, True]
 
 
@@ -702,7 +716,7 @@ def test_dedup_matches_the_oracle_on_randomised_blocks(oracle_module):
     pts = rng.normal(size=(int(counts.sum()), 2)) * 0.1
     p = _pts(pts)
     assert (
-        backend.to_numpy(new.dedup_representatives(p, counts, 0.05))
+        backend.to_numpy(dedup_representatives(p, counts, 0.05))
         == backend.to_numpy(oracle_module._dedup_representatives(p, counts, 0.05))
     ).all()
 
@@ -761,8 +775,8 @@ def test_seeds_lie_inside_their_lens_triangle_on_a_folded_mesh():
     """
     mesh, _ = build(localised_fold, localised_fold_jacobian, min_img_sep=0.05)
     beta = RNG.uniform(-1.5, 1.5, size=(50, 2))
-    idx, _, bary = new.mesh_query(mesh, beta)
-    seed = backend.to_numpy(new.mesh_seeds(mesh, idx, bary))
+    idx, _, bary = mesh_query(mesh, beta)
+    seed = backend.to_numpy(mesh_seeds(mesh, idx, bary))
     assert seed.shape[0] > 0, "fixture returned no candidates"
     idx_np = backend.to_numpy(idx)
     leaves = backend.to_numpy(mesh.leaves)
@@ -784,7 +798,7 @@ def test_dedup_collapses_a_near_coincident_pair_and_keeps_the_lone_point():
     (explicit "the distant point must survive" check) from the same-named
     test above (added verbatim from the Task 14 brief)."""
     points = _pts([[0.0, 0.0], [0.0, 0.001], [1.0, 0.0]])
-    keep = backend.to_numpy(new.dedup_representatives(points, np.array([3]), 0.01))
+    keep = backend.to_numpy(dedup_representatives(points, np.array([3]), 0.01))
     assert keep.sum() == 2, "the coincident pair must collapse to one image"
     assert keep[2], "the distant point must survive"
 
@@ -797,7 +811,7 @@ def test_dedup_keeps_points_separated_by_the_tolerance():
     side. Adjacency is ``d < tol``, not ``<=``.
     """
     points = _pts([[0.0, 0.0], [0.01, 0.0]])
-    keep = backend.to_numpy(new.dedup_representatives(points, np.array([2]), 0.01))
+    keep = backend.to_numpy(dedup_representatives(points, np.array([2]), 0.01))
     assert keep.sum() == 2
 
 
@@ -814,11 +828,11 @@ def test_dedup_counts_connected_components_regardless_of_point_order():
     """
     p = np.array([[0.0, 0.0], [0.009, 0.0], [0.018, 0.0]])
     counts = np.array([3])
-    base = backend.to_numpy(new.dedup_representatives(_pts(p), counts, 0.01)).sum()
+    base = backend.to_numpy(dedup_representatives(_pts(p), counts, 0.01)).sum()
     assert base == 1, f"one chained component expected, got {base}"
     for order in ([1, 0, 2], [2, 1, 0], [0, 2, 1], [2, 0, 1]):
         got = backend.to_numpy(
-            new.dedup_representatives(_pts(p[order]), counts, 0.01)
+            dedup_representatives(_pts(p[order]), counts, 0.01)
         ).sum()
         assert got == base, f"order {order} gave {got}, not {base}"
 
@@ -833,16 +847,14 @@ def test_dedup_keeps_identical_points_in_different_blocks_distinct():
     here, and it would silently halve a multiplicity map.
     """
     points = _pts([[0.0, 0.0], [0.0, 0.0]])
-    keep = backend.to_numpy(new.dedup_representatives(points, np.array([1, 1]), 0.01))
+    keep = backend.to_numpy(dedup_representatives(points, np.array([1, 1]), 0.01))
     assert keep.sum() == 2, "identical points in different blocks are distinct"
 
 
 def test_dedup_handles_ragged_blocks_and_empty_blocks():
     """Padding must not invent images in a block that found none."""
     points = _pts([[0.0, 0.0], [5.0, 5.0], [5.0, 5.0005]])
-    keep = backend.to_numpy(
-        new.dedup_representatives(points, np.array([1, 0, 2]), 0.01)
-    )
+    keep = backend.to_numpy(dedup_representatives(points, np.array([1, 0, 2]), 0.01))
     assert keep.tolist() == [True, True, False]
 
 
@@ -868,12 +880,12 @@ def test_dedup_is_unchanged_by_bucketing_on_randomised_blocks():
     cases += [rng.integers(0, 6, size=rng.integers(1, 12)) for _ in range(20)]
     for counts in cases:
         pts = rng.normal(scale=0.01, size=(int(counts.sum()), 2)).reshape(-1, 2)
-        got = backend.to_numpy(new.dedup_representatives(_pts(pts), counts, 0.01))
+        got = backend.to_numpy(dedup_representatives(_pts(pts), counts, 0.01))
         starts = np.cumsum(counts) - counts
         want = np.concatenate(
             [
                 backend.to_numpy(
-                    new.dedup_representatives(_pts(pts[s : s + c]), np.array([c]), 0.01)
+                    dedup_representatives(_pts(pts[s : s + c]), np.array([c]), 0.01)
                 )
                 for s, c in zip(starts, counts)
             ]
@@ -885,9 +897,7 @@ def test_dedup_is_unchanged_by_bucketing_on_randomised_blocks():
 def test_dedup_keeps_exactly_one_point_per_singleton_block():
     """Blocks of one bypass the clustering kernel; they must still be kept."""
     points = _pts([[0.0, 0.0], [1.0, 1.0], [2.0, 2.0]])
-    keep = backend.to_numpy(
-        new.dedup_representatives(points, np.array([1, 1, 1]), 0.01)
-    )
+    keep = backend.to_numpy(dedup_representatives(points, np.array([1, 1, 1]), 0.01))
     assert keep.tolist() == [True, True, True]
 
 
@@ -900,7 +910,5 @@ def test_dedup_mixes_singleton_and_clustered_blocks_in_order():
     representatives in the wrong rows.
     """
     points = _pts([[9.0, 9.0], [0.0, 0.0], [0.0, 0.001], [5.0, 5.0]])
-    keep = backend.to_numpy(
-        new.dedup_representatives(points, np.array([1, 2, 1]), 0.01)
-    )
+    keep = backend.to_numpy(dedup_representatives(points, np.array([1, 2, 1]), 0.01))
     assert keep.tolist() == [True, True, False, True]

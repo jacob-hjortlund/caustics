@@ -6,7 +6,12 @@ import pytest
 from caustics.backend_obj import backend
 from caustics.cosmology import FlatLambdaCDM
 from caustics.lenses import SIE, Point
-from caustics.lenses.func import adaptive as new
+from caustics.lenses.func.adaptive import (
+    build_adaptive_mesh,
+    mesh_forward_raytrace,
+    mesh_query,
+    mesh_seeds,
+)
 from caustics.lenses.func import forward_raytrace_rootfind
 
 RNG = np.random.default_rng(20260904)
@@ -41,7 +46,7 @@ BUILD = dict(fov=6.0, init_res=4, min_img_sep=0.1, max_depth=6)
 
 @pytest.fixture(scope="module")
 def mesh():
-    return new.build_adaptive_mesh(SIE_LIKE, **BUILD)
+    return build_adaptive_mesh(SIE_LIKE, **BUILD)
 
 
 def _beta(points):
@@ -88,7 +93,7 @@ def test_forward_raytrace_matches_the_oracle(mesh, oracle_module):
     old_mesh = _oracle_mesh(oracle_module, mesh)
     beta = _beta([[0.05, 0.02], [0.4, -0.3], [1.9, 1.7]])
 
-    img, counts = new.mesh_forward_raytrace(mesh, beta, _sie_like)
+    img, counts = mesh_forward_raytrace(mesh, beta, _sie_like)
     img_o, counts_o = old_mesh.forward_raytrace(beta, _sie_like)
 
     assert backend.to_numpy(counts).tolist() == backend.to_numpy(counts_o).tolist()
@@ -97,7 +102,7 @@ def test_forward_raytrace_matches_the_oracle(mesh, oracle_module):
 
 def test_images_solve_the_lens_equation(mesh):
     beta = _beta([[0.05, 0.02], [0.4, -0.3]])
-    img, counts = new.mesh_forward_raytrace(mesh, beta, _sie_like)
+    img, counts = mesh_forward_raytrace(mesh, beta, _sie_like)
     _img_np = backend.to_numpy(img)
     bx, by = _sie_like(img[:, 0], img[:, 1])
     got = np.stack((backend.to_numpy(bx), backend.to_numpy(by)), axis=-1)
@@ -107,13 +112,11 @@ def test_images_solve_the_lens_equation(mesh):
 
 def test_forward_raytrace_is_invariant_to_batch_size(mesh):
     beta = _beta(np.random.default_rng(4).uniform(-1, 1, (12, 2)))
-    whole = [
-        backend.to_numpy(t) for t in new.mesh_forward_raytrace(mesh, beta, _sie_like)
-    ]
+    whole = [backend.to_numpy(t) for t in mesh_forward_raytrace(mesh, beta, _sie_like)]
     for size in (1, 3, 100):
         got = [
             backend.to_numpy(t)
-            for t in new.mesh_forward_raytrace(mesh, beta, _sie_like, batch_size=size)
+            for t in mesh_forward_raytrace(mesh, beta, _sie_like, batch_size=size)
         ]
         assert got[1].tolist() == whole[1].tolist()
         assert np.allclose(got[0], whole[0])
@@ -121,13 +124,13 @@ def test_forward_raytrace_is_invariant_to_batch_size(mesh):
 
 def test_forward_raytrace_returns_empty_outside_the_source_plane(mesh):
     beta = _beta([[1e6, 1e6]])
-    img, counts = new.mesh_forward_raytrace(mesh, beta, _sie_like)
+    img, counts = mesh_forward_raytrace(mesh, beta, _sie_like)
     assert backend.to_numpy(counts).tolist() == [0]
     assert backend.to_numpy(img).shape == (0, 2)
 
 
 def test_forward_raytrace_handles_empty_input(mesh):
-    img, counts = new.mesh_forward_raytrace(
+    img, counts = mesh_forward_raytrace(
         mesh, backend.as_array(np.zeros((0, 2)), dtype=backend.float64), _sie_like
     )
     assert backend.to_numpy(counts).size == 0
@@ -136,14 +139,14 @@ def test_forward_raytrace_handles_empty_input(mesh):
 
 def test_forward_raytrace_rejects_an_unknown_method(mesh):
     with pytest.raises(ValueError, match="method must be one of"):
-        new.mesh_forward_raytrace(mesh, _beta([[0.1, 0.1]]), _sie_like, method="bogus")
+        mesh_forward_raytrace(mesh, _beta([[0.1, 0.1]]), _sie_like, method="bogus")
 
 
 def test_dedup_method_never_calls_raytrace(mesh):
     def exploding(x, y):
         raise AssertionError("raytrace must not be called under method='dedup'")
 
-    img, counts = new.mesh_forward_raytrace(
+    img, counts = mesh_forward_raytrace(
         mesh, _beta([[0.05, 0.02]]), exploding, method="dedup"
     )
     assert backend.to_numpy(counts)[0] >= 1
@@ -151,8 +154,8 @@ def test_dedup_method_never_calls_raytrace(mesh):
 
 def test_dedup_positions_are_within_min_img_sep_of_the_refined_roots(mesh):
     beta = _beta([[0.4, -0.3]])
-    a, ca = new.mesh_forward_raytrace(mesh, beta, _sie_like, method="rootfind")
-    b, cb = new.mesh_forward_raytrace(mesh, beta, _sie_like, method="dedup")
+    a, ca = mesh_forward_raytrace(mesh, beta, _sie_like, method="rootfind")
+    b, cb = mesh_forward_raytrace(mesh, beta, _sie_like, method="dedup")
     assert backend.to_numpy(ca).tolist() == backend.to_numpy(cb).tolist()
     pa = np.sort(backend.to_numpy(a), axis=0)
     pb = np.sort(backend.to_numpy(b), axis=0)
@@ -218,7 +221,7 @@ def test_sie_candidates_recover_forward_raytrace_images(device):
         Rein=1.0,
         s=1e-3,
     ).to(device)
-    mesh = new.build_adaptive_mesh(
+    mesh = build_adaptive_mesh(
         lens, fov=5.0, init_res=32, min_img_sep=1e-2, device=device
     )
     for sp in ([0.2, 0.2], [0.05, -0.05], [1.4, 1.1]):
@@ -229,8 +232,8 @@ def test_sie_candidates_recover_forward_raytrace_images(device):
             np.stack([backend.to_numpy(ex), backend.to_numpy(ey)], axis=-1), 1e-2
         )
         assert expected.shape[0] > 0, f"{sp}: no reference images"
-        idx, offsets, bary = new.mesh_query(mesh, backend.as_array(np.asarray([sp])))
-        seed = backend.to_numpy(new.mesh_seeds(mesh, idx, bary))
+        idx, offsets, bary = mesh_query(mesh, backend.as_array(np.asarray([sp])))
+        seed = backend.to_numpy(mesh_seeds(mesh, idx, bary))
         assert seed.shape[0] >= expected.shape[0], "candidates must cover the images"
         refined = forward_raytrace_rootfind(
             backend.as_array(seed[:, 0], device=device),
@@ -276,10 +279,10 @@ def test_point_mass_recovers_the_analytic_image_pair():
         Rein=1.0,
         s=1e-6,
     )
-    mesh = new.build_adaptive_mesh(lens, fov=8.0, init_res=64, min_img_sep=1e-2)
+    mesh = build_adaptive_mesh(lens, fov=8.0, init_res=64, min_img_sep=1e-2)
     b = 0.4
-    idx, offsets, bary = new.mesh_query(mesh, backend.as_array(np.array([[b, 0.0]])))
-    seed = backend.to_numpy(new.mesh_seeds(mesh, idx, bary))
+    idx, offsets, bary = mesh_query(mesh, backend.as_array(np.array([[b, 0.0]])))
+    seed = backend.to_numpy(mesh_seeds(mesh, idx, bary))
     # theta_pm = (b +- sqrt(b^2 + 4 Rein^2)) / 2, both on the x axis
     expected = np.array([(b + np.sqrt(b**2 + 4)) / 2, (b - np.sqrt(b**2 + 4)) / 2])
     for theta in expected:
@@ -308,10 +311,10 @@ def test_build_and_query_run_on_the_configured_device(device):
         Rein=1.0,
         s=1e-3,
     ).to(device)
-    mesh = new.build_adaptive_mesh(
+    mesh = build_adaptive_mesh(
         lens, fov=4.0, init_res=8, min_img_sep=0.1, device=device
     )
-    idx, off, bary = new.mesh_query(
+    idx, off, bary = mesh_query(
         mesh, backend.as_array(np.array([[0.1, 0.1], [3.0, 3.0]]))
     )
     off_np = backend.to_numpy(off)
@@ -342,7 +345,7 @@ def sie_fixture(device=None):
     )
     if device is not None:
         lens = lens.to(device)
-    mesh = new.build_adaptive_mesh(
+    mesh = build_adaptive_mesh(
         lens, fov=5.0, init_res=32, min_img_sep=1e-2, device=device
     )
     return lens, mesh
@@ -357,7 +360,7 @@ def test_forward_raytrace_finds_no_spurious_sie_images():
     """
     lens, mesh = sie_fixture()
     for sp in ([0.2, 0.2], [0.05, -0.05]):
-        images, counts = new.mesh_forward_raytrace(mesh, _beta([sp]), lens.raytrace)
+        images, counts = mesh_forward_raytrace(mesh, _beta([sp]), lens.raytrace)
         images = to_np(images)
         assert to_np(counts).tolist() == [images.shape[0]]
         assert images.shape[0] > 0, f"{sp}: no images found"
@@ -386,7 +389,7 @@ def test_forward_raytrace_covers_every_sie_image():
     """
     lens, mesh = sie_fixture()
     for sp in ([0.2, 0.2], [0.05, -0.05]):
-        images, _ = new.mesh_forward_raytrace(mesh, _beta([sp]), lens.raytrace)
+        images, _ = mesh_forward_raytrace(mesh, _beta([sp]), lens.raytrace)
         images = to_np(images)
         # The reference path is float32-only: `LensBase.forward_raytrace` raises
         # "expected scalar type Float but found Double" on float64 input. The mesh
@@ -416,9 +419,9 @@ def test_forward_raytrace_recovers_the_analytic_point_mass_pair():
         Rein=1.0,
         s=1e-6,
     )
-    mesh = new.build_adaptive_mesh(lens, fov=8.0, init_res=64, min_img_sep=1e-2)
+    mesh = build_adaptive_mesh(lens, fov=8.0, init_res=64, min_img_sep=1e-2)
     b = 0.4
-    images, counts = new.mesh_forward_raytrace(mesh, _beta([[b, 0.0]]), lens.raytrace)
+    images, counts = mesh_forward_raytrace(mesh, _beta([[b, 0.0]]), lens.raytrace)
     images = to_np(images)
     assert to_np(counts).tolist() == [2], f"expected 2 images, got {images}"
     expected = np.sort([(b + np.sqrt(b**2 + 4)) / 2, (b - np.sqrt(b**2 + 4)) / 2])
@@ -434,13 +437,13 @@ def test_forward_raytrace_batches_independently():
     """
     lens, mesh = sie_fixture()
     points = [[0.2, 0.2], [0.05, -0.05], [0.4, -0.3]]
-    images, counts = new.mesh_forward_raytrace(mesh, _beta(points), lens.raytrace)
+    images, counts = mesh_forward_raytrace(mesh, _beta(points), lens.raytrace)
     counts = to_np(counts)
     assert counts.shape == (3,)
     assert counts.sum() == to_np(images).shape[0]
     offsets = np.concatenate(([0], np.cumsum(counts)))
     for i, sp in enumerate(points):
-        one, one_counts = new.mesh_forward_raytrace(mesh, _beta([sp]), lens.raytrace)
+        one, one_counts = mesh_forward_raytrace(mesh, _beta([sp]), lens.raytrace)
         assert to_np(one_counts).tolist() == [counts[i]], f"{sp}: count differs"
         block = to_np(images)[offsets[i] : offsets[i + 1]]
         assert np.allclose(block, to_np(one), atol=1e-8), f"{sp}: images differ"
@@ -449,9 +452,9 @@ def test_forward_raytrace_batches_independently():
 def test_forward_raytrace_batch_size_does_not_change_the_answer():
     lens, mesh = sie_fixture()
     beta = _beta([[0.2, 0.2], [0.05, -0.05], [0.4, -0.3], [0.0, 0.3]])
-    full, full_counts = new.mesh_forward_raytrace(mesh, beta, lens.raytrace)
+    full, full_counts = mesh_forward_raytrace(mesh, beta, lens.raytrace)
     for size in (1, 2, 3):
-        part, part_counts = new.mesh_forward_raytrace(
+        part, part_counts = mesh_forward_raytrace(
             mesh, beta, lens.raytrace, batch_size=size
         )
         assert to_np(part_counts).tolist() == to_np(full_counts).tolist()
@@ -461,9 +464,7 @@ def test_forward_raytrace_batch_size_does_not_change_the_answer():
 def test_forward_raytrace_returns_an_empty_block_outside_the_source_plane():
     """A source the mesh never maps to has zero images, not a raised error."""
     lens, mesh = sie_fixture()
-    images, counts = new.mesh_forward_raytrace(
-        mesh, _beta([[50.0, 50.0]]), lens.raytrace
-    )
+    images, counts = mesh_forward_raytrace(mesh, _beta([[50.0, 50.0]]), lens.raytrace)
     assert to_np(counts).tolist() == [0]
     assert to_np(images).shape == (0, 2)
 
@@ -471,9 +472,7 @@ def test_forward_raytrace_returns_an_empty_block_outside_the_source_plane():
 def test_forward_raytrace_rejects_an_unknown_method_on_the_sie_fixture():
     lens, mesh = sie_fixture()
     with pytest.raises(ValueError, match="rootfind"):
-        new.mesh_forward_raytrace(
-            mesh, _beta([[0.05, 0.02]]), lens.raytrace, method="nope"
-        )
+        mesh_forward_raytrace(mesh, _beta([[0.05, 0.02]]), lens.raytrace, method="nope")
 
 
 def test_dedup_method_never_calls_raytrace_across_a_batch():
@@ -488,7 +487,7 @@ def test_dedup_method_never_calls_raytrace_across_a_batch():
     def exploding_raytrace(x, y):
         raise AssertionError("raytrace must not be called for method='dedup'")
 
-    images, counts = new.mesh_forward_raytrace(
+    images, counts = mesh_forward_raytrace(
         mesh, _beta([[0.05, 0.02], [0.4, 0.3]]), exploding_raytrace, method="dedup"
     )
     assert int(to_np(counts).sum()) == images.shape[0]
@@ -497,9 +496,7 @@ def test_dedup_method_never_calls_raytrace_across_a_batch():
 def test_dedup_method_matches_rootfind_layout():
     lens, mesh = sie_fixture()
     beta = _beta([[0.05, 0.02], [3.0, 3.0], [0.0, 0.0]])
-    images, counts = new.mesh_forward_raytrace(
-        mesh, beta, lens.raytrace, method="dedup"
-    )
+    images, counts = mesh_forward_raytrace(mesh, beta, lens.raytrace, method="dedup")
     counts_np = to_np(counts)
     assert images.shape[1] == 2
     assert counts_np.shape == (3,)
@@ -510,9 +507,9 @@ def test_dedup_method_matches_rootfind_layout():
 def test_dedup_method_is_invariant_to_batch_size():
     lens, mesh = sie_fixture()
     beta = _beta(RNG.uniform(-0.3, 0.3, size=(40, 2)))
-    ref_i, ref_c = new.mesh_forward_raytrace(mesh, beta, lens.raytrace, method="dedup")
+    ref_i, ref_c = mesh_forward_raytrace(mesh, beta, lens.raytrace, method="dedup")
     for step in (1, 7, 40, 1000):
-        got_i, got_c = new.mesh_forward_raytrace(
+        got_i, got_c = mesh_forward_raytrace(
             mesh, beta, lens.raytrace, batch_size=step, method="dedup"
         )
         assert to_np(got_c).tolist() == to_np(ref_c).tolist(), f"batch_size={step}"
@@ -529,12 +526,10 @@ def test_dedup_method_agrees_with_rootfind_away_from_the_caustic():
     """
     lens, mesh = sie_fixture()
     beta = _beta([[0.01, 0.0], [0.0, 0.01], [-0.015, 0.008], [0.8, 0.8], [-0.9, 0.7]])
-    _, rootfind_counts = new.mesh_forward_raytrace(
+    _, rootfind_counts = mesh_forward_raytrace(
         mesh, beta, lens.raytrace, method="rootfind"
     )
-    _, dedup_counts = new.mesh_forward_raytrace(
-        mesh, beta, lens.raytrace, method="dedup"
-    )
+    _, dedup_counts = mesh_forward_raytrace(mesh, beta, lens.raytrace, method="dedup")
     assert to_np(dedup_counts).tolist() == to_np(rootfind_counts).tolist()
 
 
@@ -556,12 +551,8 @@ def test_dedup_positions_are_within_min_img_sep_of_the_refined_roots_across_a_ba
     """
     lens, mesh = sie_fixture()
     beta = _beta([[0.02, 0.01], [0.05, 0.02], [-0.03, 0.04], [0.3, 0.2]])
-    dedup_i, dedup_c = new.mesh_forward_raytrace(
-        mesh, beta, lens.raytrace, method="dedup"
-    )
-    root_i, root_c = new.mesh_forward_raytrace(
-        mesh, beta, lens.raytrace, method="rootfind"
-    )
+    dedup_i, dedup_c = mesh_forward_raytrace(mesh, beta, lens.raytrace, method="dedup")
+    root_i, root_c = mesh_forward_raytrace(mesh, beta, lens.raytrace, method="rootfind")
     dedup_c, root_c = to_np(dedup_c), to_np(root_c)
     assert dedup_c.tolist() == root_c.tolist(), "fixture must not straddle a caustic"
 
