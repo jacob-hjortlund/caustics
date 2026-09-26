@@ -419,7 +419,7 @@ def test_build_matches_the_oracle_mesh(oracle_module):
     remap, freeze-time invalidation and the spatial index -- must match too.
     """
     build = dict(fov=4.0, init_res=3, min_img_sep=0.2, max_depth=5)
-    got = build_adaptive_mesh(_lens(_fold_free, _fold_free_jacobian), **build)
+    got = build_adaptive_mesh(_fold_free, _fold_free_jacobian, **build)
     want = oracle_module.build_adaptive_mesh(_fold_free, **build)
     assert got.leaves.shape[0] > got.origin_leaves.shape[0], "closure must run"
 
@@ -460,14 +460,19 @@ def test_build_matches_the_oracle_mesh(oracle_module):
 
 def test_build_halves_the_requested_min_img_sep():
     mesh = build_adaptive_mesh(
-        AFFINE_LENS, fov=4.0, init_res=2, min_img_sep=0.4, max_depth=3
+        AFFINE_LENS.raytrace,
+        AFFINE_LENS.jacobian_lens_equation,
+        fov=4.0,
+        init_res=2,
+        min_img_sep=0.4,
+        max_depth=3,
     )
     assert mesh.min_img_sep == pytest.approx(0.2)
 
 
 def test_build_is_deterministic():
-    a = build_adaptive_mesh(SIE_LIKE, **BUILD)
-    b = build_adaptive_mesh(SIE_LIKE, **BUILD)
+    a = build_adaptive_mesh(SIE_LIKE.raytrace, SIE_LIKE.jacobian_lens_equation, **BUILD)
+    b = build_adaptive_mesh(SIE_LIKE.raytrace, SIE_LIKE.jacobian_lens_equation, **BUILD)
     assert backend.to_numpy(a.leaves).tolist() == backend.to_numpy(b.leaves).tolist()
     assert np.array_equal(
         backend.to_numpy(a.vertices_source),
@@ -479,14 +484,24 @@ def test_build_is_deterministic():
 def test_build_warns_when_depth_limited():
     with pytest.warns(UserWarning, match="depth-limited"):
         build_adaptive_mesh(
-            SIE_LIKE, fov=4.0, init_res=2, min_img_sep=1e-4, max_depth=2
+            SIE_LIKE.raytrace,
+            SIE_LIKE.jacobian_lens_equation,
+            fov=4.0,
+            init_res=2,
+            min_img_sep=1e-4,
+            max_depth=2,
         )
 
 
 def test_depth_limited_warning_names_the_caller_requested_min_img_sep():
     with pytest.warns(UserWarning, match="min_img_sep=0.0001"):
         build_adaptive_mesh(
-            SIE_LIKE, fov=4.0, init_res=2, min_img_sep=1e-4, max_depth=2
+            SIE_LIKE.raytrace,
+            SIE_LIKE.jacobian_lens_equation,
+            fov=4.0,
+            init_res=2,
+            min_img_sep=1e-4,
+            max_depth=2,
         )
 
 
@@ -498,7 +513,9 @@ def test_unconverged_leaves_are_kept_but_excluded_from_the_index():
     equal the converged set -- a leaf carrying any flag at all stays in
     ``leaves`` but is never a query candidate.
     """
-    mesh = build_adaptive_mesh(SIE_LIKE, **BUILD)
+    mesh = build_adaptive_mesh(
+        SIE_LIKE.raytrace, SIE_LIKE.jacobian_lens_equation, **BUILD
+    )
     status = backend.to_numpy(mesh.leaf_status)
     indexed = set(backend.to_numpy(mesh.index.cell_leaves).tolist())
     assert (status != LEAF_CONVERGED).any(), "fixture must flag some leaf"
@@ -506,13 +523,20 @@ def test_unconverged_leaves_are_kept_but_excluded_from_the_index():
 
 
 def test_mesh_dtype_is_a_backend_dtype():
-    mesh = build_adaptive_mesh(AFFINE_LENS, **BUILD)
+    mesh = build_adaptive_mesh(
+        AFFINE_LENS.raytrace, AFFINE_LENS.jacobian_lens_equation, **BUILD
+    )
     assert mesh.dtype is backend.float64
     assert backend.to_numpy(mesh.vertices_lens).dtype == np.float64
 
 
 def test_mesh_honours_a_float32_request():
-    mesh = build_adaptive_mesh(AFFINE_LENS, dtype=backend.float32, **BUILD)
+    mesh = build_adaptive_mesh(
+        AFFINE_LENS.raytrace,
+        AFFINE_LENS.jacobian_lens_equation,
+        dtype=backend.float32,
+        **BUILD,
+    )
     assert backend.to_numpy(mesh.vertices_lens).dtype == np.float32
 
 
@@ -541,7 +565,9 @@ def affine_np_jacobian(p):
 
 def new_build(fn, jac, fov=4.0, init_res=4, min_img_sep=0.25, **kw):
     lens, calls = make_counting_lens(fn, jac)
-    mesh = build_adaptive_mesh(lens, fov, init_res, min_img_sep, **kw)
+    mesh = build_adaptive_mesh(
+        lens.raytrace, lens.jacobian_lens_equation, fov, init_res, min_img_sep, **kw
+    )
     return mesh, calls
 
 
@@ -558,7 +584,13 @@ def new_sie_fixture():
         Rein=1.0,
         s=1e-3,
     )
-    mesh = build_adaptive_mesh(lens, fov=5.0, init_res=32, min_img_sep=1e-2)
+    mesh = build_adaptive_mesh(
+        lens.raytrace,
+        lens.jacobian_lens_equation,
+        fov=5.0,
+        init_res=32,
+        min_img_sep=1e-2,
+    )
     return lens, mesh
 
 
@@ -869,7 +901,13 @@ def test_mesh_stores_min_img_sep():
         Rein=1.0,
         s=1e-6,
     )
-    mesh = build_adaptive_mesh(lens, fov=4.0, init_res=8, min_img_sep=0.05)
+    mesh = build_adaptive_mesh(
+        lens.raytrace,
+        lens.jacobian_lens_equation,
+        fov=4.0,
+        init_res=8,
+        min_img_sep=0.05,
+    )
     # The build halves min_img_sep internally (the parity-condemned band at
     # max_level is about twice a leaf's size), and stores that halved value --
     # not the value passed in -- since the halved value is what the size floor
@@ -1054,7 +1092,9 @@ def test_band_is_empty_without_a_sign_change(fn, jac, build):
 def test_band_positions_follow_the_mesh_dtype_and_det_stays_float64():
     """``det`` decides every class, so it keeps the build's precision."""
     lens, _ = make_counting_lens(row_fold, row_fold_jacobian)
-    mesh = build_adaptive_mesh(lens, 4.0, 8, 2e-2, dtype=backend.float32)
+    mesh = build_adaptive_mesh(
+        lens.raytrace, lens.jacobian_lens_equation, 4.0, 8, 2e-2, dtype=backend.float32
+    )
     band = mesh.critical_band
     assert band.leaves.shape[0] > 0
     assert band.lens.dtype == backend.float32
@@ -1071,7 +1111,9 @@ def test_band_is_deterministic():
 
 def test_a_mesh_survives_a_pickle_round_trip():
     """Every ``NamedTuple`` a mesh nests unpickles from the module defining it."""
-    mesh = build_adaptive_mesh(AFFINE_LENS, **BUILD)
+    mesh = build_adaptive_mesh(
+        AFFINE_LENS.raytrace, AFFINE_LENS.jacobian_lens_equation, **BUILD
+    )
     again = pickle.loads(pickle.dumps(mesh))
     for name in ("index", "critical_band", "holes", "lattice"):
         assert type(getattr(again, name)) is type(getattr(mesh, name)), name

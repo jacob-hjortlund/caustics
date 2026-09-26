@@ -53,7 +53,9 @@ BUILD = dict(fov=4.0, init_res=3, min_img_sep=0.5, max_depth=3)
 
 @pytest.fixture(scope="module")
 def mesh():
-    return build_adaptive_mesh(SIE_LIKE, **BUILD)
+    return build_adaptive_mesh(
+        SIE_LIKE.raytrace, SIE_LIKE.jacobian_lens_equation, **BUILD
+    )
 
 
 @pytest.fixture(scope="module")
@@ -272,7 +274,9 @@ def collapse_jacobian(p):
 
 def build(fn, jac, fov=4.0, init_res=4, min_img_sep=0.25, **kw):
     lens, calls = make_counting_lens(fn, jac)
-    mesh = build_adaptive_mesh(lens, fov, init_res, min_img_sep, **kw)
+    mesh = build_adaptive_mesh(
+        lens.raytrace, lens.jacobian_lens_equation, fov, init_res, min_img_sep, **kw
+    )
     return mesh, calls
 
 

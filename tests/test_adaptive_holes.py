@@ -430,7 +430,8 @@ BUILD = dict(fov=4.0, init_res=8, min_img_sep=0.02)
 
 
 def test_a_build_without_centres_stores_empty_holes():
-    mesh = build_adaptive_mesh(sis_lens(SIS_C, 1.0), **BUILD)
+    lens = sis_lens(SIS_C, 1.0)
+    mesh = build_adaptive_mesh(lens.raytrace, lens.jacobian_lens_equation, **BUILD)
     assert mesh.holes.centres.shape[0] == 0
     assert to_np(mesh.holes.offsets).tolist() == [0]
 
@@ -438,7 +439,9 @@ def test_a_build_without_centres_stores_empty_holes():
 def test_a_build_stores_the_merged_and_sampled_holes():
     lens = sis_lens(SIS_C, 1.0)
     centres = [SIS_C, SIS_C, (1.5, 1.5)]
-    mesh = build_adaptive_mesh(lens, **BUILD, centres=centres)
+    mesh = build_adaptive_mesh(
+        lens.raytrace, lens.jacobian_lens_equation, **BUILD, centres=centres
+    )
     want = sample_holes(
         make_raytrace(lens.raytrace, None),
         *merge_centres(centres, mesh.min_img_sep),
@@ -452,15 +455,21 @@ def test_a_build_stores_the_merged_and_sampled_holes():
 
 def test_two_builds_with_centres_are_identical_holes_included():
     lens = sis_lens(SIS_C, 1.0)
-    a = build_adaptive_mesh(lens, **BUILD, centres=[SIS_C])
-    b = build_adaptive_mesh(lens, **BUILD, centres=[SIS_C])
+    a = build_adaptive_mesh(
+        lens.raytrace, lens.jacobian_lens_equation, **BUILD, centres=[SIS_C]
+    )
+    b = build_adaptive_mesh(
+        lens.raytrace, lens.jacobian_lens_equation, **BUILD, centres=[SIS_C]
+    )
     assert _same(a, b)
 
 
 def test_centres_change_nothing_but_the_holes_even_outside_the_fov():
     lens = sis_lens(SIS_C, 1.0)
-    plain = build_adaptive_mesh(lens, **BUILD)
-    holed = build_adaptive_mesh(lens, **BUILD, centres=[SIS_C, (5.0, 5.0)])
+    plain = build_adaptive_mesh(lens.raytrace, lens.jacobian_lens_equation, **BUILD)
+    holed = build_adaptive_mesh(
+        lens.raytrace, lens.jacobian_lens_equation, **BUILD, centres=[SIS_C, (5.0, 5.0)]
+    )
     assert holed.holes.centres.shape[0] == 2
     for name in AdaptiveMesh._fields:
         if name != "holes":
@@ -470,8 +479,10 @@ def test_centres_change_nothing_but_the_holes_even_outside_the_fov():
 def test_holes_cost_raytraces_on_their_circles_only_and_no_jacobian():
     plain_lens, plain = recording_lens(sis_lens(SIS_C, 1.0))
     holed_lens, holed = recording_lens(sis_lens(SIS_C, 1.0))
-    build_adaptive_mesh(plain_lens, **BUILD)
-    mesh = build_adaptive_mesh(holed_lens, **BUILD, centres=[SIS_C])
+    build_adaptive_mesh(plain_lens.raytrace, plain_lens.jacobian_lens_equation, **BUILD)
+    mesh = build_adaptive_mesh(
+        holed_lens.raytrace, holed_lens.jacobian_lens_equation, **BUILD, centres=[SIS_C]
+    )
     base = np.concatenate(plain["raytrace"])
     extra = np.concatenate(holed["raytrace"])
     n_samples = int(to_np(mesh.holes.offsets)[-1])
@@ -486,8 +497,13 @@ def test_holes_cost_raytraces_on_their_circles_only_and_no_jacobian():
 
 
 def test_holes_follow_the_mesh_dtype_where_the_band_does():
+    lens = sis_lens(SIS_C, 1.0)
     mesh = build_adaptive_mesh(
-        sis_lens(SIS_C, 1.0), **BUILD, centres=[SIS_C], dtype=backend.float32
+        lens.raytrace,
+        lens.jacobian_lens_equation,
+        **BUILD,
+        centres=[SIS_C],
+        dtype=backend.float32,
     )
     h = mesh.holes
     assert (h.centres.dtype, h.lens.dtype, h.source.dtype) == (backend.float32,) * 3
@@ -498,8 +514,13 @@ def test_holes_follow_the_mesh_dtype_where_the_band_does():
 
 
 def test_holes_land_on_the_mesh_device(device):
+    lens = sis_lens(SIS_C, 1.0)
     mesh = build_adaptive_mesh(
-        sis_lens(SIS_C, 1.0), **BUILD, centres=[SIS_C], device=device
+        lens.raytrace,
+        lens.jacobian_lens_equation,
+        **BUILD,
+        centres=[SIS_C],
+        device=device,
     )
     for field in CentreHoles._fields:
         assert backend.device(getattr(mesh.holes, field)) == backend.device(

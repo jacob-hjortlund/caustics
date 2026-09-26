@@ -189,7 +189,9 @@ def called_at(calls, method):
 
 def build(fn, jac, fov, init_res, min_img_sep, **kw):
     lens, calls = recording_lens(fn, jac, kw.pop("out_dtype", np.float64))
-    mesh = build_adaptive_mesh(lens, fov, init_res, min_img_sep, **kw)
+    mesh = build_adaptive_mesh(
+        lens.raytrace, lens.jacobian_lens_equation, fov, init_res, min_img_sep, **kw
+    )
     return mesh, lens, calls
 
 
@@ -825,7 +827,7 @@ EQUIVALENCE = {
 def test_an_extension_is_the_fresh_build_of_the_larger_fov(case):
     fn, jac, kw, target = EQUIVALENCE[case]
     mesh, lens, _ = build(fn, jac, **kw)
-    got = extend_adaptive_mesh(mesh, lens, target)
+    got = extend_adaptive_mesh(mesh, lens.raytrace, lens.jacobian_lens_equation, target)
     want, _, _ = build(fn, jac, **fresh_equivalent(kw, target))
     assert got.init_res > mesh.init_res
     assert_meshes_equal(got, want)
@@ -834,8 +836,13 @@ def test_an_extension_is_the_fresh_build_of_the_larger_fov(case):
 def test_extensions_chain():
     kw = dict(fov=4.0, init_res=8, min_img_sep=0.05)
     mesh, lens, _ = build(localised_fold, localised_fold_jacobian, **kw)
-    twice = extend_adaptive_mesh(extend_adaptive_mesh(mesh, lens, 6.0), lens, 8.0)
-    once = extend_adaptive_mesh(mesh, lens, 8.0)
+    twice = extend_adaptive_mesh(
+        extend_adaptive_mesh(mesh, lens.raytrace, lens.jacobian_lens_equation, 6.0),
+        lens.raytrace,
+        lens.jacobian_lens_equation,
+        8.0,
+    )
+    once = extend_adaptive_mesh(mesh, lens.raytrace, lens.jacobian_lens_equation, 8.0)
     fresh, _, _ = build(
         localised_fold, localised_fold_jacobian, **fresh_equivalent(kw, 8.0)
     )
@@ -851,7 +858,7 @@ def test_an_extension_carries_its_holes_and_traces_none_of_them_again():
     mesh, lens, calls = build(fn, jac, **kw)
     assert mesh.holes.centres.shape[0] == 2
     calls["raytrace"].clear()
-    got = extend_adaptive_mesh(mesh, lens, 4.0)
+    got = extend_adaptive_mesh(mesh, lens.raytrace, lens.jacobian_lens_equation, 4.0)
     want, _, _ = build(fn, jac, **fresh_equivalent(kw, 4.0))
     assert_meshes_equal(got, want)
     traced = called_at(calls, "raytrace")
@@ -864,7 +871,7 @@ def test_an_extension_carries_its_holes_and_traces_none_of_them_again():
 def test_extending_a_float32_mesh_matches_a_fresh_float32_build():
     kw = dict(fov=4.0, init_res=4, min_img_sep=0.05, dtype=backend.float32)
     mesh, lens, _ = build(localised_fold, localised_fold_jacobian, **kw)
-    got = extend_adaptive_mesh(mesh, lens, 6.0)
+    got = extend_adaptive_mesh(mesh, lens.raytrace, lens.jacobian_lens_equation, 6.0)
     want, _, _ = build(
         localised_fold, localised_fold_jacobian, **fresh_equivalent(kw, 6.0)
     )
@@ -894,7 +901,7 @@ def test_an_extension_calls_the_lens_only_in_the_ring_and_in_old_leaves_it_split
     mesh, lens, calls = build(fn, jac, 4.0, 4, 0.05)
     calls["raytrace"].clear()
     calls["jacobian"].clear()
-    ext = extend_adaptive_mesh(mesh, lens, 6.0)
+    ext = extend_adaptive_mesh(mesh, lens.raytrace, lens.jacobian_lens_equation, 6.0)
     lat = ext.lattice
     pad = lat.origin
     lo, hi = pad, pad + mesh.lattice.n
@@ -949,7 +956,7 @@ def affine_mesh():
 )
 def test_the_requested_fov_rounds_up_to_whole_cells(affine_mesh, fov, want):
     mesh, lens, _ = affine_mesh
-    ext = extend_adaptive_mesh(mesh, lens, fov)
+    ext = extend_adaptive_mesh(mesh, lens.raytrace, lens.jacobian_lens_equation, fov)
     assert ext.fov == want
     assert ext.init_res == round(want / 0.5)
 
@@ -959,21 +966,24 @@ def test_a_fov_the_mesh_already_covers_returns_the_mesh_itself(affine_mesh, fov)
     mesh, lens, calls = affine_mesh
     calls["raytrace"].clear()
     calls["jacobian"].clear()
-    assert extend_adaptive_mesh(mesh, lens, fov) is mesh
+    assert (
+        extend_adaptive_mesh(mesh, lens.raytrace, lens.jacobian_lens_equation, fov)
+        is mesh
+    )
     assert not calls["raytrace"] and not calls["jacobian"]
 
 
 def test_a_smaller_fov_raises(affine_mesh):
     mesh, lens, _ = affine_mesh
     with pytest.raises(ValueError, match="can only grow"):
-        extend_adaptive_mesh(mesh, lens, 3.9)
+        extend_adaptive_mesh(mesh, lens.raytrace, lens.jacobian_lens_equation, 3.9)
 
 
 @pytest.mark.parametrize("fov", [np.nan, np.inf])
 def test_a_non_finite_fov_raises(affine_mesh, fov):
     mesh, lens, _ = affine_mesh
     with pytest.raises(ValueError, match="finite"):
-        extend_adaptive_mesh(mesh, lens, fov)
+        extend_adaptive_mesh(mesh, lens.raytrace, lens.jacobian_lens_equation, fov)
 
 
 @pytest.mark.filterwarnings("ignore:raytrace returned")
@@ -981,9 +991,14 @@ def test_an_extension_int64_keys_cannot_hold_raises():
     """At ``max_level = 25`` the lattice keys in int64 up to ``init_res = 45``."""
     mesh, lens, _ = build(affine, affine_jacobian, 1.0, 1, 1e-7)
     assert mesh.max_level == 25
-    assert extend_adaptive_mesh(mesh, lens, 45.0).init_res == 45
+    assert (
+        extend_adaptive_mesh(
+            mesh, lens.raytrace, lens.jacobian_lens_equation, 45.0
+        ).init_res
+        == 45
+    )
     with pytest.raises(ValueError, match="lattice too fine.*Extend by less"):
-        extend_adaptive_mesh(mesh, lens, 46.0)
+        extend_adaptive_mesh(mesh, lens.raytrace, lens.jacobian_lens_equation, 46.0)
 
 
 def _messages(record):
@@ -997,7 +1012,7 @@ def test_an_extension_warns_depth_limited_as_the_fresh_build_would():
         mesh, lens, _ = build(localised_fold, localised_fold_jacobian, **kw)
     with warnings.catch_warnings(record=True) as got:
         warnings.simplefilter("always")
-        extend_adaptive_mesh(mesh, lens, 6.0)
+        extend_adaptive_mesh(mesh, lens.raytrace, lens.jacobian_lens_equation, 6.0)
     with warnings.catch_warnings(record=True) as want:
         warnings.simplefilter("always")
         build(localised_fold, localised_fold_jacobian, **fresh_equivalent(kw, 6.0))
@@ -1015,7 +1030,7 @@ def test_an_extension_checks_the_cancellation_floor_at_the_larger_fov():
     assert not any("cancellation floor" in m for m in _messages(base))
     with warnings.catch_warnings(record=True) as got:
         warnings.simplefilter("always")
-        extend_adaptive_mesh(mesh, lens, 6.0)
+        extend_adaptive_mesh(mesh, lens.raytrace, lens.jacobian_lens_equation, 6.0)
     with warnings.catch_warnings(record=True) as want:
         warnings.simplefilter("always")
         build(affine, affine_jacobian, **fresh_equivalent(kw, 6.0))
@@ -1029,7 +1044,7 @@ def test_an_extension_closes_the_critical_curves_the_fov_cut():
     kw = dict(fov=2.0, init_res=4, min_img_sep=0.05)
     mesh, lens, _ = build(sie_like, sie_like_jacobian, **kw)
     assert not to_np(mesh_critical_curves(mesh).closed).all()
-    ext = extend_adaptive_mesh(mesh, lens, 3.0)
+    ext = extend_adaptive_mesh(mesh, lens.raytrace, lens.jacobian_lens_equation, 3.0)
     got = mesh_critical_curves(ext)
     fresh, _, _ = build(sie_like, sie_like_jacobian, **fresh_equivalent(kw, 3.0))
     assert got.closed.shape[0] > 0 and to_np(got.closed).all()
@@ -1046,7 +1061,7 @@ def test_an_extension_closes_the_critical_curves_the_fov_cut():
 def test_an_extension_of_a_mesh_on_a_device_stays_on_it(device):
     kw = dict(fov=4.0, init_res=4, min_img_sep=0.05, device=device)
     mesh, lens, _ = build(localised_fold, localised_fold_jacobian, **kw)
-    got = extend_adaptive_mesh(mesh, lens, 6.0)
+    got = extend_adaptive_mesh(mesh, lens.raytrace, lens.jacobian_lens_equation, 6.0)
     want, _, _ = build(
         localised_fold, localised_fold_jacobian, **fresh_equivalent(kw, 6.0)
     )
@@ -1071,7 +1086,14 @@ def test_batch_size_and_index_cells_reach_every_path_an_extension_traces():
     )
     mesh, lens, calls = build(edge_bump, edge_bump_jacobian, **kw)
     calls["raytrace"].clear()
-    got = extend_adaptive_mesh(mesh, lens, 6.0, raytrace_batch_size=5, index_cells=16)
+    got = extend_adaptive_mesh(
+        mesh,
+        lens.raytrace,
+        lens.jacobian_lens_equation,
+        6.0,
+        raytrace_batch_size=5,
+        index_cells=16,
+    )
     assert calls["raytrace"] and max(len(xy) for xy in calls["raytrace"]) <= 5
     want, _, _ = build(edge_bump, edge_bump_jacobian, **fresh_equivalent(kw, 6.0))
     assert_meshes_equal(got, want)

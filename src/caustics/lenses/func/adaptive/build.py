@@ -196,7 +196,8 @@ def _grow(
 
 
 def build_adaptive_mesh(
-    lens,
+    raytrace,
+    jacobian,
     fov,
     init_res,
     min_img_sep,
@@ -223,17 +224,19 @@ def build_adaptive_mesh(
 
     Parameters
     ----------
-    lens:
-        The lens to mesh -- any caustics lens, or anything else exposing the
-        same two methods on 1-D arrays of shape ``(N,)``:
-        ``lens.raytrace(x, y) -> (bx, by)``, mapping lens-plane to
-        source-plane coordinates, and ``lens.jacobian_lens_equation(x, y)``,
-        returning that map's ``(N, 2, 2)`` Jacobian ``d(beta) / d(theta)``. The
-        Jacobian decides :func:`jacobian_parity_ok`, which the criterion
-        requires before it converges any leaf. ``raytrace`` goes through
-        :func:`make_raytrace` -- float64 in and out, on ``device``, chunked by
-        ``raytrace_batch_size`` -- while ``jacobian_lens_equation`` is called
-        directly on the build's own float64 coordinates.
+    raytrace: Callable[[ArrayLike, ArrayLike], Tuple[ArrayLike, ArrayLike]]
+        ``raytrace(x, y) -> (bx, by)`` on 1-D arrays of shape ``(N,)``,
+        mapping lens-plane to source-plane coordinates; for a caustics lens,
+        ``lens.raytrace``. It goes through :func:`make_raytrace`: float64 in
+        and out, on ``device``, chunked by ``raytrace_batch_size``.
+    jacobian: Callable[[ArrayLike, ArrayLike], ArrayLike]
+        ``jacobian(x, y) -> A`` on 1-D arrays of shape ``(N,)``, returning
+        the ``(N, 2, 2)`` Jacobian ``d(beta) / d(theta)`` of the map
+        ``raytrace`` traces; for a caustics lens,
+        ``lens.jacobian_lens_equation``. It decides
+        :func:`jacobian_parity_ok`, which the criterion requires before it
+        converges any leaf, and is called directly on the build's own
+        float64 coordinates.
     fov: float
         Side length of the square lens-plane domain.
 
@@ -312,9 +315,6 @@ def build_adaptive_mesh(
     -------
     AdaptiveMesh
     """
-
-    raytrace = lens.raytrace
-    jacobian = lens.jacobian_lens_equation
 
     # The parity-condemned band at max_level is model-dependent. Refining to
     # half the requested separation narrows it, without implying a universal
@@ -487,7 +487,7 @@ def _extension_cells(mesh, fov) -> int:
 
 
 def extend_adaptive_mesh(
-    mesh, lens, fov, *, raytrace_batch_size=None, index_cells=None
+    mesh, raytrace, jacobian, fov, *, raytrace_batch_size=None, index_cells=None
 ) -> AdaptiveMesh:
     """
     Grow an adaptive mesh to a larger fov about the same centre, reusing its refinement.
@@ -545,10 +545,10 @@ def extend_adaptive_mesh(
     ----------
     mesh: AdaptiveMesh
         The mesh to grow. It is not modified.
-    lens:
-        The lens ``mesh`` was built from, with the contract of
+    raytrace, jacobian:
+        The pair ``mesh`` was built from, with the contract of
         :func:`build_adaptive_mesh`. Nothing can check that it is the same
-        lens: the mesh deliberately stores none.
+        pair: the mesh deliberately stores no lens.
     fov: float
         Requested side length, about the mesh's own centre. Rounded up to the
         smallest ``mesh.fov + 2 * k * h0`` reaching it, ``h0`` being the
@@ -598,13 +598,13 @@ def extend_adaptive_mesh(
 
     tables = child_matrix_tables()
     lat = extend_lattice(mesh.lattice, k)._replace(lo=_ambient(mesh.lattice.lo))
-    raytrace_fn = make_raytrace(lens.raytrace, mesh.device)
+    raytrace_fn = make_raytrace(raytrace, mesh.device)
     cache, active, store, seed_band = seed_from_mesh(
         mesh, lat, k, raytrace_fn, raytrace_batch_size
     )
     return _grow(
         raytrace_fn,
-        lens.jacobian_lens_equation,
+        jacobian,
         lat,
         tables,
         roots=ring_triangles(init_res, k, lat.level, tables[4]),
@@ -679,7 +679,8 @@ def _curves_cut_by_fov(mesh, curves) -> int:
 
 
 def build_closed_adaptive_mesh(
-    lens,
+    raytrace,
+    jacobian,
     fov,
     init_res,
     min_img_sep,
@@ -735,12 +736,12 @@ def build_closed_adaptive_mesh(
 
     Parameters
     ----------
-    lens, fov, init_res, min_img_sep, max_depth, x0, y0, device, dtype,
-    raytrace_batch_size, index_cells, centres:
+    raytrace, jacobian, fov, init_res, min_img_sep, max_depth, x0, y0, device,
+    dtype, raytrace_batch_size, index_cells, centres:
         As for :func:`build_adaptive_mesh`, which receives all of them, with
         ``fov`` and ``init_res`` widened over the holes as stage 1 says.
-        ``lens``, ``raytrace_batch_size`` and ``index_cells`` reach every
-        extension too.
+        ``raytrace``, ``jacobian``, ``raytrace_batch_size`` and
+        ``index_cells`` reach every extension too.
     growth: float
         Factor each extension asks to multiply the fov by, before rounding
         up to whole cells. Finite and greater than 1.
@@ -800,7 +801,8 @@ def build_closed_adaptive_mesh(
         fov, init_res = widened, init_res + 2 * k
 
     mesh = build_adaptive_mesh(
-        lens,
+        raytrace,
+        jacobian,
         fov,
         init_res,
         min_img_sep,
@@ -820,7 +822,8 @@ def build_closed_adaptive_mesh(
             break
         mesh = extend_adaptive_mesh(
             mesh,
-            lens,
+            raytrace,
+            jacobian,
             growth * mesh.fov,
             raytrace_batch_size=raytrace_batch_size,
             index_cells=index_cells,

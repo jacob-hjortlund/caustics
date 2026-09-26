@@ -46,7 +46,9 @@ BUILD = dict(fov=6.0, init_res=4, min_img_sep=0.1, max_depth=6)
 
 @pytest.fixture(scope="module")
 def mesh():
-    return build_adaptive_mesh(SIE_LIKE, **BUILD)
+    return build_adaptive_mesh(
+        SIE_LIKE.raytrace, SIE_LIKE.jacobian_lens_equation, **BUILD
+    )
 
 
 def _beta(points):
@@ -222,7 +224,12 @@ def test_sie_candidates_recover_forward_raytrace_images(device):
         s=1e-3,
     ).to(device)
     mesh = build_adaptive_mesh(
-        lens, fov=5.0, init_res=32, min_img_sep=1e-2, device=device
+        lens.raytrace,
+        lens.jacobian_lens_equation,
+        fov=5.0,
+        init_res=32,
+        min_img_sep=1e-2,
+        device=device,
     )
     for sp in ([0.2, 0.2], [0.05, -0.05], [1.4, 1.1]):
         sx = backend.as_array(sp[0], device=device)
@@ -279,7 +286,13 @@ def test_point_mass_recovers_the_analytic_image_pair():
         Rein=1.0,
         s=1e-6,
     )
-    mesh = build_adaptive_mesh(lens, fov=8.0, init_res=64, min_img_sep=1e-2)
+    mesh = build_adaptive_mesh(
+        lens.raytrace,
+        lens.jacobian_lens_equation,
+        fov=8.0,
+        init_res=64,
+        min_img_sep=1e-2,
+    )
     b = 0.4
     idx, offsets, bary = mesh_query(mesh, backend.as_array(np.array([[b, 0.0]])))
     seed = backend.to_numpy(mesh_seeds(mesh, idx, bary))
@@ -312,7 +325,12 @@ def test_build_and_query_run_on_the_configured_device(device):
         s=1e-3,
     ).to(device)
     mesh = build_adaptive_mesh(
-        lens, fov=4.0, init_res=8, min_img_sep=0.1, device=device
+        lens.raytrace,
+        lens.jacobian_lens_equation,
+        fov=4.0,
+        init_res=8,
+        min_img_sep=0.1,
+        device=device,
     )
     idx, off, bary = mesh_query(
         mesh, backend.as_array(np.array([[0.1, 0.1], [3.0, 3.0]]))
@@ -346,7 +364,12 @@ def sie_fixture(device=None):
     if device is not None:
         lens = lens.to(device)
     mesh = build_adaptive_mesh(
-        lens, fov=5.0, init_res=32, min_img_sep=1e-2, device=device
+        lens.raytrace,
+        lens.jacobian_lens_equation,
+        fov=5.0,
+        init_res=32,
+        min_img_sep=1e-2,
+        device=device,
     )
     return lens, mesh
 
@@ -419,7 +442,13 @@ def test_forward_raytrace_recovers_the_analytic_point_mass_pair():
         Rein=1.0,
         s=1e-6,
     )
-    mesh = build_adaptive_mesh(lens, fov=8.0, init_res=64, min_img_sep=1e-2)
+    mesh = build_adaptive_mesh(
+        lens.raytrace,
+        lens.jacobian_lens_equation,
+        fov=8.0,
+        init_res=64,
+        min_img_sep=1e-2,
+    )
     b = 0.4
     images, counts = mesh_forward_raytrace(mesh, _beta([[b, 0.0]]), lens.raytrace)
     images = to_np(images)

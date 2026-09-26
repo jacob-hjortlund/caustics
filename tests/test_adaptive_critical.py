@@ -760,7 +760,13 @@ def test_cored_isothermal_curves_match_the_analytic_answers():
     counter-clockwise.
     """
     min_img_sep = 1e-2
-    mesh = build_adaptive_mesh(CORED, fov=4.0, init_res=16, min_img_sep=min_img_sep)
+    mesh = build_adaptive_mesh(
+        CORED.raytrace,
+        CORED.jacobian_lens_equation,
+        fov=4.0,
+        init_res=16,
+        min_img_sep=min_img_sep,
+    )
     curves = _curves(mesh)
     assert len(curves) == 2 and all(closed for _, _, closed in curves)
     (t_lens, t_src, _), (r_lens, r_src, _) = sorted(
@@ -774,7 +780,13 @@ def test_cored_isothermal_curves_match_the_analytic_answers():
 
 
 def test_without_holes_the_curves_are_trace_band_s_and_follow_no_hole():
-    mesh = build_adaptive_mesh(CORED, fov=4.0, init_res=16, min_img_sep=1e-2)
+    mesh = build_adaptive_mesh(
+        CORED.raytrace,
+        CORED.jacobian_lens_equation,
+        fov=4.0,
+        init_res=16,
+        min_img_sep=1e-2,
+    )
     got = mesh_critical_curves(mesh)
     raw = trace_band(mesh.critical_band)
     for field in ("lens", "source", "offsets", "closed"):
@@ -796,7 +808,13 @@ def test_the_fov_cuts_the_tangential_circle_into_four_open_arcs():
     Every end sits on a boundary edge, whose two samples share the boundary
     coordinate exactly, so the end is on the boundary exactly.
     """
-    mesh = build_adaptive_mesh(CORED, fov=2.0, init_res=8, min_img_sep=1e-2)
+    mesh = build_adaptive_mesh(
+        CORED.raytrace,
+        CORED.jacobian_lens_equation,
+        fov=2.0,
+        init_res=8,
+        min_img_sep=1e-2,
+    )
     curves = _curves(mesh)
     arcs = [lens for lens, _, closed in curves if not closed]
     loops = [lens for lens, _, closed in curves if closed]
@@ -817,7 +835,13 @@ def test_a_curve_through_lattice_points_is_traced_without_any_parity_flag():
     which tracing a curve through lattice points produces -- are kept, not
     removed.
     """
-    mesh = build_adaptive_mesh(ROW_FOLD, fov=4.0, init_res=8, min_img_sep=2e-2)
+    mesh = build_adaptive_mesh(
+        ROW_FOLD.raytrace,
+        ROW_FOLD.jacobian_lens_equation,
+        fov=4.0,
+        init_res=8,
+        min_img_sep=2e-2,
+    )
     status = to_np(mesh.leaf_status)
     assert not ((status & LEAF_JACOBIAN_PARITY_UNRESOLVED) != 0).any()
     curves = _curves(mesh)
@@ -838,7 +862,11 @@ def test_a_curve_ends_where_the_lens_turns_nonfinite():
     """
     min_img_sep = 0.05
     mesh = build_adaptive_mesh(
-        BROKEN_FOLD, fov=4.0, init_res=4, min_img_sep=min_img_sep
+        BROKEN_FOLD.raytrace,
+        BROKEN_FOLD.jacobian_lens_equation,
+        fov=4.0,
+        init_res=4,
+        min_img_sep=min_img_sep,
     )
     curves = _curves(mesh)
     assert len(curves) == 1
@@ -1011,7 +1039,10 @@ def _brute_counts(fn, grid, lo, hi, h, singular, excl):
 
 @pytest.fixture(scope="module")
 def two_sis():
-    mesh = build_adaptive_mesh(_sis_pair(TWO_SIS), **TWO_SIS_BUILD, centres=TWO_SIS)
+    lens = _sis_pair(TWO_SIS)
+    mesh = build_adaptive_mesh(
+        lens.raytrace, lens.jacobian_lens_equation, **TWO_SIS_BUILD, centres=TWO_SIS
+    )
     return mesh, mesh_critical_curves(mesh)
 
 
@@ -1052,7 +1083,10 @@ def test_the_count_from_the_repaired_curves_matches_a_brute_force_count(two_sis)
 def test_moving_a_centre_off_the_lattice_leaves_the_count_unchanged(two_sis):
     _, curves = two_sis
     shifted = [(0.0003, 0.0002), TWO_SIS[1]]
-    mesh = build_adaptive_mesh(_sis_pair(shifted), **TWO_SIS_BUILD, centres=shifted)
+    lens = _sis_pair(shifted)
+    mesh = build_adaptive_mesh(
+        lens.raytrace, lens.jacobian_lens_equation, **TWO_SIS_BUILD, centres=shifted
+    )
     moved = mesh_critical_curves(mesh)
     grid = _grid_of(curves)
     band = _curve_mask(curves, grid, 0.06) | _curve_mask(moved, grid, 0.06)
@@ -1060,8 +1094,13 @@ def test_moving_a_centre_off_the_lattice_leaves_the_count_unchanged(two_sis):
 
 
 def test_a_float32_mesh_repairs_its_curves_at_the_mesh_dtype():
+    lens = _sis_pair(TWO_SIS)
     mesh = build_adaptive_mesh(
-        _sis_pair(TWO_SIS), **TWO_SIS_BUILD, centres=TWO_SIS, dtype=backend.float32
+        lens.raytrace,
+        lens.jacobian_lens_equation,
+        **TWO_SIS_BUILD,
+        centres=TWO_SIS,
+        dtype=backend.float32,
     )
     curves = mesh_critical_curves(mesh)
     assert (
@@ -1157,8 +1196,10 @@ def _assert_closed_and_chord_free(mesh, curves):
 
 @pytest.fixture(scope="module")
 def bridged_sis():
+    lens = _sis_pair(WITH_COMPANION, b=WITH_COMPANION_B)
     mesh = build_adaptive_mesh(
-        _sis_pair(WITH_COMPANION, b=WITH_COMPANION_B),
+        lens.raytrace,
+        lens.jacobian_lens_equation,
         **TWO_SIS_BUILD,
         centres=WITH_COMPANION,
     )
@@ -1202,6 +1243,9 @@ def test_curves_bridged_to_a_regular_centre_come_out_closed_and_chord_free():
     goes from it straight into the origin's.
     """
     centres = TWO_SIS + [(-0.01241, 0.01688)]
-    mesh = build_adaptive_mesh(_sis_pair(TWO_SIS), **TWO_SIS_BUILD, centres=centres)
+    lens = _sis_pair(TWO_SIS)
+    mesh = build_adaptive_mesh(
+        lens.raytrace, lens.jacobian_lens_equation, **TWO_SIS_BUILD, centres=centres
+    )
     assert _hole_to_hole_steps(mesh) > 0
     _assert_closed_and_chord_free(mesh, mesh_critical_curves(mesh))

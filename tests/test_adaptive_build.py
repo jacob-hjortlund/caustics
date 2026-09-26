@@ -11,6 +11,7 @@ from caustics.lenses.func.adaptive import (
     LEAF_JACOBIAN_NONFINITE,
     LEAF_JACOBIAN_PARITY_UNRESOLVED,
     LEAF_RAYTRACE_NONFINITE,
+    build_adaptive_mesh,
     child_matrix_tables,
     shape_matrix,
 )
@@ -586,3 +587,26 @@ def test_evaluate_only_traces_uncached_points():
     assert calls["n"] == 3
     cache = evaluate(cache, lat, keys, fn, None)
     assert calls["n"] == 3, "already-cached points must not be re-traced"
+
+
+def _affine_pair():
+    """A contracting affine lens map and its Jacobian."""
+
+    def raytrace(x, y):
+        return 0.5 * x, 0.5 * y
+
+    def jacobian(x, y):
+        half, zero = x * 0.0 + 0.5, x * 0.0
+        return backend.stack(
+            (backend.stack((half, zero), dim=-1), backend.stack((zero, half), dim=-1)),
+            dim=-2,
+        )
+
+    return raytrace, jacobian
+
+
+def test_build_rejects_a_swapped_pair_loudly():
+    """``jacobian`` in ``raytrace``'s place returns an array, not a 2-tuple."""
+    raytrace, jacobian = _affine_pair()
+    with pytest.raises(ValueError, match="2-tuple"):
+        build_adaptive_mesh(jacobian, raytrace, 4.0, 4, 0.1)

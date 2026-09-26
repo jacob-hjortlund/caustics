@@ -179,7 +179,7 @@ def closed_build(fn, jac, fov, init_res, min_img_sep, **kw):
     with warnings.catch_warnings(record=True) as record:
         warnings.simplefilter("always")
         mesh, curves = build_closed_adaptive_mesh(
-            lens, fov, init_res, min_img_sep, **kw
+            lens.raytrace, lens.jacobian_lens_equation, fov, init_res, min_img_sep, **kw
         )
     messages = [str(w.message) for w in record]
     return mesh, curves, messages, lens, calls
@@ -187,7 +187,12 @@ def closed_build(fn, jac, fov, init_res, min_img_sep, **kw):
 
 def plain_build(fn, jac, fov, init_res, min_img_sep, **kw):
     lens, _ = recording_lens(fn, jac)
-    return build_adaptive_mesh(lens, fov, init_res, min_img_sep, **kw), lens
+    return (
+        build_adaptive_mesh(
+            lens.raytrace, lens.jacobian_lens_equation, fov, init_res, min_img_sep, **kw
+        ),
+        lens,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -208,7 +213,10 @@ def test_a_curve_the_fov_cuts_is_grown_until_it_closes():
     assert curves.closed.shape[0] > 0 and to_np(curves.closed).all()
     assert messages == []
     start, lens = plain_build(sie_like, sie_like_jacobian, **kw)
-    assert_meshes_equal(mesh, extend_adaptive_mesh(start, lens, 2.5))
+    assert_meshes_equal(
+        mesh,
+        extend_adaptive_mesh(start, lens.raytrace, lens.jacobian_lens_equation, 2.5),
+    )
     assert_curves_equal(curves, mesh_critical_curves(mesh))
 
 
@@ -286,7 +294,14 @@ def test_build_options_reach_the_build_and_every_extension():
     assert messages == []
     assert max(len(xy) for xy in calls["raytrace"]) <= 5
     start, lens = plain_build(sie_like, sie_like_jacobian, **kw)
-    want = extend_adaptive_mesh(start, lens, 3.0, raytrace_batch_size=5, index_cells=16)
+    want = extend_adaptive_mesh(
+        start,
+        lens.raytrace,
+        lens.jacobian_lens_equation,
+        3.0,
+        raytrace_batch_size=5,
+        index_cells=16,
+    )
     assert mesh.dtype == backend.float32
     assert_meshes_equal(mesh, want)
 
@@ -367,5 +382,5 @@ def test_bad_arguments_raise_before_any_lens_call(kw, match):
     args.update(kw)
     lens, calls = recording_lens(affine, affine_jacobian)
     with pytest.raises(ValueError, match=match):
-        build_closed_adaptive_mesh(lens, **args)
+        build_closed_adaptive_mesh(lens.raytrace, lens.jacobian_lens_equation, **args)
     assert calls == {"raytrace": [], "jacobian": []}
