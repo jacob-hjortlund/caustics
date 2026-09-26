@@ -313,6 +313,8 @@ def _one_hole(radius=0.1, n=64, shift=(5.0, 0.0)):
         lens=_arr(lens),
         source=_arr(lens + np.array(shift)),
         growth=_arr([0.0]),
+        growth_err=_arr([0.0]),
+        pseudo_caustic=backend.as_array(np.array([True]), dtype=backend.bool),
     )
 
 
@@ -505,6 +507,8 @@ def _hole_pair(n=64):
         lens=_arr(lens),
         source=_arr(lens + shift),
         growth=_arr([0.0, 0.0]),
+        growth_err=_arr([0.0, 0.0]),
+        pseudo_caustic=backend.as_array(np.array([True, True]), dtype=backend.bool),
     )
 
 

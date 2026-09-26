@@ -76,8 +76,8 @@ class CriticalCurves(NamedTuple):
     bounds a ``det A > 0`` region with the holes cut out, and its caustic
     follows the hole curve -- the pseudo-caustic at an isothermal centre --
     instead of cutting straight across it. Those points carry their hole's
-    index in ``hole``. A hole curve is a pseudo-caustic only where its
-    ``holes.growth`` is about 0; see
+    index in ``hole``. A hole curve is a pseudo-caustic only where
+    ``holes.pseudo_caustic`` is True; see
     :class:`~caustics.lenses.func.adaptive.CentreHoles`.
 
     Parameters
@@ -698,9 +698,9 @@ def mesh_critical_curves(mesh) -> CriticalCurves:
     A mesh built with ``centres`` has holes around them, and the traced
     curves are cut at each hole's circle and re-joined along the stored hole
     curve by :func:`join_at_holes`, within the limits it states; the hole
-    curves -- the pseudo-caustics, where ``holes.growth`` is about 0 -- come
-    back as ``holes``. Without them, a curve through a singular centre, where
-    the lens map jumps, gets a caustic that cuts straight across the
+    curves -- the pseudo-caustics, where ``holes.pseudo_caustic`` is True --
+    come back as ``holes``. Without them, a curve through a singular centre,
+    where the lens map jumps, gets a caustic that cuts straight across the
     pseudo-caustic, and one through a centre on a lattice point comes out
     open. Either way this function makes no lens call.
 

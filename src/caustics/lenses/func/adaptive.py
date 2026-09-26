@@ -2266,10 +2266,19 @@ class CentreHoles(NamedTuple):
     ``radius``; at a point mass, or a cusp steeper than isothermal, it is a
     huge loop; at a regular point, or a profile whose deflection vanishes at
     its centre, it is a speck. ``growth`` tells these apart: the hole curve's
-    size scales as ``radius**growth`` there, so ``growth`` is about 0 for a
+    size scales as ``radius**growth`` there, so ``growth`` is 0 for a
     pseudo-caustic, negative for a loop that runs off to infinity as the hole
     shrinks, and positive for a speck -- exactly ``1 - t`` for a power law of
     slope ``t``.
+
+    ``growth`` is measured, not known, so it is never exactly 0:
+    ``growth_err`` bounds its error, and ``pseudo_caustic`` marks the holes
+    whose ``growth`` is 0 within it. That needs no tolerance, but it resolves
+    only so much: a slope ``t`` within about ``growth_err`` of 1 -- of order
+    ``(radius / size)**2``, where ``size`` is the hole curve's, so 2e-6 for
+    a 0.005" hole in an SIS of 1" Einstein radius ``b`` -- reads as
+    isothermal. Its hole curve then differs from the isothermal one by a
+    fraction of about ``|t - 1| * |log(radius / b)|`` of its size.
 
     Samples are stored CSR per hole: hole ``h`` is rows
     ``offsets[h]:offsets[h + 1]`` of ``angle``, ``lens`` and ``source``, in
@@ -2303,8 +2312,16 @@ class CentreHoles(NamedTuple):
         *Unit: arcsec*
     growth: ArrayLike
         ``(H,)`` float64 log-slope of the hole curve's size against the hole
-        radius, from circles at ``radius`` and ``radius / 4``. NaN when both
-        circles map to a single point.
+        radius as the hole shrinks to nothing, extrapolated from circles
+        down to ``radius / 64`` (:func:`sample_holes`). NaN when the circles
+        map to a single point.
+    growth_err: ArrayLike
+        ``(H,)`` float64 bound on the error of ``growth``; NaN where
+        ``growth`` is.
+    pseudo_caustic: ArrayLike
+        ``(H,)`` bool, True where ``|growth| <= growth_err``: where the hole
+        curve is the pseudo-caustic, to within about ``radius``. False where
+        ``growth`` is NaN.
     """
 
     centres: ArrayLike
@@ -2314,6 +2331,8 @@ class CentreHoles(NamedTuple):
     lens: ArrayLike
     source: ArrayLike
     growth: ArrayLike
+    growth_err: ArrayLike
+    pseudo_caustic: ArrayLike
 
 
 def empty_holes(device=None) -> CentreHoles:
@@ -2326,6 +2345,8 @@ def empty_holes(device=None) -> CentreHoles:
         lens=backend.zeros((0, 2), dtype=backend.float64, device=device),
         source=backend.zeros((0, 2), dtype=backend.float64, device=device),
         growth=backend.zeros((0,), dtype=backend.float64, device=device),
+        growth_err=backend.zeros((0,), dtype=backend.float64, device=device),
+        pseudo_caustic=backend.zeros((0,), dtype=backend.bool, device=device),
     )
 
 
@@ -2429,8 +2450,8 @@ def merge_centres(centres, min_img_sep) -> Tuple[ArrayLike, ArrayLike]:
     return mean[order], radius[order]
 
 
-# Hole sampling: the first even pass, the refinement cap, and the circles the
-# growth exponent is measured on.
+# Hole sampling: the first even pass, the refinement cap, and the even
+# samples on each of the circles the growth exponent is measured on.
 HOLE_INITIAL_SAMPLES = 256
 HOLE_MAX_SAMPLES = 1 << 16
 HOLE_GROWTH_SAMPLES = 1024
@@ -2493,10 +2514,19 @@ def sample_holes(raytrace_fn, centres, radius, min_img_sep, batch_size) -> Centr
     between them, and is warned about; only enormous hole curves, such as a
     point mass's, reach it.
 
-    ``growth`` compares the hole curve's size -- its bounding box's diagonal
-    -- on :data:`HOLE_GROWTH_SAMPLES` even samples at ``radius`` and at
-    ``radius / 4``: ``log(size(r) / size(r / 4)) / log(4)``. No Jacobian is
-    called.
+    ``growth`` comes from the hole curve's size -- its bounding box's
+    diagonal -- on :data:`HOLE_GROWTH_SAMPLES` even samples at ``radius``
+    and at ``radius / 4``, ``/ 16`` and ``/ 64``. The slope between two
+    neighbouring circles, ``g(r) = log(size(r) / size(r / 4)) / log(4)``,
+    is biased by a term linear in ``r``: the lens map's smooth part --
+    the identity, and every other lens's deflection -- stretches the hole
+    curve by that much. At an isothermal centre it is all of ``g``, of
+    order ``radius / size``. Richardson extrapolation cancels it:
+    ``R(r) = (4 g(r / 4) - g(r)) / 3``, and ``growth = R(r / 4)``. What
+    is left falls as ``r**p`` -- ``p = 2`` at an isothermal centre of a
+    lens map smooth everywhere else -- so ``growth_err = |R(r) - R(r / 4)|``
+    is ``4**p - 1`` times that error, a bound for any ``p >= 1/2``. No
+    Jacobian is called.
 
     Parameters
     ----------
@@ -2525,8 +2555,8 @@ def sample_holes(raytrace_fn, centres, radius, min_img_sep, batch_size) -> Centr
     Raises
     ------
     ValueError
-        If the lens is not finite somewhere on a circle at ``radius`` or at
-        ``radius / 4``.
+        If the lens is not finite somewhere on a circle at ``radius``,
+        ``radius / 4``, ``/ 16`` or ``/ 64``.
 
     Warns
     -----
@@ -2588,13 +2618,23 @@ def sample_holes(raytrace_fn, centres, radius, min_img_sep, batch_size) -> Centr
         two_pi / HOLE_GROWTH_SAMPLES
     )
     shape = (n_holes, HOLE_GROWTH_SAMPLES, 2)
-    outer = _trace_hole_points(
-        raytrace_fn, centres, radius, g_hole, g_angle, batch_size
-    ).reshape(shape)
-    inner = _trace_hole_points(
-        raytrace_fn, centres, radius, g_hole, g_angle, batch_size, scale=0.25
-    ).reshape(shape)
-    growth = backend.log(_extent(outer) / _extent(inner)) / math.log(4.0)
+    size = [
+        _extent(
+            _trace_hole_points(
+                raytrace_fn, centres, radius, g_hole, g_angle, batch_size, 0.25**k
+            ).reshape(shape)
+        )
+        for k in range(4)
+    ]
+    # `step[k] / log(4)` is the slope `g` between circles k and k + 1, and
+    # `R(r / 4) - R(r)` folds to one sum of steps. Both scale by a constant
+    # rather than dividing by one: jax divides an array of more than one
+    # element by a constant as a multiply by its reciprocal, so a quotient
+    # would depend on how many holes share the call.
+    step = [backend.log(size[k] / size[k + 1]) for k in range(3)]
+    scale = 1.0 / (3.0 * math.log(4.0))
+    growth = (4.0 * step[2] - step[1]) * scale
+    growth_err = backend.abs(5.0 * step[1] - step[0] - 4.0 * step[2]) * scale
 
     counts = backend.bincount(hole, minlength=n_holes)
     offsets = backend.concatenate(
@@ -2608,6 +2648,8 @@ def sample_holes(raytrace_fn, centres, radius, min_img_sep, batch_size) -> Centr
         lens=hole_circle(centres, radius, hole, angle),
         source=source,
         growth=growth,
+        growth_err=growth_err,
+        pseudo_caustic=backend.abs(growth) <= growth_err,
     )
 
 
@@ -3877,6 +3919,8 @@ def freeze(
         lens=to_device(backend.to(holes.lens, dtype=dtype)),
         source=to_device(backend.to(holes.source, dtype=dtype)),
         growth=to_device(holes.growth),
+        growth_err=to_device(holes.growth_err),
+        pseudo_caustic=to_device(holes.pseudo_caustic),
     )
 
     return AdaptiveMesh(
@@ -4073,10 +4117,10 @@ def build_adaptive_mesh(
         ``min_img_sep`` -- the halved value -- and centres closer than twice
         that share one (:func:`merge_centres`). The image of each hole's
         boundary is traced and stored as ``AdaptiveMesh.holes``
-        (:func:`sample_holes`), with no Jacobian call and at least 2304
-        raytraces per hole: 256 initial samples and two growth circles of
+        (:func:`sample_holes`), with no Jacobian call and at least 4352
+        raytraces per hole: 256 initial samples and four growth circles of
         1024. A hole that reaches the cap costs up to
-        :data:`HOLE_MAX_SAMPLES` + 2048 raytraces and stores up to
+        :data:`HOLE_MAX_SAMPLES` + 4096 raytraces and stores up to
         :data:`HOLE_MAX_SAMPLES` samples. A ``UserWarning`` is raised for
         each hole whose refinement is capped at :data:`HOLE_MAX_SAMPLES`
         samples before every chord falls below ``min_img_sep``; such a hole

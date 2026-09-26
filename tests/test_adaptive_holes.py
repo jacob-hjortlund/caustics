@@ -6,6 +6,8 @@ import numpy as np
 import pytest
 
 from caustics.backend_obj import backend
+from caustics.cosmology import FlatLambdaCDM
+from caustics.lenses import SIE, SinglePlane
 from caustics.lenses.func import adaptive as new
 
 
@@ -26,8 +28,9 @@ def test_empty_holes_has_no_hole():
     holes = new.empty_holes()
     assert tuple(holes.centres.shape) == (0, 2)
     assert tuple(holes.lens.shape) == (0, 2) and tuple(holes.source.shape) == (0, 2)
-    for field in ("radius", "angle", "growth"):
+    for field in ("radius", "angle", "growth", "growth_err", "pseudo_caustic"):
         assert tuple(getattr(holes, field).shape) == (0,), field
+    assert holes.pseudo_caustic.dtype == backend.bool
     assert to_np(holes.offsets).tolist() == [0]
 
 
@@ -135,6 +138,34 @@ def point_mass_raytrace(c, theta_e):
     return raytrace
 
 
+def sis_in_shear_raytrace(c, b, kappa, gamma_1, gamma_2):
+    """The SIS of ``sis_raytrace`` in a uniform convergence and shear about ``c``:
+    the smooth pull other lenses add at an isothermal centre."""
+    sis = sis_raytrace(c, b)
+
+    def raytrace(x, y):
+        dx, dy = x - c[0], y - c[1]
+        bx, by = sis(x, y)
+        return (
+            bx - (kappa + gamma_1) * dx - gamma_2 * dy,
+            by - gamma_2 * dx - (kappa - gamma_1) * dy,
+        )
+
+    return raytrace
+
+
+def power_law_raytrace(c, b, t):
+    """A circular power law of slope ``t`` at ``c``:
+    ``f(c + r u) = c + (r - b**t * r**(1 - t)) u``, the SIS at ``t = 1``."""
+
+    def raytrace(x, y):
+        dx, dy = x - c[0], y - c[1]
+        k = b**t * backend.sqrt(dx * dx + dy * dy) ** -t
+        return x - k * dx, y - k * dy
+
+    return raytrace
+
+
 def affine_raytrace(x, y):
     return 0.7 * x + 0.1 * y, -0.2 * x + 0.9 * y
 
@@ -181,18 +212,73 @@ def test_an_sis_hole_curve_is_its_analytic_circle_sampled_to_min_img_sep():
     assert np.allclose(source, np.array(c) + (r - b) * u, rtol=0, atol=1e-12)
     chords = np.hypot(*(np.roll(source, -1, axis=0) - source).T)
     assert chords.max() <= r
-    assert abs(to_np(holes.growth)[0]) < 0.01
+
+
+# An isothermal centre alone, and in the uniform convergence and shear other
+# lenses add there. The hole curve's size then changes by about ``r / b`` of
+# itself between radii -- 1e-2 here -- which a slope between two circles reads
+# as a growth of order 5e-3 rather than 0.
+ISOTHERMAL = {
+    "sis": sis_raytrace((0.3, -0.2), 1.0),
+    "sis in shear": sis_in_shear_raytrace((0.3, -0.2), 1.0, 0.1, 0.2, -0.1),
+}
+
+
+@pytest.mark.parametrize("name", ISOTHERMAL)
+def test_an_isothermal_centre_is_a_pseudo_caustic(name):
+    holes, _ = sample(ISOTHERMAL[name], [(0.3, -0.2)], [0.01], 0.01)
+    growth, err = to_np(holes.growth)[0], to_np(holes.growth_err)[0]
+    assert to_np(holes.pseudo_caustic).tolist() == [True]
+    assert abs(growth) <= err
+    assert abs(growth) < 1e-5
+
+
+@pytest.mark.parametrize("t", [1.0 - 1e-4, 1.0 + 1e-4])
+def test_a_power_law_a_hair_off_isothermal_is_no_pseudo_caustic(t):
+    """A slope ``t`` gives ``growth = 1 - t``, resolved well below 1e-4."""
+    c = (0.3, -0.2)
+    holes, _ = sample(power_law_raytrace(c, 1.0, t), [c], [0.01], 0.01)
+    growth, err = to_np(holes.growth)[0], to_np(holes.growth_err)[0]
+    assert to_np(holes.pseudo_caustic).tolist() == [False]
+    assert abs(growth - (1.0 - t)) <= err < 2.5e-5
+
+
+def test_both_centres_of_two_overlapping_sie_lenses_are_pseudo_caustics():
+    """Each SIE's pseudo-caustic is shifted and sheared by the other's smooth
+    deflection; a slope between two circles read these as 8e-4 and -7e-4."""
+    cosmology = FlatLambdaCDM(name="cosmo")
+    lenses = [
+        SIE(cosmology=cosmology, name=name, x0=c, y0=c, q=0.4, phi=phi, Rein=1.2, s=0.0)
+        for name, c, phi in (("sie_1", 0.5, np.pi / 4), ("sie_2", 0.001, np.pi))
+    ]
+    lens = SinglePlane(
+        cosmology=cosmology, name="lens", z_l=0.5, z_s=1.5, lenses=lenses
+    )
+    centres = [(0.001, 0.001), (0.5, 0.5)]
+    holes, _ = sample(lens.raytrace, centres, [0.005, 0.005], 0.005)
+    assert to_np(holes.pseudo_caustic).tolist() == [True, True]
 
 
 def test_a_point_mass_hole_curve_grows_as_the_hole_shrinks():
     c = (0.1, 0.2)
     holes, _ = sample(point_mass_raytrace(c, 0.1), [c], [0.01], 0.01)
     assert abs(to_np(holes.growth)[0] + 1.0) < 0.01
+    assert to_np(holes.pseudo_caustic).tolist() == [False]
 
 
 def test_a_regular_point_hole_curve_shrinks_with_the_hole():
     holes, _ = sample(affine_raytrace, [(0.4, -0.3)], [0.01], 0.01)
     assert abs(to_np(holes.growth)[0] - 1.0) < 1e-9
+    assert to_np(holes.pseudo_caustic).tolist() == [False]
+
+
+def test_a_lens_mapping_every_circle_to_one_point_has_no_growth():
+    def constant(x, y):
+        return 0.0 * x + 0.5, 0.0 * y - 0.1
+
+    holes, _ = sample(constant, [(0.4, -0.3)], [0.01], 0.01)
+    assert np.isnan(to_np(holes.growth)[0])
+    assert to_np(holes.pseudo_caustic).tolist() == [False]
 
 
 def test_a_hole_curve_too_large_to_resolve_stops_at_the_cap_and_warns():
@@ -229,13 +315,20 @@ def test_a_lens_not_finite_on_a_hole_circle_raises_naming_the_centre():
         sample(broken, [c], [0.01], 0.01)
 
 
-def test_the_growth_circle_at_a_quarter_radius_must_be_finite_too():
+@pytest.mark.parametrize(
+    "nan_within, named",
+    [(0.005, r"radius 0\.0025 "), (3e-4, r"radius 0\.00015625 ")],
+    ids=["quarter", "sixty-fourth"],
+)
+def test_every_growth_circle_down_to_a_64th_of_the_radius_must_be_finite(
+    nan_within, named
+):
     c = (0.4, -0.3)
     broken = nan_where(
         affine_raytrace,
-        lambda x, y: (x - c[0]) ** 2 + (y - c[1]) ** 2 < 0.005**2,
+        lambda x, y: (x - c[0]) ** 2 + (y - c[1]) ** 2 < nan_within**2,
     )
-    with pytest.raises(ValueError, match=r"radius 0\.0025"):
+    with pytest.raises(ValueError, match=named):
         sample(broken, [c], [0.01], 0.01)
 
 
@@ -243,9 +336,8 @@ def test_holes_raytrace_only_their_circles_and_batching_changes_nothing():
     c, r = (0.3, -0.2), 0.01
     holes, calls = sample(sis_raytrace(c, 1.0), [c], [r], r)
     d = np.hypot(*(np.concatenate(calls) - np.array(c)).T)
-    assert (
-        np.isclose(d, r, rtol=0, atol=1e-14) | np.isclose(d, r / 4, rtol=0, atol=1e-14)
-    ).all()
+    radii = r / 4.0 ** np.arange(4)
+    assert np.isclose(d[:, None], radii, rtol=0, atol=1e-14).any(axis=1).all()
     batched, batched_calls = sample(sis_raytrace(c, 1.0), [c], [r], r, batch_size=100)
     assert max(len(x) for x in batched_calls) <= 100
     for field in new.CentreHoles._fields:
@@ -267,7 +359,10 @@ def test_holes_sampled_together_match_holes_sampled_alone():
                 to_np(getattr(both, field))[off[h] : off[h + 1]],
                 to_np(getattr(alone, field)),
             ), field
-        assert np.array_equal(to_np(both.growth)[h], to_np(alone.growth)[0])
+        for field in ("growth", "growth_err", "pseudo_caustic"):
+            assert np.array_equal(
+                to_np(getattr(both, field))[h], to_np(getattr(alone, field))[0]
+            ), field
 
 
 # ---------------------------------------------------------------------------
@@ -372,15 +467,13 @@ def test_holes_cost_raytraces_on_their_circles_only_and_no_jacobian():
     base = np.concatenate(plain["raytrace"])
     extra = np.concatenate(holed["raytrace"])
     n_samples = int(to_np(mesh.holes.offsets)[-1])
-    assert len(extra) - len(base) == n_samples + 2 * new.HOLE_GROWTH_SAMPLES
+    assert len(extra) - len(base) == n_samples + 4 * new.HOLE_GROWTH_SAMPLES
     added = extra[
         ~np.isin(extra[:, 0] + 1j * extra[:, 1], base[:, 0] + 1j * base[:, 1])
     ]
     d = np.hypot(*(added - np.array(SIS_C)).T)
-    r = mesh.min_img_sep
-    assert (
-        np.isclose(d, r, rtol=0, atol=1e-12) | np.isclose(d, r / 4, rtol=0, atol=1e-12)
-    ).all()
+    radii = mesh.min_img_sep / 4.0 ** np.arange(4)
+    assert np.isclose(d[:, None], radii, rtol=0, atol=1e-12).any(axis=1).all()
     assert sum(map(len, holed["jacobian"])) == sum(map(len, plain["jacobian"]))
 
 
@@ -390,7 +483,9 @@ def test_holes_follow_the_mesh_dtype_where_the_band_does():
     )
     h = mesh.holes
     assert (h.centres.dtype, h.lens.dtype, h.source.dtype) == (backend.float32,) * 3
-    assert (h.radius.dtype, h.angle.dtype, h.growth.dtype) == (backend.float64,) * 3
+    assert (h.radius.dtype, h.angle.dtype) == (backend.float64,) * 2
+    assert (h.growth.dtype, h.growth_err.dtype) == (backend.float64,) * 2
+    assert h.pseudo_caustic.dtype == backend.bool
     assert h.offsets.dtype == backend.int64
 
 
