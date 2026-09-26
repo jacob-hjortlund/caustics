@@ -255,6 +255,12 @@ def sample_jacobians(
     )
     xy = lattice_xy(lat, lattice_ij_from_key(lat, keys))
     J = jacobian_fn(xy[:, 0], xy[:, 1])
-    if J.shape != (keys.shape[0], 2, 2):
-        raise ValueError("jacobian_fn must return shape (K, 2, 2) for K points")
+    # `getattr` for the reason `jacobian_parity_ok` gives.
+    shape = getattr(J, "shape", None)
+    if shape != (keys.shape[0], 2, 2):
+        got = type(J).__name__ if shape is None else tuple(shape)
+        raise ValueError(
+            "jacobian_fn must return an array of shape (K, 2, 2) for K points, "
+            f"got {got}"
+        )
     return keys, index.reshape(n, 6), J

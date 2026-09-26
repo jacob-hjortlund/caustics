@@ -863,6 +863,17 @@ def test_jacobian_parity_rejects_mismatched_shapes():
         )
 
 
+def _tuple_jacobian(x, y):
+    """A raytrace passed as the Jacobian: a 2-tuple, not a ``(K, 2, 2)`` array."""
+    return x, y
+
+
+def test_jacobian_parity_rejects_a_jacobian_that_returns_no_array():
+    v, m = _unit_triangles(2)
+    with pytest.raises(ValueError, match=r"\(6 \* N, 2, 2\), got tuple"):
+        jacobian_parity_ok(_tuple_jacobian, _arr(v), _arr(m))
+
+
 def test_child_shape_matrices_match_shape_matrix_of_each_child():
     """Q_k must be exactly the edge matrix of child k, bit for bit.
 
@@ -1179,3 +1190,9 @@ def test_sample_jacobians_rejects_a_wrong_shape():
     lat, six_ij = _two_triangles_sharing_an_edge()
     with pytest.raises(ValueError, match=r"\(K, 2, 2\)"):
         sample_jacobians(lat, six_ij, _fixed_jacobians(np.zeros((12, 2, 2))))
+
+
+def test_sample_jacobians_rejects_a_jacobian_that_returns_no_array():
+    lat, six_ij = _two_triangles_sharing_an_edge()
+    with pytest.raises(ValueError, match=r"\(K, 2, 2\) for K points, got tuple"):
+        sample_jacobians(lat, six_ij, _tuple_jacobian)

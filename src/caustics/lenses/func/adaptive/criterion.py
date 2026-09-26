@@ -311,8 +311,15 @@ def jacobian_parity_ok(jacobian_fn, theta_v, theta_m, *, return_details=False):
     theta = backend.concatenate((theta_v, theta_m), dim=1).reshape(-1, 2)
 
     J = jacobian_fn(theta[:, 0], theta[:, 1])
-    if J.shape != (6 * n, 2, 2):
-        raise ValueError("jacobian_fn must return shape (6 * N, 2, 2)")
+    # `getattr`, not `J.shape`: a raytrace passed as the Jacobian returns a
+    # tuple, which should fail here, naming the Jacobian, not as an
+    # AttributeError.
+    shape = getattr(J, "shape", None)
+    if shape != (6 * n, 2, 2):
+        got = type(J).__name__ if shape is None else tuple(shape)
+        raise ValueError(
+            f"jacobian_fn must return an array of shape (6 * N, 2, 2), got {got}"
+        )
 
     return parity_from_jacobians(J.reshape(n, 6, 2, 2), return_details=return_details)
 

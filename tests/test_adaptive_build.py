@@ -610,3 +610,10 @@ def test_build_rejects_a_swapped_pair_loudly():
     raytrace, jacobian = _affine_pair()
     with pytest.raises(ValueError, match="2-tuple"):
         build_adaptive_mesh(jacobian, raytrace, 4.0, 4, 0.1)
+
+
+def test_build_rejects_raytrace_given_as_jacobian_loudly():
+    """``raytrace`` in ``jacobian``'s place returns a 2-tuple, not an array."""
+    raytrace, _ = _affine_pair()
+    with pytest.raises(ValueError, match="jacobian_fn must return an array"):
+        build_adaptive_mesh(raytrace, raytrace, 4.0, 4, 0.1)
