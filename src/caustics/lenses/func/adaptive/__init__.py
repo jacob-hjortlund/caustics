@@ -6,7 +6,8 @@ from the source plane many times. It also keeps what tracing the critical
 curves and caustics needs, so that needs no further lens call.
 
 This namespace holds the public API. Everything else lives in the modules
-below, listed bottom-up: each imports only from the modules above it.
+below, listed lowest layer first: each imports only from the modules listed
+before it.
 
 Substrate -- no lens call and no mesh:
 
