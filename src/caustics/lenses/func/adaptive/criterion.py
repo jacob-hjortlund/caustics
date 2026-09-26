@@ -12,6 +12,12 @@ from ....backend_obj import backend
 from .geometry import CHILD_VERTEX_INDICES, sigma_min_2x2
 
 __all__ = (
+    "LEAF_CONVERGED",
+    "LEAF_CONVERGENCE_FAILED",
+    "LEAF_APPROX_PARITY_UNRESOLVED",
+    "LEAF_JACOBIAN_PARITY_UNRESOLVED",
+    "LEAF_RAYTRACE_NONFINITE",
+    "LEAF_JACOBIAN_NONFINITE",
     "midpoint_deviation",
     "converged_from_deviation",
     "child_shape_matrices",
@@ -20,13 +26,52 @@ __all__ = (
     "jacobian_parity_ok",
     "parity_from_jacobians",
     "evaluate_criterion",
-    "LEAF_CONVERGED",
-    "LEAF_CONVERGENCE_FAILED",
-    "LEAF_APPROX_PARITY_UNRESOLVED",
-    "LEAF_JACOBIAN_PARITY_UNRESOLVED",
-    "LEAF_RAYTRACE_NONFINITE",
-    "LEAF_JACOBIAN_NONFINITE",
 )
+
+
+# Why a leaf is not converged, as a bitmask. Each failed test sets its own bit,
+# so one status records every failure rather than a single chosen reason, and
+# `LEAF_CONVERGED` -- zero, no bit set -- is the only status that means the leaf
+# can be trusted. Only such leaves enter the spatial index. Test a flag with
+# `(status & FLAG) != 0`, never `status == FLAG`, which misses every leaf that
+# carries a second flag as well.
+#
+# Plain ints, not an `IntFlag`: `status` lives in a `backend.int64` array and
+# is compared, OR-ed, scattered and broadcast through backend ops the whole
+# way, which a NumPy-flavoured enum would fight at every one of those call
+# sites for no benefit.
+#
+# - `LEAF_CONVERGENCE_FAILED`: the midpoint-deviation test (step 7) failed, so
+#   the leaf's affine model is not accurate to `min_img_sep`.
+# - `LEAF_APPROX_PARITY_UNRESOLVED`: the four red-split children disagree on
+#   `sign(det Q_k)` (`parity_from_children`) -- a fold, as seen through the
+#   mapped samples.
+# - `LEAF_JACOBIAN_PARITY_UNRESOLVED`: the lens Jacobian's `sign(det A)`
+#   differs between the six lens-plane samples (`jacobian_parity_ok`) -- a
+#   critical curve runs between them.
+# - `LEAF_RAYTRACE_NONFINITE`: some raytraced sample is non-finite, so the rest
+#   of the criterion never ran. Also OR-ed in at freeze, by
+#   `invalidate_nonfinite_origins`, onto every origin whose closure triangles
+#   picked up a non-finite vertex.
+# - `LEAF_JACOBIAN_NONFINITE`: some sample's Jacobian is non-finite or exactly
+#   singular, so its sign says nothing. Singular counts: a sample lying exactly
+#   on a critical curve lands here, not in `LEAF_JACOBIAN_PARITY_UNRESOLVED`.
+#   The critical band still traces such a leaf, from its stored determinants.
+#
+# Below `max_level` every failing triangle splits, so no flag is ever stored
+# there -- a failure is a reason to refine, not a verdict. At `max_level`
+# nothing can split: the criterion runs with the Jacobian forced on every
+# finite triangle, and the whole bitmask is stored. Balance-cascade children
+# and closure triangles inherit their origin's status, which for a cascade
+# child is always `LEAF_CONVERGED` (see the cascade in `refine`). So apart from
+# the freeze-time `LEAF_RAYTRACE_NONFINITE`, a nonzero status means a
+# `max_level` leaf.
+LEAF_CONVERGED = 0
+LEAF_CONVERGENCE_FAILED = 1 << 0
+LEAF_APPROX_PARITY_UNRESOLVED = 1 << 1
+LEAF_JACOBIAN_PARITY_UNRESOLVED = 1 << 2
+LEAF_RAYTRACE_NONFINITE = 1 << 3
+LEAF_JACOBIAN_NONFINITE = 1 << 4
 
 
 def midpoint_deviation(beta_v, beta_m):
@@ -529,48 +574,3 @@ def evaluate_criterion(
 
     keep = status == LEAF_CONVERGED
     return keep, parity_ok, s, status
-
-
-# Why a leaf is not converged, as a bitmask. Each failed test sets its own bit,
-# so one status records every failure rather than a single chosen reason, and
-# `LEAF_CONVERGED` -- zero, no bit set -- is the only status that means the leaf
-# can be trusted. Only such leaves enter the spatial index. Test a flag with
-# `(status & FLAG) != 0`, never `status == FLAG`, which misses every leaf that
-# carries a second flag as well.
-#
-# Plain ints, not an `IntFlag`: `status` lives in a `backend.int64` array and
-# is compared, OR-ed, scattered and broadcast through backend ops the whole
-# way, which a NumPy-flavoured enum would fight at every one of those call
-# sites for no benefit.
-#
-# - `LEAF_CONVERGENCE_FAILED`: the midpoint-deviation test (step 7) failed, so
-#   the leaf's affine model is not accurate to `min_img_sep`.
-# - `LEAF_APPROX_PARITY_UNRESOLVED`: the four red-split children disagree on
-#   `sign(det Q_k)` (`parity_from_children`) -- a fold, as seen through the
-#   mapped samples.
-# - `LEAF_JACOBIAN_PARITY_UNRESOLVED`: the lens Jacobian's `sign(det A)`
-#   differs between the six lens-plane samples (`jacobian_parity_ok`) -- a
-#   critical curve runs between them.
-# - `LEAF_RAYTRACE_NONFINITE`: some raytraced sample is non-finite, so the rest
-#   of the criterion never ran. Also OR-ed in at freeze, by
-#   `invalidate_nonfinite_origins`, onto every origin whose closure triangles
-#   picked up a non-finite vertex.
-# - `LEAF_JACOBIAN_NONFINITE`: some sample's Jacobian is non-finite or exactly
-#   singular, so its sign says nothing. Singular counts: a sample lying exactly
-#   on a critical curve lands here, not in `LEAF_JACOBIAN_PARITY_UNRESOLVED`.
-#   The critical band still traces such a leaf, from its stored determinants.
-#
-# Below `max_level` every failing triangle splits, so no flag is ever stored
-# there -- a failure is a reason to refine, not a verdict. At `max_level`
-# nothing can split: the criterion runs with the Jacobian forced on every
-# finite triangle, and the whole bitmask is stored. Balance-cascade children
-# and closure triangles inherit their origin's status, which for a cascade
-# child is always `LEAF_CONVERGED` (see the cascade in `refine`). So apart from
-# the freeze-time `LEAF_RAYTRACE_NONFINITE`, a nonzero status means a
-# `max_level` leaf.
-LEAF_CONVERGED = 0
-LEAF_CONVERGENCE_FAILED = 1 << 0
-LEAF_APPROX_PARITY_UNRESOLVED = 1 << 1
-LEAF_JACOBIAN_PARITY_UNRESOLVED = 1 << 2
-LEAF_RAYTRACE_NONFINITE = 1 << 3
-LEAF_JACOBIAN_NONFINITE = 1 << 4
