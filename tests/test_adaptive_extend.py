@@ -16,13 +16,13 @@ from caustics.backend_obj import backend
 from caustics.lenses.func.adaptive import (
     AdaptiveMesh,
     CriticalBand,
-    CriticalCurves,
+    CriticalCurvesAndCaustics,
     LEAF_CONVERGED,
     LEAF_RAYTRACE_NONFINITE,
     build_adaptive_mesh,
     child_matrix_tables,
     extend_adaptive_mesh,
-    mesh_critical_curves,
+    mesh_critical_curves_and_caustics,
 )
 from caustics.lenses.func.adaptive.band import band_sample_keys, empty_band, merge_bands
 from caustics.lenses.func.adaptive.build import seed_from_mesh
@@ -1043,13 +1043,13 @@ def test_an_extension_closes_the_critical_curves_the_fov_cut():
     edge; at fov 3 it lies inside."""
     kw = dict(fov=2.0, init_res=4, min_img_sep=0.05)
     mesh, lens, _ = build(sie_like, sie_like_jacobian, **kw)
-    assert not to_np(mesh_critical_curves(mesh).closed).all()
+    assert not to_np(mesh_critical_curves_and_caustics(mesh).closed).all()
     ext = extend_adaptive_mesh(mesh, lens.raytrace, lens.jacobian_lens_equation, 3.0)
-    got = mesh_critical_curves(ext)
+    got = mesh_critical_curves_and_caustics(ext)
     fresh, _, _ = build(sie_like, sie_like_jacobian, **fresh_equivalent(kw, 3.0))
     assert got.closed.shape[0] > 0 and to_np(got.closed).all()
-    want = mesh_critical_curves(fresh)
-    for field in CriticalCurves._fields:
+    want = mesh_critical_curves_and_caustics(fresh)
+    for field in CriticalCurvesAndCaustics._fields:
         a, b = getattr(got, field), getattr(want, field)
         if field == "holes":
             for sub in type(a)._fields:

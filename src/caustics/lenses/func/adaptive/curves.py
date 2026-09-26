@@ -29,19 +29,25 @@ from .geometry import _CHILD_VERTEX_INDEX_TABLE
 from .holes import CentreHoles, empty_holes
 
 __all__ = (
-    "CriticalCurves",
+    "CriticalCurvesAndCaustics",
     "child_segments",
     "crossing_points",
     "chain_order",
     "trace_band",
     "join_at_holes",
-    "mesh_critical_curves",
+    "mesh_critical_curves_and_caustics",
 )
 
 
-class CriticalCurves(NamedTuple):
+class CriticalCurvesAndCaustics(NamedTuple):
     """
-    Critical curves and their caustics, one ordered polyline per curve, CSR.
+    Critical curves and caustics, one ordered polyline per curve, CSR.
+
+    Every point is one of two kinds, told apart by ``hole``. Most are a
+    crossing of ``det A = 0`` in ``lens``, a critical-curve point, with its
+    caustic point in ``source``. On a mesh built with ``centres``, the rest
+    lie on a hole's circle in ``lens`` and on that hole's hole curve in
+    ``source`` -- the pseudo-caustic where ``holes.pseudo_caustic`` is True.
 
     Curve ``c`` is rows ``offsets[c]:offsets[c + 1]`` of ``lens`` and
     ``source``. Travel keeps ``det A > 0`` on the left -- which runs a
@@ -293,10 +299,10 @@ def chain_order(succ) -> Tuple[ArrayLike, ArrayLike, ArrayLike]:
     return order, offsets, on_cycle[starts]
 
 
-def _no_curves(band) -> CriticalCurves:
-    """The :class:`CriticalCurves` of a band with no crossing."""
+def _no_curves(band) -> CriticalCurvesAndCaustics:
+    """The :class:`CriticalCurvesAndCaustics` of a band with no crossing."""
     device = backend.device(band.det)
-    return CriticalCurves(
+    return CriticalCurvesAndCaustics(
         lens=backend.zeros((0, 2), dtype=band.lens.dtype, device=device),
         source=backend.zeros((0, 2), dtype=band.source.dtype, device=device),
         offsets=backend.zeros((1,), dtype=backend.int64, device=device),
@@ -306,7 +312,7 @@ def _no_curves(band) -> CriticalCurves:
     )
 
 
-def trace_band(band) -> CriticalCurves:
+def trace_band(band) -> CriticalCurvesAndCaustics:
     """
     Trace the zero set of ``det A`` through a :class:`CriticalBand`.
 
@@ -321,7 +327,7 @@ def trace_band(band) -> CriticalCurves:
 
     Returns
     -------
-    CriticalCurves
+    CriticalCurvesAndCaustics
         ``hole`` is -1 at every point and ``holes`` is empty: tracing knows
         nothing of holes; :func:`join_at_holes` applies them.
 
@@ -364,7 +370,7 @@ def trace_band(band) -> CriticalCurves:
     lens_points, source_points = crossing_points(
         edges, band.lens, band.source, band.det
     )
-    return CriticalCurves(
+    return CriticalCurvesAndCaustics(
         lens=lens_points,
         source=source_points,
         offsets=offsets,
@@ -381,7 +387,7 @@ def _turn(angle) -> ArrayLike:
     return angle - two_pi * backend.floor(angle / two_pi)
 
 
-def join_at_holes(curves, holes) -> CriticalCurves:
+def join_at_holes(curves, holes) -> CriticalCurvesAndCaustics:
     """
     Cut traced curves at hole circles and re-join them along the hole curves.
 
@@ -440,13 +446,13 @@ def join_at_holes(curves, holes) -> CriticalCurves:
 
     Parameters
     ----------
-    curves: CriticalCurves
+    curves: CriticalCurvesAndCaustics
         As :func:`trace_band` returns them.
     holes: CentreHoles
 
     Returns
     -------
-    CriticalCurves
+    CriticalCurvesAndCaustics
         With ``holes`` set to ``holes``.
 
     Raises
@@ -527,7 +533,7 @@ def join_at_holes(curves, holes) -> CriticalCurves:
     seg_first = backend.flatnonzero(is_first)
     seg_last = backend.flatnonzero(is_last)
     if seg_first.shape[0] == 0:
-        return CriticalCurves(
+        return CriticalCurvesAndCaustics(
             lens=curves.lens[:0],
             source=curves.source[:0],
             offsets=backend.zeros((1,), dtype=int64, device=device),
@@ -662,7 +668,7 @@ def join_at_holes(curves, holes) -> CriticalCurves:
     if kept.shape[0] < closed.shape[0]:
         offsets = backend.concatenate((offsets[:1], offsets[1:][kept]), dim=0)
         closed = closed[kept]
-    return CriticalCurves(
+    return CriticalCurvesAndCaustics(
         lens=pool_lens[gather],
         source=pool_source[gather],
         offsets=offsets,
@@ -672,7 +678,7 @@ def join_at_holes(curves, holes) -> CriticalCurves:
     )
 
 
-def mesh_critical_curves(mesh) -> CriticalCurves:
+def mesh_critical_curves_and_caustics(mesh) -> CriticalCurvesAndCaustics:
     """
     Critical curves and caustics of the lens an adaptive mesh was built from.
 
@@ -710,7 +716,7 @@ def mesh_critical_curves(mesh) -> CriticalCurves:
     centred on the origin, for instance -- several crossings can sit on that
     sample, so consecutive points of the returned curves can coincide
     exactly and some segments have zero length. They are kept, not removed;
-    see :class:`CriticalCurves` for the guard this implies for callers
+    see :class:`CriticalCurvesAndCaustics` for the guard this implies for callers
     computing tangents, normals or arc length. An isolated degenerate
     critical point -- where ``det A`` touches zero at one sample without
     changing sign -- comes back as a closed curve of zero extent, every
@@ -722,7 +728,7 @@ def mesh_critical_curves(mesh) -> CriticalCurves:
 
     Returns
     -------
-    CriticalCurves
+    CriticalCurvesAndCaustics
         With ``holes`` set to ``mesh.holes``.
     """
     curves = trace_band(mesh.critical_band)

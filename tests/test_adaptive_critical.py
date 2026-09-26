@@ -12,10 +12,10 @@ from caustics.backend_obj import backend
 from caustics.lenses.func.adaptive import (
     CentreHoles,
     CriticalBand,
-    CriticalCurves,
+    CriticalCurvesAndCaustics,
     LEAF_JACOBIAN_PARITY_UNRESOLVED,
     build_adaptive_mesh,
-    mesh_critical_curves,
+    mesh_critical_curves_and_caustics,
 )
 from caustics.lenses.func.adaptive.band import empty_band
 from caustics.lenses.func.adaptive.curves import (
@@ -328,10 +328,13 @@ def _one_hole(radius=0.1, n=64, shift=(5.0, 0.0)):
 
 
 def _traced(*curves):
-    """Hand-built ``CriticalCurves`` from ``(points, closed)`` pairs; source = 2 * lens."""
+    """Hand-built ``CriticalCurvesAndCaustics`` from ``(points, closed)`` pairs.
+
+    ``source`` is ``2 * lens``.
+    """
     pts = np.concatenate([np.asarray(p, dtype=np.float64) for p, _ in curves])
     offsets = np.cumsum([0] + [len(p) for p, _ in curves])
-    return CriticalCurves(
+    return CriticalCurvesAndCaustics(
         lens=_arr(pts),
         source=_arr(2.0 * pts),
         offsets=backend.as_array(offsets, dtype=backend.int64),
@@ -731,7 +734,7 @@ RADIAL_CAUSTIC = RADIAL * abs(1.0 - 1.2 / _R_RADIAL)
 
 def _curves(mesh):
     """``[(lens, source, closed), ...]`` per curve, as numpy."""
-    curves = mesh_critical_curves(mesh)
+    curves = mesh_critical_curves_and_caustics(mesh)
     off = to_np(curves.offsets)
     lens, source, closed = (
         to_np(curves.lens),
@@ -787,7 +790,7 @@ def test_without_holes_the_curves_are_trace_band_s_and_follow_no_hole():
         init_res=16,
         min_img_sep=1e-2,
     )
-    got = mesh_critical_curves(mesh)
+    got = mesh_critical_curves_and_caustics(mesh)
     raw = trace_band(mesh.critical_band)
     for field in ("lens", "source", "offsets", "closed"):
         assert np.array_equal(
@@ -1043,7 +1046,7 @@ def two_sis():
     mesh = build_adaptive_mesh(
         lens.raytrace, lens.jacobian_lens_equation, **TWO_SIS_BUILD, centres=TWO_SIS
     )
-    return mesh, mesh_critical_curves(mesh)
+    return mesh, mesh_critical_curves_and_caustics(mesh)
 
 
 def test_curves_through_singular_centres_come_out_closed_and_chord_free(two_sis):
@@ -1087,7 +1090,7 @@ def test_moving_a_centre_off_the_lattice_leaves_the_count_unchanged(two_sis):
     mesh = build_adaptive_mesh(
         lens.raytrace, lens.jacobian_lens_equation, **TWO_SIS_BUILD, centres=shifted
     )
-    moved = mesh_critical_curves(mesh)
+    moved = mesh_critical_curves_and_caustics(mesh)
     grid = _grid_of(curves)
     band = _curve_mask(curves, grid, 0.06) | _curve_mask(moved, grid, 0.06)
     assert np.array_equal(_count(moved, grid)[~band], _count(curves, grid)[~band])
@@ -1102,7 +1105,7 @@ def test_a_float32_mesh_repairs_its_curves_at_the_mesh_dtype():
         centres=TWO_SIS,
         dtype=backend.float32,
     )
-    curves = mesh_critical_curves(mesh)
+    curves = mesh_critical_curves_and_caustics(mesh)
     assert (
         curves.lens.dtype == backend.float32 and curves.source.dtype == backend.float32
     )
@@ -1203,7 +1206,7 @@ def bridged_sis():
         **TWO_SIS_BUILD,
         centres=WITH_COMPANION,
     )
-    return mesh, mesh_critical_curves(mesh)
+    return mesh, mesh_critical_curves_and_caustics(mesh)
 
 
 def test_curves_bridged_to_a_singular_companion_come_out_closed_and_chord_free(
@@ -1248,4 +1251,4 @@ def test_curves_bridged_to_a_regular_centre_come_out_closed_and_chord_free():
         lens.raytrace, lens.jacobian_lens_equation, **TWO_SIS_BUILD, centres=centres
     )
     assert _hole_to_hole_steps(mesh) > 0
-    _assert_closed_and_chord_free(mesh, mesh_critical_curves(mesh))
+    _assert_closed_and_chord_free(mesh, mesh_critical_curves_and_caustics(mesh))

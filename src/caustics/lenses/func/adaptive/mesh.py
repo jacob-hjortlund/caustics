@@ -266,7 +266,7 @@ class AdaptiveMesh(NamedTuple):
     samples. That flag misses a leaf whose samples straddle the curve only
     through an exact ``det A == 0``, so ``critical_band`` is the complete
     record of every ``max_level`` leaf ``det A`` changes sign across;
-    :func:`~caustics.lenses.func.adaptive.curves.mesh_critical_curves`
+    :func:`~caustics.lenses.func.adaptive.curves.mesh_critical_curves_and_caustics`
     turns it into the ordered curves themselves.
 
     ``min_img_sep`` is stored because it is the mesh's own defining tolerance
@@ -328,13 +328,13 @@ class AdaptiveMesh(NamedTuple):
         The ``max_level`` leaves ``det A`` changes sign across, with ``det A``
         and the image at their six samples, kept from the build's own
         ``max_level`` pass so that
-        :func:`~caustics.lenses.func.adaptive.curves.mesh_critical_curves`
+        :func:`~caustics.lenses.func.adaptive.curves.mesh_critical_curves_and_caustics`
         needs no lens. A superset of the ``LEAF_JACOBIAN_PARITY_UNRESOLVED``
         leaves; see :class:`CriticalBand`.
     holes: CentreHoles
         Holes of radius ``min_img_sep`` around the centres passed to the
         build, with the images of their boundary circles, so that
-        :func:`~caustics.lenses.func.adaptive.curves.mesh_critical_curves`
+        :func:`~caustics.lenses.func.adaptive.curves.mesh_critical_curves_and_caustics`
         can repair curves through lens centres without a lens call. Empty
         when no centres were given. See :class:`CentreHoles`.
     lattice: Lattice

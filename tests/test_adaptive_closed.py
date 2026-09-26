@@ -16,11 +16,11 @@ import pytest
 from caustics.backend_obj import backend
 from caustics.lenses.func.adaptive import (
     AdaptiveMesh,
-    CriticalCurves,
+    CriticalCurvesAndCaustics,
     build_adaptive_mesh,
     build_closed_adaptive_mesh,
     extend_adaptive_mesh,
-    mesh_critical_curves,
+    mesh_critical_curves_and_caustics,
 )
 from caustics.lenses.func.adaptive.lattice import lattice_xy
 
@@ -164,7 +164,7 @@ def assert_meshes_equal(got, want):
 
 
 def assert_curves_equal(got, want):
-    for field in CriticalCurves._fields:
+    for field in CriticalCurvesAndCaustics._fields:
         a, b = getattr(got, field), getattr(want, field)
         if field == "holes":
             for sub in type(a)._fields:
@@ -217,7 +217,7 @@ def test_a_curve_the_fov_cuts_is_grown_until_it_closes():
         mesh,
         extend_adaptive_mesh(start, lens.raytrace, lens.jacobian_lens_equation, 2.5),
     )
-    assert_curves_equal(curves, mesh_critical_curves(mesh))
+    assert_curves_equal(curves, mesh_critical_curves_and_caustics(mesh))
 
 
 @pytest.mark.parametrize("x0, y0", [(0.5, 0.0), (-0.5, 0.0), (0.0, 0.5), (0.0, -0.5)])
@@ -240,7 +240,7 @@ def test_a_mesh_whose_fov_cuts_no_curve_is_the_plain_build():
     assert messages == []
     want, _ = plain_build(sie_like, sie_like_jacobian, **kw)
     assert_meshes_equal(mesh, want)
-    assert_curves_equal(curves, mesh_critical_curves(want))
+    assert_curves_equal(curves, mesh_critical_curves_and_caustics(want))
 
 
 def test_a_curve_open_inside_the_fov_does_not_grow_it():
@@ -275,7 +275,7 @@ def test_running_out_of_iterations_warns_and_returns_the_last_mesh(
     assert (mesh.fov, mesh.init_res) == (fov, init_res)
     assert not to_np(curves.closed).all()
     assert len(messages) == 1 and "still cuts" in messages[0]
-    assert_curves_equal(curves, mesh_critical_curves(mesh))
+    assert_curves_equal(curves, mesh_critical_curves_and_caustics(mesh))
 
 
 def test_build_options_reach_the_build_and_every_extension():

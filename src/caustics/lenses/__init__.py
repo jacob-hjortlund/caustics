@@ -27,8 +27,8 @@ from .func import (
     MeshIndex,
     CriticalBand,
     CentreHoles,
-    CriticalCurves,
-    mesh_critical_curves,
+    CriticalCurvesAndCaustics,
+    mesh_critical_curves_and_caustics,
 )
 
 __all__ = [
@@ -61,6 +61,6 @@ __all__ = [
     "MeshIndex",
     "CriticalBand",
     "CentreHoles",
-    "CriticalCurves",
-    "mesh_critical_curves",
+    "CriticalCurvesAndCaustics",
+    "mesh_critical_curves_and_caustics",
 ]

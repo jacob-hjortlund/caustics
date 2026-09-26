@@ -50,7 +50,7 @@ class CriticalBand(NamedTuple):
     Samples are deduplicated by lattice key: a sample shared by several band
     leaves is one row, with one ``det``, so every leaf sharing it agrees on
     its class. That consistency is what lets
-    :func:`~caustics.lenses.func.adaptive.curves.mesh_critical_curves`
+    :func:`~caustics.lenses.func.adaptive.curves.mesh_critical_curves_and_caustics`
     chain the crossings of neighbouring leaves.
 
     Parameters

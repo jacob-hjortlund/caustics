@@ -109,8 +109,8 @@ from .adaptive import (
     LEAF_JACOBIAN_PARITY_UNRESOLVED,
     LEAF_RAYTRACE_NONFINITE,
     LEAF_JACOBIAN_NONFINITE,
-    CriticalCurves,
-    mesh_critical_curves,
+    CriticalCurvesAndCaustics,
+    mesh_critical_curves_and_caustics,
 )
 
 __all__ = (
@@ -199,8 +199,8 @@ __all__ = (
     "MeshIndex",
     "CriticalBand",
     "CentreHoles",
-    "CriticalCurves",
-    "mesh_critical_curves",
+    "CriticalCurvesAndCaustics",
+    "mesh_critical_curves_and_caustics",
     # "LEAF_CONVERGED",
     # "LEAF_SIZE_FLOOR",
     # "LEAF_FORCED",

@@ -29,7 +29,7 @@ from .band import CriticalBand, empty_band
 from .holes import merge_centres, sample_holes
 from .refinement import balance, refine
 from .mesh import AdaptiveMesh, freeze
-from .curves import CriticalCurves, mesh_critical_curves
+from .curves import CriticalCurvesAndCaustics, mesh_critical_curves_and_caustics
 
 __all__ = (
     "validate_build_args",
@@ -298,7 +298,7 @@ def build_adaptive_mesh(
         between them, and only an enormous hole curve, such as a point
         mass's, reaches the cap.
 
-        :func:`~caustics.lenses.func.adaptive.curves.mesh_critical_curves`
+        :func:`~caustics.lenses.func.adaptive.curves.mesh_critical_curves_and_caustics`
         cuts every hole, singular centre or not, out of the curves it traces
         and re-joins them along the hole curves: a critical curve lying
         wholly inside a hole is dropped, with only the hole curve standing in
@@ -493,7 +493,7 @@ def extend_adaptive_mesh(
     Grow an adaptive mesh to a larger fov about the same centre, reusing its refinement.
 
     For a mesh whose critical curves the fov cuts open -- see
-    :func:`~caustics.lenses.func.adaptive.curves.mesh_critical_curves` --
+    :func:`~caustics.lenses.func.adaptive.curves.mesh_critical_curves_and_caustics` --
     this adds whole level-0 cells around it instead of rebuilding. The result
     is bit for bit the mesh :func:`build_adaptive_mesh` produces on the same
     lattice: both run the same seed, refine, balance and freeze stages, a
@@ -695,7 +695,7 @@ def build_closed_adaptive_mesh(
     raytrace_batch_size=None,
     index_cells=None,
     centres=None,
-) -> Tuple[AdaptiveMesh, CriticalCurves]:
+) -> Tuple[AdaptiveMesh, CriticalCurvesAndCaustics]:
     """
     Build an adaptive mesh, then grow its fov until it cuts no critical curve.
 
@@ -711,7 +711,7 @@ def build_closed_adaptive_mesh(
        :func:`~caustics.lenses.func.adaptive.curves.join_at_holes`), and
        the fov only grows, so from here on every hole stays inside.
     2. :func:`build_adaptive_mesh` builds the mesh, and
-       :func:`~caustics.lenses.func.adaptive.curves.mesh_critical_curves`
+       :func:`~caustics.lenses.func.adaptive.curves.mesh_critical_curves_and_caustics`
        traces its curves.
     3. While an open curve has an end on the fov boundary, and fewer than
        ``max_iters`` extensions have run, :func:`extend_adaptive_mesh` grows
@@ -753,8 +753,8 @@ def build_closed_adaptive_mesh(
     -------
     mesh: AdaptiveMesh
         The last mesh built or extended.
-    curves: CriticalCurves
-        ``mesh_critical_curves(mesh)``, as the last check traced it.
+    curves: CriticalCurvesAndCaustics
+        ``mesh_critical_curves_and_caustics(mesh)``, as the last check traced it.
 
     Raises
     ------
@@ -815,7 +815,7 @@ def build_closed_adaptive_mesh(
         index_cells=index_cells,
         centres=centres,
     )
-    curves = mesh_critical_curves(mesh)
+    curves = mesh_critical_curves_and_caustics(mesh)
     cut = _curves_cut_by_fov(mesh, curves)
     for _ in range(iters):
         if cut == 0:
@@ -828,7 +828,7 @@ def build_closed_adaptive_mesh(
             raytrace_batch_size=raytrace_batch_size,
             index_cells=index_cells,
         )
-        curves = mesh_critical_curves(mesh)
+        curves = mesh_critical_curves_and_caustics(mesh)
         cut = _curves_cut_by_fov(mesh, curves)
     if cut:
         warn(

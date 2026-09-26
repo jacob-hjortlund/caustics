@@ -35,8 +35,8 @@ from .lenses.func import (
     MeshIndex,
     CriticalBand,
     CentreHoles,
-    CriticalCurves,
-    mesh_critical_curves,
+    CriticalCurvesAndCaustics,
+    mesh_critical_curves_and_caustics,
 )
 from .light import (
     Source,
@@ -92,8 +92,8 @@ __all__ = [
     "MeshIndex",
     "CriticalBand",
     "CentreHoles",
-    "CriticalCurves",
-    "mesh_critical_curves",
+    "CriticalCurvesAndCaustics",
+    "mesh_critical_curves_and_caustics",
     "Source",
     "Pixelated",
     "PixelatedTime",

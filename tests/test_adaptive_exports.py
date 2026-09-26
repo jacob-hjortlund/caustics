@@ -22,8 +22,8 @@ def test_new_symbols_are_re_exported_at_every_package_level(package):
         "MeshIndex",
         "CriticalBand",
         "CentreHoles",
-        "CriticalCurves",
-        "mesh_critical_curves",
+        "CriticalCurvesAndCaustics",
+        "mesh_critical_curves_and_caustics",
     ):
         assert getattr(package, name) is getattr(func, name), name
         assert name in package.__all__, name
@@ -84,12 +84,12 @@ CURATED = (
     "mesh_query",
     "mesh_seeds",
     "mesh_forward_raytrace",
-    "mesh_critical_curves",
+    "mesh_critical_curves_and_caustics",
     "AdaptiveMesh",
     "MeshIndex",
     "CriticalBand",
     "CentreHoles",
-    "CriticalCurves",
+    "CriticalCurvesAndCaustics",
     "LEAF_CONVERGED",
     "LEAF_CONVERGENCE_FAILED",
     "LEAF_APPROX_PARITY_UNRESOLVED",

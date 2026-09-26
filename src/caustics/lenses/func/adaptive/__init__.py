@@ -33,7 +33,7 @@ Using a mesh:
 
 - :mod:`.query` -- :func:`mesh_query` and :func:`mesh_seeds`.
 - :mod:`.images` -- :func:`mesh_forward_raytrace`.
-- :mod:`.curves` -- :func:`mesh_critical_curves`.
+- :mod:`.curves` -- :func:`mesh_critical_curves_and_caustics`.
 
 Entry points:
 
@@ -66,7 +66,7 @@ from .holes import CentreHoles
 from .mesh import AdaptiveMesh, MeshIndex
 from .query import mesh_query, mesh_seeds
 from .images import mesh_forward_raytrace
-from .curves import CriticalCurves, mesh_critical_curves
+from .curves import CriticalCurvesAndCaustics, mesh_critical_curves_and_caustics
 from .build import (
     build_adaptive_mesh,
     build_closed_adaptive_mesh,
@@ -80,12 +80,12 @@ __all__ = (
     "mesh_query",
     "mesh_seeds",
     "mesh_forward_raytrace",
-    "mesh_critical_curves",
+    "mesh_critical_curves_and_caustics",
     "AdaptiveMesh",
     "MeshIndex",
     "CriticalBand",
     "CentreHoles",
-    "CriticalCurves",
+    "CriticalCurvesAndCaustics",
     "LEAF_CONVERGED",
     "LEAF_CONVERGENCE_FAILED",
     "LEAF_APPROX_PARITY_UNRESOLVED",
