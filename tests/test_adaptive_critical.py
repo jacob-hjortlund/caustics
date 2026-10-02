@@ -20,10 +20,13 @@ from caustics.lenses.func.adaptive import (
 from caustics.lenses.func.adaptive.band import empty_band
 from caustics.lenses.func.adaptive.curves import (
     chain_order,
+    chain_segments,
     child_segments,
     crossing_points,
+    edge_zeros,
     join_at_holes,
     trace_band,
+    triangle_segments,
 )
 from caustics.lenses.func.adaptive.geometry import CHILD_VERTEX_INDICES
 from caustics.lenses.func.adaptive.holes import empty_holes
@@ -1252,3 +1255,61 @@ def test_curves_bridged_to_a_regular_centre_come_out_closed_and_chord_free():
     )
     assert _hole_to_hole_steps(mesh) > 0
     _assert_closed_and_chord_free(mesh, mesh_critical_curves_and_caustics(mesh))
+
+
+def test_triangle_segments_keep_the_positive_side_on_the_left():
+    # (0,0), (1,0), (0,1), positively oriented; only vertex 0 is positive.
+    tri = backend.as_array([[0, 1, 2]], dtype=backend.int64)
+    positive = backend.as_array([True, False, False])
+    start, end = triangle_segments(tri, positive)
+    # From edge (0, 1) to edge (2, 0): travelling from (0.5, 0) towards
+    # (0, 0.5) keeps vertex 0 on the left.
+    assert to_np(start).tolist() == [[0, 1]]
+    assert to_np(end).tolist() == [[0, 2]]
+
+
+def test_triangle_segments_skip_triangles_of_one_class():
+    tri = backend.as_array([[0, 1, 2]], dtype=backend.int64)
+    for value in (True, False):
+        start, _ = triangle_segments(tri, backend.as_array([value] * 3))
+        assert start.shape[0] == 0
+
+
+def test_chain_segments_close_a_fan_into_one_counter_clockwise_loop():
+    # A unit square fanned about its centre, vertex 4, the only positive one.
+    tri = backend.as_array(
+        [[0, 1, 4], [1, 2, 4], [2, 3, 4], [3, 0, 4]], dtype=backend.int64
+    )
+    positive = backend.as_array([False, False, False, False, True])
+    start, end = triangle_segments(tri, positive)
+    edges, offsets, closed = chain_segments(start, end, 5, "crossing")
+    assert to_np(offsets).tolist() == [0, 4]
+    assert to_np(closed).tolist() == [True]
+    walk = [tuple(e) for e in to_np(edges).tolist()]
+    i = walk.index((0, 4))
+    assert walk[i:] + walk[:i] == [(0, 4), (1, 4), (2, 4), (3, 4)]
+
+
+def test_chain_segments_name_the_crossing_in_their_assertions():
+    start = backend.as_array([[0, 1], [0, 1]], dtype=backend.int64)
+    end = backend.as_array([[1, 2], [2, 3]], dtype=backend.int64)
+    with pytest.raises(AssertionError, match="a widget has two successors"):
+        chain_segments(start, end, 4, "widget")
+
+
+def test_chain_segments_of_nothing_is_no_curve():
+    empty = backend.zeros((0, 2), dtype=backend.int64)
+    edges, offsets, closed = chain_segments(empty, empty, 3, "crossing")
+    assert edges.shape == (0, 2)
+    assert to_np(offsets).tolist() == [0]
+    assert closed.shape[0] == 0
+
+
+def test_edge_zeros_interpolate_the_zero_in_every_plane():
+    edges = backend.as_array([[0, 1]], dtype=backend.int64)
+    field = _arr([-1.0, 3.0])
+    a = _arr([[0.0, 0.0], [4.0, 0.0]])
+    b = _arr([[0.0, 1.0], [0.0, 5.0]])
+    za, zb = edge_zeros(edges, field, (a, b))
+    assert to_np(za).tolist() == [[1.0, 0.0]]
+    assert to_np(zb).tolist() == [[0.0, 2.0]]

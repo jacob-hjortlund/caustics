@@ -30,9 +30,12 @@ from .holes import CentreHoles, empty_holes
 
 __all__ = (
     "CriticalCurvesAndCaustics",
+    "triangle_segments",
     "child_segments",
+    "edge_zeros",
     "crossing_points",
     "chain_order",
+    "chain_segments",
     "trace_band",
     "join_at_holes",
     "mesh_critical_curves_and_caustics",
@@ -118,6 +121,53 @@ def _sorted_pair(a, b) -> ArrayLike:
     return backend.stack((backend.minimum(a, b), backend.maximum(a, b)), dim=-1)
 
 
+def triangle_segments(tri, positive) -> Tuple[ArrayLike, ArrayLike]:
+    """
+    The oriented crossing segment of each triangle whose corners are not all of one class.
+
+    A triangle with mixed classes has exactly one odd corner ``i``, the lone
+    positive or the lone negative, and with ``(i, j, k)`` cyclic the boundary
+    between the classes crosses its edges ``(i, j)`` and ``(k, i)``. The
+    segment keeps the positive side on its left: from ``(i, j)`` to ``(k, i)``
+    when the odd corner is positive, and the reverse when it is negative. On
+    positively oriented triangles sharing an edge, the segment ending on it
+    is always met by one starting there, which is what makes the segments
+    chain (:func:`chain_segments`).
+
+    Parameters
+    ----------
+    tri: ArrayLike
+        ``(K, 3)`` int64 sample indices, positively oriented.
+    positive: ArrayLike
+        ``(S,)`` bool class of each sample.
+
+    Returns
+    -------
+    start: ArrayLike
+        ``(M,)`` segments' starting edges, shape ``(M, 2)`` int64 sample
+        pairs, smaller index first.
+    end: ArrayLike
+        Their ending edges, shape ``(M, 2)``, in the same form.
+    """
+    pos = positive[tri]
+    n_positive = backend.sum(backend.long(pos), dim=1)
+    mixed = backend.flatnonzero((n_positive == 1) | (n_positive == 2))
+    tri, pos = tri[mixed], pos[mixed]
+    odd_positive = n_positive[mixed] == 1
+    # The odd corner is the one True entry of `pos` where one corner is
+    # positive, and the one False entry where two are.
+    odd_mask = backend.where(backend.unsqueeze(odd_positive, -1), pos, ~pos)
+    odd = backend.argmax(backend.long(odd_mask), 1)
+    rows = backend.arange(tri.shape[0], dtype=backend.int64)
+    p_i = tri[rows, odd]
+    p_j = tri[rows, (odd + 1) % 3]
+    p_k = tri[rows, (odd + 2) % 3]
+    e_ij = _sorted_pair(p_i, p_j)
+    e_ki = _sorted_pair(p_k, p_i)
+    flip = backend.unsqueeze(odd_positive, -1)
+    return backend.where(flip, e_ij, e_ki), backend.where(flip, e_ki, e_ij)
+
+
 def child_segments(samples, det) -> Tuple[ArrayLike, ArrayLike]:
     """
     The oriented zero-crossing segment of ``det A`` on each red-split child.
@@ -152,23 +202,44 @@ def child_segments(samples, det) -> Tuple[ArrayLike, ArrayLike]:
         Their ending edges, shape ``(K, 2)``, in the same form.
     """
     kids = samples[:, _CHILD_VERTEX_INDEX_TABLE].reshape(-1, 3)
-    positive = det[kids] >= 0
-    n_positive = backend.sum(backend.long(positive), dim=1)
-    mixed = backend.flatnonzero((n_positive == 1) | (n_positive == 2))
-    kids, positive = kids[mixed], positive[mixed]
-    odd_positive = n_positive[mixed] == 1
-    # The odd corner is the one True entry of `positive` where one corner is
-    # positive, and the one False entry where two are.
-    odd_mask = backend.where(backend.unsqueeze(odd_positive, -1), positive, ~positive)
-    odd = backend.argmax(backend.long(odd_mask), 1)
-    rows = backend.arange(kids.shape[0], dtype=backend.int64)
-    p_i = kids[rows, odd]
-    p_j = kids[rows, (odd + 1) % 3]
-    p_k = kids[rows, (odd + 2) % 3]
-    e_ij = _sorted_pair(p_i, p_j)
-    e_ki = _sorted_pair(p_k, p_i)
-    flip = backend.unsqueeze(odd_positive, -1)
-    return backend.where(flip, e_ij, e_ki), backend.where(flip, e_ki, e_ij)
+    return triangle_segments(kids, det >= 0)
+
+
+def edge_zeros(edges, field, planes) -> Tuple[ArrayLike, ...]:
+    """
+    Where a piecewise-linear ``field`` crosses zero on each edge, in every plane.
+
+    The zero of the linear interpolant from ``p = edges[:, 0]`` to
+    ``q = edges[:, 1]``: ``t = field[p] / (field[p] - field[q])``, applied to
+    each plane's positions. The ends must have opposite classes, so the
+    denominator is never zero, and ``t == 0`` exactly when ``field[p] == 0``.
+    Computed in float64 and returned at each plane's dtype.
+
+    Parameters
+    ----------
+    edges: ArrayLike
+        ``(N, 2)`` int64 sample pairs.
+    field: ArrayLike
+        ``(S,)`` the field at each sample.
+    planes: Tuple[ArrayLike, ...]
+        ``(S, 2)`` positions of the samples, one array per plane.
+
+        *Unit: arcsec*
+
+    Returns
+    -------
+    Tuple[ArrayLike, ...]
+        ``(N, 2)`` zero of each edge, one array per plane.
+
+        *Unit: arcsec*
+    """
+    p, q = edges[:, 0], edges[:, 1]
+    t = backend.unsqueeze(field[p] / (field[p] - field[q]), -1)
+    points = []
+    for plane in planes:
+        x = backend.to(plane, dtype=backend.float64)
+        points.append(backend.to(x[p] + t * (x[q] - x[p]), dtype=plane.dtype))
+    return tuple(points)
 
 
 def crossing_points(edges, lens, source, det) -> Tuple[ArrayLike, ArrayLike]:
@@ -206,13 +277,8 @@ def crossing_points(edges, lens, source, det) -> Tuple[ArrayLike, ArrayLike]:
 
         *Unit: arcsec*
     """
-    p, q = edges[:, 0], edges[:, 1]
-    t = backend.unsqueeze(det[p] / (det[p] - det[q]), -1)
-    points = []
-    for plane in (lens, source):
-        x = backend.to(plane, dtype=backend.float64)
-        points.append(backend.to(x[p] + t * (x[q] - x[p]), dtype=plane.dtype))
-    return points[0], points[1]
+    lens_points, source_points = edge_zeros(edges, det, (lens, source))
+    return lens_points, source_points
 
 
 def chain_order(succ) -> Tuple[ArrayLike, ArrayLike, ArrayLike]:
@@ -299,6 +365,75 @@ def chain_order(succ) -> Tuple[ArrayLike, ArrayLike, ArrayLike]:
     return order, offsets, on_cycle[starts]
 
 
+def chain_segments(
+    start, end, n_samples, what
+) -> Tuple[ArrayLike, ArrayLike, ArrayLike]:
+    """
+    Chain oriented segments, each from one sample-pair edge to another, into curves.
+
+    Each distinct edge is one node, keyed by its sample pair; each segment
+    links its starting node to its ending one; :func:`chain_order` orders
+    the result. Shared by :func:`trace_band` and
+    :func:`~caustics.lenses.func.adaptive.regions.magnified_regions`.
+
+    Parameters
+    ----------
+    start, end: ArrayLike
+        ``(K, 2)`` int64 sample pairs, smaller index first, as
+        :func:`triangle_segments` returns them.
+    n_samples: int
+        Number of samples, bounding every index, for the node keys.
+    what: str
+        What a node is, for the assertion messages.
+
+    Returns
+    -------
+    edges: ArrayLike
+        ``(N, 2)`` int64 node edges, curve by curve in travel order.
+    offsets: ArrayLike
+        ``(C + 1,)`` int64 CSR offsets into ``edges``.
+    closed: ArrayLike
+        ``(C,)`` bool, True where the curve is a loop.
+
+    Raises
+    ------
+    AssertionError
+        ``"a {what} has two successors"`` or ``"a {what} has two
+        predecessors"`` when a node is linked twice, which a conforming,
+        positively oriented triangulation rules out: a guard against silent
+        corruption rather than a reachable input.
+    """
+    int64 = backend.int64
+    device = backend.device(start)
+    k = start.shape[0]
+    if k == 0:
+        return (
+            backend.zeros((0, 2), dtype=int64, device=device),
+            backend.zeros((1,), dtype=int64, device=device),
+            backend.zeros((0,), dtype=backend.bool, device=device),
+        )
+    s = n_samples
+    keys = backend.concatenate(
+        (start[:, 0] * s + start[:, 1], end[:, 0] * s + end[:, 1]), dim=0
+    )
+    nodes, inverse = backend.unique(keys, return_inverse=True)
+    frm, to = inverse[:k], inverse[k:]
+    n = nodes.shape[0]
+    # `raise AssertionError` rather than a bare `assert`, as elsewhere in the
+    # adaptive kernels: `python -O` strips bare asserts. Two separate guards,
+    # so each reports which side of the chain actually broke.
+    if bool(backend.any(backend.bincount(frm, minlength=n) > 1)):
+        raise AssertionError(f"a {what} has two successors")
+    if bool(backend.any(backend.bincount(to, minlength=n) > 1)):
+        raise AssertionError(f"a {what} has two predecessors")
+    succ = backend.fill_at_indices(
+        backend.zeros((n,), dtype=int64, device=device) - 1, frm, to
+    )
+    order, offsets, closed = chain_order(succ)
+    ordered = nodes[order]
+    return backend.stack((ordered // s, ordered % s), dim=-1), offsets, closed
+
+
 def _no_curves(band) -> CriticalCurvesAndCaustics:
     """The :class:`CriticalCurvesAndCaustics` of a band with no crossing."""
     device = backend.device(band.det)
@@ -316,10 +451,10 @@ def trace_band(band) -> CriticalCurvesAndCaustics:
     """
     Trace the zero set of ``det A`` through a :class:`CriticalBand`.
 
-    Each distinct crossing edge is one node, keyed by its sample pair; each
-    child's segment links its starting node to its ending one; and
-    :func:`chain_order` orders the result. Each node's point is computed once,
-    so the two children sharing an edge agree on it exactly.
+    Each child's segment (:func:`child_segments`) is chained into curves by
+    :func:`chain_segments`, each distinct crossing edge one node, keyed by
+    its sample pair. Each node's point is computed once, so the two children
+    sharing an edge agree on it exactly.
 
     Parameters
     ----------
@@ -341,35 +476,15 @@ def trace_band(band) -> CriticalCurvesAndCaustics:
         against silent corruption rather than a reachable input.
     """
     start, end = child_segments(band.samples, band.det)
-    k = start.shape[0]
-    if k == 0:
+    if start.shape[0] == 0:
         return _no_curves(band)
-
-    s = band.lens.shape[0]
-    keys = backend.concatenate(
-        (start[:, 0] * s + start[:, 1], end[:, 0] * s + end[:, 1]), dim=0
+    edges, offsets, closed = chain_segments(
+        start, end, band.lens.shape[0], "critical-curve crossing"
     )
-    nodes, inverse = backend.unique(keys, return_inverse=True)
-    frm, to = inverse[:k], inverse[k:]
-    n = nodes.shape[0]
-    # `raise AssertionError` rather than a bare `assert`, as elsewhere in the
-    # adaptive kernels: `python -O` strips bare asserts. Two separate guards,
-    # so each reports which side of the chain actually broke.
-    if bool(backend.any(backend.bincount(frm, minlength=n) > 1)):
-        raise AssertionError("a critical-curve crossing has two successors")
-    if bool(backend.any(backend.bincount(to, minlength=n) > 1)):
-        raise AssertionError("a critical-curve crossing has two predecessors")
-
-    device = backend.device(band.det)
-    succ = backend.fill_at_indices(
-        backend.zeros((n,), dtype=backend.int64, device=device) - 1, frm, to
-    )
-    order, offsets, closed = chain_order(succ)
-    ordered = nodes[order]
-    edges = backend.stack((ordered // s, ordered % s), dim=-1)
     lens_points, source_points = crossing_points(
         edges, band.lens, band.source, band.det
     )
+    device = backend.device(band.det)
     return CriticalCurvesAndCaustics(
         lens=lens_points,
         source=source_points,
