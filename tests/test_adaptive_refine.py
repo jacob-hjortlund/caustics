@@ -260,7 +260,13 @@ def _make_counting_lens(fn, jac):
     reads, ``raytrace`` and ``jacobian_lens_equation``, and ``calls`` counts
     the points and batches each one evaluated.
     """
-    calls = {"points": 0, "batches": 0, "jacobian_points": 0, "jacobian_batches": 0}
+    calls = {
+        "points": 0,
+        "batches": 0,
+        "jacobian_points": 0,
+        "jacobian_batches": 0,
+        "jacobian_xy": [],
+    }
 
     def raytrace(x, y):
         xy = np.stack([backend.to_numpy(x), backend.to_numpy(y)], axis=-1)
@@ -271,6 +277,7 @@ def _make_counting_lens(fn, jac):
 
     def jacobian_lens_equation(x, y):
         xy = np.stack([backend.to_numpy(x), backend.to_numpy(y)], axis=-1)
+        calls["jacobian_xy"].append(xy)
         calls["jacobian_points"] += xy.shape[0]
         calls["jacobian_batches"] += 1
         return backend.as_array(jac(xy), dtype=backend.float64)
@@ -427,9 +434,8 @@ def test_refine_evaluates_the_jacobian_only_where_it_can_withhold_convergence():
 
     Two fixtures pin both ends exactly, each in one batch. On the identity map
     every level-0 triangle passes the other tests, so each is checked once,
-    below ``max_level``, on its own six points: there, unlike raytraced
-    points, Jacobian samples are not deduplicated between triangles that
-    share them. On a ``kappa == 1`` sheet none ever passes the deviation test,
+    below ``max_level``, and every distinct sample among them is evaluated
+    once, however many triangles share it. On a ``kappa == 1`` sheet none ever passes the deviation test,
     so the Jacobian never runs below ``max_level``, and its one call is the
     forced pass there -- which evaluates each distinct lattice sample once.
     That is 1089 points, the whole widened lattice, where six per leaf would
@@ -441,7 +447,8 @@ def test_refine_evaluates_the_jacobian_only_where_it_can_withhold_convergence():
     v, level, _, _ = store_compact(store)
     assert bool(backend.all(level < max_level))
     assert calls["jacobian_batches"] == 1
-    assert calls["jacobian_points"] == 6 * v.shape[0]
+    assert calls["jacobian_points"] == _distinct_samples(cache, v, lat)
+    assert counters["jacobian_points"] == calls["jacobian_points"]
 
     cache, active, store, counters, lat, calls, max_level = _refine_with(
         _collapse, _collapse_jacobian, min_img_sep=0.5
@@ -451,6 +458,29 @@ def test_refine_evaluates_the_jacobian_only_where_it_can_withhold_convergence():
     assert bool(backend.all(level == max_level))
     assert calls["jacobian_batches"] == 1
     assert calls["jacobian_points"] == _distinct_samples(cache, v, lat) == 1089
+
+
+def test_refine_never_evaluates_the_jacobian_twice_at_a_point():
+    """The vertex cache keeps every Jacobian value and reads it back.
+
+    Across every level, no lattice point reaches ``jacobian_fn`` twice, and
+    the cache holds exactly ``det A`` of what the lens returned at each point
+    it evaluated. ``_localised_fold`` tests candidates on several levels.
+    """
+    cache, active, store, counters, lat, calls, max_level = _refine_with(
+        _localised_fold, _localised_fold_jacobian, min_img_sep=0.05
+    )
+    assert max_level >= 3
+    xy = np.concatenate(calls["jacobian_xy"])
+    ij = np.rint((xy - backend.to_numpy(lat.lo)) / lat.scale).astype(np.int64)
+    assert np.unique(ij, axis=0).shape[0] == ij.shape[0]
+    assert counters["jacobian_points"] == ij.shape[0]
+    done = backend.flatnonzero(cache.evaluated)
+    assert done.shape[0] > 0
+    J = _localised_fold_jacobian(backend.to_numpy(lattice_xy(lat, cache.ij[done])))
+    want = J[:, 0, 0] * J[:, 1, 1] - J[:, 0, 1] * J[:, 1, 0]
+    assert np.array_equal(backend.to_numpy(cache.det[done]), want)
+    assert bool(backend.all(cache.has_det == cache.evaluated))
 
 
 def _sis_raytrace(p, b=1.0):

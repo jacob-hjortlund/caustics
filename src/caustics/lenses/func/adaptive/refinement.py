@@ -27,7 +27,6 @@ from .lattice import (
     initial_triangles,
     lattice_ij_from_key,
     lattice_key,
-    lattice_xy,
     midpoint_ij,
 )
 from .sampling import evaluate, sample_jacobians, trace_keys
@@ -36,7 +35,6 @@ from .criterion import (
     LEAF_RAYTRACE_NONFINITE,
     apply_jacobian_signs,
     approximate_criterion,
-    evaluate_criterion,
     jacobian_rows,
 )
 from .band import band_from_samples, empty_band
@@ -238,20 +236,22 @@ def refine(
     Python-level recursion over individual triangles, no per-triangle ``raytrace``.
 
     **The criterion converges no triangle without the Jacobian's agreement, at
-    any level.** :func:`evaluate_criterion` evaluates ``jacobian_fn`` on every
-    triangle that passes all its other tests, and one whose six samples
-    disagree on ``sign(det A)`` -- or where some ``A`` is non-finite or
-    singular -- splits instead of converging. So no leaf the criterion
-    converged has a critical curve running between its samples, while the
-    Jacobian cost stays proportional to the triangles about to converge rather
-    than to every triangle tested. A balance-cascade child is the exception:
-    it inherits its parent's verdict without a Jacobian check of its own, and
-    its three edge midpoints are points the parent's check never saw. Below
-    ``max_level``, unlike raytraced points, Jacobian evaluations are not
-    deduplicated: every checked triangle evaluates its own six points, shared
-    vertices included. The per-level status bitmask is discarded below
-    ``max_level``, since every failure there is a reason to split rather than
-    a verdict.
+    any level.** The Jacobian test runs on every triangle that passes all the
+    criterion's other tests (:func:`approximate_criterion`,
+    :func:`jacobian_rows`), and one whose six samples disagree on
+    ``sign(det A)`` -- or where some ``A`` is non-finite or singular -- splits
+    instead of converging (:func:`apply_jacobian_signs`). So no leaf the
+    criterion converged has a critical curve running between its samples,
+    while the Jacobian cost stays proportional to the triangles about to
+    converge rather than to every triangle tested. A balance-cascade child is
+    the exception: it inherits its parent's verdict without a Jacobian check
+    of its own, and its three edge midpoints are points the parent's check
+    never saw. Like raytraced points, Jacobian values are kept in the vertex
+    cache: :func:`sample_jacobians` evaluates each lattice point at most once
+    per build, keeping ``det A`` and the criterion's sign of it, and every
+    later triangle that samples the point reads them back. The per-level
+    status bitmask is discarded below ``max_level``, since every failure there
+    is a reason to split rather than a verdict.
 
     At ``max_level`` nothing splits, so there is no cascade, so no force-split.
     The midpoints are still evaluated: traced once, deduplicated on their
@@ -303,9 +303,10 @@ def refine(
         From :func:`make_raytrace`.
     jacobian_fn: Callable[[ArrayLike, ArrayLike], ArrayLike]
         ``jacobian_fn(x, y) -> (K, 2, 2)``, the Jacobian of the map
-        ``raytrace_fn`` traces, forwarded to :func:`evaluate_criterion`. Called
-        directly on the lattice's float64 lens-plane coordinates: not through
-        :func:`make_raytrace`, and not chunked by ``batch_size``.
+        ``raytrace_fn`` traces, evaluated through :func:`sample_jacobians` at
+        most once per lattice point. Called directly on the lattice's float64
+        lens-plane coordinates: not through :func:`make_raytrace`, and not
+        chunked by ``batch_size``.
     lat: Lattice
     init_res: int
         Level-0 grid resolution.
@@ -340,6 +341,8 @@ def refine(
     Returns
     -------
     cache: VertexCache
+        With ``det A`` and the criterion's sign at every cached point the
+        Jacobian was evaluated at.
     active: ArrayLike
         The active-vertex set.
     store: LeafStore
@@ -359,7 +362,7 @@ def refine(
         sample was non-finite.
         ``max_level_midpoints``: unique ``max_level`` midpoints traced for the
         parity test.
-        ``jacobian_points``: points passed to ``jacobian_fn``.
+        ``jacobian_points``: points passed to ``jacobian_fn``, each at most once.
         ``forced``: children produced by the balance cascade.
         ``cascade_rounds``: balance-cascade rounds run over the whole build.
     band: CriticalBand
@@ -494,13 +497,7 @@ def refine(
 
         rows = backend.flatnonzero(good)
 
-        theta_v = lattice_xy(lat, active_ij[rows])
-        theta_m = lattice_xy(lat, mid_ij[rows])
-
-        keep, parity_ok, s, _status = evaluate_criterion(
-            jacobian_fn,
-            theta_v,
-            theta_m,
+        approx_status, child_ok, s = approximate_criterion(
             beta_v[rows],
             beta_m[rows],
             active_cls[rows],
@@ -509,6 +506,22 @@ def refine(
             min_img_sep,
             PINV0,
             COMPOSE,
+        )
+        # Lazily: only the rows about to converge reach the Jacobian. Their
+        # six samples are all cached -- `evaluate` traced them above -- so
+        # every value is kept, and a point a later level samples again is
+        # read back rather than evaluated twice.
+        tested = jacobian_rows(approx_status)
+        checked = rows[tested]
+        cache, _, sample_index, _, sign, called = sample_jacobians(
+            lat,
+            cache,
+            backend.concatenate((active_ij[checked], mid_ij[checked]), dim=1),
+            jacobian_fn,
+        )
+        counters["jacobian_points"] += called
+        keep, parity_ok, _status = apply_jacobian_signs(
+            approx_status, child_ok, tested, sign[sample_index]
         )
         counters["parity_splits"] += int(backend.to_numpy(backend.sum(~parity_ok)))
         counters["deviation_splits"] += int(
