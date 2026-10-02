@@ -111,6 +111,13 @@ from .adaptive import (
     LEAF_JACOBIAN_NONFINITE,
     CriticalCurvesAndCaustics,
     mesh_critical_curves_and_caustics,
+    mesh_total_magnification,
+    build_magnification_mesh,
+    MagnificationMesh,
+    magnified_regions,
+    MagnifiedRegions,
+    magnified_area,
+    in_magnified_region,
 )
 
 __all__ = (
@@ -201,6 +208,13 @@ __all__ = (
     "CentreHoles",
     "CriticalCurvesAndCaustics",
     "mesh_critical_curves_and_caustics",
+    "mesh_total_magnification",
+    "build_magnification_mesh",
+    "MagnificationMesh",
+    "magnified_regions",
+    "MagnifiedRegions",
+    "magnified_area",
+    "in_magnified_region",
     # "LEAF_CONVERGED",
     # "LEAF_SIZE_FLOOR",
     # "LEAF_FORCED",

@@ -29,6 +29,13 @@ from .func import (
     CentreHoles,
     CriticalCurvesAndCaustics,
     mesh_critical_curves_and_caustics,
+    mesh_total_magnification,
+    build_magnification_mesh,
+    MagnificationMesh,
+    magnified_regions,
+    MagnifiedRegions,
+    magnified_area,
+    in_magnified_region,
 )
 
 __all__ = [
@@ -63,4 +70,11 @@ __all__ = [
     "CentreHoles",
     "CriticalCurvesAndCaustics",
     "mesh_critical_curves_and_caustics",
+    "mesh_total_magnification",
+    "build_magnification_mesh",
+    "MagnificationMesh",
+    "magnified_regions",
+    "MagnifiedRegions",
+    "magnified_area",
+    "in_magnified_region",
 ]

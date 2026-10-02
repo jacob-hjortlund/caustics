@@ -35,6 +35,12 @@ Using a mesh:
 - :mod:`.query` -- :func:`mesh_query` and :func:`mesh_seeds`.
 - :mod:`.images` -- :func:`mesh_forward_raytrace`.
 - :mod:`.curves` -- :func:`mesh_critical_curves_and_caustics`.
+- :mod:`.magnification` -- :func:`mesh_total_magnification`, and the sheet
+  edges across which the image count changes.
+- :mod:`.source_mesh` -- :func:`build_magnification_mesh`, an adaptive
+  source-plane mesh sampled with the total magnification.
+- :mod:`.regions` -- :func:`magnified_regions`, :func:`magnified_area` and
+  :func:`in_magnified_region`, from a :class:`MagnificationMesh`.
 
 Entry points:
 
@@ -68,6 +74,14 @@ from .mesh import AdaptiveMesh, MeshIndex
 from .query import mesh_query, mesh_seeds
 from .images import mesh_forward_raytrace
 from .curves import CriticalCurvesAndCaustics, mesh_critical_curves_and_caustics
+from .magnification import mesh_total_magnification
+from .source_mesh import MagnificationMesh, build_magnification_mesh
+from .regions import (
+    MagnifiedRegions,
+    in_magnified_region,
+    magnified_area,
+    magnified_regions,
+)
 from .build import (
     build_adaptive_mesh,
     build_closed_adaptive_mesh,
@@ -82,11 +96,18 @@ __all__ = (
     "mesh_seeds",
     "mesh_forward_raytrace",
     "mesh_critical_curves_and_caustics",
+    "mesh_total_magnification",
+    "build_magnification_mesh",
+    "magnified_regions",
+    "magnified_area",
+    "in_magnified_region",
     "AdaptiveMesh",
     "MeshIndex",
     "CriticalBand",
     "CentreHoles",
     "CriticalCurvesAndCaustics",
+    "MagnificationMesh",
+    "MagnifiedRegions",
     "LEAF_CONVERGED",
     "LEAF_CONVERGENCE_FAILED",
     "LEAF_APPROX_PARITY_UNRESOLVED",

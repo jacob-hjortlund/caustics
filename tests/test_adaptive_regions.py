@@ -226,3 +226,24 @@ def test_the_fold_strip_area_is_open_and_about_its_width(fold_mag):
     # The strip is 1/16 tall and 1 wide; the area ratio's few-per-cent error
     # moves its level line by about 0.01.
     assert abs(float(to_np(area)) - 0.0625) < 0.025
+
+
+MAGNIFICATION_API = (
+    "mesh_total_magnification",
+    "build_magnification_mesh",
+    "MagnificationMesh",
+    "magnified_regions",
+    "MagnifiedRegions",
+    "magnified_area",
+    "in_magnified_region",
+)
+
+
+def test_the_magnification_api_is_exported_at_every_package_level():
+    import caustics
+
+    adaptive = caustics.lenses.func.adaptive
+    for package in (caustics, caustics.lenses, caustics.lenses.func, adaptive):
+        for name in MAGNIFICATION_API:
+            assert name in package.__all__, (package.__name__, name)
+            assert getattr(package, name) is getattr(adaptive, name)
