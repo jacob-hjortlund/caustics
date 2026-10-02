@@ -1,26 +1,28 @@
 """
 Total magnification at source-plane points, read off an adaptive mesh.
 
-:func:`mesh_total_magnification` sums, over the converged leaves whose
-source-plane image contains a point, each leaf's magnification -- the ratio
-of its lens- and source-plane areas -- counting a point on a shared edge
-once (:func:`counts_once`), and reads the images of the critical band as
-infinitely magnified. :func:`sheet_edges` returns the source-plane images
-of the lens edges across which the image count changes. Nothing here calls
-the lens.
+:func:`mesh_total_magnification` sums the magnification of each image -- one
+per converged leaf whose source-plane image contains the point, a point on a
+shared edge counted once (:func:`counts_once`) -- and reads the images of the
+critical band as infinitely magnified. Each image's magnification is
+``1 / |det A|``, with ``det A`` interpolated from the leaf's vertices at the
+point's barycentric position (:func:`hit_magnification`).
+:func:`sheet_edges` returns the source-plane images of the lens edges across
+which the image count changes. Nothing here calls the lens.
 """
 
 import math
 from typing import Callable, NamedTuple, Tuple
 
 from ....backend_obj import ArrayLike, backend
-from .geometry import _CHILD_VERTEX_INDEX_TABLE, shape_matrix
+from .geometry import _CHILD_VERTEX_INDEX_TABLE, sanitize_bary, shape_matrix
 from .criterion import LEAF_CONVERGED
 from .mesh import MeshIndex, build_index
 from .query import _as_beta, index_hits
 
 __all__ = (
     "leaf_magnification",
+    "hit_magnification",
     "counts_once",
     "BandCover",
     "band_cover",
@@ -35,7 +37,10 @@ __all__ = (
 
 def leaf_magnification(mesh, leaves) -> ArrayLike:
     """
-    Magnification of each leaf: its lens-plane area over its source-plane area.
+    Area ratio of each leaf: its lens-plane area over its source-plane area.
+
+    The fallback of :func:`hit_magnification`, for a leaf whose vertex
+    ``det A`` cannot be interpolated safely.
 
     The density of lens-plane area per unit source-plane area under the
     leaf's affine map, ``1 / |det|`` of that map. Leaves are positively
@@ -57,6 +62,55 @@ def leaf_magnification(mesh, leaves) -> ArrayLike:
     P = shape_matrix(backend.to(mesh.vertices_lens[mesh.leaves[leaves]], dtype=f64))
     area2_lens = P[:, 0, 0] * P[:, 1, 1] - P[:, 0, 1] * P[:, 1, 0]
     return area2_lens / backend.abs(backend.to(mesh.leaf_area2[leaves], dtype=f64))
+
+
+def hit_magnification(mesh, leaves, bary) -> ArrayLike:
+    """
+    Magnification of the image in each hit leaf: ``1 / |det A|`` interpolated at ``bary``.
+
+    ``det A`` is interpolated from ``vertices_det`` at the leaf's three
+    vertices, weighted by the point's barycentric coordinates. An affine map
+    preserves barycentric coordinates, so this is ``det A`` at the lens-plane
+    point :func:`~caustics.lenses.func.adaptive.query.mesh_seeds` returns --
+    the image where the leaf's affine map places it. Neighbouring leaves
+    share their edges' vertices, so within a sheet the value is continuous
+    from leaf to leaf.
+
+    Where the three values are finite and of one strict sign, the
+    interpolant is a convex combination of them, nonzero everywhere in the
+    leaf. Otherwise -- a critical curve might cross the leaf, or the lens
+    Jacobian was not finite at a vertex -- the leaf reads its area ratio,
+    :func:`leaf_magnification`. Only a leaf the balance forced can fail: one
+    the criterion converged had one strict sign of ``det A`` at its six
+    samples, which hold every vertex of its closure triangles.
+
+    Parameters
+    ----------
+    mesh: AdaptiveMesh
+    leaves: ArrayLike
+        ``(K,)`` int64 indices into ``mesh.leaves``, converged ones.
+    bary: ArrayLike
+        ``(K, 3)`` barycentric coordinates in the simplex, at any float dtype.
+
+    Returns
+    -------
+    ArrayLike
+        ``(K,)`` float64.
+    """
+    d3 = mesh.vertices_det[mesh.leaves[leaves]]
+    ok = backend.all(backend.isfinite(d3), dim=1) & (
+        backend.all(d3 > 0, dim=1) | backend.all(d3 < 0, dim=1)
+    )
+    det = backend.sum(backend.to(bary, dtype=backend.float64) * d3, dim=1)
+    # `where` before dividing, so that no fallback row divides by a zero or
+    # a NaN on its way to being replaced.
+    mu = 1.0 / backend.abs(backend.where(ok, det, backend.ones_like(det)))
+    fallback = backend.flatnonzero(~ok)
+    if fallback.shape[0]:
+        mu = backend.fill_at_indices(
+            mu, fallback, leaf_magnification(mesh, leaves[fallback])
+        )
+    return mu
 
 
 def counts_once(tri, w, area2) -> ArrayLike:
@@ -234,8 +288,9 @@ def total_magnification(mesh, cover, beta) -> Tuple[ArrayLike, ArrayLike]:
     once = backend.flatnonzero(
         counts_once(mesh.vertices_source[mesh.leaves[cand]], w, mesh.leaf_area2[cand])
     )
-    qidx, cand = qidx[once], cand[once]
-    mu, n = _per_point_sum(qidx, leaf_magnification(mesh, cand), b)
+    qidx, cand, w = qidx[once], cand[once], w[once]
+    bary = sanitize_bary(w, mesh.leaf_area2[cand])
+    mu, n = _per_point_sum(qidx, hit_magnification(mesh, cand, bary), b)
     band, _, _ = index_hits(cover.index, cover.vertices, cover.triangles, beta)
     in_band = backend.bincount(band, minlength=b) > 0
     return backend.where(in_band, backend.inf, mu), n
@@ -278,12 +333,20 @@ def mesh_total_magnification(
     """
     Total point-source magnification at source-plane points, and the image count.
 
-    ``mu`` sums ``mu_i``, the ratio of a leaf's lens- and source-plane areas
-    (:func:`leaf_magnification`), over the converged leaves whose
-    source-plane image contains the point, a point on a shared edge or
-    vertex counted once (:func:`counts_once`); ``n`` counts them. It is the
-    point-source total magnification of the mesh's piecewise-affine lens
-    map. A point outside every leaf image has ``mu = 0`` and ``n = 0``.
+    ``mu`` sums the magnification of each image, one per converged leaf
+    whose source-plane image contains the point, a point on a shared edge or
+    vertex counted once (:func:`counts_once`); ``n`` counts them. Each
+    image's magnification is ``1 / |det A|``, with ``det A`` interpolated
+    barycentrically from ``vertices_det`` at the point's position in the leaf
+    (:func:`hit_magnification`): the lens Jacobian's own determinant, at the
+    image the leaf's affine map locates. The images and their count are the
+    mesh's piecewise-affine lens map's; their magnifications are not its area
+    ratios. A point outside every leaf image has ``mu = 0`` and ``n = 0``.
+
+    Within an image sheet ``mu`` is continuous: neighbouring leaves share
+    their edges' vertices, so their interpolants agree along those edges.
+    It jumps only where the set of covering leaves changes: across sheet
+    edges (:func:`sheet_edges`) and the critical band.
 
     A point inside the source-plane image of a critical-band leaf's red-split
     children reads ``mu = +inf``, above every threshold: near a fold
@@ -297,13 +360,19 @@ def mesh_total_magnification(
     -- typically next to a singular centre -- contribute nothing; their lens
     area is at the ``min_img_sep`` scale. Holes remove no leaf.
 
-    Accuracy: the lens build bounds each leaf's position error, of order
-    ``h**2``, not the error of its slope, of order ``h``, so ``mu_i`` errs
-    like ``sqrt(min_img_sep)``. Measured on an analytic fold, the median
-    relative error is 8%, 4% and 2% at ``min_img_sep`` 0.02, 0.005 and
-    0.001 (95th percentile 18%, 10% and 4%); on an SIS and a cored
-    isothermal lens, 1-5% median at 0.01-0.002. Averaging over source cells
-    does not remove it: it is a bias at the leaf scale, not noise.
+    A converged leaf whose three vertex ``det A`` are not finite and of one
+    strict sign reads its area ratio instead (:func:`leaf_magnification`).
+    That is possible only on a leaf the balance forced, and was seen on none
+    of the lenses measured.
+
+    Accuracy: where the affine map puts the image, within the build's
+    tolerance, and the interpolation both err at order ``h**2``. Measured
+    median relative error, with the 95th percentile in brackets: on an SIS,
+    0.049% (0.20%), 0.026% (0.11%) and 0.011% (0.045%) at ``min_img_sep`` 0.01,
+    0.005 and 0.002; on an analytic fold, 0.34% (1.9%), 0.087% (0.54%) and
+    0.021% (0.11%) at 0.02, 0.005 and 0.001; on a cored isothermal lens,
+    0.049% (0.31%) and 0.012% (0.065%) at 0.01 and 0.002. Area ratios gave
+    1-5% median on the same lenses.
 
     Parameters
     ----------

@@ -13,6 +13,7 @@ from caustics.lenses.func.adaptive.magnification import (
     mesh_total_magnification,
     sheet_edges,
 )
+from caustics.lenses.func.adaptive.query import mesh_query, mesh_seeds
 
 
 def to_np(x):
@@ -61,6 +62,22 @@ def _sis_jacobian(x, y):
     return _stack_2x2(
         1.0 - 1.0 / r + k * x * x, k * x * y, k * x * y, 1.0 - 1.0 / r + k * y * y
     )
+
+
+def _collapse(x, y):
+    """A ``kappa == 1`` sheet: every point maps to the origin."""
+    return 0.0 * x, 0.0 * y
+
+
+def _collapse_jacobian(x, y):
+    zero = 0.0 * x
+    return _stack_2x2(zero, zero, zero, zero)
+
+
+def _half_but_nan_jacobian_near_the_origin(x, y):
+    """``_half``'s Jacobian, NaN within 0.3 of the origin, where ``_half`` is finite."""
+    bad = (x * x + y * y) < 0.09
+    return backend.where(bad[:, None, None], backend.nan, _half_jacobian(x, y))
 
 
 @pytest.fixture(scope="module")
@@ -145,10 +162,10 @@ def test_a_lens_that_is_not_finite_at_a_vertex_still_samples_finite_magnificatio
     beta = _arr([[0.3, 0.0], [0.0, -0.45], [0.2, 0.2]])
     mu, _ = mesh_total_magnification(mesh, beta)
     assert np.isfinite(to_np(mu)).all()
-    # mu_tot = 2 / |beta| inside the SIS's Einstein radius; the area ratio
-    # errs like sqrt(min_img_sep), so the tolerance is loose.
+    # mu_tot = 2 / |beta| inside the SIS's Einstein radius. Interpolated det A
+    # errs by 0.06-0.6% at these three points (measured 2026-10-02).
     expected = 2.0 / np.linalg.norm(to_np(beta), axis=1)
-    np.testing.assert_allclose(to_np(mu), expected, rtol=0.2)
+    np.testing.assert_allclose(to_np(mu), expected, rtol=0.02)
 
 
 def test_a_float32_mesh_samples_the_float64_mesh_magnifications():
@@ -217,3 +234,121 @@ def test_the_corner_diagonal_of_a_one_cell_mesh_is_not_a_fov_edge():
     assert diagonal.sum() == 1
     assert not fov[diagonal][0]
     assert fov[~diagonal].all() and (~diagonal).sum() == 2
+
+
+def test_each_image_reads_det_a_interpolated_at_its_affine_preimage(fold_mesh):
+    """``det A = 1 - 2y`` is linear, so interpolating it is exact: each image
+    contributes ``1 / |1 - 2 y|`` at the seed `mesh_seeds` gives it."""
+    rng = np.random.default_rng(5)
+    beta = _arr(rng.uniform([-1.5, -1.5], [1.5, 0.2], (300, 2)))
+    mu, _ = mesh_total_magnification(fold_mesh, beta)
+    idx, off, bary = mesh_query(fold_mesh, beta)
+    y = to_np(mesh_seeds(fold_mesh, idx, bary))[:, 1]
+    owner = np.repeat(np.arange(300), np.diff(to_np(off)))
+    want = np.bincount(owner, 1.0 / np.abs(1.0 - 2.0 * y), minlength=300)
+    mu = to_np(mu)
+    finite = np.isfinite(mu)
+    assert finite.sum() > 200 and (want[finite] > 0).sum() > 100
+    np.testing.assert_allclose(mu[finite], want[finite], rtol=1e-12)
+
+
+def test_at_a_vertex_image_an_image_reads_that_vertex_s_det_a_exactly(half_mesh):
+    """With ``det A`` linear over the lens plane, every point reads it exactly
+    to rounding, and a point at a vertex's image -- on several leaves, one of
+    which counts it -- reads that vertex's own value, bit for bit."""
+    lens = to_np(half_mesh.vertices_lens)
+    det = 0.25 + 0.05 * lens[:, 0] + 0.03 * lens[:, 1]
+    mesh = half_mesh._replace(vertices_det=_arr(det))
+    inner = np.flatnonzero(np.abs(lens).max(axis=1) < 2.0)
+    mu, n = mesh_total_magnification(
+        mesh, _arr(to_np(half_mesh.vertices_source)[inner])
+    )
+    assert to_np(n).tolist() == [1] * inner.size
+    assert np.array_equal(to_np(mu), 1.0 / det[inner])
+    rng = np.random.default_rng(4)
+    beta = rng.uniform(-0.9, 0.9, (400, 2))
+    mu, _ = mesh_total_magnification(mesh, _arr(beta))
+    theta = 2.0 * beta
+    np.testing.assert_allclose(
+        to_np(mu), 1.0 / (0.25 + 0.05 * theta[:, 0] + 0.03 * theta[:, 1]), rtol=1e-12
+    )
+
+
+def test_a_leaf_whose_vertex_det_a_is_not_of_one_strict_sign_reads_its_area_ratio(
+    half_mesh,
+):
+    """``det A = 0.5`` everywhere interpolates to ``mu = 2``, where the leaves'
+    area ratio is 4. One vertex set to ``-0.5``, NaN or 0 sends every leaf
+    around it to its area ratio, and no other."""
+    rng = np.random.default_rng(9)
+    beta = _arr(rng.uniform(-0.9, 0.9, (400, 2)))
+    idx, off, _ = mesh_query(half_mesh, beta)
+    assert (np.diff(to_np(off)) == 1).all()
+    leaves = to_np(half_mesh.leaves)[to_np(idx)]
+    v = int(leaves[0, 0])
+    touches = (leaves == v).any(axis=1)
+    assert touches.any() and not touches.all()
+    for bad in (-0.5, np.nan, 0.0):
+        det = np.full(half_mesh.vertices_det.shape[0], 0.5)
+        det[v] = bad
+        mu, n = mesh_total_magnification(
+            half_mesh._replace(vertices_det=_arr(det)), beta
+        )
+        assert to_np(n).tolist() == [1] * 400
+        np.testing.assert_allclose(to_np(mu), np.where(touches, 4.0, 2.0), rtol=1e-12)
+
+
+def test_magnification_is_continuous_across_a_shared_edge_within_a_sheet(fold_mesh):
+    """Two converged leaves of one parity share an edge's two vertices, so
+    their interpolants agree along it: just either side of its midpoint, mu
+    differs by its gradient times the step, where area ratios jumped."""
+    leaves = to_np(fold_mesh.leaves)
+    side = np.sign(to_np(fold_mesh.leaf_area2))
+    owners = {}
+    for t in np.flatnonzero(to_np(fold_mesh.leaf_status) == 0):
+        for e in range(3):
+            edge = tuple(sorted((leaves[t, e], leaves[t, (e + 1) % 3])))
+            owners.setdefault(edge, []).append(t)
+    shared = [
+        e for e, ts in owners.items() if len(ts) == 2 and side[ts[0]] == side[ts[1]]
+    ]
+    assert len(shared) > 50
+    pick = np.random.default_rng(2).choice(len(shared), 50, replace=False)
+    a = np.array([shared[k][0] for k in pick])
+    b = np.array([shared[k][1] for k in pick])
+    src = to_np(fold_mesh.vertices_source)
+    mid, d = 0.5 * (src[a] + src[b]), src[b] - src[a]
+    normal = np.stack([-d[:, 1], d[:, 0]], axis=1) / np.linalg.norm(d, axis=1)[:, None]
+    left = [
+        to_np(x) for x in mesh_total_magnification(fold_mesh, _arr(mid + 1e-9 * normal))
+    ]
+    right = [
+        to_np(x) for x in mesh_total_magnification(fold_mesh, _arr(mid - 1e-9 * normal))
+    ]
+    same = (left[1] == right[1]) & np.isfinite(left[0]) & np.isfinite(right[0])
+    assert same.sum() >= 40
+    np.testing.assert_allclose(left[0][same], right[0][same], rtol=1e-6, atol=0)
+
+
+def test_a_jacobian_not_finite_where_the_raytrace_is_leaves_magnifications_finite():
+    """``vertices_det`` holds the NaN the lens returned, and no converged
+    leaf's image reads it: every point reads 4 or, where its image's leaf
+    failed, 0."""
+    mesh = build_adaptive_mesh(
+        _half, _half_but_nan_jacobian_near_the_origin, 4.0, 4, 0.25
+    )
+    r2 = (to_np(mesh.vertices_lens) ** 2).sum(axis=1)
+    assert np.isnan(to_np(mesh.vertices_det)[r2 < 0.09]).any()
+    beta = np.random.default_rng(6).uniform(-0.9, 0.9, (400, 2))
+    mu, n = (to_np(x) for x in mesh_total_magnification(mesh, _arr(beta)))
+    assert np.isfinite(mu).all()
+    assert (mu[n == 0] == 0).all() and (n == 0).any()
+    np.testing.assert_allclose(mu[n == 1], 4.0, rtol=1e-12)
+
+
+def test_a_mesh_with_no_converged_leaf_has_no_magnification_anywhere():
+    mesh = build_adaptive_mesh(_collapse, _collapse_jacobian, 4.0, 4, 0.5)
+    assert (to_np(mesh.leaf_status) != 0).all()
+    assert (to_np(mesh.vertices_det) == 0).all()
+    mu, n = mesh_total_magnification(mesh, _arr([[0.0, 0.0], [0.3, -0.2]]))
+    assert to_np(mu).tolist() == [0.0, 0.0] and to_np(n).tolist() == [0, 0]
