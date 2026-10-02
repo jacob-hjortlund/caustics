@@ -9,7 +9,7 @@ converge.
 """
 
 from ....backend_obj import backend
-from .geometry import CHILD_VERTEX_INDICES, sigma_min_2x2
+from .geometry import CHILD_VERTEX_INDICES, jacobian_signs, sigma_min_2x2
 
 __all__ = (
     "LEAF_CONVERGED",
@@ -24,6 +24,7 @@ __all__ = (
     "parity_from_children",
     "jacobian_parity_ok",
     "parity_from_jacobians",
+    "parity_from_signs",
     "evaluate_criterion",
 )
 
@@ -292,19 +293,10 @@ def parity_from_jacobians(J, *, return_details=False):
     True where ``sign(det A)`` is one strict sign at all six samples of a triangle.
 
     The arithmetic half of :func:`jacobian_parity_ok`, on Jacobians already
-    evaluated, so a caller holding them makes no second call. The
-    ``max_level`` pass of :func:`refine` is that caller: it evaluates each
-    lattice point once, however many triangles share it, and keeps the
-    values for the critical band.
-
-    The sign is read off a row-scaled copy of ``A``. Dividing a row by a
-    positive number scales ``det A`` by a positive factor, so the sign is
-    unchanged, while the scaled entries are at most one in magnitude -- so a
-    Jacobian with huge entries cannot overflow the determinant to ``inf``,
-    and one with tiny entries cannot underflow it to an exact zero that would
-    read as singular. A non-finite ``A`` is swapped for the identity before
-    any arithmetic, so it never reaches the determinant; the finiteness mask
-    carries its failure instead.
+    evaluated: :func:`parity_from_signs` of their
+    :func:`~caustics.lenses.func.adaptive.geometry.jacobian_signs`, which
+    reads the sign off a row-scaled ``A`` so that neither overflow nor
+    underflow can fake one.
 
     Parameters
     ----------
@@ -331,32 +323,43 @@ def parity_from_jacobians(J, *, return_details=False):
         raise ValueError("J must have shape (N, 6, 2, 2)")
 
     n = J.shape[0]
-    if n == 0:
-        empty = backend.zeros((0,), dtype=backend.bool, device=backend.device(J))
+    signs = jacobian_signs(J.reshape(-1, 2, 2)).reshape(n, 6)
+    return parity_from_signs(signs, return_details=return_details)
+
+
+def parity_from_signs(signs, *, return_details=False):
+    """
+    True where the criterion's sign of ``det A`` is one strict sign at all six samples.
+
+    ``signs`` are :func:`~caustics.lenses.func.adaptive.geometry.jacobian_signs`
+    at each triangle's ``theta_1, theta_2, theta_3, m_1, m_2, m_3``. A 0 is a
+    sample whose sign says nothing -- non-finite or exactly singular -- and
+    fails its triangle, as ``LEAF_JACOBIAN_NONFINITE``. Keeping the signs
+    rather than the Jacobians is what lets the build evaluate each lattice
+    point once and judge every triangle sharing it from the stored sign
+    (:func:`~caustics.lenses.func.adaptive.sampling.sample_jacobians`).
+
+    Parameters
+    ----------
+    signs: ArrayLike
+        Shape ``(N, 6)`` int64.
+    return_details: bool
+        Also return the non-finite mask.
+
+    Returns
+    -------
+    parity_ok: ArrayLike
+        ``(N,)`` bool, True where all six signs are equal and nonzero.
+    jacobian_nonfinite: ArrayLike
+        ``(N,)`` bool, returned only with ``return_details``. True where some
+        sign is 0. Always a subset of ``~parity_ok``.
+    """
+    if signs.shape[0] == 0:
+        empty = backend.zeros((0,), dtype=backend.bool, device=backend.device(signs))
         return (empty, empty) if return_details else empty
-
-    J = J.reshape(-1, 2, 2)
-    finite_J = backend.all(backend.isfinite(J), dim=(-2, -1))
-
-    # Keep nonfinite matrices out of subsequent arithmetic.
-    # Their failure flags are retained through finite_J.
-    identity = backend.to(backend.eye(2), dtype=J.dtype, device=backend.device(J))
-    safe_J = backend.where(finite_J[:, None, None], J, identity)
-
-    # Positive row scaling preserves determinant sign while avoiding
-    # overflow/underflow caused by the overall matrix scale.
-    row_scale = backend.max(backend.abs(safe_J), dim=-1)
-    scaled = safe_J / backend.where(row_scale > 0, row_scale, 1.0)[..., None]
-
-    det = scaled[:, 0, 0] * scaled[:, 1, 1] - scaled[:, 0, 1] * scaled[:, 1, 0]
-
-    usable = finite_J & backend.isfinite(det) & (det != 0)
-    jacobian_nonfinite = ~backend.all(usable.reshape(n, 6), dim=1)
-
-    det = det.reshape(n, 6)
-    same_sign = backend.all(det > 0, dim=1) | backend.all(det < 0, dim=1)
+    jacobian_nonfinite = backend.any(signs == 0, dim=1)
+    same_sign = backend.all(signs > 0, dim=1) | backend.all(signs < 0, dim=1)
     parity_ok = ~jacobian_nonfinite & same_sign
-
     if return_details:
         return parity_ok, jacobian_nonfinite
     return parity_ok

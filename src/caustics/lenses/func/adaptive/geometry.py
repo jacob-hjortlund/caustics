@@ -2,7 +2,8 @@
 Triangle and affine maths shared by the mesh build and its queries.
 
 The red-refinement child ordering and its integer group tables, the smallest
-singular value that scales the refinement criterion, the minimum angle closure
+singular value that scales the refinement criterion, the determinant of the
+lens Jacobian and the criterion's sign of it, the minimum angle closure
 compares, and the containment test and barycentric coordinates the
 source-plane query reads. Nothing here calls the lens or knows about a mesh.
 """
@@ -21,6 +22,8 @@ __all__ = (
     "triangle_weights",
     "contains",
     "sanitize_bary",
+    "jacobian_det",
+    "jacobian_signs",
     "min_angle",
 )
 
@@ -352,6 +355,65 @@ def sanitize_bary(w, d) -> ArrayLike:
     normed = bary / backend.unsqueeze(safe, -1)
     third = backend.ones_like(bary) / 3
     return backend.where(backend.unsqueeze(ok, -1), normed, third)
+
+
+def jacobian_det(J) -> ArrayLike:
+    """
+    ``det A`` of a batch of lens Jacobians, as float64.
+
+    Formed in ``J``'s own dtype and then cast, the formula the critical band
+    has always stored, so that every ``det A`` the build keeps -- a band
+    sample's, a vertex's -- is one value per lattice point, whichever array
+    holds it.
+
+    Parameters
+    ----------
+    J: ArrayLike
+        Shape ``(K, 2, 2)``.
+
+    Returns
+    -------
+    ArrayLike
+        Shape ``(K,)`` float64.
+    """
+    return backend.to(
+        J[:, 0, 0] * J[:, 1, 1] - J[:, 0, 1] * J[:, 1, 0], dtype=backend.float64
+    )
+
+
+def jacobian_signs(J) -> ArrayLike:
+    """
+    The refinement criterion's sign of ``det A`` at each point: +1, -1 or 0.
+
+    0 where ``A`` is non-finite or exactly singular: a sign that says nothing.
+    The sign is read off a row-scaled copy of ``A``. Dividing a row by a
+    positive number scales ``det A`` by a positive factor, so the sign is
+    unchanged, while the scaled entries are at most one in magnitude -- so a
+    Jacobian with huge entries cannot overflow the determinant to ``inf``, and
+    one with tiny entries cannot underflow it to an exact zero that would read
+    as singular. A non-finite ``A`` is swapped for the identity before any
+    arithmetic. Within a few ulps of zero this sign can differ from that of
+    :func:`jacobian_det`, which is not scaled; see
+    :class:`~caustics.lenses.func.adaptive.band.CriticalBand`.
+
+    Parameters
+    ----------
+    J: ArrayLike
+        Shape ``(K, 2, 2)``.
+
+    Returns
+    -------
+    ArrayLike
+        Shape ``(K,)`` int64.
+    """
+    finite = backend.all(backend.isfinite(J), dim=(-2, -1))
+    identity = backend.to(backend.eye(2), dtype=J.dtype, device=backend.device(J))
+    safe = backend.where(finite[:, None, None], J, identity)
+    row_scale = backend.max(backend.abs(safe), dim=-1)
+    scaled = safe / backend.where(row_scale > 0, row_scale, 1.0)[..., None]
+    det = scaled[:, 0, 0] * scaled[:, 1, 1] - scaled[:, 0, 1] * scaled[:, 1, 0]
+    usable = finite & backend.isfinite(det) & (det != 0)
+    return backend.long(usable) * (2 * backend.long(det > 0) - 1)
 
 
 def min_angle(tri) -> ArrayLike:

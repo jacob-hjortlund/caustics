@@ -28,8 +28,14 @@ from caustics.lenses.func.adaptive.criterion import (
     jacobian_parity_ok,
     parity_from_children,
     parity_from_jacobians,
+    parity_from_signs,
 )
-from caustics.lenses.func.adaptive.geometry import CHILD_VERTEX_INDICES, ROOT_SHAPES
+from caustics.lenses.func.adaptive.geometry import (
+    CHILD_VERTEX_INDICES,
+    ROOT_SHAPES,
+    jacobian_det,
+    jacobian_signs,
+)
 from caustics.lenses.func.adaptive.lattice import (
     initial_triangles,
     lattice_xy,
@@ -1187,3 +1193,95 @@ def test_sample_jacobians_rejects_a_jacobian_that_returns_no_array():
     lat, six_ij = _two_triangles_sharing_an_edge()
     with pytest.raises(ValueError, match=r"\(K, 2, 2\) for K points, got tuple"):
         sample_jacobians(lat, six_ij, _tuple_jacobian)
+
+
+def _awkward_jacobians():
+    """132 Jacobians, 22 triangles' worth.
+
+    60 random ones; every special case the sign rule must handle, at rows
+    60-67; and 64 near-singular ones, whose raw and row-scaled determinants
+    can round to opposite signs.
+    """
+    rng = np.random.default_rng(31)
+    special = np.array(
+        [
+            [[np.nan, 0.0], [0.0, 1.0]],
+            [[np.inf, 0.0], [0.0, 1.0]],
+            [[-np.inf, 1.0], [1.0, 1.0]],
+            [[1.0, 2.0], [2.0, 4.0]],
+            [[0.0, 0.0], [0.0, 0.0]],
+            [[1e200, 0.0], [0.0, 1e200]],
+            [[1e-200, 0.0], [0.0, 1e-200]],
+            [[1e200, 1.0], [1.0, -1e200]],
+        ]
+    )
+    row = rng.normal(size=(64, 2))
+    near = np.stack([row, row * (1.0 + 1e-15 * rng.normal(size=(64, 1)))], axis=1)
+    return np.concatenate([rng.normal(size=(60, 2, 2)), special, near])
+
+
+def _reference_signs(J):
+    """The sign rule as `parity_from_jacobians` wrote it before the split, in
+    numpy, with the row-scaled determinant it reads the sign off."""
+    finite = np.isfinite(J).all(axis=(1, 2))
+    safe = np.where(finite[:, None, None], J, np.eye(2))
+    scale = np.abs(safe).max(axis=2)
+    scaled = safe / np.where(scale > 0, scale, 1.0)[..., None]
+    det = scaled[:, 0, 0] * scaled[:, 1, 1] - scaled[:, 0, 1] * scaled[:, 1, 0]
+    usable = finite & np.isfinite(det) & (det != 0)
+    return np.where(usable, np.sign(det), 0).astype(np.int64), det
+
+
+def test_jacobian_signs_are_the_criterion_s_row_scaled_signs():
+    J = _awkward_jacobians()
+    got = backend.to_numpy(jacobian_signs(_arr(J)))
+    want, det = _reference_signs(J)
+    assert got.dtype == np.int64 and set(got.tolist()) <= {-1, 0, 1}
+    # Non-finite and singular say nothing; the row scaling survives what
+    # overflows or underflows the raw determinant.
+    assert got[60:68].tolist() == [0, 0, 0, 0, 0, 1, 1, -1]
+    # The near-singular rows' determinant is rounding noise, which jax's CPU
+    # arithmetic need not round as numpy does, so the reference binds where
+    # it is clear of zero.
+    clear = np.abs(det) > 1e-12
+    assert clear[:60].all()
+    assert np.array_equal(got[clear], want[clear])
+
+
+def test_parity_from_signs_reads_the_verdict_parity_from_jacobians_gives():
+    J = _awkward_jacobians()
+    signs = jacobian_signs(_arr(J)).reshape(-1, 6)
+    got = [backend.to_numpy(x) for x in parity_from_signs(signs, return_details=True)]
+    want = [
+        backend.to_numpy(x)
+        for x in parity_from_jacobians(
+            _arr(J.reshape(-1, 6, 2, 2)), return_details=True
+        )
+    ]
+    s = backend.to_numpy(signs)
+    nonfinite = (s == 0).any(axis=1)
+    ok = ~nonfinite & ((s > 0).all(axis=1) | (s < 0).all(axis=1))
+    assert nonfinite.any() and (~ok & ~nonfinite).any()
+    assert got[0].tolist() == want[0].tolist() == ok.tolist()
+    assert got[1].tolist() == want[1].tolist() == nonfinite.tolist()
+
+
+def test_parity_from_signs_of_no_triangles_is_empty():
+    ok, nonfinite = parity_from_signs(
+        backend.zeros((0, 6), dtype=backend.int64), return_details=True
+    )
+    assert tuple(ok.shape) == (0,) and tuple(nonfinite.shape) == (0,)
+
+
+def test_jacobian_det_is_the_raw_determinant_in_the_jacobian_s_dtype_cast_to_float64():
+    J = RNG.normal(size=(16, 2, 2))
+    got = jacobian_det(_arr(J))
+    assert got.dtype == backend.float64
+    assert np.array_equal(
+        backend.to_numpy(got), J[:, 0, 0] * J[:, 1, 1] - J[:, 0, 1] * J[:, 1, 0]
+    )
+    J32 = J.astype(np.float32)
+    got32 = jacobian_det(backend.as_array(J32, dtype=backend.float32))
+    assert got32.dtype == backend.float64
+    want32 = J32[:, 0, 0] * J32[:, 1, 1] - J32[:, 0, 1] * J32[:, 1, 0]
+    assert np.array_equal(backend.to_numpy(got32), want32.astype(np.float64))
