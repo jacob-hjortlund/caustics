@@ -24,7 +24,10 @@ from caustics.lenses.func.adaptive import (
     triangle_weights,
 )
 from caustics.lenses.func.adaptive.criterion import (
+    apply_jacobian_signs,
+    approximate_criterion,
     child_shape_matrices,
+    jacobian_rows,
     jacobian_parity_ok,
     parity_from_children,
     parity_from_jacobians,
@@ -57,6 +60,10 @@ def oracle_module():
 
 def _arr(x):
     return backend.as_array(np.asarray(x, dtype=np.float64), dtype=backend.float64)
+
+
+def _i64(x):
+    return backend.as_array(np.asarray(x, dtype=np.int64), dtype=backend.int64)
 
 
 def _samples(n=64):
@@ -1285,3 +1292,63 @@ def test_jacobian_det_is_the_raw_determinant_in_the_jacobian_s_dtype_cast_to_flo
     assert got32.dtype == backend.float64
     want32 = J32[:, 0, 0] * J32[:, 1, 1] - J32[:, 0, 1] * J32[:, 1, 0]
     assert np.array_equal(backend.to_numpy(got32), want32.astype(np.float64))
+
+
+def test_jacobian_rows_are_the_would_be_converged_rows_or_every_finite_row_when_forced():
+    status = _i64(
+        [
+            LEAF_CONVERGED,
+            LEAF_CONVERGENCE_FAILED,
+            LEAF_RAYTRACE_NONFINITE,
+            LEAF_APPROX_PARITY_UNRESOLVED | LEAF_CONVERGENCE_FAILED,
+            LEAF_CONVERGED,
+        ]
+    )
+    assert backend.to_numpy(jacobian_rows(status)).tolist() == [0, 4]
+    assert backend.to_numpy(jacobian_rows(status, True)).tolist() == [0, 1, 3, 4]
+
+
+def test_apply_jacobian_signs_adds_the_jacobian_flags_on_its_rows_alone():
+    """Row 0 passes; row 1 changes sign; row 2 has already failed and gains the
+    non-finite flag without being rescued; row 3 is not tested and keeps its
+    status."""
+    status = _i64(
+        [LEAF_CONVERGED, LEAF_CONVERGED, LEAF_CONVERGENCE_FAILED, LEAF_CONVERGED]
+    )
+    child_ok = backend.as_array(np.array([True, True, False, True]))
+    signs = _i64([[1] * 6, [1, 1, -1, 1, 1, 1], [1, 1, 1, 1, 1, 0]])
+    keep, parity_ok, got = apply_jacobian_signs(
+        status, child_ok, _i64([0, 1, 2]), signs
+    )
+    assert backend.to_numpy(got).tolist() == [
+        LEAF_CONVERGED,
+        LEAF_JACOBIAN_PARITY_UNRESOLVED,
+        LEAF_CONVERGENCE_FAILED | LEAF_JACOBIAN_NONFINITE,
+        LEAF_CONVERGED,
+    ]
+    assert backend.to_numpy(keep).tolist() == [True, False, False, True]
+    assert backend.to_numpy(parity_ok).tolist() == [True, False, False, True]
+    # Its inputs are untouched, under torch too.
+    assert backend.to_numpy(status).tolist() == [0, 0, LEAF_CONVERGENCE_FAILED, 0]
+    assert backend.to_numpy(child_ok).tolist() == [True, True, False, True]
+
+
+@pytest.mark.parametrize("force", [False, True])
+def test_the_criterion_is_its_three_parts_in_turn(force):
+    M, G, COMPOSE, PINV0, ROOT_CLASS = child_matrix_tables()
+    beta_v, beta_m = _samples(48)
+    theta_v, theta_m = _six_points(RNG.normal(size=(48, 3, 2)))
+    classes = backend.as_array(RNG.integers(0, 6, 48), dtype=backend.int64)
+    beta = (_arr(beta_v), _arr(beta_m), classes, 1, 0.5, 0.05, PINV0, COMPOSE)
+    want = evaluate_criterion(
+        _fold_jacobian, _arr(theta_v), _arr(theta_m), *beta, force_jacobian=force
+    )
+    status, child_ok, s = approximate_criterion(*beta)
+    rows = jacobian_rows(status, force)
+    assert rows.shape[0] > 0
+    six = np.concatenate((theta_v, theta_m), axis=1)[backend.to_numpy(rows)]
+    xy = _arr(six.reshape(-1, 2))
+    signs = jacobian_signs(_fold_jacobian(xy[:, 0], xy[:, 1])).reshape(-1, 6)
+    keep, parity_ok, status = apply_jacobian_signs(status, child_ok, rows, signs)
+    for got, w in zip((keep, parity_ok, s, status), want):
+        assert backend.to_numpy(got).tolist() == backend.to_numpy(w).tolist()

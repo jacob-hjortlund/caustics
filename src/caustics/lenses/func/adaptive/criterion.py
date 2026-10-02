@@ -25,6 +25,9 @@ __all__ = (
     "jacobian_parity_ok",
     "parity_from_jacobians",
     "parity_from_signs",
+    "approximate_criterion",
+    "jacobian_rows",
+    "apply_jacobian_signs",
     "evaluate_criterion",
 )
 
@@ -210,6 +213,33 @@ def parity_from_children(Q):
     return backend.all(sign_q == sign_q[:, :1], dim=1)
 
 
+def _jacobian_signs_at(jacobian_fn, theta_v, theta_m):
+    """
+    :func:`~caustics.lenses.func.adaptive.geometry.jacobian_signs` at each
+    triangle's six samples, shape ``(N, 6)``: one ``jacobian_fn`` call on all
+    ``6 * N`` points, triangle-major, and none when ``N == 0``.
+    """
+    if theta_v.shape != theta_m.shape or theta_v.shape[1:] != (3, 2):
+        raise ValueError("theta_v and theta_m must both have shape (N, 3, 2)")
+    n = theta_v.shape[0]
+    if n == 0:
+        return backend.zeros(
+            (0, 6), dtype=backend.int64, device=backend.device(theta_v)
+        )
+    theta = backend.concatenate((theta_v, theta_m), dim=1).reshape(-1, 2)
+    J = jacobian_fn(theta[:, 0], theta[:, 1])
+    # `getattr`, not `J.shape`: a raytrace passed as the Jacobian returns a
+    # tuple, which should fail here, naming the Jacobian, not as an
+    # AttributeError.
+    shape = getattr(J, "shape", None)
+    if shape != (6 * n, 2, 2):
+        got = type(J).__name__ if shape is None else tuple(shape)
+        raise ValueError(
+            f"jacobian_fn must return an array of shape (6 * N, 2, 2), got {got}"
+        )
+    return jacobian_signs(J).reshape(n, 6)
+
+
 def jacobian_parity_ok(jacobian_fn, theta_v, theta_m, *, return_details=False):
     """
     True where ``sign(det A)`` is one strict sign at all six sample points.
@@ -226,7 +256,8 @@ def jacobian_parity_ok(jacobian_fn, theta_v, theta_m, *, return_details=False):
     ``jacobian_fn`` is called once, on all ``6 * N`` points, flattened
     triangle-major in the order ``theta_1, theta_2, theta_3, m_1, m_2, m_3`` --
     and not at all when ``N == 0``. The verdict itself is
-    :func:`parity_from_jacobians` on the result.
+    :func:`parity_from_signs` of the points'
+    :func:`~caustics.lenses.func.adaptive.geometry.jacobian_signs`.
 
     Parameters
     ----------
@@ -264,28 +295,8 @@ def jacobian_parity_ok(jacobian_fn, theta_v, theta_m, *, return_details=False):
         If ``theta_v`` and ``theta_m`` are not both ``(N, 3, 2)``, or if
         ``jacobian_fn`` does not return ``(6 * N, 2, 2)``.
     """
-    if theta_v.shape != theta_m.shape or theta_v.shape[1:] != (3, 2):
-        raise ValueError("theta_v and theta_m must both have shape (N, 3, 2)")
-
-    n = theta_v.shape[0]
-    if n == 0:
-        empty = backend.zeros((0,), dtype=backend.bool, device=backend.device(theta_v))
-        return (empty, empty) if return_details else empty
-
-    theta = backend.concatenate((theta_v, theta_m), dim=1).reshape(-1, 2)
-
-    J = jacobian_fn(theta[:, 0], theta[:, 1])
-    # `getattr`, not `J.shape`: a raytrace passed as the Jacobian returns a
-    # tuple, which should fail here, naming the Jacobian, not as an
-    # AttributeError.
-    shape = getattr(J, "shape", None)
-    if shape != (6 * n, 2, 2):
-        got = type(J).__name__ if shape is None else tuple(shape)
-        raise ValueError(
-            f"jacobian_fn must return an array of shape (6 * N, 2, 2), got {got}"
-        )
-
-    return parity_from_jacobians(J.reshape(n, 6, 2, 2), return_details=return_details)
+    signs = _jacobian_signs_at(jacobian_fn, theta_v, theta_m)
+    return parity_from_signs(signs, return_details=return_details)
 
 
 def parity_from_jacobians(J, *, return_details=False):
@@ -365,6 +376,128 @@ def parity_from_signs(signs, *, return_details=False):
     return parity_ok
 
 
+def approximate_criterion(
+    beta_v, beta_m, classes, level, h0, min_img_sep, pinv0, compose
+):
+    """
+    Every test of :func:`evaluate_criterion` but the Jacobian's.
+
+    Child parity (:func:`parity_from_children`), the deviation test
+    (:func:`converged_from_deviation`) and finiteness, from the six mapped
+    samples alone. Split out so that a caller holding a cache of Jacobian
+    values -- :func:`~caustics.lenses.func.adaptive.refinement.refine` -- can
+    pick the rows the Jacobian test needs (:func:`jacobian_rows`), find their
+    signs, and finish with :func:`apply_jacobian_signs`.
+
+    Parameters
+    ----------
+    beta_v, beta_m, classes, level, h0, min_img_sep, pinv0, compose:
+        As for :func:`evaluate_criterion`.
+
+    Returns
+    -------
+    status: ArrayLike
+        ``(n,)`` int64 bitmask of ``LEAF_APPROX_PARITY_UNRESOLVED``,
+        ``LEAF_CONVERGENCE_FAILED`` and ``LEAF_RAYTRACE_NONFINITE``.
+    child_ok: ArrayLike
+        ``(n,)`` bool, child parity.
+    s: ArrayLike
+        ``(n,)`` float64, as :func:`evaluate_criterion` returns it.
+    """
+    Q = child_shape_matrices(beta_v, beta_m)
+    child_ok = parity_from_children(Q)
+
+    A = Q @ pinv0[compose[classes]]
+    s = backend.min(sigma_min_2x2(A), dim=1) * (2.0 ** (level + 1)) / h0
+
+    r = midpoint_deviation(beta_v, beta_m)
+    deviation_ok = converged_from_deviation(r, s, min_img_sep)
+
+    finite_samples = backend.all(backend.isfinite(beta_v), dim=(1, 2)) & backend.all(
+        backend.isfinite(beta_m), dim=(1, 2)
+    )
+
+    status = (
+        (backend.long(~child_ok) * LEAF_APPROX_PARITY_UNRESOLVED)
+        | (backend.long(finite_samples & ~deviation_ok) * LEAF_CONVERGENCE_FAILED)
+        | (backend.long(~finite_samples) * LEAF_RAYTRACE_NONFINITE)
+    )
+    return status, child_ok, s
+
+
+def jacobian_rows(status, force_jacobian=False):
+    """
+    Rows the Jacobian parity test runs on, given :func:`approximate_criterion`'s ``status``.
+
+    Lazily, only the rows that would otherwise converge, ``status ==
+    LEAF_CONVERGED``, which keeps the Jacobian off the split path. Forced,
+    every row whose samples are finite -- every row without
+    ``LEAF_RAYTRACE_NONFINITE`` -- for ``max_level``, where ``status`` is the
+    leaf's final record. A row with a non-finite sample is never tested,
+    forced or not.
+
+    Parameters
+    ----------
+    status: ArrayLike
+        ``(n,)`` int64, from :func:`approximate_criterion`.
+    force_jacobian: bool
+
+    Returns
+    -------
+    ArrayLike
+        ``(k,)`` int64 indices into ``status``, ascending.
+    """
+    if force_jacobian:
+        return backend.flatnonzero((status & LEAF_RAYTRACE_NONFINITE) == 0)
+    return backend.flatnonzero(status == LEAF_CONVERGED)
+
+
+def apply_jacobian_signs(status, child_ok, rows, signs):
+    """
+    Join the Jacobian parity test's verdict on ``rows`` to the other tests'.
+
+    The test only adds flags: ``LEAF_JACOBIAN_PARITY_UNRESOLVED`` where the
+    six signs are nonzero but mixed, ``LEAF_JACOBIAN_NONFINITE`` where some
+    sign is 0 (:func:`parity_from_signs`). So it never rescues a row another
+    test failed. ``status`` and ``child_ok`` are copied, never written.
+
+    Parameters
+    ----------
+    status: ArrayLike
+        ``(n,)`` int64, from :func:`approximate_criterion`.
+    child_ok: ArrayLike
+        ``(n,)`` bool, from :func:`approximate_criterion`.
+    rows: ArrayLike
+        ``(k,)`` int64, from :func:`jacobian_rows`.
+    signs: ArrayLike
+        ``(k, 6)`` int64,
+        :func:`~caustics.lenses.func.adaptive.geometry.jacobian_signs` at the
+        six samples of each of ``rows``.
+
+    Returns
+    -------
+    keep: ArrayLike
+        ``(n,)`` bool, ``status == LEAF_CONVERGED``.
+    parity_ok: ArrayLike
+        ``(n,)`` bool: on ``rows``, child parity and the Jacobian's both; on
+        any other row, child parity alone.
+    status: ArrayLike
+        ``(n,)`` int64, with the Jacobian's flags OR-ed in on ``rows``.
+    """
+    jacobian_ok, jacobian_nonfinite = parity_from_signs(signs, return_details=True)
+    jacobian_status = (
+        backend.long(~jacobian_ok & ~jacobian_nonfinite)
+        * LEAF_JACOBIAN_PARITY_UNRESOLVED
+    ) | (backend.long(jacobian_nonfinite) * LEAF_JACOBIAN_NONFINITE)
+    status = backend.fill_at_indices(
+        backend.copy(status), rows, status[rows] | jacobian_status
+    )
+    parity_ok = backend.fill_at_indices(
+        backend.copy(child_ok), rows, child_ok[rows] & jacobian_ok
+    )
+    return status == LEAF_CONVERGED, parity_ok, status
+
+
 def evaluate_criterion(
     jacobian_fn,
     theta_v,
@@ -416,6 +549,10 @@ def evaluate_criterion(
 
     The Jacobian can only add flags. It never clears one the other tests set,
     so it cannot rescue a triangle into convergence.
+
+    It is :func:`approximate_criterion`, :func:`jacobian_rows` and
+    :func:`apply_jacobian_signs` in turn, with the signs read off
+    ``jacobian_fn`` or ``jacobian``.
 
     Parameters
     ----------
@@ -491,59 +628,13 @@ def evaluate_criterion(
         Jacobian was evaluated on.
     """
 
-    Q = child_shape_matrices(beta_v, beta_m)
-    child_ok = parity_from_children(Q)
-
-    A = Q @ pinv0[compose[classes]]
-    s = backend.min(sigma_min_2x2(A), dim=1) * (2.0 ** (level + 1)) / h0
-
-    r = midpoint_deviation(beta_v, beta_m)
-    deviation_ok = converged_from_deviation(r, s, min_img_sep)
-
-    finite_samples = backend.all(backend.isfinite(beta_v), dim=(1, 2)) & backend.all(
-        backend.isfinite(beta_m), dim=(1, 2)
+    status, child_ok, s = approximate_criterion(
+        beta_v, beta_m, classes, level, h0, min_img_sep, pinv0, compose
     )
-
-    # Initial status from mapping samples and the approximate tests.
-    status = (
-        (backend.long(~child_ok) * LEAF_APPROX_PARITY_UNRESOLVED)
-        | (backend.long(finite_samples & ~deviation_ok) * LEAF_CONVERGENCE_FAILED)
-        | (backend.long(~finite_samples) * LEAF_RAYTRACE_NONFINITE)
-    )
-
-    # Normally check Jacobians only for candidates that would otherwise
-    # converge. At max_level, check every finite triangle.
-    candidate = status == LEAF_CONVERGED
-    rows = backend.flatnonzero(finite_samples & (candidate | force_jacobian))
-
+    rows = jacobian_rows(status, force_jacobian)
     if jacobian is None:
-        jacobian_ok, jacobian_nonfinite = jacobian_parity_ok(
-            jacobian_fn,
-            theta_v[rows],
-            theta_m[rows],
-            return_details=True,
-        )
+        signs = _jacobian_signs_at(jacobian_fn, theta_v[rows], theta_m[rows])
     else:
-        jacobian_ok, jacobian_nonfinite = parity_from_jacobians(
-            jacobian[rows], return_details=True
-        )
-
-    jacobian_status = (
-        backend.long(~jacobian_ok & ~jacobian_nonfinite)
-        * LEAF_JACOBIAN_PARITY_UNRESOLVED
-    ) | (backend.long(jacobian_nonfinite) * LEAF_JACOBIAN_NONFINITE)
-
-    # Preserve existing failures; Jacobians can add failures but cannot
-    # rescue a failed child-parity or deviation test.
-    status = backend.fill_at_indices(status, rows, status[rows] | jacobian_status)
-
-    # Used by refinement counters. Unchecked rows retain the child result;
-    # checked rows must pass both child parity and Jacobian parity.
-    parity_ok = backend.fill_at_indices(
-        backend.copy(child_ok),
-        rows,
-        child_ok[rows] & jacobian_ok,
-    )
-
-    keep = status == LEAF_CONVERGED
+        signs = jacobian_signs(jacobian[rows].reshape(-1, 2, 2)).reshape(-1, 6)
+    keep, parity_ok, status = apply_jacobian_signs(status, child_ok, rows, signs)
     return keep, parity_ok, s, status
