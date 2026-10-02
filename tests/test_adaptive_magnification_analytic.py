@@ -1,10 +1,11 @@
 """
 Magnified regions of three analytic lenses against their exact regions.
 
-The tolerances come from the measured accuracy of the area-ratio
-magnification (spec, section 8): it errs like sqrt(min_img_sep), a few per
-cent at the lens tolerances used here, which moves a boundary by about that
-relative change in mu over |d mu / d beta|, plus src_tol.
+The magnification is interpolated det A, accurate to a fraction of a per
+cent at the lens tolerances used here (see mesh_total_magnification), so a
+boundary lies within src_tol -- one floor edge -- of the exact one, and each
+region comes back as its exact set of loops. Bounds are about three times
+the errors measured on 2026-10-02.
 """
 
 import numpy as np
@@ -104,11 +105,11 @@ def test_the_fold_strip_has_its_exact_edges_and_area(fold_lens):
     b = to_np(magnified_regions(mag, 4.0).source)[:, 1]
     lower = b < 0.22
     assert lower.any() and (~lower).any()
-    assert np.abs(b[lower] - 0.1875).max() < 0.02
+    assert np.abs(b[lower] - 0.1875).max() <= mag.src_tol
     # A crossing on an edge across the caustic lies between its two samples.
     assert (np.abs(b[~lower] - 0.25) <= mag.src_tol).all()
     area, _ = magnified_area(mag, 4.0)
-    assert abs(float(to_np(area)) - 0.0625) < 0.008
+    assert abs(float(to_np(area)) - 0.0625) < 0.0015
 
 
 @pytest.fixture(scope="module")
@@ -135,22 +136,15 @@ def sis_mag(sis_lens):
 
 def test_the_sis_region_is_the_disk_of_radius_two_over_mu_min(sis_mag):
     regions = magnified_regions(sis_mag, 4.0)
+    # One loop: the sampled field is continuous within each sheet, so it
+    # crosses mu_min once along every ray from the centre.
+    assert to_np(regions.offsets).tolist() == [0, to_np(regions.source).shape[0]]
     assert to_np(regions.closed).all()
     r = np.linalg.norm(to_np(regions.source), axis=1)
-    assert np.abs(r - 0.5).max() < 0.06
+    assert np.abs(r - 0.5).max() <= sis_mag.src_tol
     area, complete = magnified_area(sis_mag, 4.0)
     assert bool(to_np(complete))
-    assert abs(float(to_np(area)) / (np.pi * 0.25) - 1.0) < 0.08
-    # The sampled field's leaf-scale error adds small islands and holes along
-    # the boundary (see MagnifiedRegions); one loop must still carry the disk,
-    # so a chaining fault cannot hide among them.
-    pts, off = to_np(regions.source), to_np(regions.offsets)
-    loops = [pts[off[c] : off[c + 1]] for c in range(len(off) - 1)]
-    signed = [
-        0.5 * np.sum(c[:, 0] * np.roll(c[:, 1], -1) - np.roll(c[:, 0], -1) * c[:, 1])
-        for c in loops
-    ]
-    assert max(signed) / float(to_np(area)) > 0.99
+    assert abs(float(to_np(area)) / (np.pi * 0.25) - 1.0) < 1e-3
 
 
 def test_sweep_and_threshold_modes_agree_on_the_sis_disk(sis_lens, sis_mag):
@@ -172,12 +166,15 @@ def test_the_cored_region_is_a_disk_and_an_annulus_inside_the_radial_caustic(
         cored_lens, 8, 0.005, mu_min=6.0, fov=1.6, x0=0.0, y0=0.0
     )
     r_disk, r_annulus, r_caustic = _cored_crossings(6.0)
-    r = np.linalg.norm(to_np(magnified_regions(mag, 6.0).source), axis=1)
+    regions = magnified_regions(mag, 6.0)
+    # The disk's edge, and the annulus's inner and outer edges.
+    assert to_np(regions.offsets).shape[0] == 4 and to_np(regions.closed).all()
+    r = np.linalg.norm(to_np(regions.source), axis=1)
     radii = np.array([r_disk, r_annulus, r_caustic])
-    assert np.abs(r[:, None] - radii[None, :]).min(axis=1).max() < 0.06
+    assert np.abs(r[:, None] - radii[None, :]).min(axis=1).max() < 0.01
     area, _ = magnified_area(mag, 6.0)
     exact = np.pi * (r_disk**2 + r_caustic**2 - r_annulus**2)
-    assert abs(float(to_np(area)) / exact - 1.0) < 0.12
+    assert abs(float(to_np(area)) / exact - 1.0) < 3e-4
 
 
 def test_no_converged_leaf_of_these_lenses_needs_the_area_ratio(

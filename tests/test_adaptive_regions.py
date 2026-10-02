@@ -77,7 +77,7 @@ def _curves(regions):
 
 def test_the_fold_strip_is_bounded_by_its_level_line_and_its_caustic(fold_mag):
     b = to_np(magnified_regions(fold_mag, 4.0).source)[:, 1]
-    near_level = np.abs(b - 0.1875) < 0.04
+    near_level = np.abs(b - 0.1875) <= fold_mag.src_tol
     # A crossing on an edge from the band strip (mu = inf) to beyond the
     # caustic (mu = 0) lies between the two samples: within one floor edge,
     # at most src_tol, of the caustic, on either side.
@@ -223,9 +223,9 @@ def test_a_window_that_misses_every_image_has_no_region(sis_lens):
 def test_the_fold_strip_area_is_open_and_about_its_width(fold_mag):
     area, complete = magnified_area(fold_mag, 4.0)
     assert not bool(to_np(complete))
-    # The strip is 1/16 tall and 1 wide; the area ratio's few-per-cent error
-    # moves its level line by about 0.01.
-    assert abs(float(to_np(area)) - 0.0625) < 0.025
+    # The strip is 1/16 tall and 1 wide; the level line lies within src_tol
+    # of its exact place, and the error measured on 2026-10-02 was 1.6e-3.
+    assert abs(float(to_np(area)) - 0.0625) < 0.005
 
 
 MAGNIFICATION_API = (
