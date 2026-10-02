@@ -32,17 +32,19 @@ __all__ = (
 
 class VertexCache(NamedTuple):
     """
-    Lattice key to slot, with the source-plane image of every evaluated point.
+    Lattice key to slot, with the sample at every evaluated point.
 
     Lookup is ``backend.searchsorted`` against a sorted key array rather than
     a Python dict, so a whole level's worth of points resolves in one
     vectorized call. Slots are assigned monotonically in order of first
     evaluation and never move.
 
-    ``ij`` and ``beta`` hold the lattice coordinates and source-plane image of
-    every evaluated point, shape ``(N, 2)`` and indexed by slot. ``keys`` and
-    ``slots`` are the sorted-key index: ``keys`` is ascending, and
-    ``slots[i]`` is the slot of ``keys[i]``.
+    ``ij`` and ``beta`` hold the lattice coordinates and the sample at every
+    evaluated point, shape ``(N, 2)`` and indexed by slot: the source-plane
+    image in a lens build, ``(mu_tot, n)`` in a magnification build
+    (:func:`~caustics.lenses.func.adaptive.source_mesh.build_magnification_mesh`).
+    ``keys`` and ``slots`` are the sorted-key index: ``keys`` is ascending,
+    and ``slots[i]`` is the slot of ``keys[i]``.
     """
 
     keys: ArrayLike
