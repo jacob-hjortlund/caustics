@@ -4,15 +4,17 @@ The frozen :class:`AdaptiveMesh`, its spatial index, and :func:`freeze`.
 :func:`freeze` is the last stage of every build: canonical ordering and
 closure, the critical band mapped onto the closed leaves, vertex compaction,
 freeze-time invalidation, and the source-plane index (:func:`build_index`).
-It makes no lens call.
+Its one lens call, made only when needed, evaluates the Jacobian at the
+vertices no criterion reached.
 """
 
 import math
 from typing import Any, NamedTuple
 
 from ....backend_obj import ArrayLike, backend
-from .geometry import shape_matrix
+from .geometry import jacobian_det, shape_matrix
 from .state import cache_size, store_compact
+from .sampling import call_jacobian
 from .lattice import Lattice, lattice_key, lattice_xy
 from .criterion import LEAF_CONVERGED, LEAF_RAYTRACE_NONFINITE
 from .band import CriticalBand, band_leaf_index, merge_bands
@@ -290,6 +292,16 @@ class AdaptiveMesh(NamedTuple):
         Lattice coordinates of every vertex, shape ``(V, 2)`` int64 -- the
         integer pair ``vertices_lens`` is computed from, exact at any
         ``dtype``. Vertices are in ascending lattice-key order.
+    vertices_det: ArrayLike
+        ``det A`` of the lens Jacobian at every vertex, shape ``(V,)``,
+        float64 whatever ``dtype`` is. It is the value the build evaluated at
+        the vertex (:func:`~caustics.lenses.func.adaptive.sampling.sample_jacobians`)
+        or, at a vertex no criterion reached, the one :func:`freeze`
+        evaluated, formed as
+        :func:`~caustics.lenses.func.adaptive.geometry.jacobian_det` forms
+        it, so a critical-band sample at a vertex carries this same value.
+        :func:`~caustics.lenses.func.adaptive.magnification.mesh_total_magnification`
+        interpolates it. Non-finite wherever the lens Jacobian is.
     leaves: ArrayLike
         Terminal-triangle vertex indices, shape ``(L, 3)`` int64 into both
         vertex arrays, positively oriented.
@@ -366,6 +378,7 @@ class AdaptiveMesh(NamedTuple):
     vertices_lens: ArrayLike
     vertices_source: ArrayLike
     vertices_ij: ArrayLike
+    vertices_det: ArrayLike
     leaves: ArrayLike
     leaf_area2: ArrayLike
     leaf_origin: ArrayLike
@@ -400,6 +413,7 @@ def freeze(
     band,
     seed_band,
     *,
+    jacobian_fn,
     fov,
     init_res,
     min_img_sep,
@@ -415,8 +429,8 @@ def freeze(
 
     The last stage of every build: canonical ordering and closure, the
     critical band merged and mapped onto the closed leaves, vertex
-    compaction, freeze-time invalidation, and the spatial index. It makes no
-    lens call. :func:`build_adaptive_mesh` and :func:`extend_adaptive_mesh`
+    compaction, freeze-time invalidation, and the spatial index. Its only
+    lens call is the Jacobian fill below. :func:`build_adaptive_mesh` and :func:`extend_adaptive_mesh`
     both end here, so the frozen mesh is a function of the refinement alone,
     never of the order it was produced in.
 
@@ -433,6 +447,11 @@ def freeze(
         The band carried over from a seeding mesh, ``leaves`` indexing
         ``store``'s rows too; :func:`empty_band` for a fresh build. It wins
         :func:`merge_bands`' tie on a shared sample.
+    jacobian_fn: Callable[[ArrayLike, ArrayLike], ArrayLike]
+        The Jacobian ``refine`` evaluated. Called once, on the vertices whose
+        ``det A`` the cache lacks -- the midpoints of balance-forced leaves no
+        criterion sampled, and in an extension those of old leaves the balance
+        split -- and not at all when there are none.
     fov: float
         *Unit: arcsec*
     init_res: int
@@ -488,6 +507,18 @@ def freeze(
     )
     leaves = remap[leaf_v]
     origin_leaves = remap[pre_v]
+
+    # One Jacobian call, at most, for the vertices without a `det A`. Every
+    # other vertex already holds one: evaluated once in this build, or
+    # carried over from a seeding mesh.
+    missing = used[backend.flatnonzero(~cache.has_det[used])]
+    det = cache.det
+    if missing.shape[0]:
+        det = backend.fill_at_indices(
+            backend.copy(det),
+            missing,
+            jacobian_det(call_jacobian(lat, cache.ij[missing], jacobian_fn)),
+        )
 
     if dtype is None:
         dtype = backend.float64
@@ -551,6 +582,7 @@ def freeze(
         vertices_lens=to_device(vl),
         vertices_source=to_device(vs),
         vertices_ij=to_device(cache.ij[used]),
+        vertices_det=to_device(det[used]),
         leaves=to_device(leaves),
         leaf_area2=to_device(leaf_area2),
         leaf_origin=to_device(origin),

@@ -1121,3 +1121,45 @@ def test_a_mesh_survives_a_pickle_round_trip():
         assert np.array_equal(
             to_np(getattr(again, name)), to_np(getattr(mesh, name))
         ), name
+
+
+def test_every_vertex_carries_det_a_as_float64_at_any_mesh_dtype():
+    mesh, _ = new_build(localised_fold, localised_fold_jacobian, min_img_sep=0.05)
+    assert mesh.vertices_det.dtype == backend.float64
+    J = localised_fold_jacobian(to_np(mesh.vertices_lens))
+    want = J[:, 0, 0] * J[:, 1, 1] - J[:, 0, 1] * J[:, 1, 0]
+    assert np.array_equal(to_np(mesh.vertices_det), want)
+    m32, _ = new_build(
+        localised_fold, localised_fold_jacobian, min_img_sep=0.05, dtype=backend.float32
+    )
+    assert m32.vertices_det.dtype == backend.float64
+    assert np.array_equal(to_np(m32.vertices_det), want)
+
+
+def test_a_critical_band_sample_at_a_vertex_carries_that_vertex_s_det():
+    mesh, _ = new_build(row_fold, row_fold_jacobian, init_res=8, min_img_sep=2e-2)
+    det = dict(
+        zip(
+            map(tuple, to_np(mesh.vertices_ij).tolist()),
+            to_np(mesh.vertices_det).tolist(),
+        )
+    )
+    lat, band = mesh.lattice, mesh.critical_band
+    ij = np.rint((to_np(band.lens) - to_np(lat.lo)) / lat.scale).astype(np.int64)
+    at = [k for k, p in enumerate(map(tuple, ij.tolist())) if p in det]
+    assert len(at) > 0
+    assert [to_np(band.det)[k] for k in at] == [det[tuple(ij[k])] for k in at]
+
+
+def test_a_float32_jacobian_still_gives_float64_det_a():
+    """Formed from the float32 entries, then cast, as the band's det is."""
+    lens, _ = make_counting_lens(localised_fold, localised_fold_jacobian)
+
+    def jacobian32(x, y):
+        return backend.to(lens.jacobian_lens_equation(x, y), dtype=backend.float32)
+
+    mesh = build_adaptive_mesh(lens.raytrace, jacobian32, 4.0, 4, 0.05)
+    assert mesh.vertices_det.dtype == backend.float64
+    J = localised_fold_jacobian(to_np(mesh.vertices_lens)).astype(np.float32)
+    want = J[:, 0, 0] * J[:, 1, 1] - J[:, 0, 1] * J[:, 1, 0]
+    assert np.array_equal(to_np(mesh.vertices_det), want.astype(np.float64))

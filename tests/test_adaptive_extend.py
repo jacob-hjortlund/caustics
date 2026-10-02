@@ -691,7 +691,8 @@ def seed_of(mesh, lens, k):
 
 def test_seeding_a_mesh_and_freezing_it_again_reproduces_it():
     """With nothing added, seed then freeze is the identity -- non-finite
-    leaves and the band included -- and a float64 mesh costs no lens call."""
+    leaves and the band included -- and a float64 mesh costs no lens call,
+    raytrace or Jacobian."""
     fn, jac = broken_where(
         localised_fold, localised_fold_jacobian, lambda p: p[:, 0] > 1.5
     )
@@ -700,6 +701,7 @@ def test_seeding_a_mesh_and_freezing_it_again_reproduces_it():
     assert mesh.holes.centres.shape[0] == 1
     assert ((to_np(mesh.leaf_status) & LEAF_RAYTRACE_NONFINITE) != 0).any()
     calls["raytrace"].clear()
+    calls["jacobian"].clear()
     lat, cache, active, store, band = seed_of(mesh, lens, 0)
     again = freeze(
         lat,
@@ -708,6 +710,7 @@ def test_seeding_a_mesh_and_freezing_it_again_reproduces_it():
         store,
         empty_band(),
         band,
+        jacobian_fn=lens.jacobian_lens_equation,
         fov=mesh.fov,
         init_res=mesh.init_res,
         min_img_sep=mesh.min_img_sep,
@@ -720,6 +723,7 @@ def test_seeding_a_mesh_and_freezing_it_again_reproduces_it():
     )
     assert_meshes_equal(again, mesh)
     assert not calls["raytrace"]
+    assert not calls["jacobian"]
 
 
 def test_seeding_drops_the_freeze_time_flag_below_max_level():
@@ -758,6 +762,95 @@ def test_seeding_a_float32_mesh_raytraces_its_outer_boundary_again():
     assert np.array_equal(
         beta[~edge], to_np(mesh.vertices_source)[~edge].astype(np.float64)
     )
+
+
+def test_seeding_carries_det_a_and_an_extension_keeps_it_at_every_old_vertex():
+    """The ring's criterion evaluates the Jacobian again at old vertices on the
+    seam, for their sign, and each still keeps the det A its mesh stored --
+    here shifted by one, so a value evaluated again could not pass for it."""
+    fn, jac = ring_fold(2.0)
+    mesh, lens, calls = build(fn, jac, 4.0, 4, 0.05)
+    marked = mesh._replace(vertices_det=mesh.vertices_det + 1.0)
+    _, cache, _, _, _ = seed_of(marked, lens, 1)
+    assert np.array_equal(to_np(cache.det), to_np(marked.vertices_det))
+    assert to_np(cache.has_det).all() and not to_np(cache.evaluated).any()
+    calls["jacobian"].clear()
+    ext = extend_adaptive_mesh(marked, lens.raytrace, lens.jacobian_lens_equation, 6.0)
+    pad = ext.lattice.origin
+    old = to_np(marked.vertices_ij) + pad
+    det = dict(
+        zip(
+            map(tuple, to_np(ext.vertices_ij).tolist()),
+            to_np(ext.vertices_det).tolist(),
+        )
+    )
+    assert [det[tuple(v)] for v in old.tolist()] == to_np(marked.vertices_det).tolist()
+    lat = ext.lattice
+    called = np.rint((called_at(calls, "jacobian") - to_np(lat.lo)) / lat.scale)
+    called = set(map(tuple, (called.astype(np.int64) + lat.origin).tolist()))
+    n_old = mesh.lattice.n
+    seam = old[((old - pad == 0) | (old - pad == n_old)).any(axis=1)]
+    assert set(map(tuple, seam.tolist())) & called
+
+
+def test_a_build_evaluates_the_jacobian_once_per_lattice_point_and_at_every_vertex():
+    mesh, _, calls = build(localised_fold, localised_fold_jacobian, 4.0, 4, 0.05)
+    lat = mesh.lattice
+    ij = np.rint((called_at(calls, "jacobian") - to_np(lat.lo)) / lat.scale)
+    ij = ij.astype(np.int64)
+    assert np.unique(ij, axis=0).shape[0] == ij.shape[0]
+    seen = set(map(tuple, ij.tolist()))
+    assert all(tuple(v) in seen for v in to_np(mesh.vertices_ij).tolist())
+
+
+@pytest.mark.parametrize(
+    "fn, jac, init_res, sep, fills",
+    [
+        (localised_fold, localised_fold_jacobian, 4, 0.05, True),
+        (row_fold, row_fold_jacobian, 8, 2e-2, False),
+    ],
+    ids=["forced_leaves", "none_missing"],
+)
+def test_freeze_evaluates_the_jacobian_only_at_the_vertices_nothing_else_reached(
+    fn, jac, init_res, sep, fills
+):
+    """``localised_fold``'s balance forces leaves off forced leaves, whose
+    midpoints no criterion sampled (274 of its 2492 vertices); ``row_fold``
+    has none, and freeze makes no Jacobian call at all."""
+    ctx = refine_setup(fn, jac, 4.0, init_res, sep)
+    cache, active, store, band = refine_with(ctx)
+    store, cache, active, _ = balance_with(ctx, cache, active, store)
+    before = len(ctx.calls["jacobian"])
+    mesh = freeze(
+        ctx.lat,
+        cache,
+        active,
+        store,
+        band,
+        empty_band(),
+        jacobian_fn=ctx.jacobian,
+        fov=4.0,
+        init_res=init_res,
+        min_img_sep=ctx.sep,
+        d_floor=ctx.max_level,
+        max_level=ctx.max_level,
+        dtype=None,
+        device=None,
+        index_cells=None,
+    )
+    fill = ctx.calls["jacobian"][before:]
+    assert len(fill) == (1 if fills else 0)
+    lo, scale = to_np(ctx.lat.lo), ctx.lat.scale
+
+    def points(xy):
+        return set(map(tuple, np.rint((xy - lo) / scale).astype(np.int64).tolist()))
+
+    seen = points(np.concatenate(ctx.calls["jacobian"][:before]))
+    missing = {
+        tuple(v) for v in to_np(mesh.vertices_ij).tolist() if tuple(v) not in seen
+    }
+    assert (len(missing) > 0) == fills
+    assert (points(fill[0]) if fill else set()) == missing
 
 
 # ---------------------------------------------------------------------------
@@ -898,9 +991,11 @@ def _in_any_triangle(points, triangles):
 
 
 def test_an_extension_calls_the_lens_only_in_the_ring_and_in_old_leaves_it_splits():
-    """No Jacobian call strictly inside the old domain; no old vertex
-    raytraced again; and every raytraced point strictly inside lies in an old
-    leaf the extension split, which ``ring_fold(2.0)`` makes it do."""
+    """No old vertex strictly inside the old domain is raytraced or
+    evaluated again, and every raytrace and Jacobian call strictly inside
+    lies in an old leaf the extension split, which ``ring_fold(2.0)`` makes it
+    do. The Jacobian calls there are freeze's, at the split leaves' new
+    vertices."""
     fn, jac = ring_fold(2.0)
     mesh, lens, calls = build(fn, jac, 4.0, 4, 0.05)
     calls["raytrace"].clear()
@@ -918,15 +1013,14 @@ def test_an_extension_calls_the_lens_only_in_the_ring_and_in_old_leaves_it_split
 
     jacobian_ij = to_ij(called_at(calls, "jacobian"))
     assert jacobian_ij.shape[0] > 0
-    assert not strictly_inside(jacobian_ij).any()
-
     raytrace_ij = to_ij(called_at(calls, "raytrace"))
     old_vertices = to_np(mesh.vertices_ij) + pad
-    assert not set(map(tuple, raytrace_ij.tolist())) & set(
-        map(tuple, old_vertices.tolist())
-    )
+    old = set(map(tuple, old_vertices.tolist()))
+    assert not set(map(tuple, raytrace_ij.tolist())) & old
 
     inner = raytrace_ij[strictly_inside(raytrace_ij)]
+    inner_jacobian = jacobian_ij[strictly_inside(jacobian_ij)]
+    assert not set(map(tuple, inner_jacobian.tolist())) & old
     kept = {
         tuple(sorted(map(tuple, t)))
         for t in to_np(ext.vertices_ij)[to_np(ext.origin_leaves)].tolist()
@@ -940,6 +1034,9 @@ def test_an_extension_calls_the_lens_only_in_the_ring_and_in_old_leaves_it_split
     )
     assert inner.shape[0] > 0 and split.shape[0] > 0, "ring_fold must split old leaves"
     assert _in_any_triangle(inner, split).all()
+    # freeze's fill call: det A at the midpoints the split leaves gained.
+    assert inner_jacobian.shape[0] > 0
+    assert _in_any_triangle(inner_jacobian, split).all()
 
 
 @pytest.fixture

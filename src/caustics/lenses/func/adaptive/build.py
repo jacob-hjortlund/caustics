@@ -183,6 +183,7 @@ def _grow(
         store,
         band,
         seed_band,
+        jacobian_fn=jacobian_fn,
         fov=fov,
         init_res=init_res,
         min_img_sep=min_img_sep,
@@ -235,8 +236,10 @@ def build_adaptive_mesh(
         ``raytrace`` traces; for a caustics lens,
         ``lens.jacobian_lens_equation``. It decides
         :func:`jacobian_parity_ok`, which the criterion requires before it
-        converges any leaf, and is called directly on the build's own
-        float64 coordinates.
+        converges any leaf, and gives ``AdaptiveMesh.vertices_det``. It is
+        called directly on the build's own float64 coordinates, at most once
+        per lattice point: every value it returns is kept in the vertex
+        cache.
     fov: float
         Side length of the square lens-plane domain.
 
@@ -379,6 +382,11 @@ def seed_from_mesh(
       vertices on its outer boundary are raytraced again: they are the only
       old points the ring's criterion reads, and it must read float64 values
       straight from ``raytrace``, as :func:`make_raytrace` explains.
+    - ``det`` is ``vertices_det``, with ``has_det`` set and ``evaluated``
+      clear. The ring's criterion evaluates the Jacobian again at the old
+      vertices it samples, all on the old boundary, for their sign, and each
+      keeps its ``det``. Being float64 at every mesh dtype, it needs no
+      re-evaluation for a float32 mesh.
     - Every vertex is active: a mesh's vertices are exactly its leaves'.
     - The store has one row per origin, in ``origin_leaves`` order, with the
       level and status of its first leaf: ``leaf_origin`` is non-decreasing
@@ -429,9 +437,9 @@ def seed_from_mesh(
         slots=backend.arange(n_vertices, dtype=backend.int64),
         ij=ij,
         beta=beta,
-        det=backend.zeros((n_vertices,), dtype=backend.float64) + backend.nan,
+        det=backend.to(_ambient(mesh.vertices_det), dtype=backend.float64),
         sign=backend.zeros((n_vertices,), dtype=backend.int64),
-        has_det=backend.zeros((n_vertices,), dtype=backend.bool),
+        has_det=backend.ones((n_vertices,), dtype=backend.bool),
         evaluated=backend.zeros((n_vertices,), dtype=backend.bool),
     )
     active = backend.ones((n_vertices,), dtype=backend.bool)
@@ -535,15 +543,19 @@ def extend_adaptive_mesh(
     differed by at most two ulp; two fresh builds there differed in 11. That
     is a measurement, not a guarantee: a last-bit difference in an image can
     flip a verdict at a threshold or move a bounding box across an index
-    cell.
+    cell. The same holds for the Jacobian: a vertex's ``det A``, and a point's
+    sign, are whatever the call that first evaluated the point returned.
 
     Lens calls: the ring's own refinement, exactly what a fresh build spends
-    there; midpoints inside old leaves the balance force-splits; and, for a
-    mesh not stored at float64, the vertices on its outer boundary, raytraced
-    again so the ring's criterion reads float64 values. No Jacobian call
-    lands strictly inside the old domain. Closure, ordering and indexing
-    still run over the whole mesh, without a lens call. The holes are carried
-    over from ``mesh`` unchanged and cost no lens call.
+    there; the midpoints inside old leaves the balance force-splits,
+    raytraced, with their Jacobians evaluated at freeze; and, for a mesh not
+    stored at float64, the vertices on its outer boundary, raytraced again so
+    the ring's criterion reads float64 values. Jacobian calls strictly inside
+    the old domain land only in old leaves the balance splits. The ring's
+    criterion evaluates the Jacobian again at the old vertices on the seam,
+    for their sign, and each keeps its ``det A``. Closure, ordering and
+    indexing still run over the whole mesh, without a lens call. The holes
+    are carried over from ``mesh`` unchanged and cost no lens call.
 
     Parameters
     ----------
