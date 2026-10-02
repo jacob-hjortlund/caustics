@@ -8,6 +8,7 @@ from ....backend_obj import ArrayLike, backend
 from .geometry import contains, sanitize_bary, triangle_weights
 
 __all__ = (
+    "index_hits",
     "mesh_query",
     "mesh_seeds",
 )
@@ -37,6 +38,92 @@ def _empty_query_result(mesh, n_queries) -> Tuple[ArrayLike, ArrayLike, ArrayLik
         backend.zeros((n_queries + 1,), dtype=int64, device=mesh.device),
         backend.zeros((0, 3), dtype=mesh.vertices_source.dtype, device=mesh.device),
     )
+
+
+def index_hits(
+    index, vertices, triangles, beta
+) -> Tuple[ArrayLike, ArrayLike, ArrayLike]:
+    """
+    Triangles of a :class:`~caustics.lenses.func.adaptive.mesh.MeshIndex` whose image contains each point.
+
+    One cell lookup per point, then :func:`contains` on that cell's
+    triangles, zeros counting as inside. The candidate-and-containment core
+    of :func:`mesh_query`, shared with callers that need the raw weights --
+    the count-once rule of
+    :func:`~caustics.lenses.func.adaptive.magnification.counts_once` reads
+    their exact zeros -- or that index another triangle set, such as the
+    critical band's children or a source-plane magnification mesh. Not
+    chunked: the caller chunks.
+
+    Parameters
+    ----------
+    index: MeshIndex
+        Built over ``triangles`` by :func:`build_index`.
+    vertices: ArrayLike
+        ``(V, 2)`` positions ``triangles`` indexes, at ``beta``'s dtype.
+
+        *Unit: arcsec*
+    triangles: ArrayLike
+        ``(T, 3)`` int64 vertex indices.
+    beta: ArrayLike
+        ``(B, 2)`` query points.
+
+        *Unit: arcsec*
+
+    Returns
+    -------
+    qidx: ArrayLike
+        ``(K,)`` int64 point of each hit, non-decreasing.
+    tri: ArrayLike
+        ``(K,)`` int64 triangle of each hit, ascending within each point.
+    w: ArrayLike
+        ``(K, 3)`` :func:`triangle_weights` of each hit, unnormalized.
+    """
+    int64 = backend.int64
+    device = backend.device(beta)
+    b = beta.shape[0]
+    u = backend.long(backend.floor((beta - index.lo) / index.cell))
+    # Containment is a coordinate test against the stored exact `hi`, never a
+    # cell-index test on `u`. Because `cell = span / [nx, ny]`, a point sitting
+    # exactly on the upper bbox edge (x == hi_x) gives `u_x == nx`, which
+    # fails `u_x < nx` -- even though `build_index` clips leaf registration
+    # to column `nx - 1`, i.e. the leaf IS indexed, in the very column that
+    # test would reject. Do NOT recompute `hi` as `lo + cell * [nx, ny]`:
+    # `(span / n) * n` need not equal `span` to the ulp, so the exact
+    # `index.hi` from the build is used instead. A leaf containing a
+    # `beta` with x == hi has its `i1_x` clipped to `nx - 1`, the column the
+    # clamp below selects, so this coordinate test is provably complete.
+    inside = (
+        (beta[:, 0] >= index.lo[0])
+        & (beta[:, 0] <= index.hi[0])
+        & (beta[:, 1] >= index.lo[1])
+        & (beta[:, 1] <= index.hi[1])
+    )
+    # Clamped only to keep the gather in range; `inside` forces an empty
+    # block for out-of-bbox points.
+    cell = backend.clamp(u[:, 0], 0, index.nx - 1) * index.ny + backend.clamp(
+        u[:, 1], 0, index.ny - 1
+    )
+    start = index.cell_offsets[cell]
+    count = backend.where(
+        inside, index.cell_offsets[cell + 1] - start, backend.zeros_like(start)
+    )
+    total = int(backend.to_numpy(backend.sum(count)))
+    if total == 0:
+        return (
+            backend.zeros((0,), dtype=int64, device=device),
+            backend.zeros((0,), dtype=int64, device=device),
+            backend.zeros((0, 3), dtype=vertices.dtype, device=device),
+        )
+    qidx = backend.repeat(backend.arange(b, dtype=int64, device=device), count, axis=0)
+    base = backend.cumsum(count, dim=0) - count
+    within = backend.arange(total, dtype=int64, device=device) - backend.repeat(
+        base, count, axis=0
+    )
+    cand = index.cell_leaves[start[qidx] + within]
+    w = triangle_weights(vertices[triangles[cand]], beta[qidx])
+    hit = backend.flatnonzero(contains(w))
+    return qidx[hit], cand[hit], w[hit]
 
 
 def mesh_query(mesh, beta, batch_size=None) -> Tuple[ArrayLike, ArrayLike, ArrayLike]:
@@ -86,67 +173,17 @@ def mesh_query(mesh, beta, batch_size=None) -> Tuple[ArrayLike, ArrayLike, Array
 
     for lo in range(0, n, step):
         chunk = beta[lo : lo + step]
-        b = chunk.shape[0]
-        u = backend.long(backend.floor((chunk - index.lo) / index.cell))
-        # Containment is a coordinate test against the stored exact `hi`, never a
-        # cell-index test on `u`. Because `cell = span / [nx, ny]`, a point sitting
-        # exactly on the upper bbox edge (x == hi_x) gives `u_x == nx`, which
-        # fails `u_x < nx` -- even though `build_index` clips leaf registration
-        # to column `nx - 1`, i.e. the leaf IS indexed, in the very column that
-        # test would reject. Do NOT recompute `hi` as `lo + cell * [nx, ny]`:
-        # `(span / n) * n` need not equal `span` to the ulp, so the exact
-        # `mesh.index.hi` from the build is used instead. A leaf containing a
-        # `beta` with x == hi has its `i1_x` clipped to `nx - 1`, the column the
-        # clamp below selects, so this coordinate test is provably complete.
-        inside = (
-            (chunk[:, 0] >= index.lo[0])
-            & (chunk[:, 0] <= index.hi[0])
-            & (chunk[:, 1] >= index.lo[1])
-            & (chunk[:, 1] <= index.hi[1])
+        qidx, cand, w = index_hits(index, mesh.vertices_source, mesh.leaves, chunk)
+        # Per-query hit counts from `qidx` alone. `bincount` is a reduction
+        # both backends agree on; a scatter-add would not be: torch keeps the
+        # last write on duplicate indices, jax accumulates.
+        count_parts.append(
+            backend.long(backend.bincount(qidx, minlength=chunk.shape[0]))
         )
-        # Clamped only to keep the gather in range; `inside` forces an empty
-        # block for out-of-bbox points.
-        cell = backend.clamp(u[:, 0], 0, index.nx - 1) * index.ny + backend.clamp(
-            u[:, 1], 0, index.ny - 1
-        )
-        start = index.cell_offsets[cell]
-        count = backend.where(
-            inside, index.cell_offsets[cell + 1] - start, backend.zeros_like(start)
-        )
-        total = int(backend.to_numpy(backend.sum(count)))
-        if total == 0:
-            count_parts.append(backend.zeros((b,), dtype=int64, device=mesh.device))
+        if cand.shape[0] == 0:
             continue
-
-        qidx = backend.repeat(
-            backend.arange(b, dtype=int64, device=mesh.device), count, axis=0
-        )
-        base = backend.cumsum(count, dim=0) - count
-        within = backend.arange(
-            total, dtype=int64, device=mesh.device
-        ) - backend.repeat(base, count, axis=0)
-        cand = index.cell_leaves[start[qidx] + within]
-
-        w = triangle_weights(mesh.vertices_source[mesh.leaves[cand]], chunk[qidx])
-        hit = contains(w)
-
-        # Per-query hit counts by cumsum differences. Never add_at_indices:
-        # torch keeps the last write on duplicate indices, jax accumulates --
-        # so a scatter-add would mean two different things on the two backends.
-        csum = backend.concatenate(
-            (
-                backend.zeros((1,), dtype=int64, device=mesh.device),
-                backend.cumsum(backend.long(hit), dim=0),
-            ),
-            dim=0,
-        )
-        count_parts.append(csum[base + count] - csum[base])
-        idx_parts.append(cand[hit])
-        # Gather `leaf_area2` after masking by `hit`, not before: `cand` is the
-        # pre-containment candidate list, so `leaf_area2[cand]` would be a
-        # full-length temporary thrown away by the mask on the very next
-        # operation.
-        bary_parts.append(sanitize_bary(w[hit], mesh.leaf_area2[cand[hit]]))
+        idx_parts.append(cand)
+        bary_parts.append(sanitize_bary(w, mesh.leaf_area2[cand]))
 
     counts = backend.concatenate(count_parts, dim=0)
     offsets = backend.concatenate(

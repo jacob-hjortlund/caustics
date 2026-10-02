@@ -916,3 +916,17 @@ def test_dedup_mixes_singleton_and_clustered_blocks_in_order():
     points = _pts([[9.0, 9.0], [0.0, 0.0], [0.0, 0.001], [5.0, 5.0]])
     keep = backend.to_numpy(dedup_representatives(points, np.array([1, 2, 1]), 0.01))
     assert keep.tolist() == [True, True, False, True]
+
+
+def test_index_hits_are_the_query_hits_with_raw_weights(mesh, beta):
+    from caustics.lenses.func.adaptive.query import index_hits
+
+    qidx, tri, w = index_hits(mesh.index, mesh.vertices_source, mesh.leaves, beta)
+    idx, off, _ = mesh_query(mesh, beta)
+    counts = np.diff(backend.to_numpy(off))
+    assert np.array_equal(backend.to_numpy(tri), backend.to_numpy(idx))
+    assert np.array_equal(
+        backend.to_numpy(qidx), np.repeat(np.arange(beta.shape[0]), counts)
+    )
+    expected = triangle_weights(mesh.vertices_source[mesh.leaves[tri]], beta[qidx])
+    assert np.array_equal(backend.to_numpy(w), backend.to_numpy(expected))
