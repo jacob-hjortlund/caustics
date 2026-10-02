@@ -5,7 +5,9 @@ Total magnification at source-plane points, read off an adaptive mesh.
 source-plane image contains a point, each leaf's magnification -- the ratio
 of its lens- and source-plane areas -- counting a point on a shared edge
 once (:func:`counts_once`), and reads the images of the critical band as
-infinitely magnified. Nothing here calls the lens.
+infinitely magnified. :func:`sheet_edges` returns the source-plane images
+of the lens edges across which the image count changes. Nothing here calls
+the lens.
 """
 
 import math
@@ -13,6 +15,7 @@ from typing import Callable, NamedTuple, Tuple
 
 from ....backend_obj import ArrayLike, backend
 from .geometry import _CHILD_VERTEX_INDEX_TABLE, shape_matrix
+from .criterion import LEAF_CONVERGED
 from .mesh import MeshIndex, build_index
 from .query import _as_beta, index_hits
 
@@ -25,6 +28,8 @@ __all__ = (
     "total_magnification",
     "make_sampler",
     "mesh_total_magnification",
+    "SheetEdges",
+    "sheet_edges",
 )
 
 
@@ -332,3 +337,79 @@ def mesh_total_magnification(
             backend.zeros((0,), dtype=backend.int64, device=mesh.device),
         )
     return backend.concatenate(mus, dim=0), backend.concatenate(ns, dim=0)
+
+
+class SheetEdges(NamedTuple):
+    """
+    Source-plane images of the lens edges across which the image count changes.
+
+    ``source`` is ``(E, 2, 2)``: each edge's two ends at the mesh dtype,
+    lower vertex index first. ``dn`` is ``(E,)`` int64, never zero: summed
+    over the edge's converged leaves, +1 for a leaf lying to the left of the
+    edge directed from its lower vertex index to its higher, in the source
+    plane, and -1 for one to its right -- ``Delta n_e`` of the deposition
+    report. ``fov`` is ``(E,)`` bool, True on edges of the lens fov.
+    """
+
+    source: ArrayLike
+    fov: ArrayLike
+    dn: ArrayLike
+
+
+def sheet_edges(mesh) -> SheetEdges:
+    """
+    The edges where the converged leaves' source-plane images begin or end.
+
+    Each converged leaf contributes its three edges in lens-plane order, the
+    order that keeps it on their left; in the source plane it lies on their
+    left where ``leaf_area2 > 0``. ``dn`` sums those sides per undirected
+    edge, by a sort and cumsum differences rather than a scatter-add. Two
+    converged leaves of one parity sharing an edge cancel; the edges left
+    are the fov boundary, the edges around the critical band and other
+    failed leaves, and folds.
+
+    ``fov`` marks the edges exactly one leaf of the whole mesh, of any
+    status, has: the mesh is conforming and covers its square, so these are
+    exactly the fov boundary. Testing whether both endpoints lie on the
+    lattice boundary instead would take in the corner-to-corner diagonal of
+    an ``init_res = 1`` mesh, an interior edge.
+
+    Parameters
+    ----------
+    mesh: AdaptiveMesh
+
+    Returns
+    -------
+    SheetEdges
+    """
+    int64 = backend.int64
+    leaves = mesh.leaves
+    n_vertices = mesh.vertices_source.shape[0]
+    a = leaves.reshape(-1)
+    b = leaves[:, [1, 2, 0]].reshape(-1)
+    key = backend.minimum(a, b) * n_vertices + backend.maximum(a, b)
+    # A non-converged leaf weighs zero; its `leaf_area2` may be NaN, which the
+    # `where` reads as -1 before the zero weight removes it.
+    converged = backend.long(mesh.leaf_status == LEAF_CONVERGED)
+    side = backend.long(backend.where(mesh.leaf_area2 > 0, 1, -1)) * converged
+    eps = backend.repeat(side, 3, axis=0) * backend.long(backend.where(a < b, 1, -1))
+    keys, inverse = backend.unique(key, return_inverse=True)
+    order = backend.argsort(inverse)
+    counts = backend.long(backend.bincount(inverse, minlength=keys.shape[0]))
+    csum = backend.concatenate(
+        (
+            backend.zeros((1,), dtype=int64, device=backend.device(eps)),
+            backend.cumsum(eps[order], dim=0),
+        ),
+        dim=0,
+    )
+    ends = backend.cumsum(counts, dim=0)
+    dn = csum[ends] - csum[ends - counts]
+    sheet = backend.flatnonzero(dn != 0)
+    lo, hi = keys[sheet] // n_vertices, keys[sheet] % n_vertices
+    vs = mesh.vertices_source
+    return SheetEdges(
+        source=backend.stack((vs[lo], vs[hi]), dim=1),
+        fov=counts[sheet] == 1,
+        dn=dn[sheet],
+    )

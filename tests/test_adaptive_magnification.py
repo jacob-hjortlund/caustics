@@ -11,6 +11,7 @@ from caustics.lenses.func.adaptive.magnification import (
     band_magnification_floor,
     counts_once,
     mesh_total_magnification,
+    sheet_edges,
 )
 
 
@@ -163,3 +164,56 @@ def test_a_float32_mesh_samples_the_float64_mesh_magnifications():
     finite = np.isfinite(to_np(mu64))
     assert np.array_equal(np.isfinite(to_np(mu32)), finite)
     np.testing.assert_allclose(to_np(mu32)[finite], to_np(mu64)[finite], rtol=1e-4)
+
+
+def test_an_affine_sheet_is_bounded_by_its_fov_edges_alone(half_mesh):
+    edges = sheet_edges(half_mesh)
+    src, dn = to_np(edges.source), to_np(edges.dn)
+    assert to_np(edges.fov).all()
+    assert src.shape == (16, 2, 2)
+    mid = src.mean(axis=1)
+    bottom, top = np.isclose(mid[:, 1], -1.0), np.isclose(mid[:, 1], 1.0)
+    left, right = np.isclose(mid[:, 0], -1.0), np.isclose(mid[:, 0], 1.0)
+    assert (bottom | top | left | right).all()
+    # Vertices are in lattice-key order, x first: a bottom or top edge runs
+    # in +x, a left or right one in +y, and dn is +1 with the sheet on the
+    # left of that direction.
+    assert (dn[bottom] == 1).all() and (dn[top] == -1).all()
+    assert (dn[left] == -1).all() and (dn[right] == 1).all()
+
+
+def test_the_fold_mesh_has_band_edges_hugging_the_caustic(fold_mesh):
+    edges = sheet_edges(fold_mesh)
+    inner = ~to_np(edges.fov)
+    assert inner.any()
+    beta_y = to_np(edges.source)[inner][..., 1]
+    assert (beta_y <= 0.25 + 1e-12).all() and (beta_y >= 0.25 - 0.1).all()
+    assert set(np.abs(to_np(edges.dn)[inner]).tolist()) <= {1, 2}
+
+
+def _half_but_nan_top_left(x, y):
+    nan = backend.where(y - x > 0.5, 0.0 * x + float("nan"), 0.0 * x)
+    return 0.5 * x + nan, 0.5 * y + nan
+
+
+def _half_but_nan_top_left_jacobian(x, y):
+    nan = backend.where(y - x > 0.5, 0.0 * x + float("nan"), 0.0 * x)
+    half, zero = 0.5 + nan, 0.0 * x
+    return _stack_2x2(half, zero, zero, half)
+
+
+def test_the_corner_diagonal_of_a_one_cell_mesh_is_not_a_fov_edge():
+    # One cell, two leaves: the upper-left one has a NaN vertex, so the
+    # diagonal it shares with the converged lower-right one is a sheet edge
+    # with both endpoints on the lattice boundary -- yet not a fov edge.
+    mesh = build_adaptive_mesh(
+        _half_but_nan_top_left, _half_but_nan_top_left_jacobian, 2.0, 1, 6.0
+    )
+    edges = sheet_edges(mesh)
+    src, fov = to_np(edges.source), to_np(edges.fov)
+    diagonal = np.isclose(src[:, 0, 0], src[:, 0, 1]) & np.isclose(
+        src[:, 1, 0], src[:, 1, 1]
+    )
+    assert diagonal.sum() == 1
+    assert not fov[diagonal][0]
+    assert fov[~diagonal].all() and (~diagonal).sum() == 2
