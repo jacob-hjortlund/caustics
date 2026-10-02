@@ -45,6 +45,20 @@ class MagnifiedRegions(NamedTuple):
     :class:`~caustics.lenses.func.adaptive.curves.CriticalCurvesAndCaustics`,
     so anything computing tangents or arc length must guard against them.
 
+    Expect small extra loops along each boundary. Where the gradient of
+    ``mu`` across the boundary is small next to the sampled field's
+    leaf-scale error (see
+    :func:`~caustics.lenses.func.adaptive.magnification.mesh_total_magnification`),
+    the field crosses ``mu_min`` more than once, and each excursion is traced
+    faithfully as a small closed island or hole beside the main boundary.
+    On an SIS lens mesh at ``min_img_sep = 0.005``, the disk ``mu_tot >= 4``
+    came back as one loop carrying 99.9% of its area and 48 islands and
+    holes of at most 4e-4 arcsec^2 each, up to 0.04 arcsec from the exact
+    circle. Areas and membership are hardly affected, since the islands
+    nearly cancel; where a single curve per region is wanted, keep the
+    loops of largest area. Interpolating ``det A`` at the lens vertices
+    instead of using area ratios would shrink them.
+
     Parameters
     ----------
     source: ArrayLike
@@ -95,6 +109,9 @@ def magnified_regions(mag, mu_min) -> MagnifiedRegions:
     crossing there. For a threshold ``mag`` targeted, every boundary point
     is within ``mag.src_tol`` of where the sampled field crosses it; see
     :func:`~caustics.lenses.func.adaptive.source_mesh.build_magnification_mesh`.
+    Where the sampled field crosses ``mu_min`` more than once near a
+    boundary, the result holds small islands and holes as well as the main
+    boundary; see :class:`MagnifiedRegions`.
 
     Parameters
     ----------

@@ -129,6 +129,16 @@ def test_the_sis_region_is_the_disk_of_radius_two_over_mu_min(sis_mag):
     area, complete = magnified_area(sis_mag, 4.0)
     assert bool(to_np(complete))
     assert abs(float(to_np(area)) / (np.pi * 0.25) - 1.0) < 0.08
+    # The sampled field's leaf-scale error adds small islands and holes along
+    # the boundary (see MagnifiedRegions); one loop must still carry the disk,
+    # so a chaining fault cannot hide among them.
+    pts, off = to_np(regions.source), to_np(regions.offsets)
+    loops = [pts[off[c] : off[c + 1]] for c in range(len(off) - 1)]
+    signed = [
+        0.5 * np.sum(c[:, 0] * np.roll(c[:, 1], -1) - np.roll(c[:, 0], -1) * c[:, 1])
+        for c in loops
+    ]
+    assert max(signed) / float(to_np(area)) > 0.99
 
 
 def test_sweep_and_threshold_modes_agree_on_the_sis_disk(sis_lens, sis_mag):

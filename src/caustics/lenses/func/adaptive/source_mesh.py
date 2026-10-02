@@ -619,7 +619,11 @@ def build_magnification_mesh(
         The square window: side and centre. Default: centred on the
         bounding box of the converged leaves' source-plane images,
         ``mesh.index``, with its longer side. A region the window cuts comes
-        back open.
+        back open. The default window's edges usually lie on the image of
+        the lens fov's boundary, so the leaves along them are
+        ``incomplete`` -- up to a level-0 cell deep where no criterion
+        refines them -- and regions and points there are not known. A
+        window strictly inside that image avoids it.
 
         *Unit: arcsec*
     batch_size: Optional[int]
