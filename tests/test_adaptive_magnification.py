@@ -1,0 +1,165 @@
+import math
+
+import numpy as np
+import pytest
+
+from caustics.backend_obj import backend
+from caustics.lenses.func.adaptive import build_adaptive_mesh
+from caustics.lenses.func.adaptive.geometry import shape_matrix, triangle_weights
+from caustics.lenses.func.adaptive.magnification import (
+    band_cover,
+    band_magnification_floor,
+    counts_once,
+    mesh_total_magnification,
+)
+
+
+def to_np(x):
+    return backend.to_numpy(x)
+
+
+def _arr(x):
+    return backend.as_array(np.asarray(x, dtype=np.float64), dtype=backend.float64)
+
+
+def _stack_2x2(a, b, c, d):
+    return backend.stack(
+        (backend.stack((a, b), dim=-1), backend.stack((c, d), dim=-1)), dim=-2
+    )
+
+
+def _half(x, y):
+    """``beta = theta / 2``: every lattice point maps to a dyadic, exactly."""
+    return 0.5 * x, 0.5 * y
+
+
+def _half_jacobian(x, y):
+    half, zero = 0.5 + 0.0 * x, 0.0 * x
+    return _stack_2x2(half, zero, zero, half)
+
+
+def _row_fold(x, y):
+    """``det A = 1 - 2y``: a fold on ``y = 0.5``, its caustic ``beta_y = 1/4``."""
+    return x * 1.0, y - y * y
+
+
+def _row_fold_jacobian(x, y):
+    one, zero = backend.ones_like(x), backend.zeros_like(x)
+    return _stack_2x2(one, zero, zero, 1.0 - 2.0 * y)
+
+
+def _sis(x, y):
+    """A singular isothermal sphere of Einstein radius 1 at the origin."""
+    r = backend.sqrt(x * x + y * y)
+    return x - x / r, y - y / r
+
+
+def _sis_jacobian(x, y):
+    r = backend.sqrt(x * x + y * y)
+    k = 1.0 / r**3
+    return _stack_2x2(
+        1.0 - 1.0 / r + k * x * x, k * x * y, k * x * y, 1.0 - 1.0 / r + k * y * y
+    )
+
+
+@pytest.fixture(scope="module")
+def half_mesh():
+    # Affine: all 32 level-0 leaves converge, each mapping to a dyadic triangle.
+    return build_adaptive_mesh(_half, _half_jacobian, 4.0, 4, 0.25)
+
+
+@pytest.fixture(scope="module")
+def fold_mesh():
+    return build_adaptive_mesh(_row_fold, _row_fold_jacobian, 4.0, 4, 0.25)
+
+
+def test_every_point_inside_an_affine_sheet_counts_once_with_its_exact_magnification(
+    half_mesh,
+):
+    # Multiples of 1/4 hit leaf-image vertices (multiples of 1/2), edge
+    # points and points on the cells' diagonals, all exactly.
+    k = np.arange(-3, 4) / 4.0
+    beta = _arr(np.stack(np.meshgrid(k, k, indexing="ij"), axis=-1).reshape(-1, 2))
+    mu, n = mesh_total_magnification(half_mesh, beta)
+    assert to_np(n).tolist() == [1] * beta.shape[0]
+    assert to_np(mu).tolist() == [4.0] * beta.shape[0]
+
+
+def _counts(tri):
+    """Whether the point (0, 0.5), on ``tri``'s edge x == 0, counts for ``tri``."""
+    tri = _arr([tri])
+    w = triangle_weights(tri, _arr([[0.0, 0.5]]))
+    P = shape_matrix(tri)
+    area2 = P[:, 0, 0] * P[:, 1, 1] - P[:, 0, 1] * P[:, 1, 0]
+    return bool(to_np(counts_once(tri, w, area2))[0])
+
+
+def test_a_shared_edge_counts_for_exactly_one_of_two_neighbours():
+    right = [[0.0, 0.0], [1.0, 0.5], [0.0, 1.0]]  # counter-clockwise, x > 0
+    left = [[0.0, 0.0], [0.0, 1.0], [-1.0, 0.5]]  # counter-clockwise, x < 0
+    assert (_counts(right), _counts(left)) == (True, False)
+
+
+def test_a_fold_edge_counts_for_both_triangles_or_for_neither():
+    # Both on the side the shift (1, eps) points into; the second clockwise.
+    assert _counts([[0.0, 0.0], [1.0, 0.5], [0.0, 1.0]])
+    assert _counts([[0.0, 0.0], [0.0, 1.0], [0.5, 0.5]])
+    # Both on the other side.
+    assert not _counts([[0.0, 0.0], [0.0, 1.0], [-1.0, 0.5]])
+    assert not _counts([[0.0, 0.0], [-0.5, 0.5], [0.0, 1.0]])
+
+
+def test_points_in_the_critical_band_images_are_infinitely_magnified(fold_mesh):
+    cover = band_cover(fold_mesh)
+    assert cover.triangles.shape[0] > 0
+    centroid = backend.sum(cover.vertices[cover.triangles], dim=1) / 3.0
+    mu, _ = mesh_total_magnification(fold_mesh, centroid)
+    assert np.isposinf(to_np(mu)).all()
+
+
+def test_a_mesh_without_a_critical_band_has_no_band_limit(half_mesh):
+    assert band_magnification_floor(half_mesh.critical_band) == math.inf
+    assert band_cover(half_mesh).triangles.shape[0] == 0
+
+
+def test_the_band_limit_is_the_smallest_reciprocal_of_a_leafs_largest_det(fold_mesh):
+    band = fold_mesh.critical_band
+    det = np.abs(to_np(band.det))[to_np(band.samples)]
+    assert band_magnification_floor(band) == float((1.0 / det.max(axis=1)).min())
+
+
+def test_results_do_not_depend_on_the_batch_size(fold_mesh):
+    rng = np.random.default_rng(3)
+    beta = _arr(rng.uniform([-1.5, -1.0], [1.5, 0.3], (200, 2)))
+    mu, n = mesh_total_magnification(fold_mesh, beta)
+    for size in (1, 7, 64):
+        mu_b, n_b = mesh_total_magnification(fold_mesh, beta, batch_size=size)
+        assert np.array_equal(to_np(mu_b), to_np(mu))
+        assert np.array_equal(to_np(n_b), to_np(n))
+
+
+def test_a_lens_that_is_not_finite_at_a_vertex_still_samples_finite_magnifications():
+    # init_res = 4 puts the SIS centre on a lattice vertex, where the map is NaN.
+    mesh = build_adaptive_mesh(_sis, _sis_jacobian, 4.0, 4, 0.02)
+    beta = _arr([[0.3, 0.0], [0.0, -0.45], [0.2, 0.2]])
+    mu, _ = mesh_total_magnification(mesh, beta)
+    assert np.isfinite(to_np(mu)).all()
+    # mu_tot = 2 / |beta| inside the SIS's Einstein radius; the area ratio
+    # errs like sqrt(min_img_sep), so the tolerance is loose.
+    expected = 2.0 / np.linalg.norm(to_np(beta), axis=1)
+    np.testing.assert_allclose(to_np(mu), expected, rtol=0.2)
+
+
+def test_a_float32_mesh_samples_the_float64_mesh_magnifications():
+    m64 = build_adaptive_mesh(_row_fold, _row_fold_jacobian, 4.0, 4, 0.25)
+    m32 = build_adaptive_mesh(
+        _row_fold, _row_fold_jacobian, 4.0, 4, 0.25, dtype=backend.float32
+    )
+    converged = np.flatnonzero(to_np(m64.leaf_status) == 0)
+    centroid = to_np(m64.vertices_source)[to_np(m64.leaves)[converged]].mean(axis=1)
+    mu64, n64 = mesh_total_magnification(m64, _arr(centroid))
+    mu32, n32 = mesh_total_magnification(m32, _arr(centroid))
+    assert np.array_equal(to_np(n32), to_np(n64))
+    finite = np.isfinite(to_np(mu64))
+    assert np.array_equal(np.isfinite(to_np(mu32)), finite)
+    np.testing.assert_allclose(to_np(mu32)[finite], to_np(mu64)[finite], rtol=1e-4)
