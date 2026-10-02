@@ -10,6 +10,7 @@ from caustics.lenses.func.adaptive.magnification import (
     band_cover,
     band_magnification_floor,
     counts_once,
+    hit_magnification,
     mesh_total_magnification,
     sheet_edges,
 )
@@ -352,3 +353,24 @@ def test_a_mesh_with_no_converged_leaf_has_no_magnification_anywhere():
     assert (to_np(mesh.vertices_det) == 0).all()
     mu, n = mesh_total_magnification(mesh, _arr([[0.0, 0.0], [0.3, -0.2]]))
     assert to_np(mu).tolist() == [0.0, 0.0] and to_np(n).tolist() == [0, 0]
+
+
+def test_a_hit_reads_the_same_magnification_in_a_call_of_any_size(fold_mesh):
+    """Each hit sums its own three terms in a fixed order, so a chunk of hits
+    reads exactly what the whole batch does -- which keeps
+    `build_magnification_mesh`'s samples equal to `mesh_total_magnification`
+    at the same points. A row reduction would not: past about 1366 rows
+    (4096 elements) jax changes how it sums a row, and a third of the rows
+    then round differently. 5000 hits against chunks of at most 1000."""
+    converged = np.flatnonzero(to_np(fold_mesh.leaf_status) == 0)
+    rng = np.random.default_rng(8)
+    leaves = rng.choice(converged, 5000)
+    bary = rng.dirichlet(np.ones(3), 5000)
+
+    def hits(lo, hi):
+        idx = backend.as_array(leaves[lo:hi], dtype=backend.int64)
+        return to_np(hit_magnification(fold_mesh, idx, _arr(bary[lo:hi])))
+
+    full = hits(0, 5000)
+    for lo in range(0, 5000, 1000):
+        assert np.array_equal(hits(lo, lo + 1000), full[lo : lo + 1000]), lo

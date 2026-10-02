@@ -101,7 +101,12 @@ def hit_magnification(mesh, leaves, bary) -> ArrayLike:
     ok = backend.all(backend.isfinite(d3), dim=1) & (
         backend.all(d3 > 0, dim=1) | backend.all(d3 < 0, dim=1)
     )
-    det = backend.sum(backend.to(bary, dtype=backend.float64) * d3, dim=1)
+    # Term by term in a fixed order, not a row reduction: jax sums a row
+    # differently once an array passes a few thousand elements, and a hit
+    # must read one value whichever chunk of a query it arrives in -- as
+    # `_per_point_sum` adds its columns for the same reason.
+    b = backend.to(bary, dtype=backend.float64)
+    det = b[:, 0] * d3[:, 0] + b[:, 1] * d3[:, 1] + b[:, 2] * d3[:, 2]
     # `where` before dividing, so that no fallback row divides by a zero or
     # a NaN on its way to being replaced.
     mu = 1.0 / backend.abs(backend.where(ok, det, backend.ones_like(det)))
