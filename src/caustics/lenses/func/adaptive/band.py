@@ -97,7 +97,7 @@ def empty_band(device=None) -> CriticalBand:
     )
 
 
-def band_from_samples(lat, cache, keys, index, J, mid_keys, mid_beta) -> CriticalBand:
+def band_from_samples(lat, cache, keys, index, det, mid_keys, mid_beta) -> CriticalBand:
     """
     The :class:`CriticalBand` among triangles whose six samples are evaluated.
 
@@ -106,8 +106,8 @@ def band_from_samples(lat, cache, keys, index, J, mid_keys, mid_beta) -> Critica
     lat: Lattice
     cache: VertexCache
         Supplies each vertex sample's image.
-    keys, index, J: ArrayLike
-        From :func:`sample_jacobians`.
+    keys, index, det: ArrayLike
+        From :func:`sample_jacobians`: ``det`` is float64, one value per key.
     mid_keys: ArrayLike
         ``(M,)`` int64 keys of the traced ``max_level`` midpoints, ascending.
     mid_beta: ArrayLike
@@ -126,9 +126,6 @@ def band_from_samples(lat, cache, keys, index, J, mid_keys, mid_beta) -> Critica
     AssertionError
         If a band sample is neither a cached vertex nor a traced midpoint.
     """
-    det = backend.to(
-        J[:, 0, 0] * J[:, 1, 1] - J[:, 0, 1] * J[:, 1, 0], dtype=backend.float64
-    )
     det6 = det[index]
     positive = det6 >= 0
     in_band = (

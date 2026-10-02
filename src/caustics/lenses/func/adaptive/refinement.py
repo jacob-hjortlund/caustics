@@ -31,7 +31,14 @@ from .lattice import (
     midpoint_ij,
 )
 from .sampling import evaluate, sample_jacobians, trace_keys
-from .criterion import LEAF_CONVERGED, LEAF_RAYTRACE_NONFINITE, evaluate_criterion
+from .criterion import (
+    LEAF_CONVERGED,
+    LEAF_RAYTRACE_NONFINITE,
+    apply_jacobian_signs,
+    approximate_criterion,
+    evaluate_criterion,
+    jacobian_rows,
+)
 from .band import band_from_samples, empty_band
 
 __all__ = (
@@ -257,8 +264,9 @@ def refine(
     OR-ed into it, and anything but ``LEAF_CONVERGED`` keeps the leaf out of
     the spatial index. A triangle that straddles a fold, in particular,
     contains it at a scale no further split can resolve. That forced pass
-    evaluates each distinct lattice sample once (:func:`sample_jacobians`)
-    rather than six times per triangle, and the same values build the
+    reads every vertex a level above already evaluated from the cache and
+    evaluates the rest, the never-cached midpoints among them, once each
+    (:func:`sample_jacobians`), and the same values build the
     :class:`CriticalBand` (:func:`band_from_samples`) -- the leaves ``det A``
     changes sign across, with ``det A`` and the image at their samples,
     midpoint images included, that would otherwise be dropped. A triangle
@@ -351,6 +359,7 @@ def refine(
         sample was non-finite.
         ``max_level_midpoints``: unique ``max_level`` midpoints traced for the
         parity test.
+        ``jacobian_points``: points passed to ``jacobian_fn``.
         ``forced``: children produced by the balance cascade.
         ``cascade_rounds``: balance-cascade rounds run over the whole build.
     band: CriticalBand
@@ -370,6 +379,7 @@ def refine(
         "sigma_zero": 0,
         "nonfinite_splits": 0,
         "max_level_midpoints": 0,
+        "jacobian_points": 0,
         "forced": 0,
         "cascade_rounds": 0,
     }
@@ -429,18 +439,7 @@ def refine(
                 if good_rows.shape[0]:
                     good_ij = active_ij[good_rows]
                     six_ij = backend.concatenate((good_ij, midpoint_ij(good_ij)), dim=1)
-                    theta = lattice_xy(lat, six_ij)
-                    # One Jacobian call over the distinct samples, not six per
-                    # triangle: shared samples then carry one `A`, which the
-                    # critical band needs, and the batch shrinks ~2.5x.
-                    sample_keys, sample_index, J = sample_jacobians(
-                        lat, six_ij, jacobian_fn
-                    )
-
-                    keep, parity_ok, s, criterion_status = evaluate_criterion(
-                        jacobian_fn,
-                        theta[:, :3],
-                        theta[:, 3:],
+                    approx_status, child_ok, s = approximate_criterion(
                         beta_v[good_rows],
                         beta_m[finite_m],
                         active_cls[good_rows],
@@ -449,8 +448,18 @@ def refine(
                         min_img_sep,
                         PINV0,
                         COMPOSE,
-                        force_jacobian=True,
-                        jacobian=J[sample_index],
+                    )
+                    # Forced, so every good row is tested. One Jacobian call at
+                    # most, over the samples not yet evaluated -- the midpoints,
+                    # never cached, among them -- so that shared samples carry
+                    # one `det A` and sign, which the critical band needs.
+                    tested = jacobian_rows(approx_status, True)
+                    cache, sample_keys, sample_index, det, sign, called = (
+                        sample_jacobians(lat, cache, six_ij, jacobian_fn)
+                    )
+                    counters["jacobian_points"] += called
+                    _, parity_ok, criterion_status = apply_jacobian_signs(
+                        approx_status, child_ok, tested, sign[sample_index][tested]
                     )
 
                     status = backend.fill_at_indices(
@@ -462,7 +471,7 @@ def refine(
                     counters["sigma_zero"] += int(backend.to_numpy(backend.sum(s == 0)))
 
                     band = band_from_samples(
-                        lat, cache, sample_keys, sample_index, J, uniq, mid_beta
+                        lat, cache, sample_keys, sample_index, det, uniq, mid_beta
                     )
                     band = band._replace(leaves=good_rows[band.leaves])
 

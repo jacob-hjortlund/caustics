@@ -41,11 +41,17 @@ from caustics.lenses.func.adaptive.geometry import (
 )
 from caustics.lenses.func.adaptive.lattice import (
     initial_triangles,
+    lattice_key,
     lattice_xy,
     make_lattice,
     midpoint_ij,
 )
-from caustics.lenses.func.adaptive.sampling import sample_jacobians
+from caustics.lenses.func.adaptive.sampling import (
+    evaluate,
+    make_raytrace,
+    sample_jacobians,
+)
+from caustics.lenses.func.adaptive.state import cache_lookup, cache_size, empty_cache
 
 RNG = np.random.default_rng(20260918)
 
@@ -1164,42 +1170,116 @@ def _two_triangles_sharing_an_edge():
     return lat, backend.concatenate((tri, midpoint_ij(tri)), dim=1)
 
 
+def _cache_holding(lat, ij):
+    """A cache holding the lattice points ``ij``, raytraced by the identity, no Jacobian."""
+    keys = backend.unique(lattice_key(lat, ij.reshape(-1, 2)))
+    return evaluate(
+        empty_cache(), lat, keys, make_raytrace(lambda x, y: (x, y), None), None
+    )
+
+
 def test_sample_jacobians_evaluates_each_distinct_lattice_point_once():
     """The shared edge's two ends and midpoint are evaluated once, not twice.
 
-    Gathering the result back through ``index`` must reproduce the Jacobian
-    at every one of the twelve samples, in triangle-major sample order.
+    Gathering through ``index`` reproduces ``det A`` and the criterion's sign
+    at every one of the twelve samples, in triangle-major sample order. With
+    nothing cached, nothing is written back.
     """
     lat, six_ij = _two_triangles_sharing_an_edge()
     jacobian_fn, calls = _recording(_fold_jacobian)
-    keys, index, J = sample_jacobians(lat, six_ij, jacobian_fn)
-    assert len(calls) == 1
-    assert calls[0].shape == (9, 2)
+    cache, keys, index, det, sign, called = sample_jacobians(
+        lat, empty_cache(), six_ij, jacobian_fn
+    )
+    assert len(calls) == 1 and calls[0].shape == (9, 2) and called == 9
     assert tuple(keys.shape) == (9,) and tuple(index.shape) == (2, 6)
     xy = backend.to_numpy(lattice_xy(lat, six_ij)).reshape(-1, 2)
-    want = backend.to_numpy(_fold_jacobian(_arr(xy[:, 0]), _arr(xy[:, 1])))
-    assert np.array_equal(backend.to_numpy(J[index]).reshape(-1, 2, 2), want)
+    J = _fold_jacobian(_arr(xy[:, 0]), _arr(xy[:, 1]))
+    assert np.array_equal(
+        backend.to_numpy(det[index]).reshape(-1), backend.to_numpy(jacobian_det(J))
+    )
+    assert np.array_equal(
+        backend.to_numpy(sign[index]).reshape(-1), backend.to_numpy(jacobian_signs(J))
+    )
+    assert cache_size(cache) == 0
+
+
+def test_sample_jacobians_keeps_cached_points_and_reads_them_back():
+    """A first call evaluates all nine points and keeps the four cached
+    vertices; a second evaluates only the five midpoints, which have no slot,
+    and returns the same values."""
+    lat, six_ij = _two_triangles_sharing_an_edge()
+    cache = _cache_holding(lat, six_ij[:, :3])
+    jacobian_fn, calls = _recording(_fold_jacobian)
+    cache, keys, index, det, sign, called = sample_jacobians(
+        lat, cache, six_ij, jacobian_fn
+    )
+    assert called == 9
+    assert backend.to_numpy(cache.evaluated).tolist() == [True] * 4
+    assert backend.to_numpy(cache.has_det).tolist() == [True] * 4
+    slot = cache_lookup(cache, keys)
+    held = backend.flatnonzero(slot >= 0)
+    assert np.array_equal(
+        backend.to_numpy(cache.det[slot[held]]), backend.to_numpy(det[held])
+    )
+    assert np.array_equal(
+        backend.to_numpy(cache.sign[slot[held]]), backend.to_numpy(sign[held])
+    )
+    again = sample_jacobians(lat, cache, six_ij, jacobian_fn)
+    assert again[5] == 5 and calls[-1].shape == (5, 2)
+    for a, b in zip(again[1:5], (keys, index, det, sign)):
+        assert np.array_equal(backend.to_numpy(a), backend.to_numpy(b))
+
+
+def test_sample_jacobians_never_calls_the_jacobian_when_every_point_is_evaluated():
+    lat, six_ij = _two_triangles_sharing_an_edge()
+    cache = _cache_holding(lat, six_ij)  # vertices and midpoints alike
+    cache, *_ = sample_jacobians(lat, cache, six_ij, _fold_jacobian)
+    *_, index, _, _, called = sample_jacobians(lat, cache, six_ij, _exploding_jacobian)
+    assert called == 0 and tuple(index.shape) == (2, 6)
+
+
+def test_sample_jacobians_keeps_a_seeded_det():
+    """A point that brings a ``det A`` from a frozen mesh but no sign is
+    evaluated for its sign, and keeps its ``det``."""
+    lat, six_ij = _two_triangles_sharing_an_edge()
+    cache = _cache_holding(lat, six_ij[:, :3])
+    cache = cache._replace(
+        det=_arr([42.0, np.nan, np.nan, np.nan]),
+        has_det=backend.as_array(np.array([True, False, False, False])),
+    )
+    cache, keys, index, det, sign, called = sample_jacobians(
+        lat, cache, six_ij, _fold_jacobian
+    )
+    assert called == 9
+    assert backend.to_numpy(cache.det)[0] == 42.0
+    assert backend.to_numpy(cache.evaluated).tolist() == [True] * 4
+    at = int(backend.to_numpy(backend.flatnonzero(cache_lookup(cache, keys) == 0))[0])
+    assert backend.to_numpy(det)[at] == 42.0
 
 
 def test_sample_jacobians_of_no_triangles_never_calls_the_jacobian():
     lat, _ = _two_triangles_sharing_an_edge()
     empty = backend.zeros((0, 6, 2), dtype=backend.int64)
-    keys, index, J = sample_jacobians(lat, empty, _exploding_jacobian)
-    assert tuple(keys.shape) == (0,)
-    assert tuple(index.shape) == (0, 6)
-    assert tuple(J.shape) == (0, 2, 2)
+    cache, keys, index, det, sign, called = sample_jacobians(
+        lat, empty_cache(), empty, _exploding_jacobian
+    )
+    assert called == 0
+    assert tuple(keys.shape) == (0,) and tuple(index.shape) == (0, 6)
+    assert tuple(det.shape) == (0,) and tuple(sign.shape) == (0,)
 
 
 def test_sample_jacobians_rejects_a_wrong_shape():
     lat, six_ij = _two_triangles_sharing_an_edge()
     with pytest.raises(ValueError, match=r"\(K, 2, 2\)"):
-        sample_jacobians(lat, six_ij, _fixed_jacobians(np.zeros((12, 2, 2))))
+        sample_jacobians(
+            lat, empty_cache(), six_ij, _fixed_jacobians(np.zeros((12, 2, 2)))
+        )
 
 
 def test_sample_jacobians_rejects_a_jacobian_that_returns_no_array():
     lat, six_ij = _two_triangles_sharing_an_edge()
     with pytest.raises(ValueError, match=r"\(K, 2, 2\) for K points, got tuple"):
-        sample_jacobians(lat, six_ij, _tuple_jacobian)
+        sample_jacobians(lat, empty_cache(), six_ij, _tuple_jacobian)
 
 
 def _awkward_jacobians():

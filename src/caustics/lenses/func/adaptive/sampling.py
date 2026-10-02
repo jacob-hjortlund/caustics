@@ -4,15 +4,24 @@ Evaluating the lens on lattice points.
 :func:`make_raytrace` wraps a user ``raytrace`` so that coordinates go out and
 come back as float64 -- the single most important property of the build.
 :func:`evaluate` fills the vertex cache without ever tracing a point twice,
-and :func:`sample_jacobians` evaluates the Jacobian once per distinct lattice
-point.
+and :func:`sample_jacobians` evaluates the Jacobian at most once per lattice
+point per build, keeping ``det A`` and the criterion's sign of it in the
+vertex cache.
 """
 
 import math
 from typing import Callable, Tuple
 
 from ....backend_obj import ArrayLike, backend
-from .state import VertexCache, cache_insert, cache_missing
+from .geometry import jacobian_det, jacobian_signs
+from .state import (
+    VertexCache,
+    cache_insert,
+    cache_lookup,
+    cache_missing,
+    cache_set_jacobian,
+    cache_size,
+)
 from .lattice import lattice_ij_from_key, lattice_key, lattice_xy
 
 __all__ = (
@@ -20,6 +29,7 @@ __all__ = (
     "trace_points",
     "trace_keys",
     "evaluate",
+    "call_jacobian",
     "sample_jacobians",
 )
 
@@ -204,25 +214,63 @@ def evaluate(cache, lat, keys, raytrace_fn, batch_size) -> VertexCache:
     return new_cache
 
 
-def sample_jacobians(
-    lat, six_ij, jacobian_fn
-) -> Tuple[ArrayLike, ArrayLike, ArrayLike]:
+def call_jacobian(lat, ij, jacobian_fn) -> ArrayLike:
     """
-    The lens Jacobian at every triangle's six samples, one call per lattice point.
-
-    A vertex is shared by about six triangles and a midpoint by two, so
-    evaluating per triangle, as :func:`jacobian_parity_ok` does, repeats
-    most points. Deduplicating on the lattice key first cuts the batch by
-    roughly ``2.5x`` on a refined region, and it gives every triangle that
-    shares a sample the same ``A`` there -- which the critical band relies
-    on.
-
-    ``jacobian_fn`` is called exactly once, on the lattice's own float64
-    coordinates, and not at all when there are no triangles.
+    ``jacobian_fn`` once, on the float64 lens-plane positions of lattice points.
 
     Parameters
     ----------
     lat: Lattice
+    ij: ArrayLike
+        ``(K, 2)`` int64 lattice coordinates.
+    jacobian_fn: Callable[[ArrayLike, ArrayLike], ArrayLike]
+        ``jacobian_fn(x, y) -> (K, 2, 2)``.
+
+    Returns
+    -------
+    ArrayLike
+        ``(K, 2, 2)``, as ``jacobian_fn`` returned it.
+
+    Raises
+    ------
+    ValueError
+        If ``jacobian_fn`` does not return ``(K, 2, 2)`` for ``K`` points.
+    """
+    xy = lattice_xy(lat, ij)
+    J = jacobian_fn(xy[:, 0], xy[:, 1])
+    # `getattr`, not `J.shape`: a raytrace passed as the Jacobian returns a
+    # tuple, which should fail here, naming the Jacobian, not as an
+    # AttributeError.
+    shape = getattr(J, "shape", None)
+    if shape != (ij.shape[0], 2, 2):
+        got = type(J).__name__ if shape is None else tuple(shape)
+        raise ValueError(
+            "jacobian_fn must return an array of shape (K, 2, 2) for K points, "
+            f"got {got}"
+        )
+    return J
+
+
+def sample_jacobians(
+    lat, cache, six_ij, jacobian_fn
+) -> Tuple[VertexCache, ArrayLike, ArrayLike, ArrayLike, ArrayLike, int]:
+    """
+    ``det A`` and the criterion's sign at every triangle's six samples, each point evaluated once.
+
+    The samples are deduplicated on their lattice keys. A key whose cache
+    slot is already ``evaluated`` reads ``det`` and ``sign`` back from the
+    cache. The rest go to a single :func:`call_jacobian`, or to none when
+    there are none. Of those, a key with a cache slot is written back
+    (:func:`cache_set_jacobian`); one with none -- a ``max_level`` midpoint,
+    whose odd coordinate is never cached -- is used here and dropped, as its
+    raytrace is. So across a build, as with raytraced points, no lattice
+    point is evaluated twice, and every triangle sharing a sample reads one
+    value there, which the critical band relies on.
+
+    Parameters
+    ----------
+    lat: Lattice
+    cache: VertexCache
     six_ij: ArrayLike
         Lattice coordinates of each triangle's ``theta_1, theta_2, theta_3,
         m_1, m_2, m_3``, shape ``(G, 6, 2)`` int64.
@@ -231,36 +279,61 @@ def sample_jacobians(
 
     Returns
     -------
+    cache: VertexCache
+        With the new values of every cached key recorded.
     keys: ArrayLike
         ``(U,)`` int64, the distinct sample keys, ascending.
     index: ArrayLike
         ``(G, 6)`` int64 index into ``keys`` of each triangle's samples.
-    J: ArrayLike
-        ``(U, 2, 2)``, the Jacobian at each distinct sample.
+    det: ArrayLike
+        ``(U,)`` float64 ``det A``: the cache's wherever it has one, so a
+        value seeded from a frozen mesh wins, and the new one elsewhere.
+    sign: ArrayLike
+        ``(U,)`` int64, :func:`jacobian_signs` of each.
+    n_called: int
+        Points passed to ``jacobian_fn``.
 
     Raises
     ------
     ValueError
-        If ``jacobian_fn`` does not return ``(K, 2, 2)`` for ``K`` points.
+        As :func:`call_jacobian`.
     """
     n = six_ij.shape[0]
     if n == 0:
         return (
+            cache,
             backend.zeros((0,), dtype=backend.int64),
             backend.zeros((0, 6), dtype=backend.int64),
-            backend.zeros((0, 2, 2), dtype=backend.float64),
+            backend.zeros((0,), dtype=backend.float64),
+            backend.zeros((0,), dtype=backend.int64),
+            0,
         )
     keys, index = backend.unique(
         lattice_key(lat, six_ij).reshape(-1), return_inverse=True
     )
-    xy = lattice_xy(lat, lattice_ij_from_key(lat, keys))
-    J = jacobian_fn(xy[:, 0], xy[:, 1])
-    # `getattr` for the reason `jacobian_parity_ok` gives.
-    shape = getattr(J, "shape", None)
-    if shape != (keys.shape[0], 2, 2):
-        got = type(J).__name__ if shape is None else tuple(shape)
-        raise ValueError(
-            "jacobian_fn must return an array of shape (K, 2, 2) for K points, "
-            f"got {got}"
+    slot = cache_lookup(cache, keys)
+    cached = slot >= 0
+    if cache_size(cache):
+        at = backend.where(cached, slot, backend.zeros_like(slot))
+        done = cached & cache.evaluated[at]
+        held = cached & cache.has_det[at]
+        det = backend.where(held, cache.det[at], backend.nan)
+        sign = backend.where(done, cache.sign[at], backend.zeros_like(slot))
+    else:
+        done = held = backend.zeros(keys.shape, dtype=backend.bool)
+        det = backend.zeros(keys.shape, dtype=backend.float64) + backend.nan
+        sign = backend.zeros_like(slot)
+    todo = backend.flatnonzero(~done)
+    n_called = int(todo.shape[0])
+    if n_called:
+        J = call_jacobian(lat, lattice_ij_from_key(lat, keys[todo]), jacobian_fn)
+        new_det, new_sign = jacobian_det(J), jacobian_signs(J)
+        # `det` and `sign` are fresh arrays from `where`/`zeros`, so filling
+        # them in place touches no caller's array.
+        det = backend.fill_at_indices(
+            det, todo, backend.where(held[todo], det[todo], new_det)
         )
-    return keys, index.reshape(n, 6), J
+        sign = backend.fill_at_indices(sign, todo, new_sign)
+        own = backend.flatnonzero(cached[todo])
+        cache = cache_set_jacobian(cache, slot[todo][own], new_det[own], new_sign[own])
+    return cache, keys, index.reshape(n, 6), det, sign, n_called

@@ -208,7 +208,8 @@ def test_refine_counters_match_the_oracle_where_no_fold_exists(
     unfolded coarse triangles -- up to nine per fixture here -- and books them
     as parity splits, although the deviation test splits them anyway.
     With no fold to find, this module books every such split to deviation, so
-    the total is unchanged.
+    the total is unchanged. The oracle never calls a Jacobian, so it has no
+    ``jacobian_points`` to match.
     """
     _, _, _, got = _run_new(raytrace, jacobian, fov, init_res, min_img_sep, max_level)
     want = dict(
@@ -217,6 +218,7 @@ def test_refine_counters_match_the_oracle_where_no_fold_exists(
         ).counters
     )
     got = dict(got)
+    got.pop("jacobian_points")
     assert got.pop("parity_splits") == 0
     assert got.pop("deviation_splits") == want.pop("deviation_splits") + want.pop(
         "parity_splits"
