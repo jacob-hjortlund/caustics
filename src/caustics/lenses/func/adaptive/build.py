@@ -429,6 +429,10 @@ def seed_from_mesh(
         slots=backend.arange(n_vertices, dtype=backend.int64),
         ij=ij,
         beta=beta,
+        det=backend.zeros((n_vertices,), dtype=backend.float64) + backend.nan,
+        sign=backend.zeros((n_vertices,), dtype=backend.int64),
+        has_det=backend.zeros((n_vertices,), dtype=backend.bool),
+        evaluated=backend.zeros((n_vertices,), dtype=backend.bool),
     )
     active = backend.ones((n_vertices,), dtype=backend.bool)
 

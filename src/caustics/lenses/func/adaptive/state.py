@@ -18,6 +18,7 @@ __all__ = (
     "cache_lookup",
     "cache_missing",
     "cache_insert",
+    "cache_set_jacobian",
     "empty_active",
     "active_add_slots",
     "active_contains_slots",
@@ -43,6 +44,18 @@ class VertexCache(NamedTuple):
     evaluated point, shape ``(N, 2)`` and indexed by slot: the source-plane
     image in a lens build, ``(mu_tot, n)`` in a magnification build
     (:func:`~caustics.lenses.func.adaptive.source_mesh.build_magnification_mesh`).
+    ``det``, ``sign``, ``has_det`` and ``evaluated``, shape ``(N,)`` and
+    indexed by slot, hold what the lens Jacobian gave at each point: ``det A``
+    as float64 (:func:`~caustics.lenses.func.adaptive.geometry.jacobian_det`)
+    where ``has_det``, and the criterion's sign of it as int64
+    (:func:`~caustics.lenses.func.adaptive.geometry.jacobian_signs`) where
+    ``evaluated``. ``evaluated`` means the Jacobian was evaluated at the point
+    in this build. ``has_det`` holds there too, and also at a vertex seeded
+    from a frozen mesh, which brings its ``det`` but no sign
+    (:func:`~caustics.lenses.func.adaptive.build.seed_from_mesh`). Entries not
+    set hold ``NaN`` and 0. A magnification build carries these columns
+    unset.
+
     ``keys`` and ``slots`` are the sorted-key index: ``keys`` is ascending,
     and ``slots[i]`` is the slot of ``keys[i]``.
     """
@@ -51,6 +64,10 @@ class VertexCache(NamedTuple):
     slots: ArrayLike
     ij: ArrayLike
     beta: ArrayLike
+    det: ArrayLike
+    sign: ArrayLike
+    has_det: ArrayLike
+    evaluated: ArrayLike
 
 
 def empty_cache(device=None) -> VertexCache:
@@ -60,6 +77,10 @@ def empty_cache(device=None) -> VertexCache:
         slots=backend.empty((0,), dtype=backend.int64, device=device),
         ij=backend.empty((0, 2), dtype=backend.int64, device=device),
         beta=backend.empty((0, 2), dtype=backend.float64, device=device),
+        det=backend.empty((0,), dtype=backend.float64, device=device),
+        sign=backend.empty((0,), dtype=backend.int64, device=device),
+        has_det=backend.empty((0,), dtype=backend.bool, device=device),
+        evaluated=backend.empty((0,), dtype=backend.bool, device=device),
     )
 
 
@@ -108,6 +129,20 @@ def cache_insert(cache, keys, ij, beta) -> Tuple[VertexCache, ArrayLike]:
 
     new_ij = backend.concatenate([cache.ij, ij], dim=0)
     new_beta = backend.concatenate([cache.beta, beta], dim=0)
+    # A point is raytraced before the Jacobian ever reaches it, so it arrives
+    # with no Jacobian value; `cache_set_jacobian` records one.
+    new_det = backend.concatenate(
+        [cache.det, backend.zeros((k,), dtype=backend.float64) + backend.nan], dim=0
+    )
+    new_sign = backend.concatenate(
+        [cache.sign, backend.zeros((k,), dtype=backend.int64)], dim=0
+    )
+    new_has_det = backend.concatenate(
+        [cache.has_det, backend.zeros((k,), dtype=backend.bool)], dim=0
+    )
+    new_evaluated = backend.concatenate(
+        [cache.evaluated, backend.zeros((k,), dtype=backend.bool)], dim=0
+    )
 
     total = cache.keys.shape[0] + k
     dest = backend.searchsorted(cache.keys, keys) + backend.arange(
@@ -131,8 +166,53 @@ def cache_insert(cache, keys, ij, beta) -> Tuple[VertexCache, ArrayLike]:
     new_slots = backend.fill_at_indices(new_slots, old_dest, cache.slots)
 
     return (
-        VertexCache(keys=new_keys, slots=new_slots, ij=new_ij, beta=new_beta),
+        VertexCache(
+            keys=new_keys,
+            slots=new_slots,
+            ij=new_ij,
+            beta=new_beta,
+            det=new_det,
+            sign=new_sign,
+            has_det=new_has_det,
+            evaluated=new_evaluated,
+        ),
         slots,
+    )
+
+
+def cache_set_jacobian(cache, slots, det, sign) -> VertexCache:
+    """
+    Record the Jacobian at ``slots``, which must be unique and not yet ``evaluated``.
+
+    Sets ``sign`` and ``evaluated`` at every slot, and ``det`` and ``has_det``
+    only where ``has_det`` is still False. So the first ``det`` a point is
+    given -- a seeding mesh's included -- is the one it keeps, and an
+    extension never changes a value the mesh it grew from stored. Writes into
+    fresh buffers, never the cache's own, for the reason :func:`store_remove`
+    gives.
+
+    Parameters
+    ----------
+    cache: VertexCache
+    slots: ArrayLike
+        ``(K,)`` int64.
+    det: ArrayLike
+        ``(K,)`` float64, from
+        :func:`~caustics.lenses.func.adaptive.geometry.jacobian_det`.
+    sign: ArrayLike
+        ``(K,)`` int64, from
+        :func:`~caustics.lenses.func.adaptive.geometry.jacobian_signs`.
+
+    Returns
+    -------
+    VertexCache
+    """
+    fresh = backend.flatnonzero(~cache.has_det[slots])
+    return cache._replace(
+        det=backend.fill_at_indices(backend.copy(cache.det), slots[fresh], det[fresh]),
+        sign=backend.fill_at_indices(backend.copy(cache.sign), slots, sign),
+        has_det=backend.fill_at_indices(backend.copy(cache.has_det), slots, True),
+        evaluated=backend.fill_at_indices(backend.copy(cache.evaluated), slots, True),
     )
 
 

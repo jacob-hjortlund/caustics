@@ -446,6 +446,10 @@ def _two_triangle_state():
         slots=i64(np.arange(4)),
         ij=i64(vertices),
         beta=f64(vertices * 1.0),
+        det=f64(np.full(4, np.nan)),
+        sign=i64(np.zeros(4)),
+        has_det=backend.as_array(np.zeros(4, dtype=bool)),
+        evaluated=backend.as_array(np.zeros(4, dtype=bool)),
     )
     store, _ = store_add(
         empty_store(), i64([[0, 3, 1], [0, 2, 3]]), 0, 0, LEAF_CONVERGED

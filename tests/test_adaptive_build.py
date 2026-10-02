@@ -36,6 +36,7 @@ from caustics.lenses.func.adaptive.state import (
     cache_insert,
     cache_lookup,
     cache_missing,
+    cache_set_jacobian,
     cache_size,
     empty_active,
     empty_cache,
@@ -160,6 +161,10 @@ def _f64(x):
     return backend.as_array(np.asarray(x, dtype=np.float64), dtype=backend.float64)
 
 
+def _bool(x):
+    return backend.as_array(np.asarray(x, dtype=bool))
+
+
 def test_cache_lookup_missing_insert():
     cache = empty_cache()
     assert backend.to_numpy(cache_lookup(cache, _i64([5, 9]))).tolist() == [-1, -1]
@@ -211,6 +216,39 @@ def test_cache_slots_are_assigned_in_insertion_order():
     # Slot order is insertion order; key order is sorted. They differ.
     assert backend.to_numpy(cache.keys).tolist() == [5, 10, 15, 20]
     assert backend.to_numpy(cache.slots).tolist() == [2, 0, 3, 1]
+
+
+def test_inserted_points_carry_no_jacobian():
+    cache, _ = cache_insert(
+        empty_cache(), _i64([3, 8]), _i64(np.zeros((2, 2))), _f64(np.zeros((2, 2)))
+    )
+    assert np.isnan(backend.to_numpy(cache.det)).all()
+    assert backend.to_numpy(cache.sign).tolist() == [0, 0]
+    assert not backend.to_numpy(cache.has_det).any()
+    assert not backend.to_numpy(cache.evaluated).any()
+
+
+def test_cache_set_jacobian_records_every_sign_and_only_a_first_det():
+    """Slot 1 already carries a det, as a vertex seeded from a frozen mesh
+    does: it gains a sign and keeps its det. The input cache is untouched,
+    under torch too."""
+    cache, _ = cache_insert(
+        empty_cache(), _i64([3, 8, 9]), _i64(np.zeros((3, 2))), _f64(np.zeros((3, 2)))
+    )
+    cache = cache._replace(
+        det=_f64([np.nan, 7.0, np.nan]), has_det=_bool([False, True, False])
+    )
+    got = cache_set_jacobian(cache, _i64([1, 2]), _f64([-1.0, 2.0]), _i64([-1, 1]))
+    assert np.array_equal(backend.to_numpy(got.det), [np.nan, 7.0, 2.0], equal_nan=True)
+    assert backend.to_numpy(got.sign).tolist() == [0, -1, 1]
+    assert backend.to_numpy(got.has_det).tolist() == [False, True, True]
+    assert backend.to_numpy(got.evaluated).tolist() == [False, True, True]
+    assert np.array_equal(
+        backend.to_numpy(cache.det), [np.nan, 7.0, np.nan], equal_nan=True
+    )
+    assert backend.to_numpy(cache.sign).tolist() == [0, 0, 0]
+    assert backend.to_numpy(cache.has_det).tolist() == [False, True, False]
+    assert backend.to_numpy(cache.evaluated).tolist() == [False, False, False]
 
 
 def test_active_membership_and_negative_slots():
