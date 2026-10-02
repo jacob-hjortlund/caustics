@@ -1,8 +1,9 @@
 """
 Regions of total magnification at least a threshold, from a magnification mesh.
 
-:func:`magnified_regions` traces their boundaries. All of this module reads
-one field at the vertices of a
+:func:`magnified_regions` traces their boundaries, :func:`magnified_area`
+measures them and :func:`in_magnified_region` tells which points lie in them.
+All three read one field at the vertices of a
 :class:`~caustics.lenses.func.adaptive.source_mesh.MagnificationMesh`,
 ``g = u(mu_min) - u(mu)`` with ``u = 1 / (1 + mu)`` (:func:`region_field`),
 under one tie rule -- ``g >= 0``, that is ``mu >= mu_min``, is inside, as
@@ -13,15 +14,20 @@ measured and the points classified inside. ``u`` is bounded and sends the
 critical band's ``+inf`` to 0, so nothing special-cases infinity.
 """
 
-from typing import NamedTuple
+from typing import NamedTuple, Tuple
 
 from ....backend_obj import ArrayLike, backend
+from .geometry import shape_matrix
+from .lattice import lattice_on_boundary
+from .query import index_hits
 from .curves import chain_segments, edge_zeros, triangle_segments
 
 __all__ = (
     "MagnifiedRegions",
     "region_field",
     "magnified_regions",
+    "magnified_area",
+    "in_magnified_region",
 )
 
 
@@ -109,3 +115,129 @@ def magnified_regions(mag, mu_min) -> MagnifiedRegions:
     return MagnifiedRegions(
         source=points, offsets=offsets, closed=closed, mu_min=float(mu_min)
     )
+
+
+def _inside_area(mag, g, area, complete, boundary) -> Tuple[ArrayLike, ArrayLike]:
+    """The area where the interpolated ``g >= 0`` over complete leaves, and whether it is whole."""
+    corners = g[mag.leaves]
+    inside = corners >= 0
+    n_in = backend.sum(backend.long(inside), dim=1)
+    odd_inside = n_in == 1
+    odd = backend.argmax(
+        backend.long(backend.where(backend.unsqueeze(odd_inside, -1), inside, ~inside)),
+        1,
+    )
+    rows = backend.arange(
+        corners.shape[0], dtype=backend.int64, device=backend.device(corners)
+    )
+    g_i = corners[rows, odd]
+    g_j = corners[rows, (odd + 1) % 3]
+    g_k = corners[rows, (odd + 2) % 3]
+    # The corner at the odd vertex, cut off by the segment between the two
+    # crossings; on a leaf of one class this is 0/0, masked below.
+    corner = (g_i / (g_i - g_j)) * (g_i / (g_i - g_k)) * area
+    mixed = (n_in == 1) | (n_in == 2)
+    zero = backend.zeros_like(area)
+    part = backend.where(n_in == 3, area, zero)
+    part = backend.where(mixed, backend.where(odd_inside, corner, area - corner), part)
+    total = backend.sum(backend.where(complete, part, zero))
+    reaches = backend.any(inside[backend.flatnonzero(~complete)]) | backend.any(
+        (g >= 0) & boundary
+    )
+    return total, ~reaches
+
+
+def magnified_area(mag, mu_min) -> Tuple[ArrayLike, ArrayLike]:
+    """
+    Source-plane area where ``mu_tot >= mu_min``, and whether the region is whole.
+
+    Per leaf, without tracing: a leaf with every vertex inside counts its
+    area ``A``; a mixed leaf with odd vertex ``i`` and crossings at
+    ``t_ij``, ``t_ik`` along its edges from ``i`` counts ``t_ij * t_ik * A``
+    when ``i`` is inside and ``A - t_ij * t_ik * A`` when it is not. That is
+    exactly the region :func:`magnified_regions` bounds, so when every loop
+    is closed it equals the loops' signed shoelace sum to rounding. Leaves
+    marked ``incomplete`` count nothing.
+
+    Parameters
+    ----------
+    mag: MagnificationMesh
+    mu_min: float or ArrayLike
+        One threshold, or a 1-D array of them: one vectorized pass each
+        gives the whole ``sigma(mu_min)``.
+
+    Returns
+    -------
+    area: ArrayLike
+        float64 of ``mu_min``'s shape, a 0-d array for a scalar.
+
+        *Unit: arcsec^2*
+    complete: ArrayLike
+        bool of ``mu_min``'s shape: False where an inside vertex lies on an
+        ``incomplete`` leaf or on the window's boundary -- where the region
+        runs into missing data and its curves come back open.
+    """
+    thresholds = backend.as_array(mu_min, dtype=backend.float64)
+    P = shape_matrix(mag.vertices[mag.leaves])
+    area = 0.5 * (P[:, 0, 0] * P[:, 1, 1] - P[:, 0, 1] * P[:, 1, 0])
+    complete = ~mag.incomplete
+    boundary = lattice_on_boundary(mag.lattice, mag.vertices_ij)
+    areas, flags = [], []
+    for t in backend.to_numpy(thresholds).reshape(-1).tolist():
+        a, c = _inside_area(mag, region_field(mag, t), area, complete, boundary)
+        areas.append(a)
+        flags.append(c)
+    shape = tuple(thresholds.shape)
+    return backend.stack(areas).reshape(shape), backend.stack(flags).reshape(shape)
+
+
+def in_magnified_region(mag, mu_min, beta) -> Tuple[ArrayLike, ArrayLike]:
+    """
+    Whether each source-plane point lies where ``mu_tot >= mu_min``.
+
+    ``mag.index`` finds the leaf containing each point; leaves do not
+    overlap, and on a shared edge both neighbours interpolate the same
+    value, so the first is used. Inside means the barycentric interpolation
+    of :func:`region_field` is ``>= 0``: exactly the side of the traced
+    segment the point falls on.
+
+    Parameters
+    ----------
+    mag: MagnificationMesh
+    mu_min: float
+    beta: ArrayLike
+        ``(B, 2)`` source-plane points.
+
+        *Unit: arcsec*
+
+    Returns
+    -------
+    inside: ArrayLike
+        ``(B,)`` bool, False wherever ``complete`` is.
+    complete: ArrayLike
+        ``(B,)`` bool, False for a point in an ``incomplete`` leaf or outside
+        the window, where the answer is not known.
+    """
+    beta = backend.as_array(beta, dtype=backend.float64, device=mag.device)
+    b = beta.shape[0]
+    inside = backend.zeros((b,), dtype=backend.bool, device=mag.device)
+    complete = backend.zeros((b,), dtype=backend.bool, device=mag.device)
+    qidx, tri, w = index_hits(mag.index, mag.vertices, mag.leaves, beta)
+    if qidx.shape[0] == 0:
+        return inside, complete
+    first = backend.flatnonzero(
+        backend.concatenate(
+            (
+                backend.ones((1,), dtype=backend.bool, device=mag.device),
+                qidx[1:] != qidx[:-1],
+            ),
+            dim=0,
+        )
+    )
+    q, t, w = qidx[first], tri[first], w[first]
+    bary = w / backend.unsqueeze(backend.sum(w, dim=1), -1)
+    value = backend.sum(bary * region_field(mag, mu_min)[mag.leaves[t]], dim=1)
+    known = ~mag.incomplete[t]
+    complete = backend.fill_at_indices(complete, q, known)
+    inside = backend.fill_at_indices(inside, q, known & (value >= 0))
+    return inside, complete

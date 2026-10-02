@@ -3,7 +3,11 @@ import pytest
 
 from caustics.backend_obj import backend
 from caustics.lenses.func.adaptive import build_adaptive_mesh
-from caustics.lenses.func.adaptive.regions import magnified_regions
+from caustics.lenses.func.adaptive.regions import (
+    in_magnified_region,
+    magnified_area,
+    magnified_regions,
+)
 from caustics.lenses.func.adaptive.source_mesh import build_magnification_mesh
 
 
@@ -132,3 +136,93 @@ def test_a_threshold_beyond_the_band_limit_leaves_only_the_band_strip(fold_mag):
     b = to_np(magnified_regions(fold_mag, 1e9).source)[:, 1]
     assert b.shape[0] > 0
     assert (np.abs(b - 0.25) <= fold_mag.src_tol).all()
+
+
+@pytest.fixture(scope="module")
+def sis_lens():
+    return build_adaptive_mesh(_sis, _sis_jacobian, 4.0, 8, 0.01, centres=[(0.0, 0.0)])
+
+
+@pytest.fixture(scope="module")
+def sis_mag(sis_lens):
+    # mu_tot >= 4 on the disk |beta| <= 0.5; the window stays inside the
+    # image of the lens fov's boundary.
+    return build_magnification_mesh(
+        sis_lens, 8, 0.02, mu_min=4.0, fov=1.5, x0=0.0, y0=0.0
+    )
+
+
+def _shoelace(curve):
+    x, y = curve[:, 0], curve[:, 1]
+    return 0.5 * np.sum(x * np.roll(y, -1) - np.roll(x, -1) * y)
+
+
+def _winding(points, curves):
+    total = np.zeros(points.shape[0])
+    for c in curves:
+        a = c[None, :, :] - points[:, None, :]
+        b = np.roll(c, -1, axis=0)[None, :, :] - points[:, None, :]
+        cross = a[..., 0] * b[..., 1] - a[..., 1] * b[..., 0]
+        total += np.arctan2(cross, (a * b).sum(-1)).sum(axis=1)
+    return total / (2.0 * np.pi)
+
+
+def test_the_area_is_the_signed_area_the_closed_loops_bound(sis_mag):
+    curves, closed = _curves(magnified_regions(sis_mag, 4.0))
+    assert closed.all()
+    area, complete = magnified_area(sis_mag, 4.0)
+    assert bool(to_np(complete))
+    np.testing.assert_allclose(
+        float(to_np(area)), sum(_shoelace(c) for c in curves), rtol=1e-9
+    )
+
+
+def test_membership_is_the_side_of_the_loops_a_point_is_on(sis_mag):
+    curves, _ = _curves(magnified_regions(sis_mag, 4.0))
+    points = np.random.default_rng(11).uniform(-0.74, 0.74, (2000, 2))
+    inside, complete = in_magnified_region(sis_mag, 4.0, _arr(points))
+    assert to_np(complete).all()
+    assert np.array_equal(to_np(inside), _winding(points, curves) > 0.5)
+
+
+def test_points_outside_the_window_are_not_known(sis_mag):
+    inside, complete = in_magnified_region(sis_mag, 4.0, _arr([[5.0, 5.0], [0.0, 0.0]]))
+    assert to_np(complete).tolist() == [False, True]
+    assert to_np(inside).tolist() == [False, True]
+
+
+def test_the_area_takes_the_shape_of_mu_min(sis_mag):
+    area, complete = magnified_area(sis_mag, [4.0, 8.0])
+    assert tuple(area.shape) == (2,) and tuple(complete.shape) == (2,)
+    single, _ = magnified_area(sis_mag, 4.0)
+    assert tuple(single.shape) == ()
+    assert float(to_np(area)[0]) == float(to_np(single))
+    assert to_np(area)[1] < to_np(area)[0]
+
+
+def test_a_zero_threshold_takes_the_whole_window(sis_mag):
+    area, complete = magnified_area(sis_mag, 0.0)
+    np.testing.assert_allclose(float(to_np(area)), sis_mag.fov**2, rtol=1e-12)
+    assert not bool(to_np(complete))
+    assert to_np(magnified_regions(sis_mag, 0.0).offsets).tolist() == [0]
+
+
+def test_a_window_that_misses_every_image_has_no_region(sis_lens):
+    far = build_magnification_mesh(
+        sis_lens, 4, 0.1, mu_min=4.0, fov=1.0, x0=50.0, y0=0.0
+    )
+    assert (to_np(far.mu) == 0).all()
+    assert not to_np(far.incomplete).any()
+    assert to_np(magnified_regions(far, 4.0).offsets).tolist() == [0]
+    area, complete = magnified_area(far, 4.0)
+    assert float(to_np(area)) == 0.0 and bool(to_np(complete))
+    inside, known = in_magnified_region(far, 4.0, _arr([[50.0, 0.0]]))
+    assert to_np(inside).tolist() == [False] and to_np(known).tolist() == [True]
+
+
+def test_the_fold_strip_area_is_open_and_about_its_width(fold_mag):
+    area, complete = magnified_area(fold_mag, 4.0)
+    assert not bool(to_np(complete))
+    # The strip is 1/16 tall and 1 wide; the area ratio's few-per-cent error
+    # moves its level line by about 0.01.
+    assert abs(float(to_np(area)) - 0.0625) < 0.025
