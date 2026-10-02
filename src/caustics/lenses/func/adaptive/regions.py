@@ -45,19 +45,16 @@ class MagnifiedRegions(NamedTuple):
     :class:`~caustics.lenses.func.adaptive.curves.CriticalCurvesAndCaustics`,
     so anything computing tangents or arc length must guard against them.
 
-    Expect small extra loops along each boundary. Where the gradient of
-    ``mu`` across the boundary is small next to the sampled field's
-    leaf-scale error (see
+    Within an image sheet the sampled field is continuous (see
     :func:`~caustics.lenses.func.adaptive.magnification.mesh_total_magnification`),
-    the field crosses ``mu_min`` more than once, and each excursion is traced
-    faithfully as a small closed island or hole beside the main boundary.
-    On an SIS lens mesh at ``min_img_sep = 0.005``, the disk ``mu_tot >= 4``
-    came back as one loop carrying 99.9% of its area and 48 islands and
-    holes of at most 4e-4 arcsec^2 each, up to 0.04 arcsec from the exact
-    circle. Areas and membership are hardly affected, since the islands
-    nearly cancel; where a single curve per region is wanted, keep the
-    loops of largest area. Interpolating ``det A`` at the lens vertices
-    instead of using area ratios would shrink them.
+    so a boundary is one curve wherever ``mu`` crosses ``mu_min`` once. On an
+    SIS lens mesh at ``min_img_sep = 0.005``, the disk ``mu_tot >= 4`` comes
+    back as a single loop within 4e-4 arcsec of the exact circle. A cored
+    isothermal lens's ``mu_tot >= 6`` comes back as exactly its three circles.
+    Area-ratio magnifications had given the same disk 48 extra islands and
+    holes. A leaf read by its area ratio, the fallback of
+    :func:`~caustics.lenses.func.adaptive.magnification.hit_magnification`,
+    can still put a small excursion beside a boundary.
 
     Parameters
     ----------

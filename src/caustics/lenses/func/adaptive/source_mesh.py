@@ -584,12 +584,14 @@ def build_magnification_mesh(
     of a targeted threshold, and the area error is bounded by the perimeter
     times ``src_tol``, usually far less; in sweep mode only cells next to
     sheet edges are forced to the floor, and elsewhere ``rtol`` governs.
-    ``src_tol`` is measured against the sampled field -- the lens mesh's
-    piecewise-affine ``mu_tot``, whose accuracy
+    ``src_tol`` is measured against the sampled field -- interpolated
+    ``det A``, continuous within each image sheet and accurate to the
+    fraction of a per cent
     :func:`~caustics.lenses.func.adaptive.magnification.mesh_total_magnification`
-    states -- not against the true lens: below the scale at which the lens
-    mesh's own leaf images change ``mu``, a smaller ``src_tol`` costs more
-    and adds nothing. It is a geometric tolerance, separate from ``rtol``
+    states -- not against the true lens. That error moves a boundary by
+    about its relative size times ``mu / |grad mu|``; once ``src_tol`` is
+    below that, a smaller one costs more and adds nothing. It is a geometric
+    tolerance, separate from ``rtol``
     (how accurately ``mu`` is resolved) and ``mu_min`` (where to look).
 
     ``init_res`` carries the same completeness obligation as the lens
