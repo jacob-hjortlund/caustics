@@ -1,28 +1,80 @@
 """
-Every image of each source-plane point, from the mesh's seeds.
+Every image of each source-plane point, from a lens mesh.
 
-:func:`mesh_forward_raytrace` seeds from
-:func:`~caustics.lenses.func.adaptive.query.mesh_seeds`, refines each seed
-with Levenberg-Marquardt under ``method="rootfind"``, and merges
-near-coincident images of each source with :func:`dedup_representatives`.
+:func:`forward_raytrace` seeds Levenberg-Marquardt from each leaf whose
+source-plane image contains the point (:func:`mesh_query`,
+:func:`mesh_seeds`), keeps the roots that converge near their seed, and
+merges near-coincident roots (:func:`dedup_representatives`).
 """
 
-from typing import Callable, Optional, Tuple
-
-from ....backend_obj import ArrayLike, backend
+from ....backend_obj import backend
 from ....utils import batch_lm
-from .geometry import contains, triangle_weights
-from .query import _as_beta, mesh_query, mesh_seeds
-
-__all__ = (
-    "dedup_block_group",
-    "dedup_representatives",
-    "METHODS",
-    "mesh_forward_raytrace",
-)
+from .geometry import area2, contains, csr_offsets, sanitize_bary, triangle_weights
+from .index import as_points, index_hits
 
 
-def dedup_block_group(points, rows, n_blocks, m, tol) -> ArrayLike:
+def mesh_query(mesh, beta, batch_size=None):
+    """
+    Leaves whose source-plane image contains each point.
+
+    A point on an edge two leaves share returns both, and leaves near a
+    critical curve overlap, so the number of hits is not the image count.
+
+    Parameters
+    ----------
+    mesh: LensMesh
+    beta: ArrayLike
+        ``(B, 2)`` source-plane points.
+
+        *Unit: arcsec*
+    batch_size: Optional[int]
+        Most points per chunk; the result does not depend on it.
+
+    Returns
+    -------
+    leaf_indices: ArrayLike
+        ``(K,)`` int64 leaves, ascending within each point.
+    offsets: ArrayLike
+        ``(B + 1,)`` int64 CSR offsets into ``leaf_indices``.
+    bary: ArrayLike
+        ``(K, 3)`` float64 barycentric coordinates of each point in its
+        leaf's image, in the simplex.
+    """
+    device = backend.device(mesh.vertices_lens)
+    beta = backend.as_array(beta, dtype=backend.float64, device=device)
+    n = beta.shape[0]
+    step = max(n, 1) if batch_size is None else max(1, int(batch_size))
+    leaves = [backend.zeros((0,), dtype=backend.int64, device=device)]
+    bary = [backend.zeros((0, 3), dtype=backend.float64, device=device)]
+    counts = [backend.zeros((0,), dtype=backend.int64, device=device)]
+    for lo in range(0, n, step):
+        chunk = beta[lo : lo + step]
+        qidx, cand, w = index_hits(mesh.index, mesh.vertices_source, mesh.leaves, chunk)
+        counts.append(backend.long(backend.bincount(qidx, minlength=chunk.shape[0])))
+        leaves.append(cand)
+        tri = mesh.vertices_source[mesh.leaves[cand]]
+        bary.append(sanitize_bary(w, area2(tri)))
+    return (
+        backend.concatenate(leaves, dim=0),
+        csr_offsets(backend.concatenate(counts, dim=0)),
+        backend.concatenate(bary, dim=0),
+    )
+
+
+def mesh_seeds(mesh, leaf_indices, bary):
+    """
+    Lens-plane preimage of each hit under its leaf's affine map, ``(K, 2)``.
+
+    Accurate to ``min_img_sep`` by the refinement criterion, and inside its
+    leaf, since ``bary`` lies in the simplex.
+
+    *Unit: arcsec*
+    """
+    tri = mesh.vertices_lens[mesh.leaves[leaf_indices]]
+    return backend.sum(tri * backend.unsqueeze(bary, -1), dim=1)
+
+
+def dedup_block_group(points, rows, n_blocks, m, tol):
     """
     Connected-component representatives for blocks of exactly ``m`` points.
 
@@ -83,7 +135,7 @@ def dedup_block_group(points, rows, n_blocks, m, tol) -> ArrayLike:
     return (labels == index).reshape(-1)
 
 
-def dedup_representatives(points, counts, tol) -> ArrayLike:
+def dedup_representatives(points, counts, tol):
     """
     One representative per cluster of near-coincident points, within each block.
 
@@ -185,261 +237,92 @@ def dedup_representatives(points, counts, tol) -> ArrayLike:
     return stacked[inverse]
 
 
-METHODS = ("rootfind", "dedup")
+def _block_sums(values, offsets):
+    """Sum of ``values`` over each CSR block of ``offsets``."""
+    csum = csr_offsets(values)
+    return csum[offsets[1:]] - csum[offsets[:-1]]
 
 
-def _check_method(method) -> None:
-    """Reject an unrecognised image-finding method, naming the alternatives."""
-    if method not in METHODS:
-        raise ValueError(f"method must be one of {METHODS}, got {method!r}")
-
-
-def _to_source(raytrace):
-    """Wrap ``raytrace(x, y)`` as a ``(..., 2) -> (..., 2)`` map."""
+def _images(mesh, beta, raytrace, tol, lm_kwargs):
+    """Images and their count per point, for one chunk of ``(B, 2)`` points."""
+    device = backend.device(mesh.vertices_lens)
+    idx, offsets, bary = mesh_query(mesh, beta)
+    seed = mesh_seeds(mesh, idx, bary)
+    if seed.shape[0] == 0:
+        return seed, backend.zeros((beta.shape[0],), dtype=backend.int64, device=device)
 
     def to_source(xy):
         return backend.stack(raytrace(xy[..., 0], xy[..., 1]), dim=-1)
 
-    return to_source
-
-
-def _forward_chunk(mesh, chunk, raytrace, method, tol, lm_kwargs):
-    """
-    Images and per-source counts for one chunk of query points.
-
-    Returns
-    -------
-    images: ArrayLike or None
-        ``(K, 2)`` lens-plane positions, or ``None`` when the chunk found
-        none.
-    counts: ArrayLike
-        ``(b,)`` ``backend`` int64 image multiplicity.
-    """
-    b = chunk.shape[0]
-    int64 = backend.int64
-    device = mesh.device
-    none = (None, backend.zeros((b,), dtype=int64, device=device))
-
-    idx, offsets, bary = mesh_query(mesh, chunk)
-    seed = mesh_seeds(mesh, idx, bary)
-    if seed.shape[0] == 0:
-        return none
-
-    if method == "dedup":
-        # No residual filter and no displacement filter. Both exist to
-        # reject a root that *wandered* away from its seed -- see the Notes
-        # on `mesh_forward_raytrace`. A seed cannot wander: `bary` lies in
-        # the simplex, so the seed lies inside its leaf, and that leaf's
-        # source-plane image contains `beta`. Every seed is therefore
-        # already an approximate image, and filtering would be testing a
-        # property the construction guarantees.
-        survivors, kept = seed, offsets[1:] - offsets[:-1]
-    else:
-        to_source = _to_source(raytrace)
-        # One target per seed, so a source with several candidate leaves
-        # root-finds each of them against its own beta.
-        spans = offsets[1:] - offsets[:-1]
-        target = backend.repeat(chunk, spans, axis=0)
-        root, _, _ = batch_lm(seed, target, to_source, **lm_kwargs)
-
-        converged = backend.sum((to_source(root) - target) ** 2, dim=-1) < tol * tol
-        # See the Notes on `mesh_forward_raytrace` for why containment and
-        # the ball are OR-ed.
-        tri = mesh.vertices_lens[mesh.leaves[idx]]
-        near = contains(triangle_weights(tri, root)) | (
-            backend.sum((root - seed) ** 2, dim=-1) <= mesh.min_img_sep**2
-        )
-        keep = converged & near
-
-        # Chunk bookkeeping stays on `backend` int64 arrays: `kept` is read
-        # off `keep` by the same cumsum-difference trick `mesh_query` uses
-        # for its own per-query hit counts, never a host round trip.
-        keep_i = backend.long(keep)
-        csum = backend.concatenate(
-            (
-                backend.zeros((1,), dtype=int64, device=device),
-                backend.cumsum(keep_i, dim=0),
-            ),
-            dim=0,
-        )
-        kept = csum[offsets[1:]] - csum[offsets[:-1]]
-        if int(backend.to_numpy(backend.sum(kept))) == 0:
-            return none
-        survivors = root[keep]
-
-    unique = dedup_representatives(survivors, kept, mesh.min_img_sep)
-    unique_i = backend.long(unique)
-    kept_off = backend.concatenate(
-        (backend.zeros((1,), dtype=int64, device=device), backend.cumsum(kept, dim=0)),
-        dim=0,
+    target = backend.repeat(beta, offsets[1:] - offsets[:-1], axis=0)
+    root, _, _ = batch_lm(seed, target, to_source, **lm_kwargs)
+    converged = backend.sum((to_source(root) - target) ** 2, dim=-1) < tol * tol
+    tri = mesh.vertices_lens[mesh.leaves[idx]]
+    near = contains(triangle_weights(tri, root)) | (
+        backend.sum((root - seed) ** 2, dim=-1) <= mesh.min_img_sep**2
     )
-    csum = backend.concatenate(
-        (
-            backend.zeros((1,), dtype=int64, device=device),
-            backend.cumsum(unique_i, dim=0),
-        ),
-        dim=0,
-    )
-    counts = csum[kept_off[1:]] - csum[kept_off[:-1]]
-    return survivors[unique], counts
+    keep = converged & near
+    kept = _block_sums(backend.long(keep), offsets)
+    root = root[backend.flatnonzero(keep)]
+    unique = dedup_representatives(root, kept, mesh.min_img_sep)
+    return root[unique], _block_sums(backend.long(unique), csr_offsets(kept))
 
 
-def _image_chunks(mesh, beta, raytrace, batch_size, method, residual_tol, lm_kwargs):
-    """Yield :func:`_forward_chunk`'s ``(images, counts)`` per chunk."""
-    tol = mesh.min_img_sep if residual_tol is None else float(residual_tol)
-    lm_kwargs = {} if lm_kwargs is None else dict(lm_kwargs)
-    n = beta.shape[0]
-    step = max(1, n) if batch_size is None else max(1, int(batch_size))
-    for lo in range(0, max(n, 1), step):
-        yield _forward_chunk(
-            mesh, beta[lo : lo + step], raytrace, method, tol, lm_kwargs
-        )
-
-
-def mesh_forward_raytrace(
-    mesh,
-    beta,
-    raytrace: Callable[[ArrayLike, ArrayLike], Tuple[ArrayLike, ArrayLike]],
-    batch_size: Optional[int] = None,
-    *,
-    method: str = "rootfind",
-    residual_tol: Optional[float] = None,
-    lm_kwargs: Optional[dict] = None,
-) -> Tuple[ArrayLike, ArrayLike]:
+def forward_raytrace(
+    bx, by, raytrace, mesh, *, batch_size=None, residual_tol=None, lm_kwargs=None
+):
     """
-    Image-plane positions of every image of each source-plane point.
+    Lens-plane positions of every image of each source-plane point.
 
-    :func:`mesh_seeds` supplies a Newton seed per candidate leaf, accurate to
-    ``min_img_sep`` by construction. Under ``method="rootfind"``,
-    Levenberg-Marquardt refines each seed to a root of the lens equation,
-    unconverged roots are discarded, and the survivors are deduplicated at
-    ``min_img_sep``; under ``method="dedup"`` the seeds themselves are
-    deduplicated directly -- see the ``method`` parameter below.
+    Each leaf whose source-plane image contains the point seeds
+    Levenberg-Marquardt (:func:`~caustics.utils.batch_lm`) with the point's
+    preimage under the leaf's affine map, accurate to ``min_img_sep``. A
+    root is kept when it maps to within ``residual_tol`` of the point and
+    lies in its seed's leaf or within ``min_img_sep`` of the seed: near a
+    fold, a small residual alone admits points far from any image. Kept
+    roots closer than ``min_img_sep`` are one image.
 
     Parameters
     ----------
-    mesh: AdaptiveMesh
-        The frozen mesh to raytrace against.
-    beta: ArrayLike
-        Source-plane points, shape ``(B, 2)`` strictly. A single point must be
-        passed as ``(1, 2)``.
+    bx, by: ArrayLike
+        Source-plane points, any shape, flattened to ``(B,)``.
 
         *Unit: arcsec*
-
-    raytrace: Callable
-        **Must be the raytrace of the lens this mesh was built from**, i.e.
-        ``lens.raytrace``, called as ``raytrace(x, y) -> (bx, by)``. The seeds
-        handed to the root finder are preimages under *this* mesh's leaves, so
-        a different lens would be root-found from meaningless starting points
-        -- silently, since the residual filter would simply reject most of them
-        and return too few images rather than raising. This cannot be checked:
-        a callable carries no identity the mesh could have recorded at build
-        time.
+    raytrace: Callable[[ArrayLike, ArrayLike], Tuple[ArrayLike, ArrayLike]]
+        The raytrace ``mesh`` was built from.
+    mesh: LensMesh
     batch_size: Optional[int]
-        Chunk size over source points. Bounds peak memory for the whole
-        pipeline, not just :func:`mesh_query` -- the root finder holds
-        ``(K, 2)`` states and the dedup a ``(B_c, c, c)`` intermediate per
-        distinct candidate count ``c`` (see :func:`dedup_representatives`).
-        Image counts are invariant to this chunking. Levenberg-Marquardt's
-        shared damping schedule can shift root positions within solver
-        accuracy when the batch partition changes.
-    method: str
-        ``"rootfind"`` (default) refines every seed with
-        Levenberg-Marquardt and returns machine-precision image positions.
-        ``"dedup"`` skips the root finder entirely and deduplicates the
-        seeds, which are already accurate to ``min_img_sep`` by
-        construction. It **never calls** ``raytrace``, which is why it is
-        roughly two orders of magnitude faster; ``raytrace``,
-        ``residual_tol`` and ``lm_kwargs`` are accepted and ignored.
-
-        Positions from ``"dedup"`` are accurate to ``min_img_sep``, not to
-        machine precision. Counts agree with ``"rootfind"`` except within
-        about ``min_img_sep`` of a caustic -- measured at 12 pixels in
-        24656 on an EPL-plus-shear lens. Neither method's counts are
-        guaranteed to satisfy the odd-image theorem any longer:
-        ``"dedup"`` can merge a near-tangential pair closer than
-        ``min_img_sep`` into one, and ``"rootfind"`` can miss an image
-        outright whose seed would have fallen in a non-converged
-        ``max_level`` leaf, which was never in the index to seed the root
-        finder in the first place. Measured on the cored SIE fixture
-        (``fov=5``, ``init_res=32``) over a 25x25 source grid of 0.08 arcsec
-        pixels centred on the lens, ``"rootfind"``: even image counts --
-        impossible for this non-singular lens -- turn up at 371 of 625
-        pixels at ``min_img_sep=0.04``, 263 at ``0.02``, and 4 at ``0.01``.
-        Use ``"rootfind"`` when the position itself matters, ``"dedup"``
-        when the count does.
+        Most source points per chunk, bounding memory. Image counts do not
+        depend on it; positions can move within solver accuracy.
     residual_tol: Optional[float]
-        Source-plane tolerance on ``|raytrace(x) - beta|`` for accepting a
-        root. Defaults to ``min_img_sep``.
+        Largest ``|raytrace(x) - beta|`` of a kept root, ``mesh.min_img_sep``
+        by default.
 
         *Unit: arcsec*
-
     lm_kwargs: Optional[dict]
-        Extra keyword arguments for :func:`~caustics.utils.batch_lm`, e.g.
-        ``max_iter``.
+        Extra keyword arguments for :func:`~caustics.utils.batch_lm`.
 
     Returns
     -------
-    images: ArrayLike
-        ``(K, 2)`` lens-plane image positions, laid out block-major: the
-        ``counts[b]`` images of source ``b`` follow those of sources
-        ``0 .. b - 1``.
+    x, y: ArrayLike
+        ``(K,)`` image positions, source by source: the ``counts[b]`` images
+        of source ``b`` follow those of sources ``0 .. b - 1``.
 
         *Unit: arcsec*
-
     counts: ArrayLike
-        ``(B,)`` int64 image multiplicity of each source point.
-
-    Notes
-    -----
-    Two filters decide that a root is an image, and both are needed.
-
-    The **residual** test alone is weak near a fold caustic, where the lens
-    map is quadratic: a point sitting well over ``min_img_sep`` from the true
-    image in the lens plane can still have a small source-plane residual, so
-    it survives the residual test, escapes the dedup, and inflates the count
-    exactly where multiplicity structure matters most.
-
-    The **displacement** test closes that hole using a guarantee the mesh
-    already makes -- the seed lies inside its leaf and is accurate to
-    ``min_img_sep`` -- so a root that left its own neighbourhood is not the
-    root its seed was pointing at. It is a disjunction rather than plain
-    containment because a leaf at the size floor is itself only about
-    ``min_img_sep`` across, so a genuine root near a leaf edge can
-    legitimately land just outside it; requiring containment alone would
-    drop real images.
-
-    Neither filter applies under ``method="dedup"``. Both reject a root
-    that *wandered* -- the residual test catches a solve that converged to
-    nothing, the displacement test one that converged to a different image.
-    A seed cannot wander: it lies inside its own leaf, whose source-plane
-    image contains ``beta``. Filtering it would test a property the
-    construction already guarantees.
-
-    Root finding runs in the dtype of the frozen mesh, so a mesh built with
-    ``dtype=backend.float32`` caps the achievable accuracy near the
-    cancellation floor :func:`build_adaptive_mesh` already warns about.
+        ``(B,)`` int64 images per source.
     """
-    _check_method(method)
-    beta = _as_beta(mesh, beta)
+    device = backend.device(mesh.vertices_lens)
+    beta = as_points(bx, by, device)
+    tol = mesh.min_img_sep if residual_tol is None else float(residual_tol)
+    lm_kwargs = {} if lm_kwargs is None else dict(lm_kwargs)
     n = beta.shape[0]
-    int64 = backend.int64
-
-    def no_images():
-        return backend.zeros((0, 2), dtype=mesh.vertices_lens.dtype, device=mesh.device)
-
-    if n == 0:
-        return no_images(), backend.zeros((0,), dtype=int64, device=mesh.device)
-
-    image_parts, count_parts = [], []
-    for images, counts in _image_chunks(
-        mesh, beta, raytrace, batch_size, method, residual_tol, lm_kwargs
-    ):
-        count_parts.append(counts)
-        if images is not None:
-            image_parts.append(images)
-
-    counts = backend.concatenate(count_parts, dim=0)
-    if not image_parts:
-        return no_images(), counts
-    return backend.concatenate(image_parts, dim=0), counts
+    step = max(n, 1) if batch_size is None else max(1, int(batch_size))
+    images = [backend.zeros((0, 2), dtype=backend.float64, device=device)]
+    counts = [backend.zeros((0,), dtype=backend.int64, device=device)]
+    for lo in range(0, n, step):
+        found, count = _images(mesh, beta[lo : lo + step], raytrace, tol, lm_kwargs)
+        images.append(found)
+        counts.append(count)
+    images = backend.concatenate(images, dim=0)
+    return images[:, 0], images[:, 1], backend.concatenate(counts, dim=0)

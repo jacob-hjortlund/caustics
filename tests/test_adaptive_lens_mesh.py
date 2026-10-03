@@ -39,7 +39,7 @@ from caustics.lenses.func.adaptive.lattice import (
     lattice_xy,
     make_lattice,
 )
-from caustics.lenses.func.adaptive.curves import mesh_critical_curves_and_caustics
+from caustics.lenses.func.adaptive.curves import critical_curves_and_caustics
 from caustics.lenses.func.adaptive.lens_mesh import (
     _freeze,
     _seed,
@@ -504,6 +504,21 @@ def test_vertices_are_compacted_and_ordered_by_lattice_key():
 def test_build_is_deterministic_on_a_refined_mesh():
     a, _ = build(localised_fold, localised_fold_jacobian, min_img_sep=0.05)
     b, _ = build(localised_fold, localised_fold_jacobian, min_img_sep=0.05)
+    assert_same(a, b)
+
+
+def test_two_builds_with_centers_are_identical_holes_included():
+    c = (0.3001, -0.2003)  # off every lattice point
+
+    def fn(p):
+        return np.asarray(c) + sis_raytrace(p - np.asarray(c))
+
+    def jac(p):
+        return sis_jacobian(p - np.asarray(c))
+
+    a, _ = build(fn, jac, 4.0, 8, 0.02, centers=[c])
+    b, _ = build(fn, jac, 4.0, 8, 0.02, centers=[c])
+    assert a.holes.centers.shape[0] == 1
     assert_same(a, b)
 
 
@@ -1400,12 +1415,12 @@ def test_an_extension_closes_the_critical_curves_the_fov_cut():
     """At fov 2 the tangential curve (radius ~1.18) crosses the domain's edge; at fov 3 it lies inside."""
     kw = dict(fov=2.0, init_res=4, min_img_sep=0.05)
     mesh, lens_, _ = xbuild(sie_like, sie_like_jacobian, **kw)
-    assert not to_np(mesh_critical_curves_and_caustics(mesh).closed).all()
+    assert not to_np(critical_curves_and_caustics(mesh).closed).all()
     ext = extend_lens_mesh(mesh, lens_.raytrace, lens_.jacobian_lens_equation, 3.0)
-    got = mesh_critical_curves_and_caustics(ext)
+    got = critical_curves_and_caustics(ext)
     fresh, _, _ = xbuild(sie_like, sie_like_jacobian, **fresh_equivalent(kw, 3.0))
     assert got.closed.shape[0] > 0 and to_np(got.closed).all()
-    assert_same(got, mesh_critical_curves_and_caustics(fresh))
+    assert_same(got, critical_curves_and_caustics(fresh))
 
 
 def test_an_extension_of_a_mesh_on_a_device_stays_on_it(device):
@@ -1474,7 +1489,7 @@ def test_a_curve_the_fov_cuts_is_grown_until_it_closes():
     assert_same(
         mesh, extend_lens_mesh(start, lens_.raytrace, lens_.jacobian_lens_equation, 2.5)
     )
-    assert_same(curves, mesh_critical_curves_and_caustics(mesh))
+    assert_same(curves, critical_curves_and_caustics(mesh))
 
 
 @pytest.mark.parametrize("x0, y0", [(0.5, 0.0), (-0.5, 0.0), (0.0, 0.5), (0.0, -0.5)])
@@ -1495,7 +1510,7 @@ def test_a_mesh_whose_fov_cuts_no_curve_is_the_plain_build():
     assert messages == []
     want, _, _ = xbuild(sie_like, sie_like_jacobian, **kw)
     assert_same(mesh, want)
-    assert_same(curves, mesh_critical_curves_and_caustics(want))
+    assert_same(curves, critical_curves_and_caustics(want))
 
 
 def test_a_curve_open_inside_the_fov_does_not_grow_it():
@@ -1522,7 +1537,7 @@ def test_running_out_of_iterations_warns_and_returns_the_last_mesh(
     assert fov_and_init_res(mesh) == (fov, init_res)
     assert not to_np(curves.closed).all()
     assert len(messages) == 1 and "still cuts" in messages[0]
-    assert_same(curves, mesh_critical_curves_and_caustics(mesh))
+    assert_same(curves, critical_curves_and_caustics(mesh))
 
 
 def test_build_options_reach_the_build_and_every_extension():

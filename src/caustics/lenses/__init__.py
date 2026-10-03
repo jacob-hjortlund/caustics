@@ -16,27 +16,6 @@ from .tnfw import TNFW
 from .multiplane import Multiplane
 from .multipole import Multipole
 from .enclosed_mass import EnclosedMass
-from .func import (
-    build_adaptive_mesh,
-    extend_adaptive_mesh,
-    build_closed_adaptive_mesh,
-    mesh_query,
-    mesh_seeds,
-    mesh_forward_raytrace,
-    AdaptiveMesh,
-    MeshIndex,
-    CriticalBand,
-    CentreHoles,
-    CriticalCurvesAndCaustics,
-    mesh_critical_curves_and_caustics,
-    total_magnification,
-    build_magnification_map,
-    MagnificationMap,
-    magnified_regions,
-    MagnifiedRegions,
-    magnified_area,
-    in_magnified_region,
-)
 
 __all__ = [
     "ThinLens",
@@ -58,23 +37,4 @@ __all__ = [
     "TNFW",
     "Multipole",
     "EnclosedMass",
-    "build_adaptive_mesh",
-    "extend_adaptive_mesh",
-    "build_closed_adaptive_mesh",
-    "mesh_query",
-    "mesh_seeds",
-    "mesh_forward_raytrace",
-    "AdaptiveMesh",
-    "MeshIndex",
-    "CriticalBand",
-    "CentreHoles",
-    "CriticalCurvesAndCaustics",
-    "mesh_critical_curves_and_caustics",
-    "total_magnification",
-    "build_magnification_map",
-    "MagnificationMap",
-    "magnified_regions",
-    "MagnifiedRegions",
-    "magnified_area",
-    "in_magnified_region",
 ]

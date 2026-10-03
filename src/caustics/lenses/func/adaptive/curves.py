@@ -1,7 +1,7 @@
 """
 Critical curves and caustics, traced through an adaptive mesh's critical band.
 
-:func:`~caustics.lenses.func.adaptive.build_adaptive_mesh` keeps, as
+:func:`~caustics.lenses.func.adaptive.build_lens_mesh` keeps, as
 ``mesh.critical_band``, every ``max_level`` leaf ``det A`` changes sign across,
 with ``det A`` and the image at its six samples. Those six samples are the
 corners of the leaf's four red-split children, so ``det A`` at them defines a
@@ -14,9 +14,9 @@ where ``det A`` is continuous the true critical curve crosses the same edge:
 each lens-plane point is within one child edge, half a leaf edge, of the
 curve.
 
-A mesh built with ``centres`` also holds holes around them
-(:class:`~caustics.lenses.func.adaptive.CentreHoles`): the lens map can jump
-at a lens centre, so the curves are cut at each hole's circle and re-joined
+A mesh built with ``centers`` also holds holes around them
+(:class:`~caustics.lenses.func.adaptive.CenterHoles`): the lens map can jump
+at a lens center, so the curves are cut at each hole's circle and re-joined
 along the stored hole curve (:func:`join_at_holes`). That too is a function
 of the mesh alone.
 """
@@ -26,19 +26,17 @@ from typing import NamedTuple, Tuple
 
 from ....backend_obj import ArrayLike, backend
 from .geometry import _CHILD_VERTEX_INDEX_TABLE
-from .holes import CentreHoles, empty_holes
 
 __all__ = (
     "CriticalCurvesAndCaustics",
     "triangle_segments",
     "child_segments",
     "edge_zeros",
-    "crossing_points",
     "chain_order",
     "chain_segments",
     "trace_band",
     "join_at_holes",
-    "mesh_critical_curves_and_caustics",
+    "critical_curves_and_caustics",
 )
 
 
@@ -48,7 +46,7 @@ class CriticalCurvesAndCaustics(NamedTuple):
 
     Every point is one of two kinds, told apart by ``hole``. Most are a
     crossing of ``det A = 0`` in ``lens``, a critical-curve point, with its
-    caustic point in ``source``. On a mesh built with ``centres``, the rest
+    caustic point in ``source``. On a mesh built with ``centers``, the rest
     lie on a hole's circle in ``lens`` and on that hole's hole curve in
     ``source`` -- the pseudo-caustic where ``holes.pseudo_caustic`` is True.
 
@@ -64,7 +62,7 @@ class CriticalCurvesAndCaustics(NamedTuple):
 
     When ``det A`` is exactly zero at a sample, several crossings sit on
     that sample -- which happens whenever a curve runs through lattice
-    points; an SIS with ``Rein = 1`` centred on the origin hits ``(1, 0)``,
+    points; an SIS with ``Rein = 1`` centered on the origin hits ``(1, 0)``,
     ``(-1, 0)``, ``(0, 1)`` and ``(0, -1)`` exactly. Consecutive points can
     then coincide, so some segments of ``lens`` and ``source`` have zero
     length; they are kept, not removed, so anything computing tangents,
@@ -74,15 +72,15 @@ class CriticalCurvesAndCaustics(NamedTuple):
     zero-is-positive rule yields a closed curve of zero extent, every point
     of it at that one sample.
 
-    On a mesh built with ``centres``, a curve that reaches a hole does not run
+    On a mesh built with ``centers``, a curve that reaches a hole does not run
     into it. Within the limits :func:`join_at_holes` states, it follows the
     hole's circle, clockwise, to the next curve leaving it, so every loop
     bounds a ``det A > 0`` region with the holes cut out, and its caustic
-    follows the hole curve -- the pseudo-caustic at an isothermal centre --
+    follows the hole curve -- the pseudo-caustic at an isothermal center --
     instead of cutting straight across it. Those points carry their hole's
     index in ``hole``. A hole curve is a pseudo-caustic only where
     ``holes.pseudo_caustic`` is True; see
-    :class:`~caustics.lenses.func.adaptive.CentreHoles`.
+    :class:`~caustics.lenses.func.adaptive.CenterHoles`.
 
     Parameters
     ----------
@@ -103,9 +101,6 @@ class CriticalCurvesAndCaustics(NamedTuple):
         otherwise the index into ``holes`` of the hole whose circle the curve
         follows there. Such a point lies on that circle, not on a critical
         curve, and its ``source`` lies on the hole curve.
-    holes: CentreHoles
-        The holes the curves were cut and re-joined at: the mesh's own, or
-        an empty one.
     """
 
     lens: ArrayLike
@@ -113,7 +108,6 @@ class CriticalCurvesAndCaustics(NamedTuple):
     offsets: ArrayLike
     closed: ArrayLike
     hole: ArrayLike
-    holes: CentreHoles
 
 
 def _sorted_pair(a, b) -> ArrayLike:
@@ -242,45 +236,6 @@ def edge_zeros(edges, field, planes) -> Tuple[ArrayLike, ...]:
     return tuple(points)
 
 
-def crossing_points(edges, lens, source, det) -> Tuple[ArrayLike, ArrayLike]:
-    """
-    Where ``det A`` crosses zero on each edge, in both planes.
-
-    The zero of the linear interpolant from ``p = edges[:, 0]`` to ``q =
-    edges[:, 1]``: ``t = det[p] / (det[p] - det[q])``. The two ends have
-    opposite classes, so the denominator is never zero, and ``t == 0``
-    exactly when ``det[p] == 0`` -- the crossing then sits on ``p`` itself.
-    The caustic point applies the same ``t`` to the images, which is the
-    mesh's own piecewise-linear model of the lens map on that edge.
-
-    Computed in float64 and returned at the dtype of ``lens`` and ``source``.
-
-    Parameters
-    ----------
-    edges: ArrayLike
-        ``(N, 2)`` int64 sample pairs.
-    lens, source: ArrayLike
-        ``(S, 2)``, ``CriticalBand.lens`` and ``CriticalBand.source``.
-
-        *Unit: arcsec*
-    det: ArrayLike
-        ``(S,)`` float64, ``CriticalBand.det``.
-
-    Returns
-    -------
-    lens_points: ArrayLike
-        ``(N, 2)``, critical-curve points.
-
-        *Unit: arcsec*
-    source_points: ArrayLike
-        ``(N, 2)``, the matching caustic points.
-
-        *Unit: arcsec*
-    """
-    lens_points, source_points = edge_zeros(edges, det, (lens, source))
-    return lens_points, source_points
-
-
 def chain_order(succ) -> Tuple[ArrayLike, ArrayLike, ArrayLike]:
     """
     Order nodes along the paths and cycles of a successor array.
@@ -365,9 +320,7 @@ def chain_order(succ) -> Tuple[ArrayLike, ArrayLike, ArrayLike]:
     return order, offsets, on_cycle[starts]
 
 
-def chain_segments(
-    start, end, n_samples, what
-) -> Tuple[ArrayLike, ArrayLike, ArrayLike]:
+def chain_segments(start, end, n_samples):
     """
     Chain oriented segments, each from one sample-pair edge to another, into curves.
 
@@ -383,8 +336,6 @@ def chain_segments(
         :func:`triangle_segments` returns them.
     n_samples: int
         Number of samples, bounding every index, for the node keys.
-    what: str
-        What a node is, for the assertion messages.
 
     Returns
     -------
@@ -394,14 +345,6 @@ def chain_segments(
         ``(C + 1,)`` int64 CSR offsets into ``edges``.
     closed: ArrayLike
         ``(C,)`` bool, True where the curve is a loop.
-
-    Raises
-    ------
-    AssertionError
-        ``"a {what} has two successors"`` or ``"a {what} has two
-        predecessors"`` when a node is linked twice, which a conforming,
-        positively oriented triangulation rules out: a guard against silent
-        corruption rather than a reachable input.
     """
     int64 = backend.int64
     device = backend.device(start)
@@ -419,13 +362,6 @@ def chain_segments(
     nodes, inverse = backend.unique(keys, return_inverse=True)
     frm, to = inverse[:k], inverse[k:]
     n = nodes.shape[0]
-    # `raise AssertionError` rather than a bare `assert`, as elsewhere in the
-    # adaptive kernels: `python -O` strips bare asserts. Two separate guards,
-    # so each reports which side of the chain actually broke.
-    if bool(backend.any(backend.bincount(frm, minlength=n) > 1)):
-        raise AssertionError(f"a {what} has two successors")
-    if bool(backend.any(backend.bincount(to, minlength=n) > 1)):
-        raise AssertionError(f"a {what} has two predecessors")
     succ = backend.fill_at_indices(
         backend.zeros((n,), dtype=int64, device=device) - 1, frm, to
     )
@@ -443,7 +379,6 @@ def _no_curves(band) -> CriticalCurvesAndCaustics:
         offsets=backend.zeros((1,), dtype=backend.int64, device=device),
         closed=backend.zeros((0,), dtype=backend.bool, device=device),
         hole=backend.zeros((0,), dtype=backend.int64, device=device),
-        holes=empty_holes(device),
     )
 
 
@@ -463,27 +398,14 @@ def trace_band(band) -> CriticalCurvesAndCaustics:
     Returns
     -------
     CriticalCurvesAndCaustics
-        ``hole`` is -1 at every point and ``holes`` is empty: tracing knows
-        nothing of holes; :func:`join_at_holes` applies them.
-
-    Raises
-    ------
-    AssertionError
-        "a critical-curve crossing has two successors" if a crossing has two
-        successors, or "a critical-curve crossing has two predecessors" if
-        one has two predecessors. On a conforming, positively oriented band
-        with one ``det`` per sample neither can happen, so this guards
-        against silent corruption rather than a reachable input.
+        ``hole`` is -1 at every point: tracing knows nothing of holes;
+        :func:`join_at_holes` applies them.
     """
     start, end = child_segments(band.samples, band.det)
     if start.shape[0] == 0:
         return _no_curves(band)
-    edges, offsets, closed = chain_segments(
-        start, end, band.lens.shape[0], "critical-curve crossing"
-    )
-    lens_points, source_points = crossing_points(
-        edges, band.lens, band.source, band.det
-    )
+    edges, offsets, closed = chain_segments(start, end, band.lens.shape[0])
+    lens_points, source_points = edge_zeros(edges, band.det, (band.lens, band.source))
     device = backend.device(band.det)
     return CriticalCurvesAndCaustics(
         lens=lens_points,
@@ -492,7 +414,6 @@ def trace_band(band) -> CriticalCurvesAndCaustics:
         closed=closed,
         hole=backend.zeros((lens_points.shape[0],), dtype=backend.int64, device=device)
         - 1,
-        holes=empty_holes(device),
     )
 
 
@@ -547,14 +468,14 @@ def join_at_holes(curves, holes) -> CriticalCurvesAndCaustics:
 
     Every returned loop is then the boundary of a ``det A > 0`` region with
     the holes cut out, whatever pairing the tracer made inside a hole, and no
-    caustic runs straight across a hole curve; a curve through a centre on a
+    caustic runs straight across a hole curve; a curve through a center on a
     lattice point, whose band has a gap there, comes out closed. Those
     guarantees hold except in these limits:
 
     - A hole whose ends do not alternate, or that the fov cuts, as step 3
       says.
     - A mesh whose ``max_depth`` bound refinement before the size floor. The
-      leaves around a centre can then be larger than its hole, and curves
+      leaves around a center can then be larger than its hole, and curves
       through it can stay open or keep chords.
     - A traced segment that clips a disk with neither end inside it. It is
       not seen; the error is within a leaf edge of the hole.
@@ -563,32 +484,24 @@ def join_at_holes(curves, holes) -> CriticalCurvesAndCaustics:
     ----------
     curves: CriticalCurvesAndCaustics
         As :func:`trace_band` returns them.
-    holes: CentreHoles
+    holes: CenterHoles
 
     Returns
     -------
     CriticalCurvesAndCaustics
-        With ``holes`` set to ``holes``.
-
-    Raises
-    ------
-    AssertionError
-        "a segment has two predecessors" if two arriving ends were joined to
-        one departing end, which alternation rules out; it guards against
-        silent corruption rather than a reachable input.
     """
     n_points = curves.lens.shape[0]
-    n_holes = holes.centres.shape[0]
+    n_holes = holes.centers.shape[0]
     if n_points == 0 or n_holes == 0:
-        return curves._replace(holes=holes)
+        return curves
     device = backend.device(curves.lens)
     int64, f64 = backend.int64, backend.float64
     lens = backend.to(curves.lens, dtype=f64)
-    centres = backend.to(holes.centres, dtype=f64)
+    centers = backend.to(holes.centers, dtype=f64)
 
     # 1. Tag every point strictly inside a hole's disk; disks are disjoint.
     inside = backend.norm(
-        backend.unsqueeze(lens, 1) - backend.unsqueeze(centres, 0), dim=-1
+        backend.unsqueeze(lens, 1) - backend.unsqueeze(centers, 0), dim=-1
     ) < backend.unsqueeze(holes.radius, 0)
     tag = backend.where(
         backend.any(inside, dim=1), backend.argmax(backend.long(inside), 1), -1
@@ -654,7 +567,6 @@ def join_at_holes(curves, holes) -> CriticalCurvesAndCaustics:
             offsets=backend.zeros((1,), dtype=int64, device=device),
             closed=curves.closed[:0],
             hole=curves.hole[:0],
-            holes=holes,
         )
 
     # 3b. Bridges. Disks need only not overlap, so a traced step can go from
@@ -709,7 +621,7 @@ def join_at_holes(curves, holes) -> CriticalCurvesAndCaustics:
             dim=0,
         )
         rel = lens_rot[backend.concatenate((seg_last[arr], seg_first[dep]), dim=0)]
-        rel = rel - centres[h]
+        rel = rel - centers[h]
         phi = _turn(backend.arctan2(rel[:, 1], rel[:, 0]))
         o = backend.argsort(phi)
         seg, arriving, phi = seg[o], arriving[o], phi[o]
@@ -728,12 +640,6 @@ def join_at_holes(curves, holes) -> CriticalCurvesAndCaustics:
             pick = backend.flatnonzero((delta > 0) & (delta < span))
             pick = pick[backend.argsort(delta[pick])]
             arcs[int(backend.to_numpy(seg[ka]))] = lo + pick
-    # `raise AssertionError` rather than a bare `assert`, as elsewhere here:
-    # `python -O` strips bare asserts.
-    joined = backend.flatnonzero(succ >= 0)
-    if bool(backend.any(backend.bincount(succ[joined], minlength=n_seg) > 1)):
-        raise AssertionError("a segment has two predecessors")
-
     # 5. Chain the segments through their joins into curves.
     order, seg_offsets, closed = chain_order(succ)
 
@@ -789,64 +695,32 @@ def join_at_holes(curves, holes) -> CriticalCurvesAndCaustics:
         offsets=offsets,
         closed=closed,
         hole=pool_hole[gather],
-        holes=holes,
     )
 
 
-def mesh_critical_curves_and_caustics(mesh) -> CriticalCurvesAndCaustics:
+def critical_curves_and_caustics(mesh):
     """
-    Critical curves and caustics of the lens an adaptive mesh was built from.
+    Critical curves and caustics of the lens a mesh was built from.
 
-    A pure function of ``mesh.critical_band`` and ``mesh.holes``: no raytrace
-    and no Jacobian call. Each lens-plane point lies on a child edge whose
-    ends straddle the curve, so where ``det A`` is continuous it is within
-    one child edge of the true critical curve -- at most
-    ``mesh.min_img_sep / 2``, a quarter of the ``min_img_sep`` passed to the
-    build, unless ``max_depth`` bound, when it is half the actual
-    ``max_level`` leaf edge. Each caustic point is the image interpolated
-    along the same edge; for exact images, raytrace ``lens`` directly.
-
-    A curve ends where the band does: at the fov boundary, or next to a leaf
-    whose samples or Jacobian are non-finite, or, in principle, next to a
-    coarser converged leaf -- unless that happens inside a hole, where the
-    curve is joined instead, within the limits :func:`join_at_holes` states.
-
-    A mesh built with ``centres`` has holes around them, and the traced
-    curves are cut at each hole's circle and re-joined along the stored hole
-    curve by :func:`join_at_holes`, within the limits it states; the hole
-    curves -- the pseudo-caustics, where ``holes.pseudo_caustic`` is True --
-    come back as ``holes``. Without them, a curve through a singular centre,
-    where the lens map jumps, gets a caustic that cuts straight across the
-    pseudo-caustic, and one through a centre on a lattice point comes out
-    open. Either way this function makes no lens call.
-
-    A curve the fov cuts can be closed by growing the mesh with
-    :func:`~caustics.lenses.func.adaptive.extend_adaptive_mesh`, which reuses
-    every lens evaluation already made;
-    :func:`~caustics.lenses.func.adaptive.build_closed_adaptive_mesh` repeats
-    that until the fov cuts no curve.
-
-    Where ``det A`` is exactly zero at a sample -- as it is at ``(1, 0)``,
-    ``(-1, 0)``, ``(0, 1)`` and ``(0, -1)`` for an SIS with ``Rein = 1``
-    centred on the origin, for instance -- several crossings can sit on that
-    sample, so consecutive points of the returned curves can coincide
-    exactly and some segments have zero length. They are kept, not removed;
-    see :class:`CriticalCurvesAndCaustics` for the guard this implies for callers
-    computing tangents, normals or arc length. An isolated degenerate
-    critical point -- where ``det A`` touches zero at one sample without
-    changing sign -- comes back as a closed curve of zero extent, every
-    point of it at that one sample.
+    The zero set of ``det A`` traced through the critical band's red-split
+    children, each crossing interpolated linearly on a child edge whose ends
+    straddle it -- within half a finest leaf edge of the true curve -- and its
+    caustic point interpolated the same way. On a mesh with holes the curves
+    are cut at each hole's circle and re-joined along its hole curve
+    (:func:`join_at_holes`). A curve ends where the band does: at the fov
+    boundary or next to a non-finite leaf. Consecutive points can coincide
+    where ``det A`` is exactly zero at a sample; such zero-length segments
+    are kept. No lens call is made.
 
     Parameters
     ----------
-    mesh: AdaptiveMesh
+    mesh: LensMesh
 
     Returns
     -------
     CriticalCurvesAndCaustics
-        With ``holes`` set to ``mesh.holes``.
     """
     curves = trace_band(mesh.critical_band)
-    if mesh.holes.centres.shape[0] == 0:
-        return curves._replace(holes=mesh.holes)
+    if mesh.holes.centers.shape[0] == 0:
+        return curves
     return join_at_holes(curves, mesh.holes)

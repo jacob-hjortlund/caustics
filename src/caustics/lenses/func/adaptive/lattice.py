@@ -32,7 +32,6 @@ __all__ = (
     "initial_triangles",
     "ring_triangles",
     "midpoint_ij",
-    "edge_quarter_keys",
 )
 
 
@@ -148,7 +147,7 @@ class Lattice(NamedTuple):
 
 def make_lattice(fov, x0, y0, init_res, lattice_level) -> Lattice:
     """
-    Build a :class:`Lattice` covering ``fov``, centred at ``(x0, y0)``.
+    Build a :class:`Lattice` covering ``fov``, centered at ``(x0, y0)``.
 
     Parameters
     ----------
@@ -158,12 +157,12 @@ def make_lattice(fov, x0, y0, init_res, lattice_level) -> Lattice:
         *Unit: arcsec*
 
     x0: float
-        Domain centre, x.
+        Domain center, x.
 
         *Unit: arcsec*
 
     y0: float
-        Domain centre, y.
+        Domain center, y.
 
         *Unit: arcsec*
 
@@ -360,38 +359,4 @@ def midpoint_ij(ij) -> ArrayLike:
             (ij[:, 0] + ij[:, 1]) // 2,
         ),
         dim=1,
-    )
-
-
-def edge_quarter_keys(lat, ij) -> ArrayLike:
-    """
-    Keys of both quarter points on each of the three edges.
-
-    A neighbour across an edge that is two or more levels finer has one of
-    these as a vertex, so six hash lookups decide balance for a triangle --
-    no edge-to-triangle adjacency table and no ancestry walk. Both quarter
-    points are checked because the neighbour across an edge can itself be
-    non-uniform.
-
-    The caller must only pass triangles at level ``<= max_level - 2``, where
-    the edge vectors are divisible by four and the quarter points are lattice
-    points.
-
-    Parameters
-    ----------
-    lat: Lattice
-        Used to key the quarter points.
-    ij: ArrayLike
-        Lattice coordinates, shape ``(n, 3, 2)`` int64.
-
-    Returns
-    -------
-    ArrayLike
-        Shape ``(n, 6)`` int64.
-    """
-    a = ij[:, [0, 1, 2], :]
-    b = ij[:, [1, 2, 0], :]
-    delta = (b - a) // 4
-    return backend.concatenate(
-        (lattice_key(lat, a + delta), lattice_key(lat, b - delta)), dim=1
     )

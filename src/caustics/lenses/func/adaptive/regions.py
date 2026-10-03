@@ -115,9 +115,7 @@ def magnified_regions(mag, mu_min) -> MagnifiedRegions:
     g = region_field(mag, mu_min)
     leaves = mag.leaves[backend.flatnonzero(~mag.incomplete)]
     start, end = triangle_segments(leaves, g >= 0)
-    edges, offsets, closed = chain_segments(
-        start, end, mag.vertices.shape[0], "region-boundary crossing"
-    )
+    edges, offsets, closed = chain_segments(start, end, mag.vertices.shape[0])
     (points,) = edge_zeros(edges, g, (mag.vertices,))
     return MagnifiedRegions(source=points, offsets=offsets, closed=closed)
 

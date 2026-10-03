@@ -1,4 +1,4 @@
-"""Critical curves and caustics traced through the adaptive mesh's band."""
+"""Critical curves and caustics traced through the lens mesh's band, and the center holes they join at."""
 
 import itertools
 import math
@@ -9,27 +9,35 @@ import pytest
 from scipy.spatial import cKDTree
 
 from caustics.backend_obj import backend
+from caustics.cosmology import FlatLambdaCDM
+from caustics.lenses import SIE, SinglePlane
 from caustics.lenses.func.adaptive import (
-    CentreHoles,
+    CenterHoles,
     CriticalBand,
     CriticalCurvesAndCaustics,
     LEAF_JACOBIAN_PARITY_UNRESOLVED,
-    build_adaptive_mesh,
-    mesh_critical_curves_and_caustics,
+    LensMesh,
+    build_lens_mesh,
+    critical_curves_and_caustics,
 )
-from caustics.lenses.func.adaptive.band import empty_band
 from caustics.lenses.func.adaptive.curves import (
     chain_order,
     chain_segments,
     child_segments,
-    crossing_points,
     edge_zeros,
     join_at_holes,
     trace_band,
     triangle_segments,
 )
 from caustics.lenses.func.adaptive.geometry import CHILD_VERTEX_INDICES
-from caustics.lenses.func.adaptive.holes import empty_holes
+from caustics.lenses.func.adaptive.holes import (
+    HOLE_GROWTH_SAMPLES,
+    HOLE_MAX_SAMPLES,
+    empty_holes,
+    merge_centers,
+    sample_holes,
+)
+from caustics.lenses.func.adaptive.lens_mesh import make_sampler
 
 
 def to_np(x):
@@ -173,8 +181,8 @@ def test_child_segments_keep_positive_det_on_the_left(signs):
     classes = det[children] >= 0
     mixed = classes.any(axis=1) & ~classes.all(axis=1)
     assert start.shape[0] == int(mixed.sum())
-    p, _ = crossing_points(backend.as_array(start), band.lens, band.source, band.det)
-    q, _ = crossing_points(backend.as_array(end), band.lens, band.source, band.det)
+    p, _ = edge_zeros(backend.as_array(start), band.det, (band.lens, band.source))
+    q, _ = edge_zeros(backend.as_array(end), band.det, (band.lens, band.source))
     p, q = to_np(p), to_np(q)
     for a, b, s, e in zip(p, q, start, end):
         corners = set(s.tolist()) | set(e.tolist())
@@ -191,18 +199,6 @@ def test_child_segments_skip_a_leaf_of_one_class():
         band = _unit_band(det)
         start, end = child_segments(band.samples, band.det)
         assert start.shape[0] == 0 and end.shape[0] == 0
-
-
-def test_crossing_points_interpolate_the_zero_linearly_in_both_planes():
-    """``t = det_p / (det_p - det_q)``, applied to ``lens`` and ``source`` alike."""
-    lens = np.array([[0.0, 0.0], [4.0, 0.0]])
-    source = np.array([[1.0, 1.0], [1.0, 9.0]])
-    edges = backend.as_array(np.array([[0, 1]]), dtype=backend.int64)
-    got_lens, got_source = crossing_points(
-        edges, _arr(lens), _arr(source), _arr([1.0, -3.0])
-    )
-    assert to_np(got_lens).tolist() == [[1.0, 0.0]]
-    assert to_np(got_source).tolist() == [[1.0, 3.0]]
 
 
 def test_an_exact_zero_counts_as_positive_and_puts_the_crossing_on_it():
@@ -256,46 +252,9 @@ def test_two_leaves_sharing_an_edge_chain_through_one_crossing():
     assert np.array_equal(to_np(curves.source), to_np(curves.lens))
 
 
-def test_trace_band_rejects_a_crossing_with_two_successors():
-    """The same leaf twice gives every crossing a second successor."""
-    det = np.array([1.0, -1.0, -1.0, 1.0, -1.0, 1.0])
-    band = _band([[0, 1, 2, 3, 4, 5], [0, 1, 2, 3, 4, 5]], UNIT_LENS, det)
-    with pytest.raises(AssertionError, match="two successors"):
-        trace_band(band)
-
-
-def test_trace_band_rejects_a_crossing_with_two_predecessors():
-    """The two-leaf fixture above, with leaf A's orientation reversed.
-
-    Swapping ``theta_2`` and ``theta_3`` -- and so ``m_2`` and ``m_3``, to
-    keep ``m_i`` opposite ``theta_i`` -- makes leaf A clockwise, so both of
-    its segments run backwards along the edge it shares with leaf B: instead
-    of one segment ending where the other starts, both end on the shared
-    node, giving it two predecessors and leaving no node with two
-    successors.
-    """
-    lens = np.array(
-        [
-            [0.0, 0.0],
-            [2.0, 0.0],
-            [2.0, 2.0],
-            [0.0, 2.0],
-            [2.0, 1.0],
-            [1.0, 1.0],
-            [1.0, 0.0],
-            [1.0, 2.0],
-            [0.0, 1.0],
-        ]
-    )
-    samples = [[0, 2, 1, 4, 6, 5], [0, 2, 3, 7, 8, 5]]
-    band = _band(samples, lens, lens[:, 0] - 1.5)
-    with pytest.raises(AssertionError, match="two predecessors"):
-        trace_band(band)
-
-
 @pytest.mark.parametrize(
     "band",
-    [empty_band(), _unit_band(np.ones(6))],
+    [_band(np.zeros((0, 6)), np.zeros((0, 2)), np.zeros(0)), _unit_band(np.ones(6))],
     ids=["empty band", "one class"],
 )
 def test_a_band_without_crossings_has_no_curves(band):
@@ -305,7 +264,6 @@ def test_a_band_without_crossings_has_no_curves(band):
     assert tuple(curves.source.shape) == (0, 2)
     assert tuple(curves.closed.shape) == (0,)
     assert tuple(curves.hole.shape) == (0,)
-    assert curves.holes.centres.shape[0] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -317,8 +275,8 @@ def _one_hole(radius=0.1, n=64, shift=(5.0, 0.0)):
     """A hand-built hole at the origin: ``n`` even samples; source = lens + shift."""
     angle = 2.0 * np.pi * np.arange(n) / n
     lens = radius * np.stack([np.cos(angle), np.sin(angle)], axis=-1)
-    return CentreHoles(
-        centres=_arr([[0.0, 0.0]]),
+    return CenterHoles(
+        centers=_arr([[0.0, 0.0]]),
         radius=_arr([radius]),
         offsets=backend.as_array(np.array([0, n]), dtype=backend.int64),
         angle=_arr(angle),
@@ -343,7 +301,6 @@ def _traced(*curves):
         offsets=backend.as_array(offsets, dtype=backend.int64),
         closed=backend.as_array(np.array([c for _, c in curves]), dtype=backend.bool),
         hole=backend.as_array(np.full(len(pts), -1), dtype=backend.int64),
-        holes=empty_holes(),
     )
 
 
@@ -385,7 +342,7 @@ FIGURE_EIGHT = (
 )
 
 
-def test_a_loop_through_a_centre_twice_splits_into_two_loops_joined_clockwise():
+def test_a_loop_through_a_center_twice_splits_into_two_loops_joined_clockwise():
     holes = _one_hole()
     parts = _parts(join_at_holes(_traced((FIGURE_EIGHT, True)), holes))
     assert len(parts) == 2 and all(closed for *_, closed in parts)
@@ -486,7 +443,6 @@ def test_curves_that_never_enter_a_hole_are_left_bit_for_bit():
         assert np.array_equal(
             to_np(getattr(after, field)), to_np(getattr(before, field))
         ), field
-    assert after.holes.centres.shape[0] == 1
 
 
 def test_joining_at_no_hole_changes_nothing():
@@ -514,8 +470,8 @@ def _hole_pair(n=64):
     u = 0.1 * np.stack([np.cos(angle), np.sin(angle)], axis=-1)
     lens = np.concatenate([np.asarray(_A) + u, np.asarray(_B) + u])
     shift = np.repeat([[5.0, 0.0], [0.0, 5.0]], n, axis=0)
-    return CentreHoles(
-        centres=_arr([_A, _B]),
+    return CenterHoles(
+        centers=_arr([_A, _B]),
         radius=_arr([0.1, 0.1]),
         offsets=backend.as_array(np.array([0, n, 2 * n]), dtype=backend.int64),
         angle=_arr(np.concatenate([angle, angle])),
@@ -527,10 +483,10 @@ def _hole_pair(n=64):
     )
 
 
-def _arm(centre, degrees, radii):
-    """Points at distances ``radii`` from ``centre``, in the direction ``degrees``."""
+def _arm(center, degrees, radii):
+    """Points at distances ``radii`` from ``center``, in the direction ``degrees``."""
     t = math.radians(degrees)
-    return [(centre[0] + r * math.cos(t), centre[1] + r * math.sin(t)) for r in radii]
+    return [(center[0] + r * math.cos(t), center[1] + r * math.sin(t)) for r in radii]
 
 
 # Steps across the gap: east above the axis, and west below it. A step's
@@ -737,7 +693,7 @@ RADIAL_CAUSTIC = RADIAL * abs(1.0 - 1.2 / _R_RADIAL)
 
 def _curves(mesh):
     """``[(lens, source, closed), ...]`` per curve, as numpy."""
-    curves = mesh_critical_curves_and_caustics(mesh)
+    curves = critical_curves_and_caustics(mesh)
     off = to_np(curves.offsets)
     lens, source, closed = (
         to_np(curves.lens),
@@ -766,7 +722,7 @@ def test_cored_isothermal_curves_match_the_analytic_answers():
     counter-clockwise.
     """
     min_img_sep = 1e-2
-    mesh = build_adaptive_mesh(
+    mesh = build_lens_mesh(
         CORED.raytrace,
         CORED.jacobian_lens_equation,
         fov=4.0,
@@ -786,14 +742,14 @@ def test_cored_isothermal_curves_match_the_analytic_answers():
 
 
 def test_without_holes_the_curves_are_trace_band_s_and_follow_no_hole():
-    mesh = build_adaptive_mesh(
+    mesh = build_lens_mesh(
         CORED.raytrace,
         CORED.jacobian_lens_equation,
         fov=4.0,
         init_res=16,
         min_img_sep=1e-2,
     )
-    got = mesh_critical_curves_and_caustics(mesh)
+    got = critical_curves_and_caustics(mesh)
     raw = trace_band(mesh.critical_band)
     for field in ("lens", "source", "offsets", "closed"):
         assert np.array_equal(
@@ -802,8 +758,8 @@ def test_without_holes_the_curves_are_trace_band_s_and_follow_no_hole():
     hole = to_np(got.hole)
     assert hole.dtype == np.int64 and hole.shape == (got.lens.shape[0],)
     assert (hole == -1).all()
-    assert got.holes.centres.shape[0] == 0
-    assert to_np(got.holes.offsets).tolist() == [0]
+    assert mesh.holes.centers.shape[0] == 0
+    assert to_np(mesh.holes.offsets).tolist() == [0]
 
 
 def test_the_fov_cuts_the_tangential_circle_into_four_open_arcs():
@@ -814,7 +770,7 @@ def test_the_fov_cuts_the_tangential_circle_into_four_open_arcs():
     Every end sits on a boundary edge, whose two samples share the boundary
     coordinate exactly, so the end is on the boundary exactly.
     """
-    mesh = build_adaptive_mesh(
+    mesh = build_lens_mesh(
         CORED.raytrace,
         CORED.jacobian_lens_equation,
         fov=2.0,
@@ -841,14 +797,14 @@ def test_a_curve_through_lattice_points_is_traced_without_any_parity_flag():
     which tracing a curve through lattice points produces -- are kept, not
     removed.
     """
-    mesh = build_adaptive_mesh(
+    mesh = build_lens_mesh(
         ROW_FOLD.raytrace,
         ROW_FOLD.jacobian_lens_equation,
         fov=4.0,
         init_res=8,
         min_img_sep=2e-2,
     )
-    status = to_np(mesh.leaf_status)
+    status = to_np(mesh.origin_status)
     assert not ((status & LEAF_JACOBIAN_PARITY_UNRESOLVED) != 0).any()
     curves = _curves(mesh)
     assert len(curves) == 1
@@ -867,7 +823,7 @@ def test_a_curve_ends_where_the_lens_turns_nonfinite():
     edge of ``x = 1``.
     """
     min_img_sep = 0.05
-    mesh = build_adaptive_mesh(
+    mesh = build_lens_mesh(
         BROKEN_FOLD.raytrace,
         BROKEN_FOLD.jacobian_lens_equation,
         fov=4.0,
@@ -885,32 +841,32 @@ def test_a_curve_ends_where_the_lens_turns_nonfinite():
 
 
 # ---------------------------------------------------------------------------
-# End to end: curves through singular centres, repaired at their holes
+# End to end: curves through singular centers, repaired at their holes
 # ---------------------------------------------------------------------------
 
 # Two singular isothermal spheres of Einstein radius 1, 0.6" apart: each sits
 # in the other's field with kappa = shear = 1/1.2 > 1/2, so four branches of
-# det A = 0 end at each centre. The first is on the lattice origin, where the
+# det A = 0 end at each center. The first is on the lattice origin, where the
 # lens is NaN, so the band has a gap there and trace_band's curves are open.
 TWO_SIS = [(0.0, 0.0), (0.6, 0.0)]
 TWO_SIS_BUILD = dict(fov=5.0, init_res=10, min_img_sep=2e-2)
 
 
-def _einstein_radii(centres, b):
-    """``b`` for every centre: one radius for all, or one per centre."""
-    return [b] * len(centres) if np.isscalar(b) else list(b)
+def _einstein_radii(centers, b):
+    """``b`` for every center: one radius for all, or one per center."""
+    return [b] * len(centers) if np.isscalar(b) else list(b)
 
 
-def _sis_pair(centres, b=1.0):
+def _sis_pair(centers, b=1.0):
     """A lens-like object: singular isothermal spheres of Einstein radius ``b``.
 
-    ``b`` is one radius for every centre, or a sequence of one per centre.
+    ``b`` is one radius for every center, or a sequence of one per center.
     """
-    radii = _einstein_radii(centres, b)
+    radii = _einstein_radii(centers, b)
 
     def raytrace(x, y):
         bx, by = x * 1.0, y * 1.0
-        for (cx, cy), rein in zip(centres, radii):
+        for (cx, cy), rein in zip(centers, radii):
             dx, dy = x - cx, y - cy
             r = (dx * dx + dy * dy) ** 0.5
             bx, by = bx - rein * dx / r, by - rein * dy / r
@@ -918,7 +874,7 @@ def _sis_pair(centres, b=1.0):
 
     def jacobian(x, y):
         a00, a01, a11 = x * 0.0 + 1.0, x * 0.0, x * 0.0 + 1.0
-        for (cx, cy), rein in zip(centres, radii):
+        for (cx, cy), rein in zip(centers, radii):
             dx, dy = x - cx, y - cy
             r = (dx * dx + dy * dy) ** 0.5
             k = rein / r**3
@@ -930,13 +886,18 @@ def _sis_pair(centres, b=1.0):
     return SimpleNamespace(raytrace=raytrace, jacobian_lens_equation=jacobian)
 
 
-def _sis_pair_map(p, centres, b=1.0):
+def _sis_pair_map(p, centers, b=1.0):
     """``_sis_pair`` on numpy points ``(N, 2)``."""
     out = p.copy()
-    for c, rein in zip(centres, _einstein_radii(centres, b)):
+    for c, rein in zip(centers, _einstein_radii(centers, b)):
         d = p - np.asarray(c)
         out -= rein * d / np.hypot(d[:, 0], d[:, 1])[:, None]
     return out
+
+
+def _with_holes(curves, holes):
+    """``curves`` with the holes they were joined at alongside, for the count helpers."""
+    return SimpleNamespace(**curves._asdict(), holes=holes)
 
 
 def _grid_of(curves, dx=0.02, margin=0.2):
@@ -954,7 +915,7 @@ def _pixels(grid):
 
 
 def _winding(poly, grid):
-    """Winding number of a closed polyline round every pixel centre, by signed crossings of a rightward ray."""
+    """Winding number of a closed polyline round every pixel center, by signed crossings of a rightward ray."""
     x0, y0, dx, nx, ny = grid
     a, b = poly, np.roll(poly, -1, axis=0)
     lo, hi = np.minimum(a[:, 1], b[:, 1]), np.maximum(a[:, 1], b[:, 1])
@@ -990,8 +951,8 @@ def _count(curves, grid):
         assert closed
         N += 2 * _winding(source, grid)
     offsets = to_np(curves.holes.offsets)
-    centres, hole_source = to_np(curves.holes.centres), to_np(curves.holes.source)
-    for h, s in enumerate(centres):
+    centers, hole_source = to_np(curves.holes.centers), to_np(curves.holes.source)
+    for h, s in enumerate(centers):
         sigma = -1 - 2 * sum(_lens_winding(lens, s) for lens, *_ in parts)
         N += sigma * _winding(hole_source[offsets[h] : offsets[h + 1]], grid)
     return N
@@ -1005,7 +966,7 @@ def _curve_mask(curves, grid, width):
 
 
 def _brute_counts(fn, grid, lo, hi, h, singular, excl):
-    """Images per pixel centre: lens-plane triangles whose piecewise-linear image covers it."""
+    """Images per pixel center: lens-plane triangles whose piecewise-linear image covers it."""
     x0, y0, dx, nx, ny = grid
     g = np.arange(lo, hi + h / 2, h) + 3.3e-5
     X, Y = np.meshgrid(g, g)
@@ -1046,25 +1007,25 @@ def _brute_counts(fn, grid, lo, hi, h, singular, excl):
 @pytest.fixture(scope="module")
 def two_sis():
     lens = _sis_pair(TWO_SIS)
-    mesh = build_adaptive_mesh(
-        lens.raytrace, lens.jacobian_lens_equation, **TWO_SIS_BUILD, centres=TWO_SIS
+    mesh = build_lens_mesh(
+        lens.raytrace, lens.jacobian_lens_equation, **TWO_SIS_BUILD, centers=TWO_SIS
     )
-    return mesh, mesh_critical_curves_and_caustics(mesh)
+    return mesh, _with_holes(critical_curves_and_caustics(mesh), mesh.holes)
 
 
-def test_curves_through_singular_centres_come_out_closed_and_chord_free(two_sis):
+def test_curves_through_singular_centers_come_out_closed_and_chord_free(two_sis):
     """Without holes a chord crosses a cut of radius ~1"; traced steps are below 0.01"."""
     mesh, curves = two_sis
     assert not to_np(trace_band(mesh.critical_band).closed).all()
     parts = _parts(curves)
     assert parts and all(closed for *_, closed in parts)
-    centres, radius = to_np(mesh.holes.centres), to_np(mesh.holes.radius)
+    centers, radius = to_np(mesh.holes.centers), to_np(mesh.holes.radius)
     for lens, source, hole, _ in parts:
         traced = (hole == -1) & (np.roll(hole, -1) == -1)
         step = np.hypot(*(np.roll(source, -1, axis=0) - source).T)
         assert step[traced].max() < 0.05
-        for h in range(centres.shape[0]):
-            d = np.hypot(*(lens - centres[h]).T)
+        for h in range(centers.shape[0]):
+            d = np.hypot(*(lens - centers[h]).T)
             assert np.allclose(d[hole == h], radius[h], rtol=0, atol=1e-12)
             assert (d[hole == -1] >= radius[h]).all()
 
@@ -1086,40 +1047,17 @@ def test_the_count_from_the_repaired_curves_matches_a_brute_force_count(two_sis)
     assert np.array_equal(_count(curves, grid)[~band], truth[~band])
 
 
-def test_moving_a_centre_off_the_lattice_leaves_the_count_unchanged(two_sis):
+def test_moving_a_center_off_the_lattice_leaves_the_count_unchanged(two_sis):
     _, curves = two_sis
     shifted = [(0.0003, 0.0002), TWO_SIS[1]]
     lens = _sis_pair(shifted)
-    mesh = build_adaptive_mesh(
-        lens.raytrace, lens.jacobian_lens_equation, **TWO_SIS_BUILD, centres=shifted
+    mesh = build_lens_mesh(
+        lens.raytrace, lens.jacobian_lens_equation, **TWO_SIS_BUILD, centers=shifted
     )
-    moved = mesh_critical_curves_and_caustics(mesh)
+    moved = _with_holes(critical_curves_and_caustics(mesh), mesh.holes)
     grid = _grid_of(curves)
     band = _curve_mask(curves, grid, 0.06) | _curve_mask(moved, grid, 0.06)
     assert np.array_equal(_count(moved, grid)[~band], _count(curves, grid)[~band])
-
-
-def test_a_float32_mesh_repairs_its_curves_at_the_mesh_dtype():
-    lens = _sis_pair(TWO_SIS)
-    mesh = build_adaptive_mesh(
-        lens.raytrace,
-        lens.jacobian_lens_equation,
-        **TWO_SIS_BUILD,
-        centres=TWO_SIS,
-        dtype=backend.float32,
-    )
-    curves = mesh_critical_curves_and_caustics(mesh)
-    assert (
-        curves.lens.dtype == backend.float32 and curves.source.dtype == backend.float32
-    )
-    assert to_np(curves.closed).all()
-    on = to_np(curves.hole) >= 0
-    assert on.any()
-    got = np.concatenate([to_np(curves.lens)[on], to_np(curves.source)[on]], axis=1)
-    stored = np.concatenate([to_np(mesh.holes.lens), to_np(mesh.holes.source)], axis=1)
-    assert {tuple(row) for row in got.tolist()} <= {
-        tuple(row) for row in stored.tolist()
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -1128,7 +1066,7 @@ def test_a_float32_mesh_repairs_its_curves_at_the_mesh_dtype():
 
 # Disks only need not overlap, and at the size floor a traced step can be as
 # long as half the stored min_img_sep, so a step can cross the gap between two
-# holes. Here an SIS of Einstein radius 0.02 sits beside TWO_SIS's centre on
+# holes. Here an SIS of Einstein radius 0.02 sits beside TWO_SIS's center on
 # the lattice origin, 0.0203" from it at 40 degrees: the two holes, of radius
 # 0.01, are 0.0003" apart.
 _COMPANION = (
@@ -1143,8 +1081,8 @@ def _hole_to_hole_steps(mesh):
     """How many traced steps of ``mesh``'s band go from one hole's disk straight into another's."""
     raw = trace_band(mesh.critical_band)
     lens, off = to_np(raw.lens), to_np(raw.offsets)
-    centres, radius = to_np(mesh.holes.centres), to_np(mesh.holes.radius)
-    inside = np.hypot(*(lens[:, None, :] - centres[None]).transpose(2, 0, 1)) < radius
+    centers, radius = to_np(mesh.holes.centers), to_np(mesh.holes.radius)
+    inside = np.hypot(*(lens[:, None, :] - centers[None]).transpose(2, 0, 1)) < radius
     tag = np.where(inside.any(axis=1), inside.argmax(axis=1), -1)
     steps = 0
     for a, b in zip(off[:-1], off[1:]):
@@ -1171,11 +1109,11 @@ def _traced_steps(curves):
 
 
 def _steps_entering_holes(mesh, curves):
-    """How many traced lens-plane steps come closer to a hole's centre than its radius."""
+    """How many traced lens-plane steps come closer to a hole's center than its radius."""
     p, q, _ = _traced_steps(curves)
     d = q - p
     entering = 0
-    for c, r in zip(to_np(mesh.holes.centres), to_np(mesh.holes.radius)):
+    for c, r in zip(to_np(mesh.holes.centers), to_np(mesh.holes.radius)):
         t = ((c - p) * d).sum(axis=1) / np.maximum((d * d).sum(axis=1), 1e-300)
         closest = p + np.clip(t, 0.0, 1.0)[:, None] * d
         entering += int((np.hypot(*(closest - c).T) < r).sum())
@@ -1186,10 +1124,10 @@ def _assert_closed_off_the_holes(mesh, curves):
     """Every curve closed, its hole points on their circles, and no traced point in a hole."""
     parts = _parts(curves)
     assert parts and all(closed for *_, closed in parts)
-    centres, radius = to_np(mesh.holes.centres), to_np(mesh.holes.radius)
+    centers, radius = to_np(mesh.holes.centers), to_np(mesh.holes.radius)
     for lens, _, hole, _ in parts:
-        for h in range(centres.shape[0]):
-            d = np.hypot(*(lens - centres[h]).T)
+        for h in range(centers.shape[0]):
+            d = np.hypot(*(lens - centers[h]).T)
             assert np.allclose(d[hole == h], radius[h], rtol=0, atol=1e-12)
             assert (d[hole == -1] >= radius[h]).all()
 
@@ -1203,13 +1141,13 @@ def _assert_closed_and_chord_free(mesh, curves):
 @pytest.fixture(scope="module")
 def bridged_sis():
     lens = _sis_pair(WITH_COMPANION, b=WITH_COMPANION_B)
-    mesh = build_adaptive_mesh(
+    mesh = build_lens_mesh(
         lens.raytrace,
         lens.jacobian_lens_equation,
         **TWO_SIS_BUILD,
-        centres=WITH_COMPANION,
+        centers=WITH_COMPANION,
     )
-    return mesh, mesh_critical_curves_and_caustics(mesh)
+    return mesh, _with_holes(critical_curves_and_caustics(mesh), mesh.holes)
 
 
 def test_curves_bridged_to_a_singular_companion_come_out_closed_and_chord_free(
@@ -1242,19 +1180,19 @@ def test_the_count_through_a_bridged_hole_matches_a_brute_force_count(bridged_si
     assert np.array_equal(_count(curves, grid)[~band], truth[~band])
 
 
-def test_curves_bridged_to_a_regular_centre_come_out_closed_and_chord_free():
-    """A third centre where the lens is regular, 0.02095" from the origin.
+def test_curves_bridged_to_a_regular_center_come_out_closed_and_chord_free():
+    """A third center where the lens is regular, 0.02095" from the origin.
 
     Its hole lies 0.00095" from the origin's, and one traced step of 0.00123"
     goes from it straight into the origin's.
     """
-    centres = TWO_SIS + [(-0.01241, 0.01688)]
+    centers = TWO_SIS + [(-0.01241, 0.01688)]
     lens = _sis_pair(TWO_SIS)
-    mesh = build_adaptive_mesh(
-        lens.raytrace, lens.jacobian_lens_equation, **TWO_SIS_BUILD, centres=centres
+    mesh = build_lens_mesh(
+        lens.raytrace, lens.jacobian_lens_equation, **TWO_SIS_BUILD, centers=centers
     )
     assert _hole_to_hole_steps(mesh) > 0
-    _assert_closed_and_chord_free(mesh, mesh_critical_curves_and_caustics(mesh))
+    _assert_closed_and_chord_free(mesh, critical_curves_and_caustics(mesh))
 
 
 def test_triangle_segments_keep_the_positive_side_on_the_left():
@@ -1276,13 +1214,13 @@ def test_triangle_segments_skip_triangles_of_one_class():
 
 
 def test_chain_segments_close_a_fan_into_one_counter_clockwise_loop():
-    # A unit square fanned about its centre, vertex 4, the only positive one.
+    # A unit square fanned about its center, vertex 4, the only positive one.
     tri = backend.as_array(
         [[0, 1, 4], [1, 2, 4], [2, 3, 4], [3, 0, 4]], dtype=backend.int64
     )
     positive = backend.as_array([False, False, False, False, True])
     start, end = triangle_segments(tri, positive)
-    edges, offsets, closed = chain_segments(start, end, 5, "crossing")
+    edges, offsets, closed = chain_segments(start, end, 5)
     assert to_np(offsets).tolist() == [0, 4]
     assert to_np(closed).tolist() == [True]
     walk = [tuple(e) for e in to_np(edges).tolist()]
@@ -1290,16 +1228,9 @@ def test_chain_segments_close_a_fan_into_one_counter_clockwise_loop():
     assert walk[i:] + walk[:i] == [(0, 4), (1, 4), (2, 4), (3, 4)]
 
 
-def test_chain_segments_name_the_crossing_in_their_assertions():
-    start = backend.as_array([[0, 1], [0, 1]], dtype=backend.int64)
-    end = backend.as_array([[1, 2], [2, 3]], dtype=backend.int64)
-    with pytest.raises(AssertionError, match="a widget has two successors"):
-        chain_segments(start, end, 4, "widget")
-
-
 def test_chain_segments_of_nothing_is_no_curve():
     empty = backend.zeros((0, 2), dtype=backend.int64)
-    edges, offsets, closed = chain_segments(empty, empty, 3, "crossing")
+    edges, offsets, closed = chain_segments(empty, empty, 3)
     assert edges.shape == (0, 2)
     assert to_np(offsets).tolist() == [0]
     assert closed.shape[0] == 0
@@ -1313,3 +1244,466 @@ def test_edge_zeros_interpolate_the_zero_in_every_plane():
     za, zb = edge_zeros(edges, field, (a, b))
     assert to_np(za).tolist() == [[1.0, 0.0]]
     assert to_np(zb).tolist() == [[0.0, 2.0]]
+
+
+# ---------------------------------------------------------------------------
+# merge_centers
+# ---------------------------------------------------------------------------
+
+
+def test_empty_holes_has_no_hole():
+    holes = empty_holes()
+    assert tuple(holes.centers.shape) == (0, 2)
+    assert tuple(holes.lens.shape) == (0, 2) and tuple(holes.source.shape) == (0, 2)
+    for field in ("radius", "angle", "growth", "growth_err", "pseudo_caustic"):
+        assert tuple(getattr(holes, field).shape) == (0,), field
+    assert holes.pseudo_caustic.dtype == backend.bool
+    assert to_np(holes.offsets).tolist() == [0]
+
+
+@pytest.mark.parametrize(
+    "centers", [None, [], np.zeros((0, 2))], ids=["None", "empty list", "(0, 2)"]
+)
+def test_merge_centers_of_nothing_is_empty(centers):
+    got, radius = merge_centers(centers, 0.01)
+    assert tuple(got.shape) == (0, 2) and tuple(radius.shape) == (0,)
+
+
+@pytest.mark.parametrize(
+    "centers",
+    [[(0.3, -0.2)], ((0.3, -0.2),), np.array([[0.3, -0.2]]), _arr([[0.3, -0.2]])],
+    ids=["list", "tuple", "numpy", "backend"],
+)
+def test_a_lone_center_of_any_array_like_keeps_its_exact_position(centers):
+    got, radius = merge_centers(centers, 0.01)
+    assert to_np(got).tolist() == [[0.3, -0.2]]
+    assert to_np(radius).tolist() == [0.01]
+
+
+def test_coincident_centers_share_one_hole_at_their_common_position():
+    got, radius = merge_centers([(2.0, 2.0), (0.3, 0.1), (0.3, 0.1)], 0.01)
+    assert to_np(got).tolist() == [[0.3, 0.1], [2.0, 2.0]]
+    assert to_np(radius).tolist() == [0.01, 0.01]
+
+
+def test_centers_closer_than_twice_min_img_sep_merge_at_their_mean():
+    got, radius = merge_centers([(0.0, 0.0), (0.015, 0.0)], 0.01)
+    assert np.allclose(to_np(got), [[0.0075, 0.0]], rtol=0, atol=1e-15)
+    assert np.allclose(to_np(radius), [0.0175], rtol=0, atol=1e-15)
+
+
+def test_centers_exactly_twice_min_img_sep_apart_keep_their_own_holes():
+    got, _ = merge_centers([(0.0, 0.0), (0.02, 0.0)], 0.01)
+    assert got.shape[0] == 2
+
+
+def test_merging_repeats_until_no_two_disks_overlap():
+    """``a`` and ``b`` link; ``c`` is farther than 2 * min_img_sep from both,
+    yet its disk overlaps theirs once they merge, so all three share a hole."""
+    pts = np.array([(0.0, 0.0), (0.019, 0.0), (0.0095, 0.025)])
+    got, radius = merge_centers(pts, 0.01)
+    mean = pts.mean(axis=0)
+    assert got.shape[0] == 1
+    assert np.allclose(to_np(got)[0], mean, rtol=0, atol=1e-15)
+    want = 0.01 + np.hypot(*(pts - mean).T).max()
+    assert np.isclose(to_np(radius)[0], want, rtol=0, atol=1e-15)
+
+
+def test_merged_holes_are_disjoint_hold_their_centers_and_ignore_input_order():
+    rng = np.random.default_rng(3)
+    pts = np.concatenate(
+        [rng.uniform(-1.0, 1.0, (20, 2)), rng.uniform(0.0, 0.03, (10, 2))]
+    )
+    got, radius = merge_centers(pts, 0.01)
+    g, r = to_np(got), to_np(radius)
+    gap = np.hypot(*(g[:, None, :] - g[None, :, :]).transpose(2, 0, 1))
+    np.fill_diagonal(gap, np.inf)
+    assert (gap >= r[:, None] + r[None, :]).all()
+    held = np.hypot(*(pts[:, None, :] - g[None, :, :]).transpose(2, 0, 1)) < r[None, :]
+    assert (held.sum(axis=1) == 1).all()
+    for seed in range(3):
+        perm = np.random.default_rng(seed).permutation(len(pts))
+        again, again_radius = merge_centers(pts[perm], 0.01)
+        assert np.array_equal(to_np(again), g)
+        assert np.array_equal(to_np(again_radius), r)
+
+
+# ---------------------------------------------------------------------------
+# sample_holes
+# ---------------------------------------------------------------------------
+
+
+def sis_raytrace(c, b):
+    """A singular isothermal sphere at ``c``: ``f(c + r u) = c + (r - b) u``."""
+
+    def raytrace(x, y):
+        dx, dy = x - c[0], y - c[1]
+        r = backend.sqrt(dx * dx + dy * dy)
+        return x - b * dx / r, y - b * dy / r
+
+    return raytrace
+
+
+def point_mass_raytrace(c, theta_e):
+    """A point mass at ``c``: ``f(c + r u) = c + (r - theta_e**2 / r) u``."""
+
+    def raytrace(x, y):
+        dx, dy = x - c[0], y - c[1]
+        r2 = dx * dx + dy * dy
+        return x - theta_e**2 * dx / r2, y - theta_e**2 * dy / r2
+
+    return raytrace
+
+
+def sis_in_shear_raytrace(c, b, kappa, gamma_1, gamma_2):
+    """The SIS of ``sis_raytrace`` in a uniform convergence and shear about ``c``:
+    the smooth pull other lenses add at an isothermal center."""
+    sis = sis_raytrace(c, b)
+
+    def raytrace(x, y):
+        dx, dy = x - c[0], y - c[1]
+        bx, by = sis(x, y)
+        return (
+            bx - (kappa + gamma_1) * dx - gamma_2 * dy,
+            by - gamma_2 * dx - (kappa - gamma_1) * dy,
+        )
+
+    return raytrace
+
+
+def power_law_raytrace(c, b, t):
+    """A circular power law of slope ``t`` at ``c``:
+    ``f(c + r u) = c + (r - b**t * r**(1 - t)) u``, the SIS at ``t = 1``."""
+
+    def raytrace(x, y):
+        dx, dy = x - c[0], y - c[1]
+        k = b**t * backend.sqrt(dx * dx + dy * dy) ** -t
+        return x - k * dx, y - k * dy
+
+    return raytrace
+
+
+def affine_raytrace(x, y):
+    return 0.7 * x + 0.1 * y, -0.2 * x + 0.9 * y
+
+
+def nan_where(raytrace, where):
+    """``raytrace`` with NaN wherever ``where(x, y)`` holds."""
+
+    def broken(x, y):
+        bx, by = raytrace(x, y)
+        nan = backend.where(
+            where(x, y), backend.zeros_like(x) + float("nan"), backend.zeros_like(x)
+        )
+        return bx + nan, by + nan
+
+    return broken
+
+
+def sample(raytrace, centers, radius, min_img_sep, batch_size=None):
+    """``sample_holes`` through ``make_sampler``, and every point it traced."""
+    calls = []
+
+    def recorded(x, y):
+        calls.append(np.stack([to_np(x), to_np(y)], axis=-1))
+        return raytrace(x, y)
+
+    holes = sample_holes(
+        make_sampler(recorded, None, None),
+        _arr(centers),
+        _arr(radius),
+        min_img_sep,
+        batch_size,
+    )
+    return holes, calls
+
+
+def test_an_sis_hole_curve_is_its_analytic_circle_sampled_to_min_img_sep():
+    c, b, r = (0.3, -0.2), 1.0, 0.01
+    holes, _ = sample(sis_raytrace(c, b), [c], [r], r)
+    angle, lens, source = to_np(holes.angle), to_np(holes.lens), to_np(holes.source)
+    u = np.stack([np.cos(angle), np.sin(angle)], axis=-1)
+    assert to_np(holes.offsets).tolist() == [0, angle.size]
+    assert angle[0] >= 0 and angle[-1] < 2 * np.pi and (np.diff(angle) > 0).all()
+    assert np.allclose(lens, np.array(c) + r * u, rtol=0, atol=1e-14)
+    assert np.allclose(source, np.array(c) + (r - b) * u, rtol=0, atol=1e-12)
+    chords = np.hypot(*(np.roll(source, -1, axis=0) - source).T)
+    assert chords.max() <= r
+
+
+# An isothermal center alone, and in the uniform convergence and shear other
+# lenses add there. The hole curve's size then changes by about ``r / b`` of
+# itself between radii -- 1e-2 here -- which a slope between two circles reads
+# as a growth of order 5e-3 rather than 0.
+ISOTHERMAL = {
+    "sis": sis_raytrace((0.3, -0.2), 1.0),
+    "sis in shear": sis_in_shear_raytrace((0.3, -0.2), 1.0, 0.1, 0.2, -0.1),
+}
+
+
+@pytest.mark.parametrize("name", ISOTHERMAL)
+def test_an_isothermal_center_is_a_pseudo_caustic(name):
+    holes, _ = sample(ISOTHERMAL[name], [(0.3, -0.2)], [0.01], 0.01)
+    growth, err = to_np(holes.growth)[0], to_np(holes.growth_err)[0]
+    assert to_np(holes.pseudo_caustic).tolist() == [True]
+    assert abs(growth) <= err
+    assert abs(growth) < 1e-5
+
+
+@pytest.mark.parametrize("t", [1.0 - 1e-4, 1.0 + 1e-4])
+def test_a_power_law_a_hair_off_isothermal_is_no_pseudo_caustic(t):
+    """A slope ``t`` gives ``growth = 1 - t``, resolved well below 1e-4."""
+    c = (0.3, -0.2)
+    holes, _ = sample(power_law_raytrace(c, 1.0, t), [c], [0.01], 0.01)
+    growth, err = to_np(holes.growth)[0], to_np(holes.growth_err)[0]
+    assert to_np(holes.pseudo_caustic).tolist() == [False]
+    assert abs(growth - (1.0 - t)) <= err < 2.5e-5
+
+
+def test_both_centers_of_two_overlapping_sie_lenses_are_pseudo_caustics():
+    """Each SIE's pseudo-caustic is shifted and sheared by the other's smooth
+    deflection; a slope between two circles read these as 8e-4 and -7e-4."""
+    cosmology = FlatLambdaCDM(name="cosmo")
+    lenses = [
+        SIE(cosmology=cosmology, name=name, x0=c, y0=c, q=0.4, phi=phi, Rein=1.2, s=0.0)
+        for name, c, phi in (("sie_1", 0.5, np.pi / 4), ("sie_2", 0.001, np.pi))
+    ]
+    lens = SinglePlane(
+        cosmology=cosmology, name="lens", z_l=0.5, z_s=1.5, lenses=lenses
+    )
+    centers = [(0.001, 0.001), (0.5, 0.5)]
+    holes, _ = sample(lens.raytrace, centers, [0.005, 0.005], 0.005)
+    assert to_np(holes.pseudo_caustic).tolist() == [True, True]
+
+
+def test_a_point_mass_hole_curve_grows_as_the_hole_shrinks():
+    c = (0.1, 0.2)
+    holes, _ = sample(point_mass_raytrace(c, 0.1), [c], [0.01], 0.01)
+    assert abs(to_np(holes.growth)[0] + 1.0) < 0.01
+    assert to_np(holes.pseudo_caustic).tolist() == [False]
+
+
+def test_a_regular_point_hole_curve_shrinks_with_the_hole():
+    holes, _ = sample(affine_raytrace, [(0.4, -0.3)], [0.01], 0.01)
+    assert abs(to_np(holes.growth)[0] - 1.0) < 1e-9
+    assert to_np(holes.pseudo_caustic).tolist() == [False]
+
+
+def test_a_lens_mapping_every_circle_to_one_point_has_no_growth():
+    def constant(x, y):
+        return 0.0 * x + 0.5, 0.0 * y - 0.1
+
+    holes, _ = sample(constant, [(0.4, -0.3)], [0.01], 0.01)
+    assert np.isnan(to_np(holes.growth)[0])
+    assert to_np(holes.pseudo_caustic).tolist() == [False]
+
+
+def test_a_hole_curve_too_large_to_resolve_stops_at_the_cap_and_warns():
+    """A 1" point mass maps a 0.005" circle to a loop of radius about 200":
+    ``2**16`` samples cannot bring its chords down to 0.005"."""
+    c = (0.0, 0.0)
+    with pytest.warns(UserWarning, match=r"stopped at \d+ samples \(cap 65536\)"):
+        holes, _ = sample(point_mass_raytrace(c, 1.0), [c], [0.005], 0.005)
+    assert to_np(holes.offsets)[-1] <= HOLE_MAX_SAMPLES
+
+
+def test_a_hole_frozen_below_the_cap_warns_with_its_own_sample_count():
+    """A point mass off the hole's center makes the hole curve uneven.
+
+    Refinement then bisects only some intervals, so a round can stop short
+    of the cap because the next one would pass it. The warning states the
+    count the hole kept, not the cap.
+    """
+    c = (0.0, 0.0)
+    with pytest.warns(UserWarning, match=r"\(cap 65536\)") as got:
+        holes, _ = sample(point_mass_raytrace((0.004, 0.0), 0.3), [c], [0.005], 0.005)
+    n = int(to_np(holes.offsets)[-1])
+    assert n < HOLE_MAX_SAMPLES
+    assert any(f"stopped at {n} samples (cap 65536)" in str(w.message) for w in got)
+
+
+def test_a_lens_not_finite_on_a_hole_circle_raises_naming_the_center():
+    c = (0.4, -0.3)
+    broken = nan_where(affine_raytrace, lambda x, y: x > c[0])
+    with pytest.raises(
+        ValueError,
+        match=r"not finite on the hole circle of radius 0\.01 around \(0\.4, -0\.3\)",
+    ):
+        sample(broken, [c], [0.01], 0.01)
+
+
+@pytest.mark.parametrize(
+    "nan_within, named",
+    [(0.005, r"radius 0\.0025 "), (3e-4, r"radius 0\.00015625 ")],
+    ids=["quarter", "sixty-fourth"],
+)
+def test_every_growth_circle_down_to_a_64th_of_the_radius_must_be_finite(
+    nan_within, named
+):
+    c = (0.4, -0.3)
+    broken = nan_where(
+        affine_raytrace,
+        lambda x, y: (x - c[0]) ** 2 + (y - c[1]) ** 2 < nan_within**2,
+    )
+    with pytest.raises(ValueError, match=named):
+        sample(broken, [c], [0.01], 0.01)
+
+
+def test_holes_raytrace_only_their_circles_and_batching_changes_nothing():
+    c, r = (0.3, -0.2), 0.01
+    holes, calls = sample(sis_raytrace(c, 1.0), [c], [r], r)
+    d = np.hypot(*(np.concatenate(calls) - np.array(c)).T)
+    radii = r / 4.0 ** np.arange(4)
+    assert np.isclose(d[:, None], radii, rtol=0, atol=1e-14).any(axis=1).all()
+    batched, batched_calls = sample(sis_raytrace(c, 1.0), [c], [r], r, batch_size=100)
+    assert max(len(x) for x in batched_calls) <= 100
+    for field in CenterHoles._fields:
+        assert np.array_equal(
+            to_np(getattr(batched, field)), to_np(getattr(holes, field))
+        ), field
+
+
+def test_holes_sampled_together_match_holes_sampled_alone():
+    """One call per round covers every hole; no hole's samples leak into another's."""
+    lens = sis_raytrace((0.3, -0.2), 1.0)
+    pairs = [((0.3, -0.2), 0.01), ((1.5, 1.0), 0.02)]
+    both, _ = sample(lens, [c for c, _ in pairs], [r for _, r in pairs], 0.01)
+    off = to_np(both.offsets)
+    for h, (c, r) in enumerate(pairs):
+        alone, _ = sample(lens, [c], [r], 0.01)
+        for field in ("angle", "lens", "source"):
+            assert np.array_equal(
+                to_np(getattr(both, field))[off[h] : off[h + 1]],
+                to_np(getattr(alone, field)),
+            ), field
+        for field in ("growth", "growth_err", "pseudo_caustic"):
+            assert np.array_equal(
+                to_np(getattr(both, field))[h], to_np(getattr(alone, field))[0]
+            ), field
+
+
+# ---------------------------------------------------------------------------
+# Holes on the mesh
+# ---------------------------------------------------------------------------
+
+
+def sis_lens(c, b):
+    """A lens-like object: the SIS of ``sis_raytrace`` and its Jacobian."""
+
+    def jacobian(x, y):
+        dx, dy = x - c[0], y - c[1]
+        r = backend.sqrt(dx * dx + dy * dy)
+        k = b / r**3
+        a00 = 1.0 - b / r + k * dx * dx
+        a01 = k * dx * dy
+        a11 = 1.0 - b / r + k * dy * dy
+        return backend.stack(
+            (backend.stack((a00, a01), dim=-1), backend.stack((a01, a11), dim=-1)),
+            dim=-2,
+        )
+
+    return SimpleNamespace(raytrace=sis_raytrace(c, b), jacobian_lens_equation=jacobian)
+
+
+def recording_lens(lens):
+    """``lens`` with every point each method is called on recorded."""
+    calls = {"raytrace": [], "jacobian": []}
+
+    def raytrace(x, y):
+        calls["raytrace"].append(np.stack([to_np(x), to_np(y)], axis=-1))
+        return lens.raytrace(x, y)
+
+    def jacobian(x, y):
+        calls["jacobian"].append(np.stack([to_np(x), to_np(y)], axis=-1))
+        return lens.jacobian_lens_equation(x, y)
+
+    return SimpleNamespace(raytrace=raytrace, jacobian_lens_equation=jacobian), calls
+
+
+def _same(a, b):
+    """Equal field by field, arrays bit for bit, NaN matching NaN."""
+    if hasattr(a, "_fields"):
+        return all(_same(getattr(a, f), getattr(b, f)) for f in a._fields)
+    if hasattr(a, "shape"):
+        a, b = to_np(a), to_np(b)
+        return (
+            a.dtype == b.dtype
+            and a.shape == b.shape
+            and np.array_equal(a, b, equal_nan=a.dtype.kind == "f")
+        )
+    return a == b
+
+
+SIS_C = (0.3001, -0.2003)  # off every lattice point of BUILD
+BUILD = dict(fov=4.0, init_res=8, min_img_sep=0.02)
+
+
+def test_a_build_without_centers_stores_empty_holes():
+    lens = sis_lens(SIS_C, 1.0)
+    mesh = build_lens_mesh(lens.raytrace, lens.jacobian_lens_equation, **BUILD)
+    assert mesh.holes.centers.shape[0] == 0
+    assert to_np(mesh.holes.offsets).tolist() == [0]
+
+
+def test_a_build_stores_the_merged_and_sampled_holes():
+    lens = sis_lens(SIS_C, 1.0)
+    centers = [SIS_C, SIS_C, (1.5, 1.5)]
+    mesh = build_lens_mesh(
+        lens.raytrace, lens.jacobian_lens_equation, **BUILD, centers=centers
+    )
+    want = sample_holes(
+        make_sampler(lens.raytrace, None, None),
+        *merge_centers(centers, mesh.min_img_sep),
+        mesh.min_img_sep,
+        None,
+    )
+    assert mesh.holes.centers.shape[0] == 2
+    assert to_np(mesh.holes.radius).tolist() == [mesh.min_img_sep] * 2
+    assert _same(mesh.holes, want)
+
+
+def test_centers_change_nothing_but_the_holes_even_outside_the_fov():
+    lens = sis_lens(SIS_C, 1.0)
+    plain = build_lens_mesh(lens.raytrace, lens.jacobian_lens_equation, **BUILD)
+    holed = build_lens_mesh(
+        lens.raytrace, lens.jacobian_lens_equation, **BUILD, centers=[SIS_C, (5.0, 5.0)]
+    )
+    assert holed.holes.centers.shape[0] == 2
+    for name in LensMesh._fields:
+        if name != "holes":
+            assert _same(getattr(holed, name), getattr(plain, name)), name
+
+
+def test_holes_cost_raytraces_on_their_circles_only_and_no_jacobian():
+    plain_lens, plain = recording_lens(sis_lens(SIS_C, 1.0))
+    holed_lens, holed = recording_lens(sis_lens(SIS_C, 1.0))
+    build_lens_mesh(plain_lens.raytrace, plain_lens.jacobian_lens_equation, **BUILD)
+    mesh = build_lens_mesh(
+        holed_lens.raytrace, holed_lens.jacobian_lens_equation, **BUILD, centers=[SIS_C]
+    )
+    base = np.concatenate(plain["raytrace"])
+    extra = np.concatenate(holed["raytrace"])
+    n_samples = int(to_np(mesh.holes.offsets)[-1])
+    assert len(extra) - len(base) == n_samples + 4 * HOLE_GROWTH_SAMPLES
+    added = extra[
+        ~np.isin(extra[:, 0] + 1j * extra[:, 1], base[:, 0] + 1j * base[:, 1])
+    ]
+    d = np.hypot(*(added - np.array(SIS_C)).T)
+    radii = mesh.min_img_sep / 4.0 ** np.arange(4)
+    assert np.isclose(d[:, None], radii, rtol=0, atol=1e-12).any(axis=1).all()
+    assert sum(map(len, holed["jacobian"])) == sum(map(len, plain["jacobian"]))
+
+
+def test_holes_land_on_the_mesh_device(device):
+    lens = sis_lens(SIS_C, 1.0)
+    mesh = build_lens_mesh(
+        lens.raytrace,
+        lens.jacobian_lens_equation,
+        **BUILD,
+        centers=[SIS_C],
+        device=device,
+    )
+    for field in CenterHoles._fields:
+        assert backend.device(getattr(mesh.holes, field)) == backend.device(
+            mesh.vertices_lens
+        ), field

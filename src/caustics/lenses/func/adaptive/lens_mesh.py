@@ -46,8 +46,8 @@ from .refine import (
 from .index import MeshIndex, build_index
 from .criterion import LEAF_CONVERGED, lens_status
 from .band import CriticalBand, build_band, in_band
-from .holes import CentreHoles, merge_centres, sample_holes
-from .curves import mesh_critical_curves_and_caustics
+from .holes import CenterHoles, merge_centers, sample_holes
+from .curves import critical_curves_and_caustics
 
 
 class LensMesh(NamedTuple):
@@ -100,7 +100,7 @@ class LensMesh(NamedTuple):
         Over the source-plane images of the leaves whose origin converged.
     critical_band: CriticalBand
         The finest-level origins ``det A`` changes sign across.
-    holes: CentreHoles
+    holes: CenterHoles
         Holes around the lens centers, with their hole curves.
     min_img_sep: float
         The tolerance the mesh was refined to, half the one requested.
@@ -121,7 +121,7 @@ class LensMesh(NamedTuple):
     origin_status: ArrayLike
     index: MeshIndex  # type: ignore[assignment]  # shadows tuple.index
     critical_band: CriticalBand
-    holes: CentreHoles
+    holes: CenterHoles
     min_img_sep: float
 
 
@@ -243,7 +243,7 @@ def build_lens_mesh(
     )
     _warn_depth_limited(h0, min_img_sep, max_level)
     lat = make_lattice(fov, x0, y0, init_res, max_level + 1)
-    hole_centers, hole_radius = merge_centres(centers, min_img_sep)
+    hole_centers, hole_radius = merge_centers(centers, min_img_sep)
     holes = sample_holes(
         make_sampler(raytrace, None, device),
         hole_centers,
@@ -495,7 +495,7 @@ def _hole_rings(fov, init_res, x0, y0, centers, min_img_sep):
     outside: int
         How many holes did not.
     """
-    hole_centers, radius = merge_centres(centers, min_img_sep)
+    hole_centers, radius = merge_centers(centers, min_img_sep)
     if hole_centers.shape[0] == 0:
         return 0, 0
     center = backend.as_array([x0, y0], dtype=backend.float64)
@@ -599,7 +599,7 @@ def build_closed_lens_mesh(
         device=device,
         batch_size=batch_size,
     )
-    curves = mesh_critical_curves_and_caustics(mesh)
+    curves = critical_curves_and_caustics(mesh)
     cut = _curves_cut_by_fov(mesh, curves)
     for _ in range(max_iters):
         if cut == 0:
@@ -611,7 +611,7 @@ def build_closed_lens_mesh(
             growth * lattice_fov(mesh.lattice),
             batch_size=batch_size,
         )
-        curves = mesh_critical_curves_and_caustics(mesh)
+        curves = critical_curves_and_caustics(mesh)
         cut = _curves_cut_by_fov(mesh, curves)
     if cut:
         warn(

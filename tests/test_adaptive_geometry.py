@@ -524,7 +524,7 @@ def test_a_fresh_lattice_places_points_exactly_as_before():
 
 
 def test_extend_lattice_keeps_every_old_position_bit_for_bit():
-    """A non-dyadic centre on purpose: nothing may be recomputed from a new fov."""
+    """A non-dyadic center on purpose: nothing may be recomputed from a new fov."""
     lat = make_lattice(4.0, 0.3, -0.1, 3, 4)
     ext = extend_lattice(lat, 2)
     pad = 2 << lat.level
@@ -583,7 +583,7 @@ def test_extend_lattice_grows_the_extent_and_keeps_key_order():
 def test_an_extended_dyadic_lattice_is_the_fresh_lattice_of_the_larger_fov():
     """The premise of every equivalence test below.
 
-    With a dyadic fov, centre and cell size, a fresh lattice over the larger
+    With a dyadic fov, center and cell size, a fresh lattice over the larger
     fov places every point exactly where the extended one does.
     """
     lat = make_lattice(4.0, 0.5, -0.25, 8, 3)

@@ -37,7 +37,7 @@ from caustics.lenses.func.adaptive.magnification_map import (
     split_mask,
     triangle_cells,
 )
-from caustics.lenses.func.adaptive.query import mesh_query, mesh_seeds
+from caustics.lenses.func.adaptive.images import mesh_query, mesh_seeds
 from caustics.lenses.func.adaptive.regions import (
     in_magnified_region,
     magnified_area,

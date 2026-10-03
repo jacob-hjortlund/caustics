@@ -1,7 +1,7 @@
 """
-Holes cut around lens centres, and the images of their boundary circles.
+Holes cut around lens centers, and the images of their boundary circles.
 
-The lens map can jump at a lens centre, so no curve of ``det A = 0``
+The lens map can jump at a lens center, so no curve of ``det A = 0``
 describes what happens to images there. A hole of radius ``min_img_sep`` is
 left out of the lens plane instead, and the image of its boundary circle, the
 hole curve, is traced (:func:`sample_holes`).
@@ -10,17 +10,17 @@ it.
 """
 
 import math
-from typing import NamedTuple, Tuple
+from typing import NamedTuple
 from warnings import warn
 
 from ....backend_obj import ArrayLike, backend
-from .state import _ambient
-from .sampling import trace_points
+from .geometry import build_device, to_device
+from .refine import sample_points
 
 __all__ = (
-    "CentreHoles",
+    "CenterHoles",
     "empty_holes",
-    "merge_centres",
+    "merge_centers",
     "HOLE_INITIAL_SAMPLES",
     "HOLE_MAX_SAMPLES",
     "HOLE_GROWTH_SAMPLES",
@@ -29,19 +29,19 @@ __all__ = (
 )
 
 
-class CentreHoles(NamedTuple):
+class CenterHoles(NamedTuple):
     """
-    Small disks cut around lens centres, and the images of their boundaries.
+    Small disks cut around lens centers, and the images of their boundaries.
 
-    The lens map can jump at a lens centre -- an isothermal profile's
-    deflection depends only on the direction from its centre -- so no curve
+    The lens map can jump at a lens center -- an isothermal profile's
+    deflection depends only on the direction from its center -- so no curve
     of ``det A = 0`` describes what happens to images there. A hole of radius
-    ``radius`` around each centre is left out of the lens plane instead, and
+    ``radius`` around each center is left out of the lens plane instead, and
     the image of its boundary circle, the *hole curve*, is kept. At an
-    isothermal centre the hole curve is the pseudo-caustic to within about
+    isothermal center the hole curve is the pseudo-caustic to within about
     ``radius``; at a point mass, or a cusp steeper than isothermal, it is a
     huge loop; at a regular point, or a profile whose deflection vanishes at
-    its centre, it is a speck. ``growth`` tells these apart: the hole curve's
+    its center, it is a speck. ``growth`` tells these apart: the hole curve's
     size scales as ``radius**growth`` there, so ``growth`` is 0 for a
     pseudo-caustic, negative for a loop that runs off to infinity as the hole
     shrinks, and positive for a speck -- exactly ``1 - t`` for a power law of
@@ -62,13 +62,13 @@ class CentreHoles(NamedTuple):
 
     Parameters
     ----------
-    centres: ArrayLike
-        ``(H, 2)`` hole centres after merging, at the mesh dtype.
+    centers: ArrayLike
+        ``(H, 2)`` hole centers after merging, at the mesh dtype.
 
         *Unit: arcsec*
     radius: ArrayLike
         ``(H,)`` float64 hole radii: the mesh's ``min_img_sep``, plus the
-        spread of the centres a hole merged.
+        spread of the centers a hole merged.
 
         *Unit: arcsec*
     offsets: ArrayLike
@@ -78,7 +78,7 @@ class CentreHoles(NamedTuple):
 
         *Unit: radians*
     lens: ArrayLike
-        ``(P, 2)`` circle points ``centre + radius * (cos, sin)(angle)``, at
+        ``(P, 2)`` circle points ``center + radius * (cos, sin)(angle)``, at
         the mesh dtype.
 
         *Unit: arcsec*
@@ -100,7 +100,7 @@ class CentreHoles(NamedTuple):
         ``growth`` is NaN.
     """
 
-    centres: ArrayLike
+    centers: ArrayLike
     radius: ArrayLike
     offsets: ArrayLike
     angle: ArrayLike
@@ -111,10 +111,10 @@ class CentreHoles(NamedTuple):
     pseudo_caustic: ArrayLike
 
 
-def empty_holes(device=None) -> CentreHoles:
-    """A :class:`CentreHoles` with no hole."""
-    return CentreHoles(
-        centres=backend.zeros((0, 2), dtype=backend.float64, device=device),
+def empty_holes(device=None):
+    """A :class:`CenterHoles` with no hole."""
+    return CenterHoles(
+        centers=backend.zeros((0, 2), dtype=backend.float64, device=device),
         radius=backend.zeros((0,), dtype=backend.float64, device=device),
         offsets=backend.zeros((1,), dtype=backend.int64, device=device),
         angle=backend.zeros((0,), dtype=backend.float64, device=device),
@@ -126,7 +126,7 @@ def empty_holes(device=None) -> CentreHoles:
     )
 
 
-def _components(link) -> ArrayLike:
+def _components(link):
     """
     Connected-component label of every node of a symmetric adjacency matrix.
 
@@ -145,22 +145,22 @@ def _components(link) -> ArrayLike:
         label = new
 
 
-def merge_centres(centres, min_img_sep) -> Tuple[ArrayLike, ArrayLike]:
+def merge_centers(centers, min_img_sep):
     """
-    Merge lens centres into holes whose disks do not overlap.
+    Merge lens centers into holes whose disks do not overlap.
 
-    Centres closer than ``2 * min_img_sep`` share a hole. A hole sits at its
+    Centers closer than ``2 * min_img_sep`` share a hole. A hole sits at its
     members' mean, with radius ``min_img_sep`` plus the members' largest
-    distance from that mean, so a lone centre gets exactly ``min_img_sep``.
+    distance from that mean, so a lone center gets exactly ``min_img_sep``.
     A merged hole is larger than ``min_img_sep``, so it can reach another
-    hole's disk; merging repeats until no two disks overlap. The centres are
+    hole's disk; merging repeats until no two disks overlap. The centers are
     put in lexicographic order first and the holes are returned in it, so
-    the result -- sums included -- depends on the set of centres, not on the
+    the result -- sums included -- depends on the set of centers, not on the
     order they were given in.
 
     Parameters
     ----------
-    centres: Optional[ArrayLike]
+    centers: Optional[ArrayLike]
         ``(S, 2)`` lens-plane positions, any array-like. ``None`` or an empty
         array gives no hole.
 
@@ -172,30 +172,21 @@ def merge_centres(centres, min_img_sep) -> Tuple[ArrayLike, ArrayLike]:
 
     Returns
     -------
-    centres: ArrayLike
-        ``(H, 2)`` float64 hole centres, in lexicographic ``(x, y)`` order.
+    centers: ArrayLike
+        ``(H, 2)`` float64 hole centers, in lexicographic ``(x, y)`` order.
 
         *Unit: arcsec*
     radius: ArrayLike
         ``(H,)`` float64 hole radii.
 
         *Unit: arcsec*
-
-    Raises
-    ------
-    ValueError
-        If ``centres`` is not ``(S, 2)``, or is not finite.
     """
     f64 = backend.float64
-    if centres is None:
+    if centers is None:
         return backend.zeros((0, 2), dtype=f64), backend.zeros((0,), dtype=f64)
-    c = _ambient(backend.as_array(centres, dtype=f64))
+    c = to_device(backend.as_array(centers, dtype=f64), build_device())
     if c.reshape(-1).shape[0] == 0:
         return backend.zeros((0, 2), dtype=f64), backend.zeros((0,), dtype=f64)
-    if len(c.shape) != 2 or c.shape[1] != 2:
-        raise ValueError(f"centres must have shape (S, 2), got {tuple(c.shape)}")
-    if not bool(backend.all(backend.isfinite(c))):
-        raise ValueError("centres must be finite")
     c = c[backend.lexsort([c[:, 1], c[:, 0]])]
     link = (
         backend.norm(backend.unsqueeze(c, 1) - backend.unsqueeze(c, 0), dim=-1)
@@ -233,37 +224,35 @@ HOLE_MAX_SAMPLES = 1 << 16
 HOLE_GROWTH_SAMPLES = 1024
 
 
-def hole_circle(centres, radius, hole, angle) -> ArrayLike:
+def hole_circle(centers, radius, hole, angle):
     """
-    Points ``centres[hole] + radius[hole] * (cos, sin)(angle)``, shape ``(K, 2)``.
+    Points ``centers[hole] + radius[hole] * (cos, sin)(angle)``, shape ``(K, 2)``.
 
     *Unit: arcsec*
     """
-    c, r = centres[hole], radius[hole]
+    c, r = centers[hole], radius[hole]
     return backend.stack(
         (c[:, 0] + r * backend.cos(angle), c[:, 1] + r * backend.sin(angle)), dim=-1
     )
 
 
-def _trace_hole_points(
-    raytrace_fn, centres, radius, hole, angle, batch_size, scale=1.0
-):
+def _trace_hole_points(trace, centers, radius, hole, angle, batch_size, scale=1.0):
     """
     Images of points on the hole circles scaled by ``scale``, shape ``(K, 2)``.
 
     Raises
     ------
     ValueError
-        If any image is non-finite, naming the first such hole's centre and
+        If any image is non-finite, naming the first such hole's center and
         the radius of the circle traced.
     """
-    source = trace_points(
-        hole_circle(centres, radius * scale, hole, angle), raytrace_fn, batch_size
+    source = sample_points(
+        hole_circle(centers, radius * scale, hole, angle), trace, batch_size
     )
     bad = backend.flatnonzero(~backend.all(backend.isfinite(source), dim=1))
     if bad.shape[0]:
         h = int(backend.to_numpy(hole[bad[0]]))
-        x, y = backend.to_numpy(centres[h]).tolist()
+        x, y = backend.to_numpy(centers[h]).tolist()
         r = float(backend.to_numpy(radius[h])) * scale
         raise ValueError(
             f"the lens is not finite on the hole circle of radius {r:g} around "
@@ -272,19 +261,19 @@ def _trace_hole_points(
     return source
 
 
-def _extent(points) -> ArrayLike:
+def _extent(points):
     """Diagonal of each row's bounding box, ``(H, K, 2) -> (H,)``."""
     return backend.norm(backend.max(points, dim=1) - backend.min(points, dim=1), dim=-1)
 
 
-def sample_holes(raytrace_fn, centres, radius, min_img_sep, batch_size) -> CentreHoles:
+def sample_holes(trace, centers, radius, min_img_sep, batch_size):
     """
     Trace every hole's boundary circle and its image, the hole curve.
 
     Each circle starts with :data:`HOLE_INITIAL_SAMPLES` evenly spaced angles.
     Every angular interval whose source-plane chord exceeds ``min_img_sep``
     -- the wrap-around one included -- is then bisected, round after round,
-    one ``raytrace_fn`` call per round for all holes together, until no chord
+    one ``trace`` call per round for all holes together, until no chord
     exceeds ``min_img_sep`` or a hole would pass :data:`HOLE_MAX_SAMPLES`
     samples. A hole stopped by the cap stays exact at its samples but coarser
     between them, and is warned about; only enormous hole curves, such as a
@@ -296,24 +285,24 @@ def sample_holes(raytrace_fn, centres, radius, min_img_sep, batch_size) -> Centr
     neighbouring circles, ``g(r) = log(size(r) / size(r / 4)) / log(4)``,
     is biased by a term linear in ``r``: the lens map's smooth part --
     the identity, and every other lens's deflection -- stretches the hole
-    curve by that much. At an isothermal centre it is all of ``g``, of
+    curve by that much. At an isothermal center it is all of ``g``, of
     order ``radius / size``. Richardson extrapolation cancels it:
     ``R(r) = (4 g(r / 4) - g(r)) / 3``, and ``growth = R(r / 4)``. What
-    is left falls as ``r**p`` -- ``p = 2`` at an isothermal centre of a
+    is left falls as ``r**p`` -- ``p = 2`` at an isothermal center of a
     lens map smooth everywhere else -- so ``growth_err = |R(r) - R(r / 4)|``
     is ``4**p - 1`` times that error, a bound for any ``p >= 1/2``. No
     Jacobian is called.
 
     Parameters
     ----------
-    raytrace_fn: Callable[[ArrayLike], ArrayLike]
+    trace: Callable[[ArrayLike], ArrayLike]
         From :func:`make_raytrace`.
-    centres: ArrayLike
-        ``(H, 2)`` float64 hole centres, from :func:`merge_centres`.
+    centers: ArrayLike
+        ``(H, 2)`` float64 hole centers, from :func:`merge_centers`.
 
         *Unit: arcsec*
     radius: ArrayLike
-        ``(H,)`` float64 hole radii, from :func:`merge_centres`.
+        ``(H,)`` float64 hole radii, from :func:`merge_centers`.
 
         *Unit: arcsec*
     min_img_sep: float
@@ -325,7 +314,7 @@ def sample_holes(raytrace_fn, centres, radius, min_img_sep, batch_size) -> Centr
 
     Returns
     -------
-    CentreHoles
+    CenterHoles
         Every array float64 but ``offsets``, on the ambient device.
 
     Raises
@@ -339,7 +328,7 @@ def sample_holes(raytrace_fn, centres, radius, min_img_sep, batch_size) -> Centr
     UserWarning
         For each hole whose refinement stopped at :data:`HOLE_MAX_SAMPLES`.
     """
-    n_holes = centres.shape[0]
+    n_holes = centers.shape[0]
     if n_holes == 0:
         return empty_holes()
     int64, f64 = backend.int64, backend.float64
@@ -351,7 +340,7 @@ def sample_holes(raytrace_fn, centres, radius, min_img_sep, batch_size) -> Centr
     angle = backend.to(step % HOLE_INITIAL_SAMPLES, dtype=f64) * (
         two_pi / HOLE_INITIAL_SAMPLES
     )
-    source = _trace_hole_points(raytrace_fn, centres, radius, hole, angle, batch_size)
+    source = _trace_hole_points(trace, centers, radius, hole, angle, batch_size)
     capped = backend.zeros((n_holes,), dtype=backend.bool)
     while True:
         counts = backend.bincount(hole, minlength=n_holes)
@@ -371,7 +360,7 @@ def sample_holes(raytrace_fn, centres, radius, min_img_sep, batch_size) -> Centr
         mid = backend.where(mid >= two_pi, mid - two_pi, mid)
         new_hole = hole[rows]
         new_source = _trace_hole_points(
-            raytrace_fn, centres, radius, new_hole, mid, batch_size
+            trace, centers, radius, new_hole, mid, batch_size
         )
         hole = backend.concatenate((hole, new_hole), dim=0)
         angle = backend.concatenate((angle, mid), dim=0)
@@ -379,7 +368,7 @@ def sample_holes(raytrace_fn, centres, radius, min_img_sep, batch_size) -> Centr
         order = backend.lexsort([angle, hole])
         hole, angle, source = hole[order], angle[order], source[order]
     for h in backend.to_numpy(backend.flatnonzero(capped)).tolist():
-        x, y = backend.to_numpy(centres[h]).tolist()
+        x, y = backend.to_numpy(centers[h]).tolist()
         n = int(backend.to_numpy(backend.bincount(hole, minlength=n_holes)[h]))
         warn(
             f"the hole curve around ({x:g}, {y:g}) stopped at {n} samples "
@@ -397,7 +386,7 @@ def sample_holes(raytrace_fn, centres, radius, min_img_sep, batch_size) -> Centr
     size = [
         _extent(
             _trace_hole_points(
-                raytrace_fn, centres, radius, g_hole, g_angle, batch_size, 0.25**k
+                trace, centers, radius, g_hole, g_angle, batch_size, 0.25**k
             ).reshape(shape)
         )
         for k in range(4)
@@ -416,12 +405,12 @@ def sample_holes(raytrace_fn, centres, radius, min_img_sep, batch_size) -> Centr
     offsets = backend.concatenate(
         (backend.zeros((1,), dtype=int64), backend.cumsum(counts, dim=0)), dim=0
     )
-    return CentreHoles(
-        centres=centres,
+    return CenterHoles(
+        centers=centers,
         radius=radius,
         offsets=offsets,
         angle=angle,
-        lens=hole_circle(centres, radius, hole, angle),
+        lens=hole_circle(centers, radius, hole, angle),
         source=source,
         growth=growth,
         growth_err=growth_err,

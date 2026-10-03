@@ -1,61 +1,36 @@
 """
-The adaptive lens-plane mesh.
+Adaptive meshes of the lens plane and of the source plane.
 
-An adaptively refined triangulation of the lens plane, built once and queried
-from the source plane many times. It also keeps what tracing the critical
-curves and caustics needs, so that needs no further lens call.
+A lens mesh (:func:`build_lens_mesh`) is an adaptively refined
+triangulation of the lens plane that carries the lens map at its vertices.
+It is built once and then answers source-plane questions without further
+lens calls, except for root finding: every image of a source
+(:func:`forward_raytrace`), the critical curves and caustics
+(:func:`critical_curves_and_caustics`) and the total magnification
+(:func:`total_magnification`). A magnification map
+(:func:`build_magnification_map`) samples that magnification over a
+source-plane window, and :func:`magnified_regions`, :func:`magnified_area`
+and :func:`in_magnified_region` read the regions of ``mu_tot >= mu_min``
+off it.
 
-This namespace holds the public API. Everything else lives in the modules
-below, listed lowest layer first: each imports only from the modules listed
-before it.
+The modules, lowest layer first; each imports only from those before it:
 
-Substrate -- no lens call and no mesh:
-
-- :mod:`.geometry` -- triangle and affine maths shared by build and query.
-- :mod:`.state` -- the refinement's vertex cache, active-vertex set and leaf
-  store.
-- :mod:`.lattice` -- the dyadic integer lattice and triangles on it.
-
-Building -- :func:`build_adaptive_mesh` runs four stages, seed, refine, balance
-and freeze, on backend float64 arrays; keeping the build in one numerical
-world is what makes the ``NaN`` semantics of
-:func:`~.geometry.sigma_min_2x2` and :func:`~.criterion.converged_from_deviation`
-verifiable:
-
-- :mod:`.sampling` -- raytrace and Jacobian evaluation on lattice points.
-- :mod:`.criterion` -- the refinement criterion and the ``LEAF_*`` flags.
-- :mod:`.band` -- the critical band, kept from the ``max_level`` pass.
-- :mod:`.holes` -- holes around lens centres and their hole curves.
-- :mod:`.refinement` -- refine and balance.
-- :mod:`.closure` -- canonical order and conforming closure.
-- :mod:`.mesh` -- :class:`AdaptiveMesh`, its spatial index, and freeze.
-
-Using a mesh:
-
-- :mod:`.query` -- :func:`mesh_query` and :func:`mesh_seeds`.
-- :mod:`.images` -- :func:`mesh_forward_raytrace`.
-- :mod:`.curves` -- :func:`mesh_critical_curves_and_caustics`.
-- :mod:`.magnification` -- :func:`total_magnification`, and the sheet
-  edges across which the image count changes.
-- :mod:`.magnification_map` -- :func:`build_magnification_map`, an adaptive
-  source-plane mesh sampled with the total magnification.
-- :mod:`.regions` -- :func:`magnified_regions`, :func:`magnified_area` and
-  :func:`in_magnified_region`, from a :class:`MagnificationMap`.
-
-Entry points:
-
-- :mod:`.build` -- :func:`build_adaptive_mesh`, :func:`extend_adaptive_mesh`
-  and :func:`build_closed_adaptive_mesh`.
+- :mod:`.geometry` -- triangle maths, red-split tables, array helpers.
+- :mod:`.lattice` -- the dyadic integer lattice every vertex lives on.
+- :mod:`.refine` -- the refinement both meshes share: sample, split,
+  balance, close.
+- :mod:`.index` -- the source-plane spatial index.
+- :mod:`.criterion` -- the lens mesh's criterion and ``LEAF_*`` flags.
+- :mod:`.band` -- the critical band.
+- :mod:`.holes` -- holes around lens centers, and their hole curves.
+- :mod:`.curves` -- critical curves and caustics.
+- :mod:`.lens_mesh` -- :class:`LensMesh`: build, extend, closed build.
+- :mod:`.images` -- :func:`forward_raytrace`.
+- :mod:`.magnification` -- total magnification.
+- :mod:`.magnification_map` -- :class:`MagnificationMap`.
+- :mod:`.regions` -- magnified regions.
 """
 
-from .geometry import (
-    child_matrix_tables,
-    contains,
-    sanitize_bary,
-    shape_matrix,
-    sigma_min_2x2,
-    triangle_weights,
-)
 from .criterion import (
     LEAF_APPROX_PARITY_UNRESOLVED,
     LEAF_CONVERGED,
@@ -63,17 +38,17 @@ from .criterion import (
     LEAF_JACOBIAN_NONFINITE,
     LEAF_JACOBIAN_PARITY_UNRESOLVED,
     LEAF_RAYTRACE_NONFINITE,
-    converged_from_deviation,
-    evaluate_criterion,
-    midpoint_deviation,
 )
 from .band import CriticalBand
-from .holes import CentreHoles
-from .index import MeshIndex
-from .mesh import AdaptiveMesh
-from .query import mesh_query, mesh_seeds
-from .images import mesh_forward_raytrace
-from .curves import CriticalCurvesAndCaustics, mesh_critical_curves_and_caustics
+from .holes import CenterHoles
+from .curves import CriticalCurvesAndCaustics, critical_curves_and_caustics
+from .lens_mesh import (
+    LensMesh,
+    build_closed_lens_mesh,
+    build_lens_mesh,
+    extend_lens_mesh,
+)
+from .images import forward_raytrace
 from .magnification import total_magnification
 from .magnification_map import MagnificationMap, build_magnification_map
 from .regions import (
@@ -82,29 +57,21 @@ from .regions import (
     magnified_area,
     magnified_regions,
 )
-from .build import (
-    build_adaptive_mesh,
-    build_closed_adaptive_mesh,
-    extend_adaptive_mesh,
-)
 
 __all__ = (
-    "build_adaptive_mesh",
-    "extend_adaptive_mesh",
-    "build_closed_adaptive_mesh",
-    "mesh_query",
-    "mesh_seeds",
-    "mesh_forward_raytrace",
-    "mesh_critical_curves_and_caustics",
+    "build_lens_mesh",
+    "extend_lens_mesh",
+    "build_closed_lens_mesh",
+    "forward_raytrace",
+    "critical_curves_and_caustics",
     "total_magnification",
     "build_magnification_map",
     "magnified_regions",
     "magnified_area",
     "in_magnified_region",
-    "AdaptiveMesh",
-    "MeshIndex",
+    "LensMesh",
     "CriticalBand",
-    "CentreHoles",
+    "CenterHoles",
     "CriticalCurvesAndCaustics",
     "MagnificationMap",
     "MagnifiedRegions",
@@ -114,13 +81,4 @@ __all__ = (
     "LEAF_JACOBIAN_PARITY_UNRESOLVED",
     "LEAF_RAYTRACE_NONFINITE",
     "LEAF_JACOBIAN_NONFINITE",
-    "child_matrix_tables",
-    "contains",
-    "converged_from_deviation",
-    "evaluate_criterion",
-    "midpoint_deviation",
-    "sanitize_bary",
-    "shape_matrix",
-    "sigma_min_2x2",
-    "triangle_weights",
 )

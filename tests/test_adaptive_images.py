@@ -1,4 +1,4 @@
-from types import SimpleNamespace
+"""forward_raytrace, and the queries and dedup it is built from."""
 
 import numpy as np
 import pytest
@@ -6,15 +6,50 @@ import pytest
 from caustics.backend_obj import backend
 from caustics.cosmology import FlatLambdaCDM
 from caustics.lenses import SIE, Point
-from caustics.lenses.func.adaptive import (
-    build_adaptive_mesh,
-    mesh_forward_raytrace,
+from caustics.lenses.func import forward_raytrace_rootfind
+from caustics.lenses.func.adaptive.criterion import LEAF_CONVERGED
+from caustics.lenses.func.adaptive.geometry import area2, contains, triangle_weights
+from caustics.lenses.func.adaptive.images import (
+    dedup_representatives,
+    forward_raytrace,
     mesh_query,
     mesh_seeds,
 )
-from caustics.lenses.func import forward_raytrace_rootfind
+from caustics.lenses.func.adaptive.index import index_hits
+from caustics.lenses.func.adaptive.lens_mesh import build_lens_mesh
+
+from adaptive_maps import (
+    AFFINE,
+    affine,
+    affine_jacobian,
+    build,
+    f64,
+    lens,
+    localised_fold,
+    localised_fold_jacobian,
+    sis_jacobian,
+    sis_raytrace,
+    to_np,
+)
 
 RNG = np.random.default_rng(20260904)
+
+
+def fr(mesh, beta, raytrace, **kw):
+    """`forward_raytrace` at ``(B, 2)`` points, its images stacked ``(K, 2)``."""
+    beta = backend.as_array(beta, dtype=backend.float64)
+    x, y, counts = forward_raytrace(beta[:, 0], beta[:, 1], raytrace, mesh, **kw)
+    return backend.stack((x, y), dim=-1), counts
+
+
+def query_np(mesh, beta, batch_size=None):
+    beta = backend.as_array(np.asarray(beta, dtype=np.float64), dtype=backend.float64)
+    idx, off, bary = mesh_query(mesh, beta, batch_size=batch_size)
+    return to_np(idx), to_np(off), to_np(bary)
+
+
+def leaf_status(mesh):
+    return to_np(mesh.origin_status)[to_np(mesh.leaf_origin)]
 
 
 def _sie_like(x, y):
@@ -31,94 +66,23 @@ def _sie_like_jacobian(x, y):
     )
 
 
-SIE_LIKE = SimpleNamespace(
-    raytrace=_sie_like, jacobian_lens_equation=_sie_like_jacobian
-)
+SIE_LIKE = lens(_sie_like, _sie_like_jacobian)
 BUILD = dict(fov=6.0, init_res=4, min_img_sep=0.1, max_depth=6)
 
 
 @pytest.fixture(scope="module")
 def mesh():
-    return build_adaptive_mesh(
-        SIE_LIKE.raytrace, SIE_LIKE.jacobian_lens_equation, **BUILD
-    )
+    return build_lens_mesh(SIE_LIKE.raytrace, SIE_LIKE.jacobian_lens_equation, **BUILD)
+
+
+@pytest.fixture(scope="module")
+def beta():
+    rng = np.random.default_rng(21)
+    return backend.as_array(rng.uniform(-1.5, 1.5, (64, 2)), dtype=backend.float64)
 
 
 def _beta(points):
     return backend.as_array(np.asarray(points, dtype=np.float64), dtype=backend.float64)
-
-
-def test_images_solve_the_lens_equation(mesh):
-    beta = _beta([[0.05, 0.02], [0.4, -0.3]])
-    img, counts = mesh_forward_raytrace(mesh, beta, _sie_like)
-    _img_np = backend.to_numpy(img)
-    bx, by = _sie_like(img[:, 0], img[:, 1])
-    got = np.stack((backend.to_numpy(bx), backend.to_numpy(by)), axis=-1)
-    want = np.repeat(backend.to_numpy(beta), backend.to_numpy(counts), axis=0)
-    assert np.abs(got - want).max() < 1e-6
-
-
-def test_forward_raytrace_is_invariant_to_batch_size(mesh):
-    beta = _beta(np.random.default_rng(4).uniform(-1, 1, (12, 2)))
-    whole = [backend.to_numpy(t) for t in mesh_forward_raytrace(mesh, beta, _sie_like)]
-    for size in (1, 3, 100):
-        got = [
-            backend.to_numpy(t)
-            for t in mesh_forward_raytrace(mesh, beta, _sie_like, batch_size=size)
-        ]
-        assert got[1].tolist() == whole[1].tolist()
-        assert np.allclose(got[0], whole[0])
-
-
-def test_forward_raytrace_returns_empty_outside_the_source_plane(mesh):
-    beta = _beta([[1e6, 1e6]])
-    img, counts = mesh_forward_raytrace(mesh, beta, _sie_like)
-    assert backend.to_numpy(counts).tolist() == [0]
-    assert backend.to_numpy(img).shape == (0, 2)
-
-
-def test_forward_raytrace_handles_empty_input(mesh):
-    img, counts = mesh_forward_raytrace(
-        mesh, backend.as_array(np.zeros((0, 2)), dtype=backend.float64), _sie_like
-    )
-    assert backend.to_numpy(counts).size == 0
-    assert backend.to_numpy(img).shape == (0, 2)
-
-
-def test_forward_raytrace_rejects_an_unknown_method(mesh):
-    with pytest.raises(ValueError, match="method must be one of"):
-        mesh_forward_raytrace(mesh, _beta([[0.1, 0.1]]), _sie_like, method="bogus")
-
-
-def test_dedup_method_never_calls_raytrace(mesh):
-    def exploding(x, y):
-        raise AssertionError("raytrace must not be called under method='dedup'")
-
-    img, counts = mesh_forward_raytrace(
-        mesh, _beta([[0.05, 0.02]]), exploding, method="dedup"
-    )
-    assert backend.to_numpy(counts)[0] >= 1
-
-
-def test_dedup_positions_are_within_min_img_sep_of_the_refined_roots(mesh):
-    beta = _beta([[0.4, -0.3]])
-    a, ca = mesh_forward_raytrace(mesh, beta, _sie_like, method="rootfind")
-    b, cb = mesh_forward_raytrace(mesh, beta, _sie_like, method="dedup")
-    assert backend.to_numpy(ca).tolist() == backend.to_numpy(cb).tolist()
-    pa = np.sort(backend.to_numpy(a), axis=0)
-    pb = np.sort(backend.to_numpy(b), axis=0)
-    assert np.abs(pa - pb).max() <= mesh.min_img_sep
-
-
-# ---------------------------------------------------------------------------
-# Ported from tests/test_adaptive_mesh.py. The two SIE coverage tests below
-# once excluded the central image, which the oracle's criterion left
-# uncovered; each docstring says why they no longer need to.
-# ---------------------------------------------------------------------------
-
-
-def to_np(x):
-    return backend.to_numpy(x)
 
 
 def dedup(points, tol):
@@ -128,6 +92,71 @@ def dedup(points, tol):
         if all(np.linalg.norm(p - q) >= tol for q in keep):
             keep.append(p)
     return np.array(sorted(keep, key=tuple)) if keep else np.zeros((0, 2))
+
+
+def _sie_build(device=None):
+    lens = SIE(
+        name="sie",
+        cosmology=FlatLambdaCDM(name="cosmo"),
+        z_l=0.5,
+        z_s=1.5,
+        x0=0.0,
+        y0=0.0,
+        q=0.4,
+        phi=np.pi / 5,
+        Rein=1.0,
+        s=1e-3,
+    )
+    if device is not None:
+        lens = lens.to(device)
+    mesh = build_lens_mesh(
+        lens.raytrace,
+        lens.jacobian_lens_equation,
+        fov=5.0,
+        init_res=32,
+        min_img_sep=1e-2,
+        device=device,
+    )
+    return lens, mesh
+
+
+@pytest.fixture(scope="module")
+def sie():
+    return _sie_build()
+
+
+def test_images_solve_the_lens_equation(mesh):
+    beta = _beta([[0.05, 0.02], [0.4, -0.3]])
+    img, counts = fr(mesh, beta, _sie_like)
+    _img_np = backend.to_numpy(img)
+    bx, by = _sie_like(img[:, 0], img[:, 1])
+    got = np.stack((backend.to_numpy(bx), backend.to_numpy(by)), axis=-1)
+    want = np.repeat(backend.to_numpy(beta), backend.to_numpy(counts), axis=0)
+    assert np.abs(got - want).max() < 1e-6
+
+
+def test_forward_raytrace_is_invariant_to_batch_size(mesh):
+    beta = _beta(np.random.default_rng(4).uniform(-1, 1, (12, 2)))
+    whole = [backend.to_numpy(t) for t in fr(mesh, beta, _sie_like)]
+    for size in (1, 3, 100):
+        got = [backend.to_numpy(t) for t in fr(mesh, beta, _sie_like, batch_size=size)]
+        assert got[1].tolist() == whole[1].tolist()
+        assert np.allclose(got[0], whole[0])
+
+
+def test_forward_raytrace_returns_empty_outside_the_source_plane(mesh):
+    beta = _beta([[1e6, 1e6]])
+    img, counts = fr(mesh, beta, _sie_like)
+    assert backend.to_numpy(counts).tolist() == [0]
+    assert backend.to_numpy(img).shape == (0, 2)
+
+
+def test_forward_raytrace_handles_empty_input(mesh):
+    img, counts = fr(
+        mesh, backend.as_array(np.zeros((0, 2)), dtype=backend.float64), _sie_like
+    )
+    assert backend.to_numpy(counts).size == 0
+    assert backend.to_numpy(img).shape == (0, 2)
 
 
 def test_sie_candidates_recover_forward_raytrace_images(device):
@@ -167,7 +196,7 @@ def test_sie_candidates_recover_forward_raytrace_images(device):
         Rein=1.0,
         s=1e-3,
     ).to(device)
-    mesh = build_adaptive_mesh(
+    mesh = build_lens_mesh(
         lens.raytrace,
         lens.jacobian_lens_equation,
         fov=5.0,
@@ -219,34 +248,6 @@ def test_sie_candidates_recover_forward_raytrace_images(device):
             ), f"{sp}: converged to {p}, which is not a forward_raytrace image"
 
 
-def test_point_mass_recovers_the_analytic_image_pair():
-    lens = Point(
-        name="pt",
-        cosmology=FlatLambdaCDM(name="cosmo"),
-        z_l=0.5,
-        z_s=1.5,
-        x0=0.0,
-        y0=0.0,
-        Rein=1.0,
-        s=1e-6,
-    )
-    mesh = build_adaptive_mesh(
-        lens.raytrace,
-        lens.jacobian_lens_equation,
-        fov=8.0,
-        init_res=64,
-        min_img_sep=1e-2,
-    )
-    b = 0.4
-    idx, offsets, bary = mesh_query(mesh, backend.as_array(np.array([[b, 0.0]])))
-    seed = backend.to_numpy(mesh_seeds(mesh, idx, bary))
-    # theta_pm = (b +- sqrt(b^2 + 4 Rein^2)) / 2, both on the x axis
-    expected = np.array([(b + np.sqrt(b**2 + 4)) / 2, (b - np.sqrt(b**2 + 4)) / 2])
-    for theta in expected:
-        assert np.abs(seed[:, 0] - theta).min() < 5e-2
-        assert np.abs(seed[np.argmin(np.abs(seed[:, 0] - theta)), 1]) < 5e-2
-
-
 def test_build_and_query_run_on_the_configured_device(device):
     """Build and query complete on the configured device and return sane CSR.
 
@@ -268,7 +269,7 @@ def test_build_and_query_run_on_the_configured_device(device):
         Rein=1.0,
         s=1e-3,
     ).to(device)
-    mesh = build_adaptive_mesh(
+    mesh = build_lens_mesh(
         lens.raytrace,
         lens.jacobian_lens_equation,
         fov=4.0,
@@ -292,42 +293,16 @@ def test_build_and_query_run_on_the_configured_device(device):
     assert np.isfinite(bary_np).all()
 
 
-def sie_fixture(device=None):
-    lens = SIE(
-        name="sie",
-        cosmology=FlatLambdaCDM(name="cosmo"),
-        z_l=0.5,
-        z_s=1.5,
-        x0=0.0,
-        y0=0.0,
-        q=0.4,
-        phi=np.pi / 5,
-        Rein=1.0,
-        s=1e-3,
-    )
-    if device is not None:
-        lens = lens.to(device)
-    mesh = build_adaptive_mesh(
-        lens.raytrace,
-        lens.jacobian_lens_equation,
-        fov=5.0,
-        init_res=32,
-        min_img_sep=1e-2,
-        device=device,
-    )
-    return lens, mesh
-
-
-def test_forward_raytrace_finds_no_spurious_sie_images():
+def test_forward_raytrace_finds_no_spurious_sie_images(sie):
     """Every returned image is an image `lens.forward_raytrace` also finds.
 
     The residual and leaf-or-ball filters exist for this: a stalled
     Levenberg-Marquardt solve leaves a point that is not an image, and dedup will
     not absorb it when it sits further than `min_img_sep` from a real one.
     """
-    lens, mesh = sie_fixture()
+    lens, mesh = sie
     for sp in ([0.2, 0.2], [0.05, -0.05]):
-        images, counts = mesh_forward_raytrace(mesh, _beta([sp]), lens.raytrace)
+        images, counts = fr(mesh, _beta([sp]), lens.raytrace)
         images = to_np(images)
         assert to_np(counts).tolist() == [images.shape[0]]
         assert images.shape[0] > 0, f"{sp}: no images found"
@@ -342,7 +317,7 @@ def test_forward_raytrace_finds_no_spurious_sie_images():
             ), f"{sp}: returned {p}, which is not a forward_raytrace image"
 
 
-def test_forward_raytrace_covers_every_sie_image():
+def test_forward_raytrace_covers_every_sie_image(sie):
     """The converse contract: no image is dropped by the filters or the dedup.
 
     Every image, including the central one inside the softening radius
@@ -354,9 +329,9 @@ def test_forward_raytrace_covers_every_sie_image():
     derivation), and all five images of each source come back. Measured,
     every image is covered to within 4.4e-5.
     """
-    lens, mesh = sie_fixture()
+    lens, mesh = sie
     for sp in ([0.2, 0.2], [0.05, -0.05]):
-        images, _ = mesh_forward_raytrace(mesh, _beta([sp]), lens.raytrace)
+        images, _ = fr(mesh, _beta([sp]), lens.raytrace)
         images = to_np(images)
         # The reference path is float32-only: `LensBase.forward_raytrace` raises
         # "expected scalar type Float but found Double" on float64 input. The mesh
@@ -386,7 +361,7 @@ def test_forward_raytrace_recovers_the_analytic_point_mass_pair():
         Rein=1.0,
         s=1e-6,
     )
-    mesh = build_adaptive_mesh(
+    mesh = build_lens_mesh(
         lens.raytrace,
         lens.jacobian_lens_equation,
         fov=8.0,
@@ -394,7 +369,7 @@ def test_forward_raytrace_recovers_the_analytic_point_mass_pair():
         min_img_sep=1e-2,
     )
     b = 0.4
-    images, counts = mesh_forward_raytrace(mesh, _beta([[b, 0.0]]), lens.raytrace)
+    images, counts = fr(mesh, _beta([[b, 0.0]]), lens.raytrace)
     images = to_np(images)
     assert to_np(counts).tolist() == [2], f"expected 2 images, got {images}"
     expected = np.sort([(b + np.sqrt(b**2 + 4)) / 2, (b - np.sqrt(b**2 + 4)) / 2])
@@ -402,137 +377,378 @@ def test_forward_raytrace_recovers_the_analytic_point_mass_pair():
     assert np.abs(images[:, 1]).max() < 1e-4
 
 
-def test_forward_raytrace_batches_independently():
+def test_forward_raytrace_batches_independently(sie):
     """A batched call equals looping one source at a time.
 
     Falsifiable against the two bugs the ragged layout invites: targets paired
     with the wrong seeds, and dedup merging images of different sources.
     """
-    lens, mesh = sie_fixture()
+    lens, mesh = sie
     points = [[0.2, 0.2], [0.05, -0.05], [0.4, -0.3]]
-    images, counts = mesh_forward_raytrace(mesh, _beta(points), lens.raytrace)
+    images, counts = fr(mesh, _beta(points), lens.raytrace)
     counts = to_np(counts)
     assert counts.shape == (3,)
     assert counts.sum() == to_np(images).shape[0]
     offsets = np.concatenate(([0], np.cumsum(counts)))
     for i, sp in enumerate(points):
-        one, one_counts = mesh_forward_raytrace(mesh, _beta([sp]), lens.raytrace)
+        one, one_counts = fr(mesh, _beta([sp]), lens.raytrace)
         assert to_np(one_counts).tolist() == [counts[i]], f"{sp}: count differs"
         block = to_np(images)[offsets[i] : offsets[i + 1]]
         assert np.allclose(block, to_np(one), atol=1e-8), f"{sp}: images differ"
 
 
-def test_forward_raytrace_batch_size_does_not_change_the_answer():
-    lens, mesh = sie_fixture()
-    beta = _beta([[0.2, 0.2], [0.05, -0.05], [0.4, -0.3], [0.0, 0.3]])
-    full, full_counts = mesh_forward_raytrace(mesh, beta, lens.raytrace)
-    for size in (1, 2, 3):
-        part, part_counts = mesh_forward_raytrace(
-            mesh, beta, lens.raytrace, batch_size=size
-        )
-        assert to_np(part_counts).tolist() == to_np(full_counts).tolist()
-        assert np.allclose(to_np(part), to_np(full), atol=1e-8)
+def test_query_seeds_an_inner_image_that_runs_into_the_lens_center():
+    """The coverage the old terminate-on-non-finite policy destroyed.
 
+    For the SIS the inner image runs continuously into the lens center as the
+    source approaches the cut: ``|theta_minus| = b - beta``. Terminating the six
+    level-0 triangles that share the origin therefore removed a hexagon of
+    half-width ``fov / init_res`` from the spatial index -- 1.0 arcsec on this
+    fixture -- and with it the seed for every inner image inside it, exactly
+    where a grid-and-Newton forward_raytrace is already weakest.
 
-def test_forward_raytrace_returns_an_empty_block_outside_the_source_plane():
-    """A source the mesh never maps to has zero images, not a raised error."""
-    lens, mesh = sie_fixture()
-    images, counts = mesh_forward_raytrace(mesh, _beta([[50.0, 50.0]]), lens.raytrace)
-    assert to_np(counts).tolist() == [0]
-    assert to_np(images).shape == (0, 2)
+    Hand-derived, not read off the mesh: at ``beta = 0.8`` and ``b = 1`` the two
+    images are ``theta = 1.8`` and ``theta = -0.2``, since
+    ``1.8 * (1 - 1/1.8) = 0.8`` and ``-0.2 * (1 - 1/0.2) = 0.8``. The inner one
+    sits 5x deeper inside the old hexagon than its half-width, so the old policy
+    returns only the outer seed, 2.0 arcsec away.
 
-
-def test_forward_raytrace_rejects_an_unknown_method_on_the_sie_fixture():
-    lens, mesh = sie_fixture()
-    with pytest.raises(ValueError, match="rootfind"):
-        mesh_forward_raytrace(mesh, _beta([[0.05, 0.02]]), lens.raytrace, method="nope")
-
-
-def test_dedup_method_never_calls_raytrace_across_a_batch():
-    """The whole point of `method="dedup"` is that the lens is not evaluated.
-
-    A mesh seed is the preimage of beta under its own leaf's affine map, so it
-    is already an approximate image; there is nothing left to solve. If this
-    fails, the method is doing the work it exists to skip.
+    Compose the public ``mesh_query`` and ``mesh_seeds`` interfaces so this
+    regression exercises the same seeding path used by forward raytracing.
     """
-    lens, mesh = sie_fixture()
-
-    def exploding_raytrace(x, y):
-        raise AssertionError("raytrace must not be called for method='dedup'")
-
-    images, counts = mesh_forward_raytrace(
-        mesh, _beta([[0.05, 0.02], [0.4, 0.3]]), exploding_raytrace, method="dedup"
+    mesh, _ = build(sis_raytrace, sis_jacobian, min_img_sep=0.05)
+    idx, offsets, bary = query_np(mesh, np.array([[0.8, 0.0]]))
+    seed = backend.to_numpy(
+        mesh_seeds(mesh, backend.as_array(idx), backend.as_array(bary))
     )
-    assert int(to_np(counts).sum()) == images.shape[0]
+    assert offsets.shape[0] == 2 and seed.shape[0] > 0
+    for image in ([-0.2, 0.0], [1.8, 0.0]):
+        gap = np.linalg.norm(seed - np.asarray(image), axis=1).min()
+        assert gap <= 0.05, f"no seed within min_img_sep of {image}, closest {gap:.3g}"
 
 
-def test_dedup_method_matches_rootfind_layout():
-    lens, mesh = sie_fixture()
-    beta = _beta([[0.05, 0.02], [3.0, 3.0], [0.0, 0.0]])
-    images, counts = mesh_forward_raytrace(mesh, beta, lens.raytrace, method="dedup")
-    counts_np = to_np(counts)
-    assert images.shape[1] == 2
-    assert counts_np.shape == (3,)
-    assert int(counts_np.sum()) == images.shape[0]
-    assert counts_np[1] == 0, "a point outside the source-plane mesh has no images"
+def test_query_covers_points_on_the_source_bbox_upper_edge():
+    """Regression: the upper bbox edge used to return zero candidates.
+
+    `cell = span / [nx, ny]`, so a point at `x == hi_x` yields `u_x == nx`. The
+    old cell-index containment test rejected it, while `build_index` clips leaf
+    registration to `nx - 1` -- so leaves whose AABB reaches `hi` were indexed
+    but unreachable. Measured before the fix: 18 of 18 upper-edge vertices
+    returned nothing where brute-force containment found candidates.
+    """
+    mesh, _ = build(localised_fold, localised_fold_jacobian, min_img_sep=0.05)
+    vs = backend.to_numpy(mesh.vertices_source)
+    leaves = backend.to_numpy(mesh.leaves)
+    status = leaf_status(mesh)
+    hi = backend.to_numpy(mesh.index.hi)
+    on_edge = np.flatnonzero((vs[:, 0] == hi[0]) | (vs[:, 1] == hi[1]))
+    assert on_edge.size > 0, "fixture must have vertices on the upper bbox edge"
+    for v in on_edge:
+        beta = vs[v]
+        tri = backend.as_array(vs[leaves])
+        pts = backend.as_array(np.repeat(beta[None], leaves.shape[0], axis=0))
+        truth = backend.to_numpy(contains(triangle_weights(tri, pts)))
+        # Only LEAF_CONVERGED leaves are indexed (see `LensMesh`'s
+        # docstring): a leaf carrying any failure flag is never a candidate.
+        expected = set(np.flatnonzero(truth & (status == LEAF_CONVERGED)).tolist())
+        idx, off, _ = query_np(mesh, beta[None])
+        assert (
+            set(idx[off[0] : off[1]].tolist()) >= expected
+        ), f"upper-edge point {beta} lost candidates"
 
 
-def test_dedup_method_is_invariant_to_batch_size():
-    lens, mesh = sie_fixture()
-    beta = _beta(RNG.uniform(-0.3, 0.3, size=(40, 2)))
-    ref_i, ref_c = mesh_forward_raytrace(mesh, beta, lens.raytrace, method="dedup")
-    for step in (1, 7, 40, 1000):
-        got_i, got_c = mesh_forward_raytrace(
-            mesh, beta, lens.raytrace, batch_size=step, method="dedup"
+def test_query_matches_brute_force_containment_on_multi_cell_leaves():
+    """The one-cell-lookup completeness claim, on a mesh with wide leaf AABBs.
+
+    `build_index` registers each leaf across its full cell rectangle, not just
+    its three vertex cells -- and no other test distinguishes those, since the
+    vertex-cell test checks only vertices and the crack test's uniform reference
+    shares `build_index` so a common bug cancels. Measured on this fixture:
+    520 of 4932 leaves span three or more index cells on an axis.
+    """
+    mesh, _ = build(localised_fold, localised_fold_jacobian, min_img_sep=0.05)
+    vs = backend.to_numpy(mesh.vertices_source)
+    leaves = backend.to_numpy(mesh.leaves)
+    status = leaf_status(mesh)
+    lo = backend.to_numpy(mesh.index.lo)
+    cell = backend.to_numpy(mesh.index.cell)
+    tri = vs[leaves]
+    i0 = np.floor((tri.min(axis=1) - lo) / cell).astype(np.int64)
+    i1 = np.floor((tri.max(axis=1) - lo) / cell).astype(np.int64)
+    span = i1 - i0 + 1
+    assert (span >= 3).any(), "fixture must contain multi-cell leaf AABBs"
+    beta = RNG.uniform(-0.9, 0.9, size=(200, 2))
+    idx, off, _ = query_np(mesh, beta)
+    tri_b = backend.as_array(tri)
+    for b in range(beta.shape[0]):
+        pts = backend.as_array(np.repeat(beta[b][None], leaves.shape[0], axis=0))
+        truth = backend.to_numpy(contains(triangle_weights(tri_b, pts)))
+        # Only LEAF_CONVERGED leaves are indexed, as in
+        # test_query_covers_points_on_the_source_bbox_upper_edge above.
+        expected = set(np.flatnonzero(truth & (status == LEAF_CONVERGED)).tolist())
+        assert set(idx[off[b] : off[b + 1]].tolist()) >= expected
+
+
+def test_query_csr_is_well_formed_on_a_folded_mesh():
+    mesh, _ = build(localised_fold, localised_fold_jacobian, min_img_sep=0.05)
+    beta = RNG.uniform(-2.5, 2.5, size=(64, 2))
+    idx, off, bary = query_np(mesh, beta)
+    assert off.shape == (65,) and off[0] == 0 and off[-1] == idx.shape[0]
+    assert (np.diff(off) >= 0).all()
+    assert bary.shape == (idx.shape[0], 3)
+    for b in range(64):
+        block = idx[off[b] : off[b + 1]]
+        assert (np.diff(block) > 0).all(), "blocks must be strictly ascending"
+
+
+def test_query_handles_empty_input_and_misses():
+    mesh, _ = build(affine, affine_jacobian)
+    idx, off, bary = query_np(mesh, np.zeros((0, 2)))
+    assert off.tolist() == [0] and idx.shape == (0,) and bary.shape == (0, 3)
+    far = np.array([[1e6, 1e6], [-1e6, 0.0]])
+    idx, off, bary = query_np(mesh, far)
+    assert off.tolist() == [0, 0, 0]
+
+
+def test_query_is_invariant_to_batch_size_and_point_order():
+    mesh, _ = build(localised_fold, localised_fold_jacobian, min_img_sep=0.05)
+    beta = RNG.uniform(-1.5, 1.5, size=(97, 2))
+    ref = query_np(mesh, beta)
+    for bs in (1, 7, 96, 97, 1000):
+        got = query_np(mesh, beta, batch_size=bs)
+        for a, b in zip(ref, got):
+            assert np.array_equal(a, b)
+    perm = RNG.permutation(97)
+    pidx, poff, pbary = query_np(mesh, beta[perm])
+    for pos, old in enumerate(perm):
+        assert np.array_equal(
+            pidx[poff[pos] : poff[pos + 1]], ref[0][ref[1][old] : ref[1][old + 1]]
         )
-        assert to_np(got_c).tolist() == to_np(ref_c).tolist(), f"batch_size={step}"
-        assert np.allclose(to_np(got_i), to_np(ref_i)), f"batch_size={step}"
+        # `bary` too, not just the indices: a permutation-dependent bug that
+        # scrambled coordinates while leaving leaf ids correct would otherwise
+        # slip through this check.
+        assert np.array_equal(
+            pbary[poff[pos] : poff[pos + 1]], ref[2][ref[1][old] : ref[1][old + 1]]
+        )
 
 
-def test_dedup_method_agrees_with_rootfind_away_from_the_caustic():
-    """Counts must match where the answer is unambiguous.
+def test_query_finds_the_affine_preimage():
+    mesh, _ = build(affine, affine_jacobian, fov=4.0, init_res=4, min_img_sep=0.25)
+    lens_pts = RNG.uniform(-1.8, 1.8, size=(200, 2))
+    beta = lens_pts @ AFFINE.T
+    idx, off, bary = query_np(mesh, beta)
+    assert (np.diff(off) >= 1).all(), "every interior point must hit a leaf"
+    leaves = backend.to_numpy(mesh.leaves)
+    vl = backend.to_numpy(mesh.vertices_lens)
+    seed = np.einsum("kj,kjd->kd", bary, vl[leaves[idx]])
+    first = seed[off[:-1]]
+    assert np.allclose(first, lens_pts, atol=1e-9)
 
-    Inside the tangential caustic an SIE has four images, outside it two, and
-    the two methods may legitimately disagree only within about min_img_sep of
-    the caustic itself (spec section 4.3). Sampling well inside and well
-    outside keeps the assertion on the part of the contract that is exact.
+
+def test_bary_is_in_the_simplex_on_every_leaf():
+    """The simplex guarantee end to end, on a curved mesh."""
+    mesh, _ = build(localised_fold, localised_fold_jacobian, min_img_sep=0.05)
+    beta = RNG.uniform(-0.4, 0.4, size=(40, 2))
+    idx, off, bary = query_np(mesh, beta)
+    assert idx.shape[0] > 0, "fixture returned no candidates"
+    assert np.isfinite(bary).all()
+    assert (bary >= 0).all() and (bary <= 1).all()
+    assert np.allclose(bary.sum(axis=1), 1.0, atol=1e-12)
+
+
+def test_bary_reconstructs_beta_on_every_hit_leaf():
+    """Barycentric coordinates invert the source-plane map on every hit leaf."""
+    mesh, _ = build(localised_fold, localised_fold_jacobian, min_img_sep=0.05)
+    beta = RNG.uniform(-1.5, 1.5, size=(200, 2))
+    idx, off, bary = query_np(mesh, beta)
+    area = np.abs(to_np(area2(mesh.vertices_source[mesh.leaves])))[idx]
+    vs = backend.to_numpy(mesh.vertices_source)
+    leaves = backend.to_numpy(mesh.leaves)
+    owner = np.repeat(np.arange(len(beta)), np.diff(off))
+    assert idx.shape[0] > 0, "fixture returned no candidates"
+    good = area > 1e-10
+    assert (
+        good.all()
+    ), "fixture produced a degenerate leaf; the ~good branch needs writing"
+    recon = np.einsum("kj,kjd->kd", bary, vs[leaves[idx]])
+    assert np.allclose(recon, beta[owner], atol=1e-8)
+
+
+def _pts(x):
+    return backend.as_array(np.asarray(x, dtype=np.float64), dtype=backend.float64)
+
+
+def test_dedup_collapses_points_closer_than_the_tolerance():
+    pts = _pts([[0.0, 0.0], [0.05, 0.0], [1.0, 0.0]])
+    keep = backend.to_numpy(dedup_representatives(pts, np.array([3]), 0.1))
+    assert keep.tolist() == [True, False, True]
+
+
+def test_dedup_keeps_points_separated_by_exactly_the_tolerance():
+    pts = _pts([[0.0, 0.0], [0.1, 0.0]])
+    keep = backend.to_numpy(dedup_representatives(pts, np.array([2]), 0.1))
+    assert keep.tolist() == [True, True]
+
+
+def _cross2(u, v):
+    """Scalar cross product of 2-D vectors.
+
+    ``np.cross`` on 2-vectors is deprecated in NumPy 2.0 and emits a
+    ``DeprecationWarning`` per call. This is the same value, computed
+    component-wise, and is bit-identical to the ``np.cross`` result.
     """
-    lens, mesh = sie_fixture()
-    beta = _beta([[0.01, 0.0], [0.0, 0.01], [-0.015, 0.008], [0.8, 0.8], [-0.9, 0.7]])
-    _, rootfind_counts = mesh_forward_raytrace(
-        mesh, beta, lens.raytrace, method="rootfind"
+    return u[..., 0] * v[..., 1] - u[..., 1] * v[..., 0]
+
+
+def test_seeds_lie_inside_their_lens_triangle_on_a_folded_mesh():
+    """RENAMED from ``test_seeds_lie_inside_their_lens_triangle``: this checks
+    the stronger inside-the-triangle sign condition on a folded, multi-level
+    mesh, distinct from the bounding-box check the same-named test above
+    (added verbatim from the Task 14 brief) performs on the module-level
+    ``mesh``/``beta`` fixtures.
+
+    ADAPTED: the oracle's ``Mesh.seeds`` accepted ``beta`` (query-and-seed) or
+    ``leaf_indices``/``bary`` (gather-only) behind a ``_check_call`` guard, so
+    the legacy test compared the two modes against each other and also
+    checked the CSR ``offsets`` the ``beta`` mode returned. ``mesh_seeds`` has
+    only the gather-only form, so that comparison has no counterpart and is
+    dropped; ``triangles_lens(leaf_indices=idx)`` (also dropped) is replaced
+    by the same manual ``vertices_lens[leaves[idx]]`` gather ``mesh_seeds``
+    itself performs.
+    """
+    mesh, _ = build(localised_fold, localised_fold_jacobian, min_img_sep=0.05)
+    beta = RNG.uniform(-1.5, 1.5, size=(50, 2))
+    idx, _, bary = mesh_query(mesh, beta)
+    seed = backend.to_numpy(mesh_seeds(mesh, idx, bary))
+    assert seed.shape[0] > 0, "fixture returned no candidates"
+    idx_np = backend.to_numpy(idx)
+    leaves = backend.to_numpy(mesh.leaves)
+    vl = backend.to_numpy(mesh.vertices_lens)
+    tri = vl[leaves[idx_np]]
+    for k in range(len(seed)):
+        w = np.array(
+            [
+                _cross2(tri[k, (i + 1) % 3] - seed[k], tri[k, (i + 2) % 3] - seed[k])
+                for i in range(3)
+            ]
+        )
+        assert (w >= -1e-9).all() or (w <= 1e-9).all()
+
+
+def test_dedup_counts_connected_components_regardless_of_point_order():
+    """RENAMED from ``test_dedup_counts_connected_components_not_greedy_clusters``:
+    this checks invariance across four explicit permutations, distinct from
+    the single-order check in the same-named test above (added verbatim from
+    the Task 14 brief).
+
+    Three collinear points spaced ``0.9 * tol`` apart form one connected
+    component. Greedy returns 2 for the order below and 1 for ``[1, 0, 2]`` --
+    the answer would depend on the order ``mesh_query`` happened to emit
+    candidates in, which is not something a multiplicity map may depend on.
+    """
+    p = np.array([[0.0, 0.0], [0.009, 0.0], [0.018, 0.0]])
+    counts = np.array([3])
+    base = backend.to_numpy(dedup_representatives(_pts(p), counts, 0.01)).sum()
+    assert base == 1, f"one chained component expected, got {base}"
+    for order in ([1, 0, 2], [2, 1, 0], [0, 2, 1], [2, 0, 1]):
+        got = backend.to_numpy(
+            dedup_representatives(_pts(p[order]), counts, 0.01)
+        ).sum()
+        assert got == base, f"order {order} gave {got}, not {base}"
+
+
+def test_dedup_keeps_identical_points_in_different_blocks_distinct():
+    """RENAMED from ``test_dedup_never_merges_across_blocks`` to avoid
+    shadowing the same-named test above (added verbatim from the Task 14
+    brief); both exercise the same contract on equivalent input.
+
+    Two source points whose images coincide must not collapse into one. The
+    padded ``(B, M, M)`` formulation makes cross-block bleed the natural bug
+    here, and it would silently halve a multiplicity map.
+    """
+    points = _pts([[0.0, 0.0], [0.0, 0.0]])
+    keep = backend.to_numpy(dedup_representatives(points, np.array([1, 1]), 0.01))
+    assert keep.sum() == 2, "identical points in different blocks are distinct"
+
+
+def test_dedup_handles_ragged_blocks_and_empty_blocks():
+    """Padding must not invent images in a block that found none."""
+    points = _pts([[0.0, 0.0], [5.0, 5.0], [5.0, 5.0005]])
+    keep = backend.to_numpy(dedup_representatives(points, np.array([1, 0, 2]), 0.01))
+    assert keep.tolist() == [True, True, False]
+
+
+def test_dedup_is_unchanged_by_bucketing_on_randomised_blocks():
+    """The bucketed kernel must agree with a per-block reference exactly.
+
+    Blocks are grouped by count and run at their own M rather than padded to
+    the global maximum, so the risk is a scatter that puts one block's answer
+    on another block's rows. Running each block *alone* through the same
+    function is the independent reference: a single-block call has nothing to
+    mis-scatter.
+
+    What this does NOT check: both sides call the same clustering kernel
+    (:func:`~caustics.lenses.func.adaptive.dedup_block_group` via
+    :func:`~caustics.lenses.func.adaptive.dedup_representatives`), so a bug
+    inside that kernel itself -- a wrong sentinel, a wrong iteration bound --
+    reproduces identically on both sides and is invisible to this comparison.
+    """
+    rng = np.random.default_rng(20260910)
+    # The all-empty vector is explicit: 20 random draws from this seed never
+    # produce one, and it is the case that reaches the `total == 0` early exit.
+    cases = [np.zeros(4, dtype=np.int64)]
+    cases += [rng.integers(0, 6, size=rng.integers(1, 12)) for _ in range(20)]
+    for counts in cases:
+        pts = rng.normal(scale=0.01, size=(int(counts.sum()), 2)).reshape(-1, 2)
+        got = backend.to_numpy(dedup_representatives(_pts(pts), counts, 0.01))
+        starts = np.cumsum(counts) - counts
+        want = np.concatenate(
+            [
+                backend.to_numpy(
+                    dedup_representatives(_pts(pts[s : s + c]), np.array([c]), 0.01)
+                )
+                for s, c in zip(starts, counts)
+            ]
+            + [np.zeros(0, dtype=bool)]
+        )
+        assert got.tolist() == want.tolist(), f"counts={counts.tolist()}"
+
+
+def test_dedup_keeps_exactly_one_point_per_singleton_block():
+    """Blocks of one bypass the clustering kernel; they must still be kept."""
+    points = _pts([[0.0, 0.0], [1.0, 1.0], [2.0, 2.0]])
+    keep = backend.to_numpy(dedup_representatives(points, np.array([1, 1, 1]), 0.01))
+    assert keep.tolist() == [True, True, True]
+
+
+def test_dedup_mixes_singleton_and_clustered_blocks_in_order():
+    """The bypass and the kernel write into one output; order must survive.
+
+    Block 0 is a singleton, block 1 collapses to one image, block 2 is a
+    singleton again. A scatter that appends the bypassed blocks after the
+    clustered ones would pass every count-based assertion and still return the
+    representatives in the wrong rows.
+    """
+    points = _pts([[9.0, 9.0], [0.0, 0.0], [0.0, 0.001], [5.0, 5.0]])
+    keep = backend.to_numpy(dedup_representatives(points, np.array([1, 2, 1]), 0.01))
+    assert keep.tolist() == [True, True, False, True]
+
+
+def test_index_hits_are_the_query_hits_with_raw_weights(mesh, beta):
+    qidx, tri, w = index_hits(mesh.index, mesh.vertices_source, mesh.leaves, beta)
+    idx, off, _ = mesh_query(mesh, beta)
+    counts = np.diff(backend.to_numpy(off))
+    assert np.array_equal(backend.to_numpy(tri), backend.to_numpy(idx))
+    assert np.array_equal(
+        backend.to_numpy(qidx), np.repeat(np.arange(beta.shape[0]), counts)
     )
-    _, dedup_counts = mesh_forward_raytrace(mesh, beta, lens.raytrace, method="dedup")
-    assert to_np(dedup_counts).tolist() == to_np(rootfind_counts).tolist()
+    expected = triangle_weights(mesh.vertices_source[mesh.leaves[tri]], beta[qidx])
+    assert np.array_equal(backend.to_numpy(w), backend.to_numpy(expected))
 
 
-def test_dedup_positions_are_within_min_img_sep_of_the_refined_roots_across_a_batch():
-    """Positions are accurate to min_img_sep, the build's *lens-plane* tolerance.
-
-    Not to a source-plane residual: `min_img_sep` bounds the seed's distance
-    from the image in the lens plane, and the source-plane residual is that
-    distance times the local Jacobian, which is large inside the SIE's core.
-    Measured on these four sources, seeds within 2e-3 of the lens centre --
-    which now converge, see
-    ``test_sie_candidates_recover_forward_raytrace_images`` -- reach
-    source-plane residuals of 0.16, against 1.6e-3 for every seed outside the
-    core. Comparing against the root finder's own answer is what the
-    documented contract actually claims.
-
-    Measured worst case on this fixture: 1.6e-3, against the mesh's own
-    ``min_img_sep`` of 5e-3 -- half the 1e-2 the build was asked for.
-    """
-    lens, mesh = sie_fixture()
-    beta = _beta([[0.02, 0.01], [0.05, 0.02], [-0.03, 0.04], [0.3, 0.2]])
-    dedup_i, dedup_c = mesh_forward_raytrace(mesh, beta, lens.raytrace, method="dedup")
-    root_i, root_c = mesh_forward_raytrace(mesh, beta, lens.raytrace, method="rootfind")
-    dedup_c, root_c = to_np(dedup_c), to_np(root_c)
-    assert dedup_c.tolist() == root_c.tolist(), "fixture must not straddle a caustic"
-
-    do = np.concatenate(([0], np.cumsum(dedup_c)))
-    ro = np.concatenate(([0], np.cumsum(root_c)))
-    di, ri = to_np(dedup_i), to_np(root_i)
-    for b in range(dedup_c.size):
-        D, R = di[do[b] : do[b + 1]], ri[ro[b] : ro[b + 1]]
-        nearest = np.linalg.norm(D[:, None, :] - R[None, :, :], axis=-1).min(axis=1)
-        assert (nearest <= mesh.min_img_sep).all(), f"source {b}: {nearest}"
+def test_forward_raytrace_reads_a_scalar_source_and_empty_sources(mesh):
+    x, y, counts = forward_raytrace(0.05, 0.02, _sie_like, mesh)
+    assert counts.shape == (1,) and int(to_np(counts)[0]) >= 1
+    assert x.shape == y.shape == (int(to_np(counts)[0]),)
+    x, y, counts = forward_raytrace(f64([]), f64([]), _sie_like, mesh)
+    assert x.shape == y.shape == (0,) and counts.shape == (0,)
