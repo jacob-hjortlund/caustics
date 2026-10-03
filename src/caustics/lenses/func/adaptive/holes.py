@@ -14,19 +14,8 @@ from typing import NamedTuple
 from warnings import warn
 
 from ....backend_obj import ArrayLike, backend
-from .geometry import build_device, to_device
+from .geometry import build_device, csr_offsets, to_device
 from .refine import sample_points
-
-__all__ = (
-    "CenterHoles",
-    "empty_holes",
-    "merge_centers",
-    "HOLE_INITIAL_SAMPLES",
-    "HOLE_MAX_SAMPLES",
-    "HOLE_GROWTH_SAMPLES",
-    "hole_circle",
-    "sample_holes",
-)
 
 
 class CenterHoles(NamedTuple):
@@ -47,14 +36,9 @@ class CenterHoles(NamedTuple):
     shrinks, and positive for a speck -- exactly ``1 - t`` for a power law of
     slope ``t``.
 
-    ``growth`` is measured, not known, so it is never exactly 0:
-    ``growth_err`` bounds its error, and ``pseudo_caustic`` marks the holes
-    whose ``growth`` is 0 within it. That needs no tolerance, but it resolves
-    only so much: a slope ``t`` within about ``growth_err`` of 1 -- of order
-    ``(radius / size)**2``, where ``size`` is the hole curve's, so 2e-6 for
-    a 0.005" hole in an SIS of 1" Einstein radius ``b`` -- reads as
-    isothermal. Its hole curve then differs from the isothermal one by a
-    fraction of about ``|t - 1| * |log(radius / b)|`` of its size.
+    ``growth`` is measured, so never exactly 0: ``growth_err`` bounds its
+    error, and ``pseudo_caustic`` marks the holes whose ``growth`` is 0
+    within it.
 
     Samples are stored CSR per hole: hole ``h`` is rows
     ``offsets[h]:offsets[h + 1]`` of ``angle``, ``lens`` and ``source``, in
@@ -63,7 +47,7 @@ class CenterHoles(NamedTuple):
     Parameters
     ----------
     centers: ArrayLike
-        ``(H, 2)`` hole centers after merging, at the mesh dtype.
+        ``(H, 2)`` float64 hole centers after merging.
 
         *Unit: arcsec*
     radius: ArrayLike
@@ -78,12 +62,11 @@ class CenterHoles(NamedTuple):
 
         *Unit: radians*
     lens: ArrayLike
-        ``(P, 2)`` circle points ``center + radius * (cos, sin)(angle)``, at
-        the mesh dtype.
+        ``(P, 2)`` float64 circle points ``center + radius * (cos, sin)(angle)``.
 
         *Unit: arcsec*
     source: ArrayLike
-        ``(P, 2)`` their images -- the hole curve -- at the mesh dtype.
+        ``(P, 2)`` float64 images of ``lens``: the hole curve.
 
         *Unit: arcsec*
     growth: ArrayLike
@@ -279,24 +262,21 @@ def sample_holes(trace, centers, radius, min_img_sep, batch_size):
     between them, and is warned about; only enormous hole curves, such as a
     point mass's, reach it.
 
-    ``growth`` comes from the hole curve's size -- its bounding box's
-    diagonal -- on :data:`HOLE_GROWTH_SAMPLES` even samples at ``radius``
-    and at ``radius / 4``, ``/ 16`` and ``/ 64``. The slope between two
-    neighbouring circles, ``g(r) = log(size(r) / size(r / 4)) / log(4)``,
-    is biased by a term linear in ``r``: the lens map's smooth part --
-    the identity, and every other lens's deflection -- stretches the hole
-    curve by that much. At an isothermal center it is all of ``g``, of
-    order ``radius / size``. Richardson extrapolation cancels it:
-    ``R(r) = (4 g(r / 4) - g(r)) / 3``, and ``growth = R(r / 4)``. What
-    is left falls as ``r**p`` -- ``p = 2`` at an isothermal center of a
-    lens map smooth everywhere else -- so ``growth_err = |R(r) - R(r / 4)|``
-    is ``4**p - 1`` times that error, a bound for any ``p >= 1/2``. No
-    Jacobian is called.
+    ``growth`` is read off the hole curve's size -- its bounding box's
+    diagonal -- on :data:`HOLE_GROWTH_SAMPLES` even samples at ``radius``,
+    ``radius / 4``, ``/ 16`` and ``/ 64``. The slope between neighbouring
+    circles, ``g(r) = log(size(r) / size(r / 4)) / log(4)``, carries a bias
+    linear in ``r`` from the smooth part of the lens map; Richardson
+    extrapolation, ``R(r) = (4 g(r / 4) - g(r)) / 3``, cancels it, and
+    ``growth = R(r / 4)``. What is left falls as ``r**p``, so
+    ``growth_err = |R(r) - R(r / 4)|`` bounds it for any ``p >= 1/2``.
 
     Parameters
     ----------
     trace: Callable[[ArrayLike], ArrayLike]
-        From :func:`make_raytrace`.
+        ``(N, 2)`` lens-plane positions to ``(N, 2)`` images, as
+        :func:`~caustics.lenses.func.adaptive.lens_mesh.make_sampler` gives
+        without a Jacobian.
     centers: ArrayLike
         ``(H, 2)`` float64 hole centers, from :func:`merge_centers`.
 
@@ -310,12 +290,12 @@ def sample_holes(trace, centers, radius, min_img_sep, batch_size):
 
         *Unit: arcsec*
     batch_size: Optional[int]
-        Forwarded to :func:`trace_points`.
+        Most points per ``trace`` call.
 
     Returns
     -------
     CenterHoles
-        Every array float64 but ``offsets``, on the ambient device.
+        On the backend's default device.
 
     Raises
     ------
@@ -391,20 +371,16 @@ def sample_holes(trace, centers, radius, min_img_sep, batch_size):
         )
         for k in range(4)
     ]
-    # `step[k] / log(4)` is the slope `g` between circles k and k + 1, and
-    # `R(r / 4) - R(r)` folds to one sum of steps. Both scale by a constant
-    # rather than dividing by one: jax divides an array of more than one
-    # element by a constant as a multiply by its reciprocal, so a quotient
-    # would depend on how many holes share the call.
+    # `step[k] / log(4)` is the slope between circles k and k + 1. Scale, never
+    # divide: jax turns a division by a constant into a multiply by its
+    # reciprocal for some shapes only, so a quotient would depend on H.
     step = [backend.log(size[k] / size[k + 1]) for k in range(3)]
     scale = 1.0 / (3.0 * math.log(4.0))
     growth = (4.0 * step[2] - step[1]) * scale
     growth_err = backend.abs(5.0 * step[1] - step[0] - 4.0 * step[2]) * scale
 
     counts = backend.bincount(hole, minlength=n_holes)
-    offsets = backend.concatenate(
-        (backend.zeros((1,), dtype=int64), backend.cumsum(counts, dim=0)), dim=0
-    )
+    offsets = csr_offsets(counts)
     return CenterHoles(
         centers=centers,
         radius=radius,

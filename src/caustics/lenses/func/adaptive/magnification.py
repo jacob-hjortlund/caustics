@@ -57,14 +57,10 @@ def counts_once(tri, w, area2):
     zero one and a positive y component. At a vertex both zero weights are
     tested.
 
-    Exact: two leaves sharing an edge form its vector from the same stored
-    vertices in opposite orders, and IEEE subtraction negates exactly, so
-    their inward normals are exact negatives and exactly one passes -- the
-    property :func:`~caustics.lenses.func.adaptive.geometry.triangle_weights`
-    already relies on. Around a vertex inside one sheet exactly one leaf
-    contains the direction ``(1, eps)``. On a fold edge, both leaves on one
-    side, both count or neither does, as they should. A zero-length edge
-    never passes; converged leaves have none.
+    Two leaves sharing an edge form it from the same stored vertices in
+    opposite orders, so their inward normals are exact negatives and exactly
+    one passes. On a fold edge, with both leaves on one side, both count or
+    neither does.
 
     Parameters
     ----------
@@ -142,11 +138,9 @@ def _per_point_sum(qidx, values, n_points):
     """
     Sum and count of ``values`` per point, ``qidx`` non-decreasing.
 
-    No scatter-add: torch keeps the last write on a repeated index and jax
-    accumulates. Each point's values are laid out in a dense row by their
-    rank within the point -- distinct indices, so a plain scatter -- and the
-    columns are added in rank order, so a point's sum does not depend on how
-    many other points share its chunk.
+    Values are laid out by rank within their point -- distinct indices, as
+    torch and jax disagree on a scatter-add -- and summed in rank order, so a
+    point's sum does not depend on its chunk.
     """
     device = backend.device(qidx)
     counts = backend.long(backend.bincount(qidx, minlength=n_points))

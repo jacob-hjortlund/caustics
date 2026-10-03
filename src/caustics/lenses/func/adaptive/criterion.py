@@ -14,21 +14,6 @@ from .geometry import (
     sigma_min_2x2,
 )
 
-__all__ = (
-    "LEAF_CONVERGED",
-    "LEAF_CONVERGENCE_FAILED",
-    "LEAF_APPROX_PARITY_UNRESOLVED",
-    "LEAF_JACOBIAN_PARITY_UNRESOLVED",
-    "LEAF_RAYTRACE_NONFINITE",
-    "LEAF_JACOBIAN_NONFINITE",
-    "midpoint_deviation",
-    "converged_from_deviation",
-    "child_shape_matrices",
-    "parity_from_children",
-    "lens_status",
-)
-
-
 # Why a leaf's affine model is not trusted, as a bitmask with one bit per
 # failed test; `LEAF_CONVERGED` (zero) is the only status that is trusted.
 # Test a flag with `(status & FLAG) != 0`. Only `max_level` leaves store a
@@ -62,19 +47,19 @@ def midpoint_deviation(beta_v, beta_m):
 
     Parameters
     ----------
-    beta_v: ndarray
+    beta_v: ArrayLike
         Source-plane vertices, shape ``(n, 3, 2)``.
 
         *Unit: arcsec*
 
-    beta_m: ndarray
+    beta_m: ArrayLike
         Source-plane edge midpoints ``m1, m2, m3``, shape ``(n, 3, 2)``.
 
         *Unit: arcsec*
 
     Returns
     -------
-    ndarray
+    ArrayLike
         Shape ``(n, 3)``, a source-plane length.
 
         *Unit: arcsec*
@@ -85,30 +70,21 @@ def midpoint_deviation(beta_v, beta_m):
 
 def converged_from_deviation(r, s, min_img_sep):
     """
-    Step 7 of the refinement criterion.
+    True where every midpoint deviation is below ``s * min_img_sep``.
 
-    Written as ``all(r < threshold)`` and never as ``not any(r >= threshold)``.
-    The two are not equivalent when ``s`` is ``NaN``: under IEEE every comparison
-    against ``NaN`` is False, so the ``>=`` form would mark a maximally degenerate
-    triangle *converged*, silently inverting the intended behaviour. The ``<`` form
-    puts ``NaN`` in the split branch. It also settles the exact-equality edge -- an
-    affine-but-singular triangle (``r == 0``, ``s == 0``) gives ``0 < 0``, False,
-    and splits, which is the conservative direction.
-
-    Note the comparison is evaluated in the **source plane**: ``r`` is a
-    source-plane length and ``s`` is dimensionless, so ``s * min_img_sep`` converts
-    the lens-plane tolerance ``min_img_sep`` into a source-plane one. The
-    equivalent lens-plane form ``r / s < min_img_sep`` must not be used, because
-    dividing by ``s`` breaks on the legal and expected ``s == 0``.
+    ``s * min_img_sep`` is the lens-plane tolerance carried to the source
+    plane, which stays defined at ``s == 0``. The test is written as
+    ``r < threshold`` so that a ``NaN`` fails it, and an exactly singular
+    triangle, ``0 < 0``, fails too.
 
     Parameters
     ----------
-    r: ndarray
+    r: ArrayLike
         Midpoint deviations, shape ``(n, 3)``.
 
         *Unit: arcsec*
 
-    s: ndarray
+    s: ArrayLike
         Smallest singular value over the four children, shape ``(n,)``.
     min_img_sep: float
         Lens-plane tolerance.
@@ -117,7 +93,7 @@ def converged_from_deviation(r, s, min_img_sep):
 
     Returns
     -------
-    ndarray
+    ArrayLike
         Shape ``(n,)`` bool.
     """
     return backend.all(r < (s * min_img_sep)[:, None], dim=1)
@@ -127,25 +103,21 @@ def child_shape_matrices(beta_v, beta_m):
     """
     Source-plane edge matrices ``Q_k`` of the four red-split children.
 
-    Split out of :func:`evaluate_criterion` so the child-parity test can be
-    applied on its own, apart from the deviation and Jacobian halves of the
-    criterion.
-
     Parameters
     ----------
-    beta_v: ndarray
+    beta_v: ArrayLike
         Source-plane vertices, shape ``(n, 3, 2)``.
 
         *Unit: arcsec*
 
-    beta_m: ndarray
+    beta_m: ArrayLike
         Source-plane midpoints ``m1, m2, m3``, shape ``(n, 3, 2)``.
 
         *Unit: arcsec*
 
     Returns
     -------
-    ndarray
+    ArrayLike
         Shape ``(n, 4, 2, 2)``, child index in :data:`CHILD_VERTEX_INDICES`
         order.
     """
@@ -161,26 +133,19 @@ def parity_from_children(Q):
     """
     True where ``sign(det Q_k)`` is constant over the four children.
 
-    The parity test needs no lens-plane ``P`` at all: ``sign(det A_k) =
-    sign(det Q_k) * sign(det P_k)``, and all four children share the parent's
-    ``sign(det P_k)`` because every ``det M_k == +1``, so constancy of
-    ``sign(det A_k)`` over ``k`` is equivalent to constancy of
-    ``sign(det Q_k)``. That is what makes this usable at ``max_level``, where
-    no child is ever built and no ``P`` is ever formed.
-
-    A ``NaN`` never equals itself, so a non-finite child lands in the failing
-    branch. An exact zero gives sign 0, which differs from ``+-1`` and also
-    fails -- unless *every* child is zero, which is a constant sign and passes.
+    The children's affine maps share a sign of determinant exactly when
+    their ``Q_k`` do, since every ``det M_k == +1``. A ``NaN`` fails; an exact
+    zero fails unless every child's is zero.
 
     Parameters
     ----------
-    Q: ndarray
+    Q: ArrayLike
         Child edge matrices from :func:`child_shape_matrices`, shape
         ``(n, 4, 2, 2)``.
 
     Returns
     -------
-    ndarray
+    ArrayLike
         Shape ``(n,)`` bool.
     """
     det_q = Q[..., 0, 0] * Q[..., 1, 1] - Q[..., 0, 1] * Q[..., 1, 0]

@@ -78,12 +78,8 @@ def dedup_block_group(points, rows, n_blocks, m, tol):
     """
     Connected-component representatives for blocks of exactly ``m`` points.
 
-    Every slot is real, so this carries none of the padding machinery a
-    ragged formulation needs: no validity mask, no clipped gather, and the
-    "no label" sentinel is ``m`` rather than a global maximum. Grouping the
-    caller's blocks by count and calling this once per distinct count is what
-    keeps the ``(n_blocks, m, m)`` intermediate proportional to
-    ``sum_c B_c * c**2`` instead of ``B * max(c)**2``.
+    :func:`dedup_representatives` calls it once per distinct block size, so
+    the ``(n_blocks, m, m)`` intermediate is never padded to the largest block.
 
     Parameters
     ----------
@@ -112,10 +108,7 @@ def dedup_block_group(points, rows, n_blocks, m, tol):
     p = p.reshape(n_blocks, m, 2)
 
     delta = backend.unsqueeze(p, 2) - backend.unsqueeze(p, 1)
-    # Squared distances against a squared tolerance: no sqrt, and the
-    # comparison is exact on the diagonal, so every point is its own
-    # neighbour and the label update below is a true minimum over the closed
-    # neighbourhood.
+    # Exact on the diagonal: every point is its own neighbour.
     adjacent = backend.long(backend.sum(delta * delta, dim=-1) < tol * tol)
 
     # Min-label propagation. `m` is the sentinel for "no label": it exceeds
@@ -129,9 +122,8 @@ def dedup_block_group(points, rows, n_blocks, m, tol):
             break
         labels = updated
 
-    # Each component now carries the lowest slot index it contains, and that
-    # slot is its own label -- so the fixed points are exactly one per
-    # component.
+    # Each component is labelled with its lowest slot, the one slot that keeps
+    # its own label.
     return (labels == index).reshape(-1)
 
 
@@ -139,35 +131,13 @@ def dedup_representatives(points, counts, tol):
     """
     One representative per cluster of near-coincident points, within each block.
 
-    Clusters are the **connected components** of the ``distance < tol`` graph,
-    not the greedy clusters :func:`~caustics.lenses.func.base.remove_duplicate_points`
-    produces. The difference is order dependence: for three collinear points
-    spaced ``0.9 * tol`` apart, greedy returns two representatives in one input
-    order and one in another, so the image count would depend on the order
-    :func:`mesh_query` happened to emit candidates in. Components are a
-    function of the point set alone, which is what makes a multiplicity map
-    reproducible.
-
-    Adjacency is strict ``<``, so a pair separated by exactly ``tol`` stays
-    distinct. That matches the build contract, where ``min_img_sep`` is a size
-    floor the mesh resolves *to* rather than a scale it merges away.
-
-    Vectorized by grouping blocks that share a count and running each group at
-    its own width, because a greedy loop is one Python iteration per point --
-    fine for the handful of images of a single source, hopeless for the
-    ``nx * ny`` blocks of a multiplicity map. Blocks of zero or one point never
-    reach the kernel; their answer is already known. The cost is a
-    ``(B_c, c, c)`` intermediate per distinct count ``c``, which is why callers
-    may still want to chunk over query points when a single block is enormous.
-
-    Block-major order is restored by an inverse permutation rather than a
-    scatter: every row belongs to exactly one group, so concatenating the
-    groups' row indices gives a permutation of ``range(K)``, and ``argsort`` of
-    a permutation *is* its inverse -- computed by sorting, never by an indexed
-    assignment. That matters because torch keeps the last write on duplicate
-    indices and jax accumulates, so a scatter would mean two different things
-    on the two backends; a gather (indexing by the inverse permutation) means
-    the same thing on both.
+    Clusters are the connected components of the ``distance < tol`` graph,
+    not greedy clusters, so they depend on the point set alone, not its
+    order; a pair exactly ``tol`` apart stays distinct. Blocks are grouped by
+    size, and blocks of zero or one point skip the clustering. Block-major
+    order is restored by gathering with the inverse permutation -- the
+    ``argsort`` of the groups' rows -- since torch and jax resolve a scatter
+    to repeated indices differently.
 
     Parameters
     ----------
@@ -177,10 +147,8 @@ def dedup_representatives(points, counts, tol):
 
         *Unit: arcsec*
     counts: ArrayLike
-        Shape ``(B,)`` int, with ``counts.sum() == K``. A host-side sequence
-        is accepted directly and coerced on entry -- that is the array-like
-        input the no-``numpy``-import rule permits, not an exception to it.
-        Zero-length blocks are allowed.
+        Shape ``(B,)`` int, with ``counts.sum() == K``. Zero-length blocks are
+        allowed.
     tol: float
         Separation below which two points are the same image.
 
@@ -200,10 +168,7 @@ def dedup_representatives(points, counts, tol):
     starts = backend.cumsum(counts, dim=0) - counts
     row_groups, keep_groups = [], []
 
-    # A block of one point is its own representative and a block of none
-    # contributes nothing, so neither reaches the clustering kernel at all.
-    # On a multiplicity map those are the large majority, and skipping them is
-    # the single biggest reduction in what the kernel has to hold.
+    # A block of one point is its own representative.
     singles = backend.flatnonzero(counts == 1)
     if singles.shape[0] > 0:
         row_groups.append(starts[singles])
@@ -211,12 +176,7 @@ def dedup_representatives(points, counts, tol):
             backend.ones((singles.shape[0],), dtype=backend.bool, device=device)
         )
 
-    # The rest are grouped by *equal* count so each group runs at its own M.
-    # Padding every block to the global maximum is what made the intermediate
-    # `B * max(c)**2` and put a fine multiplicity map out of memory. The
-    # distinct counts themselves are pulled to the host: there are at most a
-    # handful of them (multiplicities are small integers), and each drives a
-    # Python-level `dedup_block_group` call with its own static shape anyway.
+    # The rest run grouped by size; there are a handful of distinct sizes.
     distinct = backend.to_numpy(backend.unique(counts[counts > 1])).tolist()
     for m in distinct:
         blocks = backend.flatnonzero(counts == m)
@@ -229,8 +189,7 @@ def dedup_representatives(points, counts, tol):
         row_groups.append(rows)
         keep_groups.append(dedup_block_group(points, rows, blocks.shape[0], m, tol))
 
-    # Every row belongs to exactly one group, so `perm` is a permutation of
-    # `range(total)` and its `argsort` is exactly its inverse.
+    # Every row is in exactly one group, so `perm` is a permutation.
     perm = backend.concatenate(row_groups, dim=0)
     inverse = backend.argsort(perm)
     stacked = backend.concatenate(keep_groups, dim=0)

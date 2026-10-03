@@ -512,11 +512,11 @@ def _curves_cut_by_fov(mesh, curves):
     How many open curves have an end on ``mesh``'s fov boundary.
 
     Exact, with no tolerance: every vertex and band sample is placed by
-    :func:`lattice_xy` and cast to the mesh dtype alike, so the boundary is
-    the vertices' own extreme coordinates, and a crossing on a boundary child
-    edge, both of whose samples share that coordinate, reproduces it bit for
-    bit (:func:`~caustics.lenses.func.adaptive.curves.crossing_points`). An
-    end at a band gap inside the fov does not count.
+    :func:`~.lattice.lattice_xy`, so the boundary is the vertices' own
+    extreme coordinates, and a crossing on a boundary child edge, both of
+    whose samples share that coordinate, reproduces it bit for bit
+    (:func:`~.curves.edge_zeros`). An end at a band gap inside the fov does
+    not count.
     """
     open_curves = backend.flatnonzero(~curves.closed)
     n_open = open_curves.shape[0]

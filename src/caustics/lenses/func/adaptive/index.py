@@ -9,7 +9,7 @@ import math
 from typing import NamedTuple
 
 from ....backend_obj import ArrayLike, backend
-from .geometry import contains, triangle_weights
+from .geometry import contains, csr_offsets, triangle_weights
 
 
 class MeshIndex(NamedTuple):
@@ -113,13 +113,7 @@ def build_index(vertices, triangles, rows):
     # A stable sort keeps each cell's triangles in ascending row order.
     order = backend.argsort(cell_id)
     counts_per_cell = backend.long(backend.bincount(cell_id, minlength=nx * ny))
-    cell_offsets = backend.concatenate(
-        [
-            backend.zeros((1,), dtype=backend.int64),
-            backend.cumsum(counts_per_cell, dim=0),
-        ],
-        dim=0,
-    )
+    cell_offsets = csr_offsets(counts_per_cell)
     return MeshIndex(
         lo=lo,
         hi=hi,

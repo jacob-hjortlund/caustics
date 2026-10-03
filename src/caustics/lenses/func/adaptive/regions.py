@@ -1,5 +1,5 @@
 """
-Regions of total magnification at least a threshold, from a magnification mesh.
+Regions of total magnification at least a threshold, from a magnification map.
 
 :func:`magnified_regions` traces their boundaries, :func:`magnified_area`
 measures them and :func:`in_magnified_region` tells which points lie in them.
@@ -14,21 +14,13 @@ measured and the points classified inside. ``u`` is bounded and sends the
 critical band's ``+inf`` to 0, so nothing special-cases infinity.
 """
 
-from typing import NamedTuple, Tuple
+from typing import NamedTuple
 
 from ....backend_obj import ArrayLike, backend
 from .geometry import shape_matrix
 from .lattice import lattice_on_boundary
 from .index import as_points, index_hits
 from .curves import chain_segments, edge_zeros, triangle_segments
-
-__all__ = (
-    "MagnifiedRegions",
-    "region_field",
-    "magnified_regions",
-    "magnified_area",
-    "in_magnified_region",
-)
 
 
 class MagnifiedRegions(NamedTuple):
@@ -40,17 +32,9 @@ class MagnifiedRegions(NamedTuple):
     and holes clockwise. ``closed`` marks the loops, whose last point joins
     back to their first; a curve that reaches an ``incomplete`` leaf or the
     edge of the window is open. A vertex exactly at ``mu_min`` puts a
-    crossing on that vertex, so consecutive points can coincide and some
-    segments have zero length; they are kept, as in
-    :class:`~caustics.lenses.func.adaptive.curves.CriticalCurvesAndCaustics`,
-    so anything computing tangents or arc length must guard against them.
-
-    Within an image sheet the sampled field is continuous (see
-    :func:`~caustics.lenses.func.adaptive.magnification.total_magnification`),
-    so a boundary is one curve wherever ``mu`` crosses ``mu_min`` once. On an
-    SIS lens mesh at ``min_img_sep = 0.005``, the disk ``mu_tot >= 4`` comes
-    back as a single loop within 4e-4 arcsec of the exact circle. A cored
-    isothermal lens's ``mu_tot >= 6`` comes back as exactly its three circles.
+    crossing on that vertex, so consecutive points can coincide: zero-length
+    segments are kept. Within an image sheet the sampled field is continuous,
+    so a boundary is one curve wherever ``mu`` crosses ``mu_min`` once.
 
     Parameters
     ----------
@@ -69,7 +53,7 @@ class MagnifiedRegions(NamedTuple):
     closed: ArrayLike
 
 
-def region_field(mag, mu_min) -> ArrayLike:
+def region_field(mag, mu_min):
     """
     ``g = 1 / (1 + mu_min) - 1 / (1 + mu)`` at every vertex: inside where ``g >= 0``.
 
@@ -86,7 +70,7 @@ def region_field(mag, mu_min) -> ArrayLike:
     return 1.0 / (1.0 + float(mu_min)) - 1.0 / (1.0 + mag.mu)
 
 
-def magnified_regions(mag, mu_min) -> MagnifiedRegions:
+def magnified_regions(mag, mu_min):
     """
     Boundaries of the source-plane regions where ``mu_tot >= mu_min``.
 
@@ -97,11 +81,11 @@ def magnified_regions(mag, mu_min) -> MagnifiedRegions:
     :func:`~caustics.lenses.func.adaptive.curves.chain_segments`. The mesh
     is conforming, so the two leaves on either side of an edge see the same
     crossing there. For a threshold ``mag`` targeted, every boundary point
-    is within ``mag.src_tol`` of where the sampled field crosses it; see
+    is within ``src_tol`` of where the sampled field crosses it; see
     :func:`~caustics.lenses.func.adaptive.magnification_map.build_magnification_map`.
     Where the sampled field crosses ``mu_min`` more than once near a
     boundary, the result holds small islands and holes as well as the main
-    boundary; see :class:`MagnifiedRegions`.
+    boundary.
 
     Parameters
     ----------
@@ -120,7 +104,7 @@ def magnified_regions(mag, mu_min) -> MagnifiedRegions:
     return MagnifiedRegions(source=points, offsets=offsets, closed=closed)
 
 
-def _inside_area(mag, g, area, complete, boundary) -> Tuple[ArrayLike, ArrayLike]:
+def _inside_area(mag, g, area, complete, boundary):
     """The area where the interpolated ``g >= 0`` over complete leaves, and whether it is whole."""
     corners = g[mag.leaves]
     inside = corners >= 0
@@ -150,7 +134,7 @@ def _inside_area(mag, g, area, complete, boundary) -> Tuple[ArrayLike, ArrayLike
     return total, ~reaches
 
 
-def magnified_area(mag, mu_min) -> Tuple[ArrayLike, ArrayLike]:
+def magnified_area(mag, mu_min):
     """
     Source-plane area where ``mu_tot >= mu_min``, and whether the region is whole.
 

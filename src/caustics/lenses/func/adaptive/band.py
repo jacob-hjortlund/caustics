@@ -11,12 +11,6 @@ from typing import NamedTuple
 from ....backend_obj import ArrayLike, backend
 from .lattice import lattice_ij_from_key, lattice_xy
 
-__all__ = (
-    "CriticalBand",
-    "in_band",
-    "build_band",
-)
-
 
 class CriticalBand(NamedTuple):
     """

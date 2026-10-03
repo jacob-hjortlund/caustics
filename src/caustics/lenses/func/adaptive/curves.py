@@ -1,5 +1,5 @@
 """
-Critical curves and caustics, traced through an adaptive mesh's critical band.
+Critical curves and caustics, traced through a lens mesh's critical band.
 
 :func:`~caustics.lenses.func.adaptive.build_lens_mesh` keeps, as
 ``mesh.critical_band``, every ``max_level`` leaf ``det A`` changes sign across,
@@ -22,74 +22,39 @@ of the mesh alone.
 """
 
 import math
-from typing import NamedTuple, Tuple
+from typing import NamedTuple
 
 from ....backend_obj import ArrayLike, backend
-from .geometry import _CHILD_VERTEX_INDEX_TABLE
-
-__all__ = (
-    "CriticalCurvesAndCaustics",
-    "triangle_segments",
-    "child_segments",
-    "edge_zeros",
-    "chain_order",
-    "chain_segments",
-    "trace_band",
-    "join_at_holes",
-    "critical_curves_and_caustics",
-)
+from .geometry import _CHILD_VERTEX_INDEX_TABLE, csr_offsets
 
 
 class CriticalCurvesAndCaustics(NamedTuple):
     """
     Critical curves and caustics, one ordered polyline per curve, CSR.
 
-    Every point is one of two kinds, told apart by ``hole``. Most are a
-    crossing of ``det A = 0`` in ``lens``, a critical-curve point, with its
-    caustic point in ``source``. On a mesh built with ``centers``, the rest
-    lie on a hole's circle in ``lens`` and on that hole's hole curve in
-    ``source`` -- the pseudo-caustic where ``holes.pseudo_caustic`` is True.
+    Curve ``c`` is rows ``offsets[c]:offsets[c + 1]`` of ``lens``, ``source``
+    and ``hole``. Most points are crossings of ``det A = 0``: a critical-curve
+    point in ``lens``, its caustic point in ``source``. On a mesh with holes,
+    a curve that reaches a hole follows the hole's circle clockwise to the
+    next curve leaving it (:func:`join_at_holes`); those points lie on the
+    circle in ``lens`` and on the hole curve in ``source``, which is the
+    pseudo-caustic where the mesh's ``holes.pseudo_caustic`` is True.
 
-    Curve ``c`` is rows ``offsets[c]:offsets[c + 1]`` of ``lens`` and
-    ``source``. Travel keeps ``det A > 0`` on the left -- which runs a
-    tangential curve clockwise and a radial one counter-clockwise on a typical
-    lens. A curve the fov or missing data cuts is open; ``closed`` marks the
-    loops, whose last point joins back to their first. Curves are ordered
-    deterministically but with no physical meaning, and so is where a loop
-    starts: :func:`trace_band` orders curves by their lowest-indexed crossing
-    and starts each loop there, and a loop :func:`join_at_holes` re-joined at
-    a hole starts right after one of its joins instead.
-
-    When ``det A`` is exactly zero at a sample, several crossings sit on
-    that sample -- which happens whenever a curve runs through lattice
-    points; an SIS with ``Rein = 1`` centered on the origin hits ``(1, 0)``,
-    ``(-1, 0)``, ``(0, 1)`` and ``(0, -1)`` exactly. Consecutive points can
-    then coincide, so some segments of ``lens`` and ``source`` have zero
-    length; they are kept, not removed, so anything computing tangents,
-    normals or arc length from consecutive differences must guard against a
-    zero-length segment. Where ``det A`` only touches zero at one sample
-    without changing sign -- an isolated degenerate critical point -- the
-    zero-is-positive rule yields a closed curve of zero extent, every point
-    of it at that one sample.
-
-    On a mesh built with ``centers``, a curve that reaches a hole does not run
-    into it. Within the limits :func:`join_at_holes` states, it follows the
-    hole's circle, clockwise, to the next curve leaving it, so every loop
-    bounds a ``det A > 0`` region with the holes cut out, and its caustic
-    follows the hole curve -- the pseudo-caustic at an isothermal center --
-    instead of cutting straight across it. Those points carry their hole's
-    index in ``hole``. A hole curve is a pseudo-caustic only where
-    ``holes.pseudo_caustic`` is True; see
-    :class:`~caustics.lenses.func.adaptive.CenterHoles`.
+    Travel keeps ``det A > 0`` on the left. A curve the fov or missing data
+    cuts is open; ``closed`` marks the loops, whose last point joins back to
+    their first. The order of the curves, and where a loop starts, is
+    deterministic but has no physical meaning. Where ``det A`` is exactly
+    zero at a sample, as when a curve runs through lattice points,
+    consecutive points can coincide: zero-length segments are kept.
 
     Parameters
     ----------
     lens: ArrayLike
-        Critical-curve points, shape ``(P, 2)``, at the mesh dtype.
+        ``(P, 2)`` float64 critical-curve or hole-circle points.
 
         *Unit: arcsec*
     source: ArrayLike
-        The matching caustic points, shape ``(P, 2)``, at the mesh dtype.
+        ``(P, 2)`` float64 caustic or hole-curve points.
 
         *Unit: arcsec*
     offsets: ArrayLike
@@ -97,10 +62,9 @@ class CriticalCurvesAndCaustics(NamedTuple):
     closed: ArrayLike
         ``(C,)`` bool, True where the curve is a loop.
     hole: ArrayLike
-        ``(P,)`` int64: -1 where the point is a crossing of ``det A = 0``,
-        otherwise the index into ``holes`` of the hole whose circle the curve
-        follows there. Such a point lies on that circle, not on a critical
-        curve, and its ``source`` lies on the hole curve.
+        ``(P,)`` int64: -1 at a crossing of ``det A = 0``, otherwise the
+        index into the mesh's ``holes`` of the hole whose circle the point
+        lies on.
     """
 
     lens: ArrayLike
@@ -110,12 +74,12 @@ class CriticalCurvesAndCaustics(NamedTuple):
     hole: ArrayLike
 
 
-def _sorted_pair(a, b) -> ArrayLike:
+def _sorted_pair(a, b):
     """``(min, max)`` of two index arrays, shape ``(K,) -> (K, 2)``."""
     return backend.stack((backend.minimum(a, b), backend.maximum(a, b)), dim=-1)
 
 
-def triangle_segments(tri, positive) -> Tuple[ArrayLike, ArrayLike]:
+def triangle_segments(tri, positive):
     """
     The oriented crossing segment of each triangle whose corners are not all of one class.
 
@@ -162,23 +126,13 @@ def triangle_segments(tri, positive) -> Tuple[ArrayLike, ArrayLike]:
     return backend.where(flip, e_ij, e_ki), backend.where(flip, e_ki, e_ij)
 
 
-def child_segments(samples, det) -> Tuple[ArrayLike, ArrayLike]:
+def child_segments(samples, det):
     """
     The oriented zero-crossing segment of ``det A`` on each red-split child.
 
-    A sample's class is ``det >= 0``, so an exact zero counts as positive --
-    a symbolic perturbation that gives every sample a strict side and so
-    every child a well-defined topology. A child whose three corners are not
-    all of one class has exactly one odd corner ``i``, the lone positive or
-    the lone negative, and with ``(i, j, k)`` cyclic the curve crosses its
-    edges ``(i, j)`` and ``(k, i)``.
-
-    The segment is oriented to keep ``det A > 0`` on its left: from ``(i, j)``
-    to ``(k, i)`` when the odd corner is positive, and the reverse when it is
-    negative. Children share the parent's positive orientation, and a child
-    edge is crossed in opposite directions by the two children on either side
-    of it, so under this rule the segment that ends on a shared edge is always
-    met by one that starts there -- which is what makes the crossings chain.
+    :func:`triangle_segments` on the four children of every band leaf. A
+    sample's class is ``det >= 0``: an exact zero counts as positive, which
+    gives every child a definite crossing.
 
     Parameters
     ----------
@@ -199,7 +153,7 @@ def child_segments(samples, det) -> Tuple[ArrayLike, ArrayLike]:
     return triangle_segments(kids, det >= 0)
 
 
-def edge_zeros(edges, field, planes) -> Tuple[ArrayLike, ...]:
+def edge_zeros(edges, field, planes):
     """
     Where a piecewise-linear ``field`` crosses zero on each edge, in every plane.
 
@@ -236,7 +190,7 @@ def edge_zeros(edges, field, planes) -> Tuple[ArrayLike, ...]:
     return tuple(points)
 
 
-def chain_order(succ) -> Tuple[ArrayLike, ArrayLike, ArrayLike]:
+def chain_order(succ):
     """
     Order nodes along the paths and cycles of a successor array.
 
@@ -252,9 +206,8 @@ def chain_order(succ) -> Tuple[ArrayLike, ArrayLike, ArrayLike]:
     3. Wyllie's list ranking over predecessors then gives each node its start
        and its distance from it.
 
-    The predecessor array is filled from successors that are unique, so no
-    scatter ever writes a repeated index -- where torch keeps the last write
-    and jax an arbitrary one.
+    Successors are unique, so the scatter filling predecessors never repeats
+    an index.
 
     Parameters
     ----------
@@ -310,14 +263,7 @@ def chain_order(succ) -> Tuple[ArrayLike, ArrayLike, ArrayLike]:
     order = backend.lexsort([dist, back])
     starts = backend.flatnonzero(start)
     counts = backend.bincount(back, minlength=k)[starts]
-    offsets = backend.concatenate(
-        (
-            backend.zeros((1,), dtype=int64, device=device),
-            backend.cumsum(counts, dim=0),
-        ),
-        dim=0,
-    )
-    return order, offsets, on_cycle[starts]
+    return order, csr_offsets(counts), on_cycle[starts]
 
 
 def chain_segments(start, end, n_samples):
@@ -370,7 +316,7 @@ def chain_segments(start, end, n_samples):
     return backend.stack((ordered // s, ordered % s), dim=-1), offsets, closed
 
 
-def _no_curves(band) -> CriticalCurvesAndCaustics:
+def _no_curves(band):
     """The :class:`CriticalCurvesAndCaustics` of a band with no crossing."""
     device = backend.device(band.det)
     return CriticalCurvesAndCaustics(
@@ -382,7 +328,7 @@ def _no_curves(band) -> CriticalCurvesAndCaustics:
     )
 
 
-def trace_band(band) -> CriticalCurvesAndCaustics:
+def trace_band(band):
     """
     Trace the zero set of ``det A`` through a :class:`CriticalBand`.
 
@@ -417,68 +363,41 @@ def trace_band(band) -> CriticalCurvesAndCaustics:
     )
 
 
-def _turn(angle) -> ArrayLike:
+def _turn(angle):
     """``angle`` wrapped into ``[0, 2 pi)``."""
     two_pi = 2.0 * math.pi
     return angle - two_pi * backend.floor(angle / two_pi)
 
 
-def join_at_holes(curves, holes) -> CriticalCurvesAndCaustics:
+def join_at_holes(curves, holes):
     """
     Cut traced curves at hole circles and re-join them along the hole curves.
 
-    Inside a hole the lens map can jump: the image of the hole's boundary
-    circle is a whole curve, the hole curve, so a traced curve's points
-    there -- interpolated across the jump -- mean nothing. They are replaced:
+    Inside a hole the lens map can jump, so a traced curve's points there
+    mean nothing. They are replaced:
 
-    1. Every point strictly inside a hole's disk is dropped, which cuts each
-       curve into segments; a curve with no point left is dropped whole. A
-       lone point between two points of the same hole counts as inside it
-       too.
+    1. Every point strictly inside a hole's disk is dropped, and so is a lone
+       point between two points of the same hole. This cuts each curve into
+       segments.
     2. A segment that starts right after a dropped point departs from that
        hole's circle; one that ends right before a dropped point arrives at
-       it. Other curve ends -- the fov, or a band gap outside every hole --
-       stay ends. Disks need only not overlap, so a traced step can go from
-       a point of one hole straight to a point of another. That step is a
-       *bridge*: a segment with no point of its own, which departs the
-       first hole, at the angle of the step's point past its circle, and
-       arrives at the second, at the angle of the step's point before its
-       circle.
-    3. Around each circle the ends, sorted by angle, alternate between
-       arriving and departing. Each arriving end is joined to the next end
-       clockwise, always a departing one: an arriving curve keeps
-       ``det A > 0`` on its left, which is clockwise of it, so the join runs
-       through a ``det A > 0`` wedge. The join inserts the hole's stored
-       samples strictly inside that clockwise interval, their ``lens`` on the
-       circle and their ``source`` on the hole curve, with ``hole`` set to the
-       hole's index. A hole whose ends do not alternate is left unjoined, and
-       its curves stay open. A hole the fov cuts may be left unjoined, or may
-       be joined across the part of its circle outside the fov, where
-       branches the mesh never traced can end. Its curves are therefore
-       reliable only once the fov contains the whole hole, which
-       :func:`~caustics.lenses.func.adaptive.extend_adaptive_mesh` can
-       arrange.
-    4. The segments are chained through their joins by :func:`chain_order`,
-       numbered by their first traced point, and the bridges after them. The
-       curves come out in the order of their first segments, so those that
-       never reach a hole keep :func:`trace_band`'s order, and a re-joined
-       loop starts at its lowest-numbered segment, right after one of its
-       joins. A curve of bridges alone that its joins leave without a point
-       is dropped.
+       it. A traced step from one hole straight to another is a *bridge*: a
+       segment with no point of its own, departing the first hole and
+       arriving at the second.
+    3. Where the ends around a circle, sorted by angle, alternate between
+       arriving and departing, each arriving end is joined to the next end
+       clockwise -- the side ``det A > 0`` is on -- through the hole's stored
+       samples strictly between them. Otherwise the hole is left unjoined.
+    4. The segments are chained through their joins (:func:`chain_order`).
+       Curves that never reach a hole keep :func:`trace_band`'s order; a
+       curve left without a point is dropped.
 
-    Every returned loop is then the boundary of a ``det A > 0`` region with
-    the holes cut out, whatever pairing the tracer made inside a hole, and no
-    caustic runs straight across a hole curve; a curve through a center on a
-    lattice point, whose band has a gap there, comes out closed. Those
-    guarantees hold except in these limits:
-
-    - A hole whose ends do not alternate, or that the fov cuts, as step 3
-      says.
-    - A mesh whose ``max_depth`` bound refinement before the size floor. The
-      leaves around a center can then be larger than its hole, and curves
-      through it can stay open or keep chords.
-    - A traced segment that clips a disk with neither end inside it. It is
-      not seen; the error is within a leaf edge of the hole.
+    Every loop then bounds a ``det A > 0`` region with the holes cut out, and
+    no caustic cuts across a hole curve, except at a hole whose ends do not
+    alternate; at a hole the fov cuts, until
+    :func:`~caustics.lenses.func.adaptive.extend_lens_mesh` grows the fov
+    over it; where ``max_depth`` left leaves larger than a hole; and where a
+    traced segment clips a disk with neither end inside it.
 
     Parameters
     ----------
@@ -507,8 +426,7 @@ def join_at_holes(curves, holes) -> CriticalCurvesAndCaustics:
         backend.any(inside, dim=1), backend.argmax(backend.long(inside), 1), -1
     )
 
-    # Per-point curve bookkeeping, shared by the retag below and the rotation
-    # that follows it.
+    # Per-point curve bookkeeping.
     counts = curves.offsets[1:] - curves.offsets[:-1]
     curve = backend.repeat(
         backend.arange(counts.shape[0], dtype=int64, device=device), counts, axis=0
@@ -520,11 +438,8 @@ def join_at_holes(curves, holes) -> CriticalCurvesAndCaustics:
     prev = backend.where(point == first, last, point - 1)
     nxt = backend.where(point == last, first, point + 1)
 
-    # 1b. The tracer's zigzag along a circle can leave a lone crossing point
-    # just outside the disk, within a leaf edge of it; untagged, its two ends
-    # would sit at one angle and break the alternation below. Count it as
-    # inside the hole too: an open curve's first or last point, missing one
-    # of the two neighbours this needs, is never retagged this way.
+    # 1b. A lone untagged point between two points of one hole, left by the
+    # tracer's zigzag along its circle, counts as inside it.
     tagged = tag >= 0
     has_prev = (point != first) | curve_closed
     has_next = (point != last) | curve_closed
@@ -550,10 +465,8 @@ def join_at_holes(curves, holes) -> CriticalCurvesAndCaustics:
     tag = tag[perm]
     tagged = tag >= 0
 
-    # 3. Segments: the maximal runs of untagged points of each curve. Found in
-    # rotated order, they are already numbered by their first traced point: a
-    # closed curve now starts at its first point after a tagged run, and every
-    # segment of it starts after one, so none starts before that point.
+    # 3. Segments: the maximal runs of untagged points of each curve, already
+    # numbered by their first traced point in rotated order.
     is_first = ~tagged & ((point == first) | tagged[backend.clamp(point - 1, 0, None)])
     is_last = ~tagged & (
         (point == last) | tagged[backend.clamp(point + 1, None, n_points - 1)]
@@ -569,16 +482,10 @@ def join_at_holes(curves, holes) -> CriticalCurvesAndCaustics:
             hole=curves.hole[:0],
         )
 
-    # 3b. Bridges. Disks need only not overlap, so a traced step can go from
-    # a point of one hole straight to a point of another. That step is a
-    # segment with no traced point, which departs the first hole and arrives
-    # at the second: it runs from the step's second point back to its first,
-    # so its departure takes the angle of the point past the first circle, its
-    # arrival that of the point before the second, and it assembles to nothing
-    # but its join's arc. Only a curve with a segment has bridges, and after
-    # the rotation none of them crosses a curve's wrap. Bridges are numbered
-    # after every real segment, in order along the curves, so a cycle holding
-    # a real segment still starts at one.
+    # 3b. Bridges: a step from one hole straight to another is a segment from
+    # the step's second point back to its first, with no point of its own.
+    # They are numbered after every real segment, so a cycle holding a real
+    # segment still starts at one.
     tag_next = tag[backend.clamp(point + 1, None, n_points - 1)]
     has_segment = backend.bincount(curve[seg_first], minlength=counts.shape[0]) > 0
     bridge = backend.flatnonzero(
@@ -674,17 +581,9 @@ def join_at_holes(curves, holes) -> CriticalCurvesAndCaustics:
             size += int(arcs[s].shape[0])
         sizes.append(size)
     gather = backend.concatenate(pieces, dim=0)
-    csum = backend.concatenate(
-        (
-            backend.zeros((1,), dtype=int64, device=device),
-            backend.cumsum(backend.as_array(sizes, dtype=int64, device=device), dim=0),
-        ),
-        dim=0,
-    )
+    csum = csr_offsets(backend.as_array(sizes, dtype=int64, device=device))
     offsets = csum[seg_offsets]
-    # A curve of bridges alone, whose joins inserted no sample, has no point:
-    # it is dropped, as a curve wholly inside a hole is. Every other curve
-    # holds a segment's traced points or an arc's samples.
+    # A curve of bridges alone whose joins inserted no sample has no point.
     kept = backend.flatnonzero(offsets[1:] > offsets[:-1])
     if kept.shape[0] < closed.shape[0]:
         offsets = backend.concatenate((offsets[:1], offsets[1:][kept]), dim=0)
