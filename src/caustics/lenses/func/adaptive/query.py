@@ -5,7 +5,7 @@ Source-plane queries of a frozen mesh: containing leaves, and seeds in them.
 from typing import Tuple
 
 from ....backend_obj import ArrayLike, backend
-from .geometry import sanitize_bary
+from .geometry import area2, sanitize_bary
 from .index import index_hits
 
 __all__ = (
@@ -22,7 +22,11 @@ def _as_beta(mesh, beta) -> ArrayLike:
     A bare ``(2,)`` raises rather than being promoted, so :func:`mesh_query`'s
     output shapes are never ambiguous.
     """
-    beta = backend.as_array(beta, dtype=mesh.vertices_source.dtype, device=mesh.device)
+    beta = backend.as_array(
+        beta,
+        dtype=mesh.vertices_source.dtype,
+        device=backend.device(mesh.vertices_lens),
+    )
     if len(beta.shape) != 2 or beta.shape[1] != 2:
         raise ValueError(
             f"beta must have shape (B, 2), got {tuple(beta.shape)}. A single "
@@ -35,9 +39,15 @@ def _empty_query_result(mesh, n_queries) -> Tuple[ArrayLike, ArrayLike, ArrayLik
     """The ``mesh_query`` result for ``n_queries`` points that all miss."""
     int64 = backend.int64
     return (
-        backend.zeros((0,), dtype=int64, device=mesh.device),
-        backend.zeros((n_queries + 1,), dtype=int64, device=mesh.device),
-        backend.zeros((0, 3), dtype=mesh.vertices_source.dtype, device=mesh.device),
+        backend.zeros((0,), dtype=int64, device=backend.device(mesh.vertices_lens)),
+        backend.zeros(
+            (n_queries + 1,), dtype=int64, device=backend.device(mesh.vertices_lens)
+        ),
+        backend.zeros(
+            (0, 3),
+            dtype=mesh.vertices_source.dtype,
+            device=backend.device(mesh.vertices_lens),
+        ),
     )
 
 
@@ -98,12 +108,14 @@ def mesh_query(mesh, beta, batch_size=None) -> Tuple[ArrayLike, ArrayLike, Array
         if cand.shape[0] == 0:
             continue
         idx_parts.append(cand)
-        bary_parts.append(sanitize_bary(w, mesh.leaf_area2[cand]))
+        bary_parts.append(
+            sanitize_bary(w, area2(mesh.vertices_source[mesh.leaves[cand]]))
+        )
 
     counts = backend.concatenate(count_parts, dim=0)
     offsets = backend.concatenate(
         (
-            backend.zeros((1,), dtype=int64, device=mesh.device),
+            backend.zeros((1,), dtype=int64, device=backend.device(mesh.vertices_lens)),
             backend.cumsum(counts, dim=0),
         ),
         dim=0,
