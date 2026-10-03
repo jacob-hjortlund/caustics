@@ -69,7 +69,8 @@ from .criterion import (
 )
 from .band import CriticalBand
 from .holes import CentreHoles
-from .mesh import AdaptiveMesh, MeshIndex
+from .index import MeshIndex
+from .mesh import AdaptiveMesh
 from .query import mesh_query, mesh_seeds
 from .images import mesh_forward_raytrace
 from .curves import CriticalCurvesAndCaustics, mesh_critical_curves_and_caustics

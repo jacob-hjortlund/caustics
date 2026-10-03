@@ -42,7 +42,7 @@ from .lattice import (
 from .sampling import evaluate
 from .refinement import balance, red_split
 from .closure import canonical_order, close
-from .mesh import MeshIndex, build_index
+from .index import MeshIndex, build_index
 from .magnification import band_magnification_floor, make_sampler, sheet_edges
 
 __all__ = (
@@ -513,7 +513,6 @@ def _freeze(lat, cache, active, store, outer_cells, index_cells):
         vertices,
         leaves,
         backend.arange(leaves.shape[0], dtype=backend.int64),
-        index_cells,
     )
     return (
         vertices,

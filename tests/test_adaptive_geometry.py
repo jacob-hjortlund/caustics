@@ -30,6 +30,7 @@ from caustics.lenses.func.adaptive.geometry import (
     to_device,
     triangle_weights,
 )
+from caustics.lenses.func.adaptive.index import as_points, build_index
 from caustics.lenses.func.adaptive.lattice import (
     check_lattice_keys,
     depth_floor,
@@ -687,3 +688,34 @@ def test_warn_depth_limited_names_the_request_and_the_needed_depth():
 def test_warn_depth_limited_is_silent_when_the_floor_is_reached(recwarn):
     warn_depth_limited("Lens mesh", "x", 0.5, 0.05, 4)
     assert not recwarn.list
+
+
+def test_build_index_of_an_empty_leaf_set_is_a_single_cell():
+    idx = build_index(f64(np.zeros((3, 2))), i64(np.zeros((0, 3))), i64(np.zeros(0)))
+    assert idx.nx == 1 and idx.ny == 1
+    assert to_np(idx.cell_leaves).size == 0
+
+
+def test_build_index_leaves_are_ascending_within_every_cell():
+    rng = np.random.default_rng(13)
+    vs = rng.normal(size=(50, 2))
+    leaves = rng.integers(0, 50, (60, 3))
+    idx = build_index(f64(vs), i64(leaves), i64(np.arange(60)))
+    offsets = to_np(idx.cell_offsets)
+    cell_leaves = to_np(idx.cell_leaves)
+    assert offsets[0] == 0 and offsets[-1] == cell_leaves.size
+    exercised = 0
+    for a, b in zip(offsets[:-1], offsets[1:]):
+        block = cell_leaves[a:b]
+        if block.size > 1:
+            exercised += 1
+            assert (np.diff(block) > 0).all()
+    assert exercised > 0, "fixture must exercise a cell containing multiple leaves"
+
+
+def test_as_points_flattens_any_shape_into_float64_rows():
+    got = as_points(2.0, 3.0, None)
+    assert got.dtype == backend.float64 and to_np(got).tolist() == [[2.0, 3.0]]
+    got = as_points(f64([[0.0, 1.0]]), f64([[2.0, 3.0]]), None)
+    assert to_np(got).tolist() == [[0.0, 2.0], [1.0, 3.0]]
+    assert as_points(f64([]), f64([]), None).shape == (0, 2)

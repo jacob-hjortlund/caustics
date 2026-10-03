@@ -19,7 +19,7 @@ from caustics.lenses.func.adaptive import (
     build_adaptive_mesh,
 )
 from caustics.lenses.func.adaptive.lattice import make_lattice
-from caustics.lenses.func.adaptive.mesh import build_index, invalidate_nonfinite_origins
+from caustics.lenses.func.adaptive.mesh import invalidate_nonfinite_origins
 
 
 def _f64(x):
@@ -71,30 +71,6 @@ def test_invalidate_ors_the_flag_into_the_status_an_origin_already_has():
         LEAF_CONVERGENCE_FAILED | LEAF_RAYTRACE_NONFINITE,
         LEAF_JACOBIAN_PARITY_UNRESOLVED,
     ]
-
-
-def test_build_index_of_an_empty_leaf_set_is_a_single_cell():
-    idx = build_index(
-        _f64(np.zeros((3, 2))), _i64(np.zeros((0, 3))), _i64(np.zeros(0)), None
-    )
-    assert idx.nx == 1 and idx.ny == 1
-    assert backend.to_numpy(idx.cell_leaves).size == 0
-
-
-def test_build_index_leaves_are_ascending_within_every_cell():
-    rng = np.random.default_rng(13)
-    vs = rng.normal(size=(50, 2))
-    leaves = rng.integers(0, 50, (60, 3))
-    idx = build_index(_f64(vs), _i64(leaves), _i64(np.arange(60)), 6)
-    offsets = backend.to_numpy(idx.cell_offsets)
-    cell_leaves = backend.to_numpy(idx.cell_leaves)
-    exercised = 0
-    for a, b in zip(offsets[:-1], offsets[1:]):
-        block = cell_leaves[a:b]
-        if block.size > 1:
-            exercised += 1
-            assert (np.diff(block) > 0).all()
-    assert exercised > 0, "fixture must exercise a cell containing multiple leaves"
 
 
 # ---------------------------------------------------------------------------
@@ -242,31 +218,6 @@ def test_index_registers_every_leaf_in_the_cell_of_each_of_its_vertices():
             iy = int(np.clip((q[1] - lo[1]) // cell[1], 0, mesh.index.ny - 1))
             c = ix * mesh.index.ny + iy
             assert leaf in cells[offs[c] : offs[c + 1]]
-
-
-def test_build_index_orders_leaves_ascending_within_every_cell():
-    """CSR blocks must come out sorted with no sort at query time.
-
-    The ordering used to come from `np.lexsort((leaf_id, cell_id))`. It now
-    comes from a stable sort on `cell_id` alone, which is only equivalent
-    because `leaf_id` is already non-decreasing in generation order. If that
-    premise ever breaks, the blocks stop being ascending -- and `query`'s
-    contract that `leaf_indices` is "strictly ascending within each block"
-    breaks with it, silently.
-    """
-    lens, mesh = new_sie_fixture()
-    offsets = to_np(mesh.index.cell_offsets)
-    leaves = to_np(mesh.index.cell_leaves)
-    assert offsets[0] == 0
-    assert offsets[-1] == leaves.size
-    assert (np.diff(offsets) >= 0).all()
-    nonempty = 0
-    for start, stop in zip(offsets[:-1], offsets[1:]):
-        block = leaves[start:stop]
-        if block.size > 1:
-            nonempty += 1
-            assert (np.diff(block) > 0).all(), "cell block is not strictly ascending"
-    assert nonempty > 0, "fixture is too coarse to exercise multi-leaf cells"
 
 
 def test_freeze_invalidates_a_whole_origin_group_from_one_bad_vertex():

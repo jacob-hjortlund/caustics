@@ -17,8 +17,8 @@ from typing import Callable, NamedTuple, Tuple
 from ....backend_obj import ArrayLike, backend
 from .geometry import _CHILD_VERTEX_INDEX_TABLE, sanitize_bary, shape_matrix
 from .criterion import LEAF_CONVERGED
-from .mesh import MeshIndex, build_index
-from .query import _as_beta, index_hits
+from .index import MeshIndex, build_index, index_hits
+from .query import _as_beta
 
 __all__ = (
     "leaf_magnification",
@@ -207,9 +207,7 @@ def band_cover(mesh, index_cells=None) -> BandCover:
     return BandCover(
         vertices=band.source,
         triangles=triangles,
-        index=build_index(
-            band.source, triangles, backend.flatnonzero(finite), index_cells
-        ),
+        index=build_index(band.source, triangles, backend.flatnonzero(finite)),
     )
 
 

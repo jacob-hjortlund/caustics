@@ -845,7 +845,7 @@ def test_dedup_mixes_singleton_and_clustered_blocks_in_order():
 
 
 def test_index_hits_are_the_query_hits_with_raw_weights(mesh, beta):
-    from caustics.lenses.func.adaptive.query import index_hits
+    from caustics.lenses.func.adaptive.index import index_hits
 
     qidx, tri, w = index_hits(mesh.index, mesh.vertices_source, mesh.leaves, beta)
     idx, off, _ = mesh_query(mesh, beta)
