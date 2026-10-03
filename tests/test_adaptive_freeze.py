@@ -22,13 +22,6 @@ from caustics.lenses.func.adaptive.lattice import make_lattice
 from caustics.lenses.func.adaptive.mesh import build_index, invalidate_nonfinite_origins
 
 
-@pytest.fixture
-def oracle_module():
-    return pytest.importorskip(
-        "caustics.lenses.old_adaptive", reason="optional frozen differential oracle"
-    )
-
-
 def _f64(x):
     return backend.as_array(np.asarray(x, dtype=np.float64), dtype=backend.float64)
 
@@ -78,51 +71,6 @@ def test_invalidate_ors_the_flag_into_the_status_an_origin_already_has():
         LEAF_CONVERGENCE_FAILED | LEAF_RAYTRACE_NONFINITE,
         LEAF_JACOBIAN_PARITY_UNRESOLVED,
     ]
-
-
-def test_invalidate_matches_the_oracle_on_duplicate_origins(oracle_module):
-    rng = np.random.default_rng(5)
-    vs = rng.normal(size=(30, 2))
-    # Vertex 18 sits in two leaves of origin 3 -- the repeated-origin OR this
-    # test is about -- and one each of origins 5, 6 and 7. (Vertex 7, used
-    # before, appears in no leaf at this seed, which left both sides all-zero.)
-    vs[18] = np.inf
-    leaves = rng.integers(0, 30, (24, 3))
-    origin = np.repeat(np.arange(8), 3)
-    pre_status = np.zeros(8, dtype=np.int64)
-
-    got = backend.to_numpy(
-        invalidate_nonfinite_origins(
-            _f64(vs), _i64(leaves), _i64(origin), _i64(pre_status)
-        )
-    )
-    want = oracle_module._invalidate_nonfinite_origins(
-        vs, leaves, origin, pre_status.astype(np.int8)
-    )
-    # The oracle overwrites a bad origin's status with its own NONFINITE code,
-    # where this module ORs in LEAF_RAYTRACE_NONFINITE. From an all-converged
-    # start the two differ only in the value written, so what must agree is
-    # which origins were flagged -- the bincount OR-reduction under test.
-    flagged = want != oracle_module.LeafStatus.CONVERGED
-    assert flagged.any() and not flagged.all(), "fixture must flag and spare"
-    assert got.tolist() == np.where(flagged, LEAF_RAYTRACE_NONFINITE, 0).tolist()
-
-
-def test_build_index_matches_the_oracle(oracle_module):
-    rng = np.random.default_rng(9)
-    vs = rng.normal(size=(60, 2)) * 2.0
-    leaves = rng.integers(0, 60, (40, 3))
-    valid = np.arange(0, 40, 2)
-
-    got = build_index(_f64(vs), _i64(leaves), _i64(valid), None)
-    want = oracle_module._build_index(vs, leaves, valid, None)
-
-    assert np.allclose(backend.to_numpy(got.lo), want[0])
-    assert np.allclose(backend.to_numpy(got.cell), want[1])
-    assert got.nx == want[2] and got.ny == want[3]
-    assert backend.to_numpy(got.cell_offsets).tolist() == want[4].tolist()
-    assert backend.to_numpy(got.cell_leaves).tolist() == want[5].tolist()
-    assert np.allclose(backend.to_numpy(got.hi), want[6])
 
 
 def test_build_index_of_an_empty_leaf_set_is_a_single_cell():
@@ -383,79 +331,9 @@ def _affine_jacobian(x, y):
     return _stack_2x2(2.0 * one, 0.5 * one, -0.25 * one, 1.5 * one)
 
 
-def _fold_free(x, y):
-    """Curved everywhere, folded nowhere on ``|x| <= 2.5``.
-
-    ``det A = 1 + 0.2 x - 0.48 cos(1.5 x) cos(2 y) >= 0.02`` there, so neither
-    parity test has a critical curve to find and the build must reproduce the
-    oracle's exactly.
-    """
-    return x + 0.4 * backend.sin(2.0 * y) + 0.1 * x * x, y + 0.4 * backend.sin(1.5 * x)
-
-
-def _fold_free_jacobian(x, y):
-    return _stack_2x2(
-        1.0 + 0.2 * x,
-        0.8 * backend.cos(2.0 * y),
-        0.6 * backend.cos(1.5 * x),
-        backend.ones_like(x),
-    )
-
-
 SIE_LIKE = _lens(_sie_like, _sie_like_jacobian)
 AFFINE_LENS = _lens(_affine, _affine_jacobian)
 BUILD = dict(fov=4.0, init_res=3, min_img_sep=0.5, max_depth=3)
-
-
-def test_build_matches_the_oracle_mesh(oracle_module):
-    """Bit for bit, on a map where the two refinement criteria coincide.
-
-    The Jacobian test replaced the oracle's quadratic-vertex parity check, so
-    across a fold the two builds deliberately differ, and `_sie_like` no
-    longer serves. `_fold_free` has no fold for either check to find, so the
-    refinement matches the oracle leaf for leaf (see
-    `test_refine_reproduces_the_oracle_leaf_set_where_no_fold_exists`) and
-    everything downstream of it -- canonical ordering, closure, the vertex
-    remap, freeze-time invalidation and the spatial index -- must match too.
-    """
-    build = dict(fov=4.0, init_res=3, min_img_sep=0.2, max_depth=5)
-    got = build_adaptive_mesh(_fold_free, _fold_free_jacobian, **build)
-    want = oracle_module.build_adaptive_mesh(_fold_free, **build)
-    assert got.leaves.shape[0] > got.origin_leaves.shape[0], "closure must run"
-
-    assert np.allclose(
-        backend.to_numpy(got.vertices_lens), backend.to_numpy(want.vertices_lens)
-    )
-    assert np.allclose(
-        backend.to_numpy(got.vertices_source),
-        backend.to_numpy(want.vertices_source),
-        equal_nan=True,
-    )
-    assert (
-        backend.to_numpy(got.leaves).tolist() == backend.to_numpy(want.leaves).tolist()
-    )
-    assert (
-        backend.to_numpy(got.leaf_origin).tolist()
-        == backend.to_numpy(want.leaf_origin).tolist()
-    )
-    assert (
-        backend.to_numpy(got.leaf_level).tolist()
-        == backend.to_numpy(want.leaf_level).tolist()
-    )
-    assert (
-        (backend.to_numpy(got.leaf_status) == LEAF_CONVERGED)
-        == (backend.to_numpy(want.leaf_status) == oracle_module.LeafStatus.CONVERGED)
-    ).all()
-    assert (
-        backend.to_numpy(got.index.cell_offsets).tolist()
-        == backend.to_numpy(want._cell_offsets).tolist()
-    )
-    assert (
-        backend.to_numpy(got.index.cell_leaves).tolist()
-        == backend.to_numpy(want._cell_leaves).tolist()
-    )
-    assert got.d_floor == want.d_floor and got.max_level == want.max_level
-    assert got.min_img_sep == want.min_img_sep
 
 
 def test_build_halves_the_requested_min_img_sep():

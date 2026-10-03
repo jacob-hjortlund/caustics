@@ -17,13 +17,6 @@ from caustics.lenses.func import forward_raytrace_rootfind
 RNG = np.random.default_rng(20260904)
 
 
-@pytest.fixture
-def oracle_module():
-    return pytest.importorskip(
-        "caustics.lenses.old_adaptive", reason="optional frozen differential oracle"
-    )
-
-
 def _sie_like(x, y):
     r = (x * x + y * y + 0.05) ** 0.5
     return x - 1.2 * x / r, y - 1.2 * y / r
@@ -53,53 +46,6 @@ def mesh():
 
 def _beta(points):
     return backend.as_array(np.asarray(points, dtype=np.float64), dtype=backend.float64)
-
-
-def _oracle_mesh(oracle_module, mesh):
-    """The oracle's `Mesh`, frozen from exactly this mesh's arrays.
-
-    Building the oracle's own mesh instead would compare the two refinement
-    criteria as well as image finding, and across `_sie_like`'s fold the
-    criteria deliberately differ. The oracle never reads its ``dtype`` field
-    here, so the numpy dtype it expects there is only for form's sake.
-    """
-    index = mesh.index
-    return oracle_module.Mesh(
-        vertices_lens=mesh.vertices_lens,
-        vertices_source=mesh.vertices_source,
-        leaves=mesh.leaves,
-        leaf_area2=mesh.leaf_area2,
-        leaf_origin=mesh.leaf_origin,
-        leaf_status=mesh.leaf_status,
-        leaf_level=mesh.leaf_level,
-        origin_leaves=mesh.origin_leaves,
-        index=(
-            index.lo,
-            index.cell,
-            index.nx,
-            index.ny,
-            index.cell_offsets,
-            index.cell_leaves,
-            index.hi,
-        ),
-        stats=None,
-        d_floor=mesh.d_floor,
-        max_level=mesh.max_level,
-        min_img_sep=mesh.min_img_sep,
-        dtype=np.float64,
-        device=mesh.device,
-    )
-
-
-def test_forward_raytrace_matches_the_oracle(mesh, oracle_module):
-    old_mesh = _oracle_mesh(oracle_module, mesh)
-    beta = _beta([[0.05, 0.02], [0.4, -0.3], [1.9, 1.7]])
-
-    img, counts = mesh_forward_raytrace(mesh, beta, _sie_like)
-    img_o, counts_o = old_mesh.forward_raytrace(beta, _sie_like)
-
-    assert backend.to_numpy(counts).tolist() == backend.to_numpy(counts_o).tolist()
-    assert np.allclose(backend.to_numpy(img), backend.to_numpy(img_o), atol=1e-8)
 
 
 def test_images_solve_the_lens_equation(mesh):

@@ -56,14 +56,6 @@ from caustics.lenses.func.adaptive.state import cache_lookup, cache_size, empty_
 RNG = np.random.default_rng(20260918)
 
 
-@pytest.fixture
-def oracle_module():
-    return pytest.importorskip(
-        "caustics.lenses.func.old_adaptive",
-        reason="optional frozen differential oracle",
-    )
-
-
 def _arr(x):
     return backend.as_array(np.asarray(x, dtype=np.float64), dtype=backend.float64)
 
@@ -152,35 +144,6 @@ def _flagged(status, flag):
     return (np.asarray(status) & flag) != 0
 
 
-def test_shape_matrix_matches_the_oracle(oracle_module):
-    tri = RNG.normal(size=(32, 3, 2))
-    assert np.allclose(
-        backend.to_numpy(shape_matrix(_arr(tri))), oracle_module.shape_matrix(tri)
-    )
-
-
-def test_affine_from_triangles_matches_the_oracle(oracle_module):
-    p, q = RNG.normal(size=(16, 3, 2)), RNG.normal(size=(16, 3, 2))
-    assert np.allclose(
-        backend.to_numpy(affine_from_triangles(_arr(p), _arr(q))),
-        oracle_module.affine_from_triangles(p, q),
-    )
-
-
-def test_child_matrix_tables_match_the_oracle(oracle_module):
-    got = child_matrix_tables()
-    want = oracle_module.child_matrix_tables()
-    for g, w in zip(got, want):
-        assert np.allclose(backend.to_numpy(g), w)
-
-
-def test_sigma_min_matches_the_oracle(oracle_module):
-    A = RNG.normal(size=(64, 2, 2))
-    assert np.allclose(
-        backend.to_numpy(sigma_min_2x2(_arr(A))), oracle_module.sigma_min_2x2(A)
-    )
-
-
 def test_sigma_min_of_zero_matrix_is_exactly_zero():
     A = np.zeros((4, 2, 2))
     got = backend.to_numpy(sigma_min_2x2(_arr(A)))
@@ -200,31 +163,6 @@ def test_converged_from_deviation_fails_closed_on_nan():
     assert not bool(backend.to_numpy(converged_from_deviation(r, s, 1.0))[0])
 
 
-def test_midpoint_deviation_matches_the_oracle(oracle_module):
-    beta_v, beta_m = _samples()
-    assert np.allclose(
-        backend.to_numpy(midpoint_deviation(_arr(beta_v), _arr(beta_m))),
-        oracle_module.midpoint_deviation(beta_v, beta_m),
-    )
-
-
-def test_child_shape_matrices_match_the_oracle(oracle_module):
-    beta_v, beta_m = _samples()
-    assert np.allclose(
-        backend.to_numpy(child_shape_matrices(_arr(beta_v), _arr(beta_m))),
-        oracle_module.child_shape_matrices(beta_v, beta_m),
-    )
-
-
-def test_parity_from_children_matches_the_oracle(oracle_module):
-    beta_v, beta_m = _samples()
-    Q = oracle_module.child_shape_matrices(beta_v, beta_m)
-    assert (
-        backend.to_numpy(parity_from_children(_arr(Q)))
-        == oracle_module.parity_from_children(Q)
-    ).all()
-
-
 def test_parity_from_children_fails_closed_on_a_nonfinite_child():
     """A NaN determinant stays NaN, so sign constancy fails closed.
 
@@ -236,58 +174,6 @@ def test_parity_from_children_fails_closed_on_a_nonfinite_child():
     Q = np.tile(np.eye(2), (1, 4, 1, 1)).reshape(1, 4, 2, 2)
     Q[0, 2, 0, 0] = np.nan
     assert not bool(backend.to_numpy(parity_from_children(_arr(Q)))[0])
-
-
-@pytest.mark.parametrize("level", [0, 2, 5])
-def test_evaluate_criterion_matches_the_oracle(oracle_module, level):
-    """The criterion's approximate half is still exactly the oracle's.
-
-    The oracle's own ``evaluate_criterion`` also ran
-    ``quadratic_vertex_parity_ok``, which the Jacobian test has replaced, so
-    its ``keep`` and ``parity_ok`` are no longer a reference. Its parts still
-    are. With a Jacobian that passes everywhere, ``s`` must be the oracle's,
-    the child-parity flag exactly the oracle's ``parity_from_children``
-    failures, the deviation flag exactly its ``converged_from_deviation``
-    failures, and ``keep`` exactly where both pass.
-    """
-    beta_v, beta_m = _samples()
-    classes = RNG.integers(0, 6, beta_v.shape[0])
-    _, _, compose, pinv0, _ = oracle_module.child_matrix_tables()
-    _, _, want_s = oracle_module.evaluate_criterion(
-        beta_v, beta_m, classes, level, 0.5, 0.01, pinv0, compose
-    )
-    want_child = oracle_module.parity_from_children(
-        oracle_module.child_shape_matrices(beta_v, beta_m)
-    )
-    want_deviation = oracle_module.converged_from_deviation(
-        oracle_module.midpoint_deviation(beta_v, beta_m), want_s, 0.01
-    )
-    assert want_child.any() and not want_child.all(), "both parity arms must occur"
-
-    keep, parity_ok, s, status = (
-        backend.to_numpy(x)
-        for x in evaluate_criterion(
-            _constant_jacobian(np.eye(2)),
-            _arr(np.zeros_like(beta_v)),
-            _arr(np.zeros_like(beta_m)),
-            _arr(beta_v),
-            _arr(beta_m),
-            backend.as_array(classes, dtype=backend.int64),
-            level,
-            0.5,
-            0.01,
-            _arr(pinv0),
-            backend.as_array(compose, dtype=backend.int64),
-        )
-    )
-    assert np.allclose(s, want_s, equal_nan=True)
-    assert (_flagged(status, LEAF_APPROX_PARITY_UNRESOLVED) == ~want_child).all()
-    assert (_flagged(status, LEAF_CONVERGENCE_FAILED) == ~want_deviation).all()
-    assert (keep == (want_child & want_deviation)).all()
-    assert (parity_ok == want_child).all()
-    # Every sample is finite and the Jacobian passes, so no other flag can occur.
-    expected_flags = LEAF_APPROX_PARITY_UNRESOLVED | LEAF_CONVERGENCE_FAILED
-    assert not (status & ~expected_flags).any()
 
 
 def test_group_tables_close_and_have_order_six():

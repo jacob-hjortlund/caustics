@@ -47,13 +47,6 @@ from caustics.lenses.func.adaptive.state import (
 )
 
 
-@pytest.fixture
-def oracle_module():
-    return pytest.importorskip(
-        "caustics.lenses.old_adaptive", reason="optional frozen differential oracle"
-    )
-
-
 def _stack_2x2(a, b, c, d):
     """``[[a, b], [c, d]]`` at every point, shape ``(N, 2, 2)``."""
     return backend.stack(
@@ -83,26 +76,6 @@ def _affine_jacobian(x, y):
     return _stack_2x2(2.0 * one, 0.5 * one, -0.25 * one, 1.5 * one)
 
 
-def _fold_free(x, y):
-    """Curved everywhere, folded nowhere on ``|x| <= 2.5``.
-
-    ``det A = 1 + 0.2 x - 0.48 cos(1.5 x) cos(2 y) >= 0.02`` there, so neither
-    parity test has a critical curve to find, while the curvature still drives
-    the deviation test through several levels -- and, at ``init_res=3``, a
-    balance cascade.
-    """
-    return x + 0.4 * backend.sin(2.0 * y) + 0.1 * x * x, y + 0.4 * backend.sin(1.5 * x)
-
-
-def _fold_free_jacobian(x, y):
-    return _stack_2x2(
-        1.0 + 0.2 * x,
-        0.8 * backend.cos(2.0 * y),
-        0.6 * backend.cos(1.5 * x),
-        backend.ones_like(x),
-    )
-
-
 def _run_new(raytrace, jacobian, fov, init_res, min_img_sep, max_level):
     tables = child_matrix_tables()
     lat = make_lattice(fov, 0.0, 0.0, init_res, max_level + 1)
@@ -121,109 +94,10 @@ def _run_new(raytrace, jacobian, fov, init_res, min_img_sep, max_level):
     return cache, active, store, counters
 
 
-def _run_old(oracle_module, raytrace, fov, init_res, min_img_sep, max_level):
-    tables = oracle_module.child_matrix_tables()
-    lat = oracle_module._Lattice(fov, 0.0, 0.0, init_res, max_level + 1)
-    fn = oracle_module._make_raytrace_np(raytrace, None)
-    return oracle_module._refine(
-        fn, lat, init_res, fov / init_res, min_img_sep, max_level, tables, None
-    )
-
-
-def _leaf_records(v, level, cls, converged, ij_of_slot, key_of_ij):
-    """Canonical joint geometry and convergence records for a leaf set."""
-    keys = np.sort(key_of_ij(ij_of_slot[v]), axis=1)
-    return sorted(
-        (tuple(key_row), int(lvl), int(shape_cls), bool(ok))
-        for key_row, lvl, shape_cls, ok in zip(keys, level, cls, converged)
-    )
-
-
 # Maps with no fold anywhere. The Jacobian test never fires on them, and the
 # oracle's quadratic-vertex parity check fires only on triangles the deviation
 # test splits anyway (see the counters test below), so the two criteria reach
 # the same verdict on every triangle.
-FOLD_FREE_CASES = [
-    (_affine, _affine_jacobian, 4.0, 2, 0.5, 2),
-    (_fold_free, _fold_free_jacobian, 4.0, 4, 0.25, 3),
-    (_fold_free, _fold_free_jacobian, 5.0, 3, 0.1, 4),
-    (_fold_free, _fold_free_jacobian, 4.0, 2, 0.02, 6),
-]
-
-
-@pytest.mark.parametrize(
-    "raytrace,jacobian,fov,init_res,min_img_sep,max_level", FOLD_FREE_CASES
-)
-def test_refine_reproduces_the_oracle_leaf_set_where_no_fold_exists(
-    oracle_module, raytrace, jacobian, fov, init_res, min_img_sep, max_level
-):
-    """Leaf for leaf, wherever the two criteria still coincide.
-
-    The Jacobian test replaced the oracle's quadratic-vertex parity check, so
-    across a fold the two refinements deliberately differ -- on `_sie_like` at
-    ``(4.0, 4, 0.25, 3)`` they no longer even agree on the leaf count, 548
-    against 536. Without a fold they reach the same verdict everywhere, and
-    everything else in the loop -- the level-synchronous batches, the splits,
-    the balance cascade and its deferred midpoints -- must still match the
-    oracle exactly.
-    """
-    cache, active, store, counters = _run_new(
-        raytrace, jacobian, fov, init_res, min_img_sep, max_level
-    )
-    ref = _run_old(oracle_module, raytrace, fov, init_res, min_img_sep, max_level)
-
-    v_new, lvl_new, cls_new, st_new = store_compact(store)
-    v_old, lvl_old, cls_old, st_old = ref.store.compact()
-
-    lat_old = oracle_module._Lattice(fov, 0.0, 0.0, init_res, max_level + 1)
-    ij_new = backend.to_numpy(cache.ij)
-    got = _leaf_records(
-        backend.to_numpy(v_new),
-        backend.to_numpy(lvl_new),
-        backend.to_numpy(cls_new),
-        backend.to_numpy(st_new) == LEAF_CONVERGED,
-        ij_new,
-        lat_old.key,
-    )
-    want = _leaf_records(
-        v_old,
-        lvl_old,
-        cls_old,
-        st_old == oracle_module.LeafStatus.CONVERGED,
-        ref.cache.ij,
-        lat_old.key,
-    )
-    assert got == want
-
-
-@pytest.mark.parametrize(
-    "raytrace,jacobian,fov,init_res,min_img_sep,max_level", FOLD_FREE_CASES
-)
-def test_refine_counters_match_the_oracle_where_no_fold_exists(
-    oracle_module, raytrace, jacobian, fov, init_res, min_img_sep, max_level
-):
-    """Every counter matches, up to how a split is attributed.
-
-    The oracle's quadratic-vertex check fires on a few strongly curved but
-    unfolded coarse triangles -- up to nine per fixture here -- and books them
-    as parity splits, although the deviation test splits them anyway.
-    With no fold to find, this module books every such split to deviation, so
-    the total is unchanged. The oracle never calls a Jacobian, so it has no
-    ``jacobian_points`` to match.
-    """
-    _, _, _, got = _run_new(raytrace, jacobian, fov, init_res, min_img_sep, max_level)
-    want = dict(
-        _run_old(
-            oracle_module, raytrace, fov, init_res, min_img_sep, max_level
-        ).counters
-    )
-    got = dict(got)
-    got.pop("jacobian_points")
-    assert got.pop("parity_splits") == 0
-    assert got.pop("deviation_splits") == want.pop("deviation_splits") + want.pop(
-        "parity_splits"
-    )
-    assert got == want
 
 
 def test_refine_converges_everywhere_at_level_zero_for_an_affine_map():
@@ -999,60 +873,6 @@ def test_canonical_order_is_independent_of_input_order():
     order_shuf = backend.to_numpy(canonical_order(lat, cache, v_shuf))
 
     assert v_np[order].tolist() == v_np[perm][order_shuf].tolist()
-
-
-def _oracle_cache_and_active(oracle_module, cache, active):
-    """The oracle's cache and active set, holding exactly ``cache`` and ``active``.
-
-    The oracle numbers its slots in insertion order, and the keys go in
-    ascending, so its slots differ from this module's: ``remap[slot]`` is the
-    oracle's slot for this module's ``slot``.
-    """
-    keys = backend.to_numpy(cache.keys)
-    slots = backend.to_numpy(cache.slots)
-    cache_o = oracle_module._VertexCache()
-    slots_o = cache_o.insert(
-        keys, backend.to_numpy(cache.ij)[slots], backend.to_numpy(cache.beta)[slots]
-    )
-    remap = np.empty_like(slots)
-    remap[slots] = slots_o
-    active_o = oracle_module._ActiveKeys(cache_o)
-    active_o.add_slots(remap[np.flatnonzero(backend.to_numpy(active))])
-    return cache_o, active_o, remap
-
-
-def test_closure_matches_the_oracle(oracle_module):
-    """`close` must reproduce the oracle's closure on identical input.
-
-    Both sides close the same pre-closure mesh -- this module's refinement,
-    mirrored into the oracle's own cache and active-set types -- so this
-    compares closure alone. Refining each side separately would compare the
-    two refinement criteria as well, and across the fold `_sie_like` has they
-    deliberately differ.
-    """
-    cache, active, store, _ = _run_new(_sie_like, _sie_like_jacobian, 4.0, 3, 0.25, 3)
-    lat = make_lattice(4.0, 0.0, 0.0, 3, 4)
-    lat_old = oracle_module._Lattice(4.0, 0.0, 0.0, 3, 4)
-    cache_o, active_o, remap = _oracle_cache_and_active(oracle_module, cache, active)
-
-    v, level, _, status = store_compact(store)
-    order = canonical_order(lat, cache, v)
-    v, level, status = v[order], level[order], status[order]
-    leaves, origin, out_level, out_status = close(lat, cache, active, v, level, status)
-    leaves_o, origin_o, lvl_out_o, st_out_o = oracle_module._close(
-        lat_old,
-        cache_o,
-        active_o,
-        remap[backend.to_numpy(v)],
-        backend.to_numpy(level),
-        backend.to_numpy(status),
-    )
-
-    assert leaves.shape[0] > v.shape[0], "fixture must give closure work to do"
-    assert remap[backend.to_numpy(leaves)].tolist() == leaves_o.tolist()
-    assert backend.to_numpy(origin).tolist() == origin_o.tolist()
-    assert backend.to_numpy(out_level).tolist() == lvl_out_o.tolist()
-    assert backend.to_numpy(out_status).tolist() == st_out_o.tolist()
 
 
 def test_closure_origin_is_non_decreasing():

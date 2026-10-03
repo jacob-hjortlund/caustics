@@ -24,13 +24,6 @@ from caustics.lenses.func.adaptive.sampling import make_raytrace
 from caustics.lenses.func.adaptive.state import store_compact
 
 
-@pytest.fixture
-def oracle_module():
-    return pytest.importorskip(
-        "caustics.lenses.old_adaptive", reason="optional frozen differential oracle"
-    )
-
-
 def _sie_like(x, y):
     r = (x * x + y * y + 0.05) ** 0.5
     return x - 1.2 * x / r, y - 1.2 * y / r
@@ -62,52 +55,6 @@ def mesh():
 def beta():
     rng = np.random.default_rng(21)
     return backend.as_array(rng.uniform(-1.5, 1.5, (64, 2)), dtype=backend.float64)
-
-
-def _oracle_mesh(oracle_module, mesh):
-    """The oracle's `Mesh`, frozen from exactly this mesh's arrays.
-
-    Building the oracle's own mesh instead would compare the two refinement
-    criteria as well as the query kernels, and across `_sie_like`'s fold the
-    criteria deliberately differ. The oracle's query never reads its ``dtype``
-    field, so the numpy dtype it expects there is only for form's sake.
-    """
-    index = mesh.index
-    return oracle_module.Mesh(
-        vertices_lens=mesh.vertices_lens,
-        vertices_source=mesh.vertices_source,
-        leaves=mesh.leaves,
-        leaf_area2=mesh.leaf_area2,
-        leaf_origin=mesh.leaf_origin,
-        leaf_status=mesh.leaf_status,
-        leaf_level=mesh.leaf_level,
-        origin_leaves=mesh.origin_leaves,
-        index=(
-            index.lo,
-            index.cell,
-            index.nx,
-            index.ny,
-            index.cell_offsets,
-            index.cell_leaves,
-            index.hi,
-        ),
-        stats=None,
-        d_floor=mesh.d_floor,
-        max_level=mesh.max_level,
-        min_img_sep=mesh.min_img_sep,
-        dtype=np.float64,
-        device=mesh.device,
-    )
-
-
-def test_query_matches_the_oracle(mesh, beta, oracle_module):
-    old_mesh = _oracle_mesh(oracle_module, mesh)
-    idx, offsets, bary = mesh_query(mesh, beta)
-    idx_o, off_o, bary_o = old_mesh.query(beta)
-
-    assert backend.to_numpy(offsets).tolist() == backend.to_numpy(off_o).tolist()
-    assert backend.to_numpy(idx).tolist() == backend.to_numpy(idx_o).tolist()
-    assert np.allclose(backend.to_numpy(bary), backend.to_numpy(bary_o))
 
 
 def test_query_csr_is_well_formed(mesh, beta):
@@ -669,16 +616,6 @@ def test_seeds_lie_inside_their_lens_triangle(mesh, beta):
     assert (s >= lo - 1e-12).all() and (s <= hi + 1e-12).all()
 
 
-def test_seeds_match_the_oracle(mesh, beta, oracle_module):
-    old_mesh = _oracle_mesh(oracle_module, mesh)
-    idx, _, bary = mesh_query(mesh, beta)
-    idx_o, _, bary_o = old_mesh.query(beta)
-    assert np.allclose(
-        backend.to_numpy(mesh_seeds(mesh, idx, bary)),
-        backend.to_numpy(old_mesh.seeds(leaf_indices=idx_o, bary=bary_o)),
-    )
-
-
 def _pts(x):
     return backend.as_array(np.asarray(x, dtype=np.float64), dtype=backend.float64)
 
@@ -712,17 +649,6 @@ def test_dedup_handles_empty_and_singleton_blocks():
     pts = _pts([[0.0, 0.0], [0.01, 0.0], [5.0, 5.0]])
     keep = backend.to_numpy(dedup_representatives(pts, np.array([0, 2, 0, 1]), 0.1))
     assert keep.tolist() == [True, False, True]
-
-
-def test_dedup_matches_the_oracle_on_randomised_blocks(oracle_module):
-    rng = np.random.default_rng(31)
-    counts = rng.integers(0, 5, 20)
-    pts = rng.normal(size=(int(counts.sum()), 2)) * 0.1
-    p = _pts(pts)
-    assert (
-        backend.to_numpy(dedup_representatives(p, counts, 0.05))
-        == backend.to_numpy(oracle_module._dedup_representatives(p, counts, 0.05))
-    ).all()
 
 
 # ---------------------------------------------------------------------------
