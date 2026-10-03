@@ -9,7 +9,13 @@ converge.
 """
 
 from ....backend_obj import backend
-from .geometry import CHILD_VERTEX_INDICES, jacobian_signs, sigma_min_2x2
+from .geometry import (
+    CHILD_VERTEX_INDICES,
+    COMPOSE,
+    PINV0,
+    jacobian_signs,
+    sigma_min_2x2,
+)
 
 __all__ = (
     "LEAF_CONVERGED",
@@ -29,6 +35,7 @@ __all__ = (
     "jacobian_rows",
     "apply_jacobian_signs",
     "evaluate_criterion",
+    "lens_status",
 )
 
 
@@ -638,3 +645,69 @@ def evaluate_criterion(
         signs = jacobian_signs(jacobian[rows].reshape(-1, 2, 2)).reshape(-1, 6)
     keep, parity_ok, status = apply_jacobian_signs(status, child_ok, rows, signs)
     return keep, parity_ok, s, status
+
+
+def lens_status(beta6, det6, cls, level, h0, min_img_sep):
+    """
+    Why each triangle's affine model of the lens map is not trusted, as a ``LEAF_*`` bitmask.
+
+    ``LEAF_CONVERGED`` -- zero -- only where every one of these holds:
+
+    - every image is finite; otherwise ``LEAF_RAYTRACE_NONFINITE`` is the
+      row's only flag;
+    - the four red-split children's source-plane edge matrices share a
+      sign of determinant (``LEAF_APPROX_PARITY_UNRESOLVED``);
+    - every mapped midpoint lies within ``s * min_img_sep`` of its affine
+      prediction, ``s`` the smallest singular value of the children's
+      affine maps (``LEAF_CONVERGENCE_FAILED``);
+    - ``det A`` is finite and nonzero at all six samples
+      (``LEAF_JACOBIAN_NONFINITE``) and of one sign
+      (``LEAF_JACOBIAN_PARITY_UNRESOLVED``).
+
+    Parameters
+    ----------
+    beta6: ArrayLike
+        ``(n, 6, 2)`` images at ``theta_1, theta_2, theta_3, m_1, m_2, m_3``,
+        ``m_i`` opposite ``theta_i``.
+
+        *Unit: arcsec*
+    det6: ArrayLike
+        ``(n, 6)`` ``det A`` at the same samples.
+    cls: ArrayLike
+        ``(n,)`` int64 orientation classes.
+    level: ArrayLike
+        ``(n,)`` int64 refinement levels.
+    h0: float
+        Level-0 cell size.
+
+        *Unit: arcsec*
+    min_img_sep: float
+        Lens-plane tolerance.
+
+        *Unit: arcsec*
+
+    Returns
+    -------
+    ArrayLike
+        ``(n,)`` int64.
+    """
+    beta_v, beta_m = beta6[:, :3], beta6[:, 3:]
+    Q = child_shape_matrices(beta_v, beta_m)
+    s = (
+        backend.min(sigma_min_2x2(Q @ PINV0[COMPOSE[cls]]), dim=1)
+        * backend.to(2 ** (level + 1), dtype=backend.float64)
+        / h0
+    )
+    deviation_ok = converged_from_deviation(
+        midpoint_deviation(beta_v, beta_m), s, min_img_sep
+    )
+    det_ok = backend.all(backend.isfinite(det6) & (det6 != 0), dim=1)
+    one_sign = backend.all(det6 > 0, dim=1) | backend.all(det6 < 0, dim=1)
+    status = (
+        backend.long(~parity_from_children(Q)) * LEAF_APPROX_PARITY_UNRESOLVED
+        | backend.long(~deviation_ok) * LEAF_CONVERGENCE_FAILED
+        | backend.long(~det_ok) * LEAF_JACOBIAN_NONFINITE
+        | backend.long(det_ok & ~one_sign) * LEAF_JACOBIAN_PARITY_UNRESOLVED
+    )
+    finite = backend.all(backend.isfinite(beta6), dim=(1, 2))
+    return backend.where(finite, status, LEAF_RAYTRACE_NONFINITE)

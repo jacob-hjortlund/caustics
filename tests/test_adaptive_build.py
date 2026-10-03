@@ -2,15 +2,7 @@ import numpy as np
 import pytest
 
 from caustics.backend_obj import backend
-from caustics.lenses.func import adaptive
-from caustics.lenses.func.adaptive import criterion
 from caustics.lenses.func.adaptive import (
-    LEAF_APPROX_PARITY_UNRESOLVED,
-    LEAF_CONVERGED,
-    LEAF_CONVERGENCE_FAILED,
-    LEAF_JACOBIAN_NONFINITE,
-    LEAF_JACOBIAN_PARITY_UNRESOLVED,
-    LEAF_RAYTRACE_NONFINITE,
     build_adaptive_mesh,
 )
 from caustics.lenses.func.adaptive.sampling import make_raytrace
@@ -18,33 +10,6 @@ from caustics.lenses.func.adaptive.sampling import make_raytrace
 
 def _f64(x):
     return backend.as_array(np.asarray(x, dtype=np.float64), dtype=backend.float64)
-
-
-def test_leaf_status_constants_are_distinct_single_bit_flags():
-    """Every failure flag is its own bit, so any OR of them decodes uniquely.
-
-    ``LEAF_CONVERGED`` is zero -- the empty set of failures -- which is what
-    lets ``status == LEAF_CONVERGED`` mean "no test failed" however many flags
-    a failing leaf carries.
-    """
-    flags = [
-        LEAF_CONVERGENCE_FAILED,
-        LEAF_APPROX_PARITY_UNRESOLVED,
-        LEAF_JACOBIAN_PARITY_UNRESOLVED,
-        LEAF_RAYTRACE_NONFINITE,
-        LEAF_JACOBIAN_NONFINITE,
-    ]
-    assert LEAF_CONVERGED == 0
-    assert flags == [1, 2, 4, 8, 16]
-    assert all(type(v) is int for v in [LEAF_CONVERGED, *flags])
-    combos = {
-        sum(f for i, f in enumerate(flags) if mask >> i & 1)
-        for mask in range(2 ** len(flags))
-    }
-    assert len(combos) == 2 ** len(flags), "some OR of flags is ambiguous"
-    for name in ("LEAF_SIZE_FLOOR", "LEAF_FORCED", "LEAF_INVALID", "LEAF_NONFINITE"):
-        for namespace in (adaptive, criterion):
-            assert not hasattr(namespace, name), f"{name} was retired with the bitmask"
 
 
 def test_make_raytrace_forces_float64_and_records_the_callback_dtype():

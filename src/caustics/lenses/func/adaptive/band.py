@@ -21,6 +21,8 @@ __all__ = (
     "band_leaf_index",
     "band_sample_keys",
     "merge_bands",
+    "in_band",
+    "build_band",
 )
 
 
@@ -279,4 +281,52 @@ def merge_bands(lat, cache, store, first, second) -> CriticalBand:
         lens=lattice_xy(lat, lattice_ij_from_key(lat, keys)),
         source=source,
         det=det,
+    )
+
+
+def in_band(det6):
+    """
+    True where a leaf's six ``det A`` are finite and not all of one class.
+
+    A sample's class is ``det >= 0``: an exact zero counts as positive, which
+    keeps a critical curve through lattice points from vanishing.
+    """
+    positive = det6 >= 0
+    return (
+        backend.all(backend.isfinite(det6), dim=1)
+        & backend.any(positive, dim=1)
+        & backend.any(~positive, dim=1)
+    )
+
+
+def build_band(lat, leaves, keys6, table_keys, table_values):
+    """
+    The :class:`CriticalBand` of ``leaves``, its sample values read from a table.
+
+    Parameters
+    ----------
+    lat: Lattice
+    leaves: ArrayLike
+        ``(F,)`` int64 index of each band leaf into ``origin_leaves``.
+    keys6: ArrayLike
+        ``(F, 6)`` int64 lattice keys of each leaf's ``theta_1, theta_2,
+        theta_3, m_1, m_2, m_3``.
+    table_keys: ArrayLike
+        ``(T,)`` int64 ascending keys, holding every key of ``keys6``.
+    table_values: ArrayLike
+        ``(T, 3)`` float64 ``(bx, by, det A)`` at ``table_keys``.
+
+    Returns
+    -------
+    CriticalBand
+        With samples numbered in ascending key order.
+    """
+    keys, samples = backend.unique(keys6.reshape(-1), return_inverse=True)
+    values = table_values[backend.searchsorted(table_keys, keys)]
+    return CriticalBand(
+        leaves=leaves,
+        samples=samples.reshape(-1, 6),
+        lens=lattice_xy(lat, lattice_ij_from_key(lat, keys)),
+        source=values[:, :2],
+        det=values[:, 2],
     )
