@@ -68,16 +68,18 @@ def build_index(vertices, triangles, rows):
     -------
     MeshIndex
     """
-    tri = backend.to(vertices[triangles[rows]], dtype=backend.float64)
+    device = backend.device(vertices)
+    f64, int64 = backend.float64, backend.int64
+    tri = backend.to(vertices[triangles[rows]], dtype=f64)
     if tri.shape[0] == 0:
         return MeshIndex(
-            lo=backend.zeros((2,), dtype=backend.float64),
-            hi=backend.ones((2,), dtype=backend.float64),
-            cell=backend.ones((2,), dtype=backend.float64),
+            lo=backend.zeros((2,), dtype=f64, device=device),
+            hi=backend.ones((2,), dtype=f64, device=device),
+            cell=backend.ones((2,), dtype=f64, device=device),
             nx=1,
             ny=1,
-            cell_offsets=backend.zeros((2,), dtype=backend.int64),
-            cell_leaves=backend.empty((0,), dtype=backend.int64),
+            cell_offsets=backend.zeros((2,), dtype=int64, device=device),
+            cell_leaves=backend.zeros((0,), dtype=int64, device=device),
         )
     flat = tri.reshape(-1, 2)
     lo, hi = backend.min(flat, dim=0), backend.max(flat, dim=0)
@@ -85,13 +87,13 @@ def build_index(vertices, triangles, rows):
 
     span_np = backend.to_numpy(span)
     c = float(math.sqrt(span_np[0] * span_np[1] / tri.shape[0]))
-    c = max(c, float(backend.finfo(backend.float64).tiny))
+    c = max(c, float(backend.finfo(f64).tiny))
     nx = max(1, int(math.ceil(span_np[0] / c)))
     ny = max(1, int(math.ceil(span_np[1] / c)))
-    cell = span / backend.as_array([nx, ny], dtype=backend.float64)
+    cell = span / backend.as_array([nx, ny], dtype=f64, device=device)
 
-    upper = backend.as_array([nx - 1, ny - 1], dtype=backend.int64)
-    lower = backend.zeros((2,), dtype=backend.int64)
+    upper = backend.as_array([nx - 1, ny - 1], dtype=int64, device=device)
+    lower = backend.zeros((2,), dtype=int64, device=device)
     i0 = backend.clamp(
         backend.long((backend.min(tri, dim=1) - lo) / cell), lower, upper
     )
@@ -101,10 +103,10 @@ def build_index(vertices, triangles, rows):
     tall = i1[:, 1] - i0[:, 1] + 1
     counts = (i1[:, 0] - i0[:, 0] + 1) * tall
     owner = backend.repeat(
-        backend.arange(counts.shape[0], dtype=backend.int64), counts, axis=0
+        backend.arange(counts.shape[0], dtype=int64, device=device), counts, axis=0
     )
     total_pairs = int(backend.to_numpy(backend.sum(counts)))
-    within = backend.arange(total_pairs, dtype=backend.int64) - backend.repeat(
+    within = backend.arange(total_pairs, dtype=int64, device=device) - backend.repeat(
         backend.cumsum(counts, dim=0) - counts, counts, axis=0
     )
     cell_id = (i0[owner, 0] + within // tall[owner]) * ny + (

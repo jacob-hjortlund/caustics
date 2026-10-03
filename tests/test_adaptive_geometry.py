@@ -696,6 +696,28 @@ def test_build_index_of_an_empty_leaf_set_is_a_single_cell():
     assert to_np(idx.cell_leaves).size == 0
 
 
+@pytest.mark.skipif(
+    backend.backend != "torch", reason="needs torch's meta default device"
+)
+@pytest.mark.parametrize("n_rows", [0, 60], ids=["empty", "filled"])
+def test_build_index_allocates_on_its_inputs_device_not_the_default_one(n_rows):
+    """A mesh on another device is indexed at query time (``band_cover``).
+
+    With the default device set to ``meta``, anything ``build_index``
+    allocates without its inputs' device lands there and fails to mix.
+    """
+    import torch
+
+    rng = np.random.default_rng(13)
+    vs = f64(rng.normal(size=(50, 2)))
+    leaves = i64(rng.integers(0, 50, (60, 3)))
+    rows = i64(np.arange(n_rows))
+    with torch.device("meta"):
+        idx = build_index(vs, leaves, rows)
+    for name in ("lo", "hi", "cell", "cell_offsets", "cell_leaves"):
+        assert getattr(idx, name).device == vs.device, name
+
+
 def test_build_index_leaves_are_ascending_within_every_cell():
     rng = np.random.default_rng(13)
     vs = rng.normal(size=(50, 2))
