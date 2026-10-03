@@ -16,7 +16,6 @@ __all__ = (
     "CHILD_VERTEX_INDICES",
     "ROOT_SHAPES",
     "shape_matrix",
-    "affine_from_triangles",
     "child_matrix_tables",
     "sigma_min_2x2",
     "triangle_weights",
@@ -69,33 +68,6 @@ def shape_matrix(tri):
     return backend.stack(
         (tri[..., 1, :] - tri[..., 0, :], tri[..., 2, :] - tri[..., 0, :]), dim=-1
     )
-
-
-def affine_from_triangles(p, q):
-    """
-    Linear part of the affine map reproducing three vertex correspondences.
-
-    Invariant under any relabelling applied simultaneously to both triangles,
-    which is what makes the parity test immune to vertex ordering.
-
-    Parameters
-    ----------
-    p: ndarray
-        Lens-plane triangle, shape ``(..., 3, 2)``.
-
-        *Unit: arcsec*
-
-    q: ndarray
-        Source-plane triangle, shape ``(..., 3, 2)``.
-
-        *Unit: arcsec*
-
-    Returns
-    -------
-    ndarray
-        Shape ``(..., 2, 2)``.
-    """
-    return shape_matrix(q) @ backend.linalg.inv(shape_matrix(p))
 
 
 def _derive_child_matrices():
@@ -184,6 +156,69 @@ def child_matrix_tables() -> (
         root_class_values.append(match)
     ROOT_CLASS = backend.as_array(root_class_values, dtype=backend.int64)
     return M, G, COMPOSE, PINV0, ROOT_CLASS
+
+
+_, _, COMPOSE, PINV0, ROOT_CLASS = child_matrix_tables()
+
+
+def area2(tri):
+    """
+    Twice the signed area of each triangle.
+
+    Parameters
+    ----------
+    tri: ArrayLike
+        ``(K, 3, 2)`` vertices.
+
+        *Unit: arcsec*
+
+    Returns
+    -------
+    ArrayLike
+        ``(K,)``, positive for a counter-clockwise triangle.
+
+        *Unit: arcsec^2*
+    """
+    P = shape_matrix(tri)
+    return P[:, 0, 0] * P[:, 1, 1] - P[:, 0, 1] * P[:, 1, 0]
+
+
+def build_device():
+    """The backend's default device, where every build runs."""
+    return backend.device(backend.zeros((0,)))
+
+
+def to_device(value, device):
+    """
+    ``value`` on ``device``: an array, or a NamedTuple of arrays and NamedTuples, field by field.
+
+    Anything else is returned as it is.
+    """
+    if isinstance(value, tuple) and hasattr(value, "_fields"):
+        return type(value)(*(to_device(v, device) for v in value))
+    if hasattr(value, "shape"):
+        return backend.to(value, device=device)
+    return value
+
+
+def is_member(sorted_values, values):
+    """True where each of ``values`` is in the ascending ``sorted_values``."""
+    if sorted_values.shape[0] == 0:
+        return backend.zeros(
+            values.shape, dtype=backend.bool, device=backend.device(values)
+        )
+    pos = backend.clamp(
+        backend.searchsorted(sorted_values, values), 0, sorted_values.shape[0] - 1
+    )
+    return sorted_values[pos] == values
+
+
+def csr_offsets(counts):
+    """CSR offsets ``(n + 1,)`` of blocks of ``counts`` ``(n,)`` rows each."""
+    zero = backend.zeros((1,), dtype=backend.int64, device=backend.device(counts))
+    return backend.concatenate(
+        (zero, backend.cumsum(backend.long(counts), dim=0)), dim=0
+    )
 
 
 def sigma_min_2x2(A):

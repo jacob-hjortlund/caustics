@@ -145,10 +145,9 @@ def assert_meshes_equal(got, want):
     for name in AdaptiveMesh._fields:
         a, b = getattr(got, name), getattr(want, name)
         if name == "lattice":
-            assert (a.level, a.n, a.stride, a.scale) == (
+            assert (a.level, a.n, a.scale) == (
                 b.level,
                 b.n,
-                b.stride,
                 b.scale,
             )
             corners = backend.to(

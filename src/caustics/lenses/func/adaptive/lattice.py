@@ -9,6 +9,7 @@ test reads.
 
 import math
 from typing import NamedTuple, Tuple
+from warnings import warn
 
 from ....backend_obj import ArrayLike, backend
 from .geometry import ROOT_SHAPES
@@ -16,6 +17,10 @@ from .geometry import ROOT_SHAPES
 __all__ = (
     "MAX_KEY",
     "depth_floor",
+    "warn_depth_limited",
+    "lattice_h0",
+    "lattice_fov",
+    "lattice_init_res",
     "check_lattice_keys",
     "Lattice",
     "make_lattice",
@@ -34,18 +39,51 @@ __all__ = (
 MAX_KEY = 2**63 - 1
 
 
-def depth_floor(fov, init_res, min_img_sep) -> int:
-    """
-    Level at which the longest leaf edge first falls to ``min_img_sep``.
-
-    Red refinement makes every child similar to its parent with ratio 1/2, so
-    ``l_max`` is a function of level alone and the size floor is a depth computable
-    up front. ``sqrt(2) * fov / init_res`` is the level-0 hypotenuse.
-    """
-    l_max0 = math.sqrt(2.0) * fov / init_res
-    if l_max0 <= min_img_sep:
+def depth_floor(h0, tol):
+    """Level at which the longest leaf edge, ``sqrt(2) * h0 / 2**level``, first falls to ``tol``."""
+    l_max0 = math.sqrt(2.0) * h0
+    if l_max0 <= tol:
         return 0
-    return int(math.ceil(math.log2(l_max0 / min_img_sep)))
+    return int(math.ceil(math.log2(l_max0 / tol)))
+
+
+def warn_depth_limited(what, request, h0, tol, max_level):
+    """
+    Warn when ``max_depth`` stopped refinement before the longest leaf edge fell to ``tol``.
+
+    ``what`` names the mesh and ``request`` the tolerance as the caller gave it.
+    """
+    d_floor = depth_floor(h0, tol)
+    if d_floor <= max_level:
+        return
+    l_max = math.sqrt(2.0) * h0 / 2**max_level
+    warn(
+        f"{what} is depth-limited: max_depth={max_level} is below d_floor={d_floor}, "
+        f"the depth required to reach {request}. Refinement stops at level "
+        f"{max_level}, where the longest leaf edge is {l_max:.3g} arcsec. Set "
+        f"max_depth >= {d_floor}, or raise init_res or the tolerance."
+    )
+
+
+def lattice_h0(lat):
+    """Level-0 cell size, ``fov / init_res``.
+
+    *Unit: arcsec*
+    """
+    return lat.scale * (1 << lat.level)
+
+
+def lattice_fov(lat):
+    """Side of the square the lattice covers.
+
+    *Unit: arcsec*
+    """
+    return lat.n * lat.scale
+
+
+def lattice_init_res(lat):
+    """Level-0 cells per axis."""
+    return lat.n >> lat.level
 
 
 def check_lattice_keys(init_res, max_level, remedy) -> None:
@@ -103,7 +141,6 @@ class Lattice(NamedTuple):
 
     level: int
     n: int
-    stride: int
     scale: float
     lo: ArrayLike
     origin: int = 0
@@ -143,10 +180,9 @@ def make_lattice(fov, x0, y0, init_res, lattice_level) -> Lattice:
     """
     level = int(lattice_level)
     n = int(init_res) * (1 << level)
-    stride = n + 1
     scale = float(fov) / n
     lo = backend.as_array([x0 - fov / 2.0, y0 - fov / 2.0], dtype=backend.float64)
-    return Lattice(level=level, n=n, stride=stride, scale=scale, lo=lo, origin=0)
+    return Lattice(level=level, n=n, scale=scale, lo=lo, origin=0)
 
 
 def extend_lattice(lat, k) -> Lattice:
@@ -157,7 +193,7 @@ def extend_lattice(lat, k) -> Lattice:
     result, and ``origin`` moves by the same amount, so ``ij - origin`` -- and
     with it :func:`lattice_xy` -- is unchanged bit for bit. ``lo`` and
     ``scale`` are never recomputed: a fresh lattice over the larger fov
-    computes both from that fov and can round differently. The stride grows,
+    computes both from that fov and can round differently. ``n`` grows,
     so keys change, but a uniform shift keeps their ``(i, j)`` lexicographic
     order, and with it every key-sorted array.
 
@@ -181,17 +217,18 @@ def extend_lattice(lat, k) -> Lattice:
         raise ValueError(f"k must be non-negative, got {k}")
     pad = k << lat.level
     n = lat.n + 2 * pad
-    return lat._replace(n=n, stride=n + 1, origin=lat.origin + pad)
+    return lat._replace(n=n, origin=lat.origin + pad)
 
 
 def lattice_key(lat, ij):
     """Lattice key of integer coordinates, shape ``(..., 2) -> (...)``."""
-    return ij[..., 0] * lat.stride + ij[..., 1]
+    return ij[..., 0] * (lat.n + 1) + ij[..., 1]
 
 
 def lattice_ij_from_key(lat, key):
     """Inverse of :func:`lattice_key`, shape ``(...) -> (..., 2)``."""
-    return backend.stack((key // lat.stride, key % lat.stride), dim=-1)
+    stride = lat.n + 1
+    return backend.stack((key // stride, key % stride), dim=-1)
 
 
 def lattice_xy(lat, ij):

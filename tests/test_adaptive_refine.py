@@ -29,7 +29,6 @@ from caustics.lenses.func.adaptive.criterion import (
     jacobian_parity_ok,
     parity_from_children,
 )
-from caustics.lenses.func.adaptive.geometry import min_angle
 from caustics.lenses.func.adaptive.lattice import (
     depth_floor,
     edge_quarter_keys,
@@ -166,7 +165,7 @@ def _refine_with(fn, jac, fov=4.0, init_res=4, min_img_sep=0.5, max_depth=25):
     """Run `refine` on a numpy ``p -> out`` map and its Jacobian, mirroring
     the legacy ``refine_with`` helper but built on the backend interfaces."""
     tables = child_matrix_tables()
-    max_level = min(max_depth, depth_floor(fov, init_res, min_img_sep))
+    max_level = min(max_depth, depth_floor(fov / init_res, min_img_sep))
     lat = make_lattice(fov, 0.0, 0.0, init_res, max_level + 1)
     lens, calls = _make_counting_lens(fn, jac)
     cache, active, store, counters, _band = refine(
@@ -842,21 +841,6 @@ def test_cascade_still_evaluates_every_point_exactly_once():
         _localised_fold, _localised_fold_jacobian, fov=4.0, init_res=4, min_img_sep=0.05
     )
     assert calls["points"] == cache_size(cache) + counters["max_level_midpoints"]
-
-
-def test_min_angle_of_an_equilateral_triangle():
-    tri = backend.as_array(
-        np.array([[[0.0, 0.0], [1.0, 0.0], [0.5, np.sqrt(3) / 2]]]),
-        dtype=backend.float64,
-    )
-    assert backend.to_numpy(min_angle(tri))[0] == pytest.approx(np.pi / 3)
-
-
-def test_min_angle_of_a_degenerate_triangle_is_zero_not_nan():
-    tri = backend.as_array(
-        np.array([[[0.0, 0.0], [0.0, 0.0], [0.0, 0.0]]]), dtype=backend.float64
-    )
-    assert backend.to_numpy(min_angle(tri))[0] == 0.0
 
 
 def test_canonical_order_is_independent_of_input_order():

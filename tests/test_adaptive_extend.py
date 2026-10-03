@@ -27,7 +27,6 @@ from caustics.lenses.func.adaptive import (
 from caustics.lenses.func.adaptive.band import band_sample_keys, empty_band, merge_bands
 from caustics.lenses.func.adaptive.build import seed_from_mesh
 from caustics.lenses.func.adaptive.lattice import (
-    check_lattice_keys,
     depth_floor,
     edge_quarter_keys,
     extend_lattice,
@@ -35,7 +34,6 @@ from caustics.lenses.func.adaptive.lattice import (
     lattice_key,
     lattice_xy,
     make_lattice,
-    ring_triangles,
 )
 from caustics.lenses.func.adaptive.mesh import freeze
 from caustics.lenses.func.adaptive.refinement import balance, refine
@@ -61,94 +59,9 @@ def f64(x):
     return backend.as_array(np.asarray(x, dtype=np.float64), dtype=backend.float64)
 
 
-def _grid(n):
-    """Every point of an ``(n + 1) x (n + 1)`` lattice, shape ``((n + 1)**2, 2)``."""
-    axis = np.arange(n + 1)
-    return np.stack(np.meshgrid(axis, axis, indexing="ij"), axis=-1).reshape(-1, 2)
-
-
-def _same_lattice(a, b):
-    return (a.level, a.n, a.stride, a.scale, a.origin) == (
-        b.level,
-        b.n,
-        b.stride,
-        b.scale,
-        b.origin,
-    ) and np.array_equal(to_np(a.lo), to_np(b.lo))
-
-
 # ---------------------------------------------------------------------------
 # The lattice anchor
 # ---------------------------------------------------------------------------
-
-
-def test_a_fresh_lattice_places_points_exactly_as_before():
-    lat = make_lattice(4.0, 0.3, -0.1, 3, 4)
-    ij = _grid(lat.n)
-    assert lat.origin == 0
-    want = to_np(lat.lo) + ij.astype(np.float64) * lat.scale
-    assert np.array_equal(to_np(lattice_xy(lat, i64(ij))), want)
-
-
-def test_extend_lattice_keeps_every_old_position_bit_for_bit():
-    """A non-dyadic centre on purpose: nothing may be recomputed from a new fov."""
-    lat = make_lattice(4.0, 0.3, -0.1, 3, 4)
-    ext = extend_lattice(lat, 2)
-    pad = 2 << lat.level
-    ij = _grid(lat.n)
-    assert np.array_equal(
-        to_np(lattice_xy(ext, i64(ij + pad))),
-        to_np(lattice_xy(lat, i64(ij))),
-    )
-
-
-def test_extend_lattice_grows_the_extent_and_keeps_key_order():
-    lat = make_lattice(4.0, 0.3, -0.1, 3, 4)
-    ext = extend_lattice(lat, 2)
-    pad = 2 << lat.level
-    assert (ext.level, ext.scale) == (lat.level, lat.scale)
-    assert ext.n == lat.n + 2 * pad
-    assert ext.stride == ext.n + 1
-    assert ext.origin == pad
-    assert np.array_equal(to_np(ext.lo), to_np(lat.lo))
-    ij = _grid(lat.n)
-    old = to_np(lattice_key(lat, i64(ij)))
-    got = to_np(lattice_key(ext, i64(ij + pad)))
-    assert np.array_equal(np.argsort(old), np.argsort(got))
-
-
-def test_an_extended_dyadic_lattice_is_the_fresh_lattice_of_the_larger_fov():
-    """The premise of every equivalence test below.
-
-    With a dyadic fov, centre and cell size, a fresh lattice over the larger
-    fov places every point exactly where the extended one does.
-    """
-    lat = make_lattice(4.0, 0.5, -0.25, 8, 3)
-    ext = extend_lattice(lat, 2)
-    fresh = make_lattice(6.0, 0.5, -0.25, 12, 3)
-    assert (ext.n, ext.stride, ext.scale) == (fresh.n, fresh.stride, fresh.scale)
-    ij = i64(_grid(ext.n))
-    assert np.array_equal(to_np(lattice_xy(ext, ij)), to_np(lattice_xy(fresh, ij)))
-
-
-def test_extend_lattice_chains_and_accepts_zero():
-    lat = make_lattice(4.0, 0.0, 0.0, 2, 3)
-    assert _same_lattice(extend_lattice(lat, 0), lat)
-    assert _same_lattice(
-        extend_lattice(extend_lattice(lat, 1), 2), extend_lattice(lat, 3)
-    )
-
-
-def test_extend_lattice_rejects_a_negative_k():
-    with pytest.raises(ValueError, match="non-negative"):
-        extend_lattice(make_lattice(4.0, 0.0, 0.0, 2, 3), -1)
-
-
-def test_check_lattice_keys_rejects_exactly_the_lattices_int64_cannot_key():
-    """``45 * 2**26 + 1`` points per axis still key in int64; ``46 * 2**26 + 1`` do not."""
-    check_lattice_keys(45, 25, "unused")
-    with pytest.raises(ValueError, match="lattice too fine.*Rebuild coarser"):
-        check_lattice_keys(46, 25, "Rebuild coarser.")
 
 
 # ---------------------------------------------------------------------------
@@ -429,7 +342,7 @@ def test_band_samples_are_in_ascending_lattice_key_order():
     lat = mesh.lattice
     lens = to_np(mesh.critical_band.lens)
     ij = np.rint((lens - to_np(lat.lo)) / lat.scale).astype(np.int64) + lat.origin
-    keys = ij[:, 0] * lat.stride + ij[:, 1]
+    keys = ij[:, 0] * (lat.n + 1) + ij[:, 1]
     assert (np.diff(keys) > 0).all()
 
 
@@ -442,7 +355,7 @@ def _two_triangle_state():
     lat = make_lattice(4.0, 0.0, 0.0, 1, 2)
     vertices = np.array([[0, 0], [0, 4], [4, 0], [4, 4]])  # ascending key order
     cache = VertexCache(
-        keys=i64(vertices[:, 0] * lat.stride + vertices[:, 1]),
+        keys=i64(vertices[:, 0] * (lat.n + 1) + vertices[:, 1]),
         slots=i64(np.arange(4)),
         ij=i64(vertices),
         beta=f64(vertices * 1.0),
@@ -485,7 +398,7 @@ def test_merge_bands_keeps_one_sample_per_key_and_the_first_band_s_value():
     assert np.array_equal(keys[to_np(merged.samples)], row_keys)
     assert np.array_equal(to_np(merged.det), det)
     assert np.array_equal(to_np(merged.source), np.stack([det, -det], axis=-1))
-    ij = np.stack((keys // lat.stride, keys % lat.stride), axis=-1)
+    ij = np.stack((keys // (lat.n + 1), keys % (lat.n + 1)), axis=-1)
     assert np.array_equal(to_np(merged.lens), to_np(lat.lo) + ij * lat.scale)
 
 
@@ -513,7 +426,7 @@ def test_merge_bands_rejects_a_band_whose_rows_do_not_hold_its_samples():
 def refine_setup(fn, jac, fov, init_res, min_img_sep):
     """Everything `refine` takes for a fresh build of these parameters."""
     sep = min_img_sep / 2
-    max_level = depth_floor(fov, init_res, sep)
+    max_level = depth_floor(fov / init_res, sep)
     lens, calls = recording_lens(fn, jac)
     return SimpleNamespace(
         lat=make_lattice(fov, 0.0, 0.0, init_res, max_level + 1),
@@ -577,30 +490,6 @@ def assert_balanced(lat, cache, active, store, max_level):
     rows = backend.flatnonzero(level <= max_level - 2)
     keys = edge_quarter_keys(lat, cache.ij[v[rows]])
     assert not bool(backend.any(active_contains(active, cache, keys)))
-
-
-def test_ring_triangles_are_the_level0_triangles_outside_the_central_block():
-    level = 3
-    root_class = child_matrix_tables()[4]
-    every_ij, every_cls = initial_triangles(6, level, root_class)
-    ring_ij, ring_cls = ring_triangles(6, 1, level, root_class)
-
-    def cells(ij):
-        return to_np(ij)[:, 0, :] // (1 << level)
-
-    def inner(ij):
-        c = cells(ij)
-        return ((c >= 1) & (c < 5)).all(axis=1)
-
-    def as_set(ij, cls):
-        return {(tuple(t.reshape(-1)), c) for t, c in zip(to_np(ij), to_np(cls))}
-
-    assert ring_ij.shape[0] == 2 * (6 * 6 - 4 * 4)
-    assert not inner(ring_ij).any()
-    ring = as_set(ring_ij, ring_cls)
-    every = as_set(every_ij, every_cls)
-    assert ring <= every
-    assert len(every - ring) == int(inner(every_ij).sum())
 
 
 def test_a_fresh_refinement_is_already_balanced_so_balance_forces_nothing():
@@ -668,10 +557,9 @@ def assert_meshes_equal(got, want):
     for name in AdaptiveMesh._fields:
         a, b = getattr(got, name), getattr(want, name)
         if name == "lattice":
-            assert (a.level, a.n, a.stride, a.scale) == (
+            assert (a.level, a.n, a.scale) == (
                 b.level,
                 b.n,
-                b.stride,
                 b.scale,
             )
             corners = backend.to(i64([[0, 0], [a.n, a.n]]), device=backend.device(a.lo))

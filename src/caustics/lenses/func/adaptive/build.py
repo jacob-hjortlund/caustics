@@ -64,7 +64,7 @@ def validate_build_args(
         raise ValueError(f"min_img_sep must be positive, got {requested_min_img_sep}")
     if max_depth < 0:
         raise ValueError(f"max_depth must be non-negative, got {max_depth}")
-    max_level = min(max_depth, depth_floor(fov, init_res, min_img_sep))
+    max_level = min(max_depth, depth_floor(fov / init_res, min_img_sep))
     check_lattice_keys(
         init_res, max_level, "Raise min_img_sep, lower max_depth, or lower init_res."
     )
@@ -330,7 +330,7 @@ def build_adaptive_mesh(
     requested_min_img_sep = min_img_sep
     min_img_sep = min_img_sep / 2
     validate_build_args(fov, init_res, min_img_sep, max_depth, requested_min_img_sep)
-    d_floor = depth_floor(fov, init_res, min_img_sep)
+    d_floor = depth_floor(fov / init_res, min_img_sep)
     max_level = min(int(max_depth), d_floor)
     warn_depth_limited(fov, init_res, min_img_sep, d_floor, max_level)
 

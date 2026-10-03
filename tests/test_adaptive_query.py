@@ -541,7 +541,7 @@ def _build_with_counters(fn, jac, fov, init_res, min_img_sep, max_depth=25):
     requested_min_img_sep = min_img_sep
     min_img_sep = min_img_sep / 2
     validate_build_args(fov, init_res, min_img_sep, max_depth, requested_min_img_sep)
-    d_floor = depth_floor(fov, init_res, min_img_sep)
+    d_floor = depth_floor(fov / init_res, min_img_sep)
     max_level = min(int(max_depth), d_floor)
     tables = child_matrix_tables()
     lat = make_lattice(fov, 0.0, 0.0, init_res, max_level + 1)

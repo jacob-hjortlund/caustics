@@ -83,7 +83,6 @@ from .multipole import (
     convergence_multipole,
 )
 from .adaptive import (
-    affine_from_triangles,
     child_matrix_tables,
     contains,
     converged_from_deviation,
@@ -186,7 +185,6 @@ __all__ = (
     "convergence_multipole",
     "physical_deflection_angle_enclosed_mass",
     "convergence_enclosed_mass",
-    "affine_from_triangles",
     "child_matrix_tables",
     "contains",
     "converged_from_deviation",

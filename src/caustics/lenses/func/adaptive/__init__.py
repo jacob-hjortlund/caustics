@@ -49,7 +49,6 @@ Entry points:
 """
 
 from .geometry import (
-    affine_from_triangles,
     child_matrix_tables,
     contains,
     sanitize_bary,
@@ -114,7 +113,6 @@ __all__ = (
     "LEAF_JACOBIAN_PARITY_UNRESOLVED",
     "LEAF_RAYTRACE_NONFINITE",
     "LEAF_JACOBIAN_NONFINITE",
-    "affine_from_triangles",
     "child_matrix_tables",
     "contains",
     "converged_from_deviation",

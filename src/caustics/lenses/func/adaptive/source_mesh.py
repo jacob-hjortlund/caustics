@@ -279,7 +279,7 @@ def validate_source_args(fov, init_res, src_tol, max_depth) -> None:
         raise ValueError(f"src_tol must be positive, got {src_tol}")
     if max_depth < 0:
         raise ValueError(f"max_depth must be non-negative, got {max_depth}")
-    max_level = min(max_depth, depth_floor(fov, init_res, src_tol))
+    max_level = min(max_depth, depth_floor(fov / init_res, src_tol))
     check_lattice_keys(
         init_res, max_level, "Raise src_tol, lower max_depth, or lower init_res."
     )
@@ -659,7 +659,7 @@ def build_magnification_mesh(
     x0 = 0.5 * (lx + hx) if x0 is None else float(x0)
     y0 = 0.5 * (ly + hy) if y0 is None else float(y0)
     validate_source_args(fov, init_res, src_tol, max_depth)
-    d_floor = depth_floor(fov, init_res, src_tol)
+    d_floor = depth_floor(fov / init_res, src_tol)
     max_level = min(int(max_depth), d_floor)
     warn_source_depth_limited(fov, init_res, src_tol, d_floor, max_level)
     mu_band = band_magnification_floor(mesh.critical_band)

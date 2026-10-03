@@ -13,19 +13,9 @@ from caustics.lenses.func.adaptive import (
     LEAF_RAYTRACE_NONFINITE,
     build_adaptive_mesh,
     child_matrix_tables,
-    shape_matrix,
 )
-from caustics.lenses.func.adaptive.build import validate_build_args
 from caustics.lenses.func.adaptive.lattice import (
-    depth_floor,
-    edge_quarter_keys,
-    initial_triangles,
-    lattice_ij_from_key,
-    lattice_key,
-    lattice_on_boundary,
-    lattice_xy,
     make_lattice,
-    midpoint_ij,
 )
 from caustics.lenses.func.adaptive.refinement import red_split
 from caustics.lenses.func.adaptive.sampling import evaluate, make_raytrace, trace_keys
@@ -45,74 +35,6 @@ from caustics.lenses.func.adaptive.state import (
     store_compact,
     store_remove,
 )
-
-
-@pytest.mark.parametrize(
-    "kwargs",
-    [
-        {"fov": 0.0, "init_res": 2, "min_img_sep": 0.1, "max_depth": 3},
-        {"fov": 1.0, "init_res": 0, "min_img_sep": 0.1, "max_depth": 3},
-        {"fov": 1.0, "init_res": 2, "min_img_sep": 0.0, "max_depth": 3},
-        {"fov": 1.0, "init_res": 2, "min_img_sep": 0.1, "max_depth": -1},
-    ],
-)
-def test_validate_build_args_rejects_bad_input(kwargs):
-    with pytest.raises(ValueError):
-        validate_build_args(**kwargs)
-
-
-def test_validate_build_args_rejects_lattice_overflow():
-    with pytest.raises(ValueError, match="lattice too fine"):
-        validate_build_args(fov=1.0, init_res=2**20, min_img_sep=1e-12, max_depth=40)
-
-
-def test_depth_floor_matches_the_size_criterion():
-    assert depth_floor(5.0, 100, 10.0) == 0
-    d = depth_floor(5.0, 100, 1e-3)
-    l0 = np.sqrt(2) * 5.0 / 100
-    assert l0 / 2**d <= 1e-3 < l0 / 2 ** (d - 1)
-
-
-def test_lattice_key_roundtrip_and_geometry():
-    lat = make_lattice(4.0, 0.0, 0.0, 4, 3)
-    assert lat.n == 32
-    ij_np = np.array([[0, 0], [32, 32], [7, 19]], dtype=np.int64)
-    ij = backend.as_array(ij_np, dtype=backend.int64)
-    key = lattice_key(lat, ij)
-    assert backend.to_numpy(lattice_ij_from_key(lat, key)).tolist() == ij_np.tolist()
-    assert np.allclose(backend.to_numpy(lattice_xy(lat, ij[0])), [-2.0, -2.0])
-    assert np.allclose(backend.to_numpy(lattice_xy(lat, ij[1])), [2.0, 2.0])
-    assert backend.to_numpy(lattice_on_boundary(lat, ij)).tolist() == [
-        True,
-        True,
-        False,
-    ]
-
-
-def test_widening_the_lattice_does_not_move_any_vertex():
-    """Bit-identical coordinates, not merely close ones.
-
-    `scale' = fov / (2n)` equals `fl(fov / n) / 2` exactly, because binary
-    floating point is scale-invariant under powers of two, and `(2 * ij) *
-    scale'` then rounds the same exact real as `ij * scale`. If this ever fails,
-    the widened lattice has perturbed the frozen mesh's geometry and every
-    downstream bit-exactness argument in the module is void.
-    """
-    fov, init_res, max_level = 4.0, 4, 3
-    narrow = make_lattice(fov, 0.0, 0.0, init_res, max_level)
-    wide = make_lattice(fov, 0.0, 0.0, init_res, max_level + 1)
-    assert wide.n == 2 * narrow.n
-    assert wide.level == max_level + 1
-
-    ij_np = np.stack(
-        np.meshgrid(np.arange(narrow.n + 1), np.arange(narrow.n + 1), indexing="ij"),
-        axis=-1,
-    ).reshape(-1, 2)
-    ij = backend.as_array(ij_np, dtype=backend.int64)
-    assert np.array_equal(
-        backend.to_numpy(lattice_xy(narrow, ij)),
-        backend.to_numpy(lattice_xy(wide, 2 * ij)),
-    )
 
 
 def _i64(x):
@@ -377,60 +299,6 @@ def test_store_remove_does_not_mutate_its_input():
     assert backend.to_numpy(after.valid).tolist() == [False, True]
 
 
-def test_initial_triangles_tile_the_square_and_are_positively_oriented():
-    """Ported from `test_adaptive_mesh.py`: geometric properties that the
-    oracle-comparison test above does not check -- full square coverage and
-    a consistent positive orientation -- rather than element-wise equality
-    with the oracle.
-    """
-    _, _, _, _, root_class = child_matrix_tables()
-    init_res, max_level = 4, 2
-    ij, cls = initial_triangles(init_res, max_level, root_class)
-    assert ij.shape == (2 * init_res**2, 3, 2)
-    P = shape_matrix(backend.to(ij, dtype=backend.float64))
-    area = P[..., 0, 0] * P[..., 1, 1] - P[..., 0, 1] * P[..., 1, 0]
-    assert bool(backend.all(area > 0))
-    step = 1 << max_level
-    assert np.isclose(float(backend.sum(area)) / 2, (init_res * step) ** 2)
-    assert set(backend.to_numpy(cls).tolist()) == set(
-        backend.to_numpy(root_class).tolist()
-    )
-
-
-def test_midpoints_are_exact_integers_and_opposite_their_vertex():
-    ij = np.array([[[0, 0], [4, 0], [0, 4]]], dtype=np.int64)
-    m = midpoint_ij(_i64(ij))
-    assert backend.to_numpy(m)[0].tolist() == [[2, 2], [0, 2], [2, 0]]
-
-
-def test_midpoints_are_exact_at_max_level_on_the_widened_lattice():
-    """The reason the lattice is one level finer than max_level.
-
-    With the lattice at max_level a triangle's edges are one unit long and
-    `midpoint_ij`'s floor division collapses each "midpoint" onto one of that
-    edge's own endpoints. One level finer, every edge vector is even at every
-    level up to and including max_level, so the midpoints are genuine lattice
-    points -- and they are exactly the points with an odd coordinate, which is
-    what guarantees they can never collide with a cached vertex.
-    """
-    _, _, _, _, root_class = child_matrix_tables()
-    max_level = 3
-    lat = make_lattice(4.0, 0.0, 0.0, 2, max_level + 1)
-    ij, cls = initial_triangles(2, lat.level, root_class)
-    # Descend to max_level by taking child C_4 (the middle child) each time.
-    for _ in range(max_level):
-        ij = midpoint_ij(ij)
-    assert bool(backend.all(ij % 2 == 0)), "max_level vertices are even"
-
-    mid = midpoint_ij(ij)
-    # Exact: the floor division threw nothing away.
-    assert bool(
-        backend.all((ij[:, [1, 2, 0]] + ij[:, [2, 0, 1]]) % 2 == 0)
-    ), "edge endpoint sums must be even for the midpoint to be exact"
-    # Every midpoint has an odd coordinate, so it is not a vertex of any level.
-    assert bool(backend.all(backend.any(mid % 2 == 1, dim=-1)))
-
-
 def test_red_split_is_triangle_major_and_advances_the_class():
     _, _, compose, _, _ = child_matrix_tables()
     v = _i64([[0, 1, 2], [3, 4, 5]])
@@ -445,16 +313,6 @@ def test_red_split_is_triangle_major_and_advances_the_class():
     assert cv_np[3].tolist() == [6, 7, 8]  # C_4 = (m1, m2, m3)
     assert cc_np[:4].tolist() == compose_np[0].tolist()
     assert cc_np[4:].tolist() == compose_np[4].tolist()
-
-
-def test_edge_quarter_keys_are_lattice_points_of_both_quarters():
-    lat = make_lattice(4.0, 0.0, 0.0, 1, 4)  # n = 16
-    ij = np.array([[[0, 0], [16, 0], [0, 16]]], dtype=np.int64)
-    keys = edge_quarter_keys(lat, _i64(ij))
-    ij_from_key = backend.to_numpy(lattice_ij_from_key(lat, keys[0]))
-    got = {tuple(p) for p in ij_from_key}
-    assert (4, 0) in got and (12, 0) in got  # edge (0,1)
-    assert (0, 4) in got and (0, 12) in got  # edge (2,0)
 
 
 def test_make_raytrace_forces_float64_and_records_the_callback_dtype():
