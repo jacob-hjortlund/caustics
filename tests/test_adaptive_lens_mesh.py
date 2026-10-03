@@ -24,20 +24,34 @@ from caustics.lenses.func.adaptive.criterion import (
     parity_from_children,
 )
 from caustics.lenses.func.adaptive.geometry import (
+    build_device,
+    child_matrix_tables,
+    to_device,
     ROOT_CLASS,
     ROOT_SHAPES,
 )
 from caustics.lenses.func.adaptive.index import index_hits
 from caustics.lenses.func.adaptive.lattice import (
+    extend_lattice,
+    lattice_fov,
+    lattice_init_res,
+    lattice_key,
     lattice_xy,
     make_lattice,
 )
+from caustics.lenses.func.adaptive.curves import mesh_critical_curves_and_caustics
 from caustics.lenses.func.adaptive.lens_mesh import (
+    _freeze,
+    _seed,
+    build_closed_lens_mesh,
     build_lens_mesh,
+    extend_lens_mesh,
     make_sampler,
 )
 
 from adaptive_maps import (
+    sie_like,
+    sie_like_jacobian,
     sis_jacobian,
     sis_raytrace,
     broken_where,
@@ -950,3 +964,620 @@ def test_the_criterion_is_blind_to_structure_below_the_sampling_scale():
     assert (to_np(coarse.origin_level) == 0).all()
     assert (to_np(coarse.origin_status) == LEAF_CONVERGED).all()
     assert (to_np(fine.origin_level) > 0).any()
+
+
+def test_an_extension_samples_no_point_the_old_mesh_holds():
+    mesh, _ = build(row_fold, row_fold_jacobian, init_res=8, min_img_sep=2e-2)
+    assert mesh.critical_band.leaves.shape[0] > 0
+    lens_, calls = numpy_lens(row_fold, row_fold_jacobian)
+    grown = extend_lens_mesh(mesh, lens_.raytrace, lens_.jacobian_lens_equation, 6.0)
+    old = np.concatenate((to_np(mesh.vertices_lens), to_np(mesh.critical_band.lens)))
+    old = {tuple(p) for p in old}
+    assert not any(tuple(p) in old for p in np.concatenate(calls.raytrace))
+    fresh, _ = build(
+        row_fold, row_fold_jacobian, fov=6.0, init_res=12, min_img_sep=2e-2
+    )
+    assert_same(grown, fresh)
+
+
+# Extension and the closed build. The fixtures use dyadic fovs, centers and
+# cell sizes, where a fresh build's lattice coincides with an extended one.
+
+
+def xbuild(fn, jac, fov, init_res, min_img_sep, **kw):
+    """``build_lens_mesh`` of numpy maps; the mesh, the lens and its recorded calls."""
+    lens_, calls = numpy_lens(fn, jac)
+    mesh = build_lens_mesh(
+        lens_.raytrace, lens_.jacobian_lens_equation, fov, init_res, min_img_sep, **kw
+    )
+    return mesh, lens_, calls
+
+
+def called_at(calls, method):
+    """Every point ``method`` was called on, stacked, shape ``(K, 2)``."""
+    batches = getattr(calls, method)
+    return np.concatenate(batches, axis=0) if batches else np.zeros((0, 2))
+
+
+def sis(c, b):
+    """A singular isothermal sphere of Einstein radius ``b`` at ``c``, and its Jacobian."""
+    c = np.asarray(c, dtype=np.float64)
+
+    def fn(p):
+        d = p - c
+        return p - b * d / np.hypot(d[:, 0], d[:, 1])[:, None]
+
+    def jac(p):
+        d = p - c
+        r = np.hypot(d[:, 0], d[:, 1])
+        k = b / r**3
+        J = np.empty((p.shape[0], 2, 2))
+        J[:, 0, 0] = 1.0 - b / r + k * d[:, 0] ** 2
+        J[:, 0, 1] = J[:, 1, 0] = k * d[:, 0] * d[:, 1]
+        J[:, 1, 1] = 1.0 - b / r + k * d[:, 1] ** 2
+        return J
+
+    return fn, jac
+
+
+# An SIS whose tangential curve, radius 0.6 about C_IN, lies inside [-1, 1]**2.
+C_IN = (0.3001, -0.2003)
+
+
+def seam_fold(seam):
+    """Curved, with a fold at ``x = seam - 0.4``, on ``[seam - 0.6, seam]``; affine elsewhere."""
+
+    def fn(p):
+        x = p[:, 0]
+        u = np.clip(x - (seam - 0.6), 0.0, 0.6)
+        tail = np.maximum(x - seam, 0.0)
+        return np.stack([0.6 * x - 5.0 * u**3 - 5.4 * tail, p[:, 1]], axis=-1)
+
+    def jac(p):
+        x = p[:, 0]
+        u = np.clip(x - (seam - 0.6), 0.0, 0.6)
+        J = np.zeros((p.shape[0], 2, 2))
+        J[:, 0, 0] = np.where(x > seam, -4.8, 0.6 - 15.0 * u**2)
+        J[:, 1, 1] = 1.0
+        return J
+
+    return fn, jac
+
+
+def mirrored(fn, jac, seam):
+    """``fn`` reflected in the line ``x = seam``."""
+
+    def reflect(p):
+        q = p.copy()
+        q[:, 0] = 2.0 * seam - q[:, 0]
+        return q
+
+    def fn_r(p):
+        return fn(reflect(p))
+
+    def jac_r(p):
+        J = jac(reflect(p))
+        J[:, :, 0] = -J[:, :, 0]
+        return J
+
+    return fn_r, jac_r
+
+
+def ring_fold(seam):
+    """`seam_fold` mirrored: affine up to ``x = seam``, folded just past it."""
+    return mirrored(*seam_fold(seam), seam)
+
+
+def edge_bump(p):
+    """A fold confined to the right edge of ``[-2, 2]**2``, exactly affine outside it."""
+    x, y = p[:, 0], p[:, 1]
+    g = np.where((x > 1.4) & (x < 2.0), 60.0 * (x - 1.4) ** 2 * (2.0 - x) ** 2, 0.0)
+    h = np.where(np.abs(y) < 2.0, (1.0 - y**2 / 4.0) ** 2, 0.0)
+    return np.stack([0.6 * x + g * h, y], axis=-1)
+
+
+def edge_bump_jacobian(p):
+    x, y = p[:, 0], p[:, 1]
+    inx, iny = (x > 1.4) & (x < 2.0), np.abs(y) < 2.0
+    g = np.where(inx, 60.0 * (x - 1.4) ** 2 * (2.0 - x) ** 2, 0.0)
+    h = np.where(iny, (1.0 - y**2 / 4.0) ** 2, 0.0)
+    dg = np.where(inx, 120.0 * (x - 1.4) * (2.0 - x) * (3.4 - 2.0 * x), 0.0)
+    dh = np.where(iny, -y * (1.0 - y**2 / 4.0), 0.0)
+    J = np.zeros((p.shape[0], 2, 2))
+    J[:, 0, 0] = 0.6 + dg * h
+    J[:, 0, 1] = g * dh
+    J[:, 1, 1] = 1.0
+    return J
+
+
+def test_a_mesh_records_its_lattice_and_the_lattice_coordinates_of_its_vertices():
+    mesh, _, _ = xbuild(localised_fold, localised_fold_jacobian, 4.0, 4, 0.05, x0=0.25)
+    lat = mesh.lattice
+    assert lat.origin == 0
+    assert lat.n == 4 << lat.level
+    assert (lattice_fov(lat), lattice_init_res(lat)) == (4.0, 4)
+    assert to_np(mesh.vertices_ij).dtype == np.int64
+    assert np.array_equal(
+        to_np(mesh.vertices_lens), to_np(lattice_xy(lat, mesh.vertices_ij))
+    )
+    keys = to_np(lattice_key(lat, mesh.vertices_ij))
+    assert (np.diff(keys) > 0).all()
+
+
+def test_origin_cls_is_the_orientation_class_of_each_origin_leaf():
+    """``P = 2**(L - d) * R @ G[c]`` in lattice units, for every origin."""
+    mesh, _, _ = xbuild(localised_fold, localised_fold_jacobian, 4.0, 4, 0.05)
+    _, G, _, _, _ = child_matrix_tables()
+    ij = to_np(mesh.vertices_ij)[to_np(mesh.origin_leaves)]
+    P = np.stack((ij[:, 1] - ij[:, 0], ij[:, 2] - ij[:, 0]), axis=-1)
+    level = to_np(mesh.origin_level)
+    R = np.array([[1, 0], [1, 1]])
+    scale = (1 << (mesh.lattice.level - level))[:, None, None]
+    assert len(set(level.tolist())) > 1
+    assert np.array_equal(P, scale * (R @ to_np(G)[to_np(mesh.origin_cls)]))
+
+
+def test_band_rows_are_in_origin_order():
+    mesh, _, _ = xbuild(row_fold, row_fold_jacobian, 4.0, 8, 2e-2)
+    leaves = to_np(mesh.critical_band.leaves)
+    assert leaves.size > 1
+    assert (np.diff(leaves) > 0).all()
+
+
+def test_band_samples_are_in_ascending_lattice_key_order():
+    mesh, _, _ = xbuild(row_fold, row_fold_jacobian, 4.0, 8, 2e-2)
+    lat = mesh.lattice
+    xy = to_np(mesh.critical_band.lens)
+    ij = np.rint((xy - to_np(lat.lo)) / lat.scale).astype(np.int64) + lat.origin
+    keys = ij[:, 0] * (lat.n + 1) + ij[:, 1]
+    assert (np.diff(keys) > 0).all()
+
+
+def test_seeding_a_mesh_and_freezing_it_again_reproduces_it():
+    """Seed then freeze, with nothing added, is the identity, and calls no lens."""
+    fn, jac = broken_where(
+        localised_fold, localised_fold_jacobian, lambda p: p[:, 0] > 1.5
+    )
+    mesh, lens_, calls = xbuild(fn, jac, 4.0, 4, 0.05, centers=[(1.0001, 0.1003)])
+    assert mesh.critical_band.leaves.shape[0] > 0
+    assert mesh.holes.radius.shape[0] == 1
+    assert ((to_np(mesh.origin_status) & LEAF_RAYTRACE_NONFINITE) != 0).any()
+    calls.raytrace.clear()
+    calls.jacobian.clear()
+    lat = to_device(mesh.lattice, build_device())
+    cache, store, seed = _seed(mesh, lat, 0)
+    sample = make_sampler(lens_.raytrace, lens_.jacobian_lens_equation, None)
+    again = _freeze(
+        lat, cache, store, sample, mesh.min_img_sep, mesh.holes, None, None, seed
+    )
+    assert_same(again, mesh)
+    assert not calls.raytrace and not calls.jacobian
+
+
+def test_seeding_carries_det_a_and_an_extension_keeps_it_at_every_old_vertex():
+    """Seeded vertices keep the det A their mesh stored -- shifted here, so a
+    value sampled again could not pass for it -- and none is sampled again."""
+    fn, jac = ring_fold(2.0)
+    mesh, lens_, calls = xbuild(fn, jac, 4.0, 4, 0.05)
+    marked = mesh._replace(vertices_det=mesh.vertices_det + 1.0)
+    cache, _, _ = _seed(marked, extend_lattice(marked.lattice, 1), 1)
+    assert np.array_equal(to_np(cache.values)[:, 2], to_np(marked.vertices_det))
+    calls.raytrace.clear()
+    calls.jacobian.clear()
+    ext = extend_lens_mesh(marked, lens_.raytrace, lens_.jacobian_lens_equation, 6.0)
+    old = to_np(marked.vertices_ij) + ext.lattice.origin
+    det = dict(
+        zip(
+            map(tuple, to_np(ext.vertices_ij).tolist()),
+            to_np(ext.vertices_det).tolist(),
+        )
+    )
+    assert [det[tuple(v)] for v in old.tolist()] == to_np(marked.vertices_det).tolist()
+    lat = ext.lattice
+    for method in ("raytrace", "jacobian"):
+        ij = np.rint((called_at(calls, method) - to_np(lat.lo)) / lat.scale)
+        called = set(map(tuple, (ij.astype(np.int64) + lat.origin).tolist()))
+        assert not called & set(map(tuple, old.tolist()))
+
+
+def fresh_equivalent(kw, target):
+    """``xbuild`` arguments for a fresh build of ``target`` on the same cells."""
+    out = dict(kw)
+    out["init_res"] = round(kw["init_res"] * target / kw["fov"])
+    out["fov"] = target
+    return out
+
+
+EQUIVALENCE = {
+    "sie_like": (
+        sie_like,
+        sie_like_jacobian,
+        dict(fov=2.0, init_res=4, min_img_sep=0.05),
+        3.0,
+    ),
+    "localised_fold": (
+        localised_fold,
+        localised_fold_jacobian,
+        dict(fov=4.0, init_res=4, min_img_sep=0.05),
+        6.0,
+    ),
+    "row_fold": (
+        row_fold,
+        row_fold_jacobian,
+        dict(fov=4.0, init_res=8, min_img_sep=2e-2),
+        6.0,
+    ),
+    "nan_across_seam": (
+        *broken_where(localised_fold, localised_fold_jacobian, lambda p: p[:, 0] > 1.5),
+        dict(fov=4.0, init_res=4, min_img_sep=0.05),
+        6.0,
+    ),
+    "affine": (
+        affine,
+        affine_jacobian,
+        dict(fov=4.0, init_res=4, min_img_sep=0.05),
+        6.0,
+    ),
+    "seam_fold": (*seam_fold(2.0), dict(fov=4.0, init_res=4, min_img_sep=0.05), 6.0),
+    "ring_fold": (*ring_fold(2.0), dict(fov=4.0, init_res=4, min_img_sep=0.05), 6.0),
+    "edge_bump": (
+        edge_bump,
+        edge_bump_jacobian,
+        dict(fov=4.0, init_res=4, min_img_sep=0.05),
+        6.0,
+    ),
+    "off_center": (
+        localised_fold,
+        localised_fold_jacobian,
+        dict(fov=4.0, init_res=8, min_img_sep=0.05, x0=0.5, y0=-0.25),
+        6.0,
+    ),
+    "depth_limited": (
+        localised_fold,
+        localised_fold_jacobian,
+        dict(fov=4.0, init_res=4, min_img_sep=0.05, max_depth=3),
+        6.0,
+    ),
+}
+
+
+@pytest.mark.filterwarnings("ignore:Lens mesh is depth-limited")
+@pytest.mark.parametrize("case", list(EQUIVALENCE))
+def test_an_extension_is_the_fresh_build_of_the_larger_fov(case):
+    fn, jac, kw, target = EQUIVALENCE[case]
+    mesh, lens_, _ = xbuild(fn, jac, **kw)
+    got = extend_lens_mesh(mesh, lens_.raytrace, lens_.jacobian_lens_equation, target)
+    want, _, _ = xbuild(fn, jac, **fresh_equivalent(kw, target))
+    assert lattice_init_res(got.lattice) > lattice_init_res(mesh.lattice)
+    assert_same(got, want)
+
+
+def test_extensions_chain():
+    kw = dict(fov=4.0, init_res=8, min_img_sep=0.05)
+    mesh, lens_, _ = xbuild(localised_fold, localised_fold_jacobian, **kw)
+    rt, jac = lens_.raytrace, lens_.jacobian_lens_equation
+    twice = extend_lens_mesh(extend_lens_mesh(mesh, rt, jac, 6.0), rt, jac, 8.0)
+    once = extend_lens_mesh(mesh, rt, jac, 8.0)
+    fresh, _, _ = xbuild(
+        localised_fold, localised_fold_jacobian, **fresh_equivalent(kw, 8.0)
+    )
+    assert_same(twice, fresh)
+    assert_same(once, fresh)
+
+
+def test_an_extension_carries_its_holes_and_traces_none_of_them_again():
+    """One center lies outside the original fov, so its hole exists from the start."""
+    c_in, c_out = (0.3001, -0.2003), (1.8001, 0.2003)
+    fn, jac = sis(c_in, 0.6)
+    kw = dict(fov=2.0, init_res=4, min_img_sep=0.05, centers=[c_in, c_out])
+    mesh, lens_, calls = xbuild(fn, jac, **kw)
+    assert mesh.holes.radius.shape[0] == 2
+    calls.raytrace.clear()
+    got = extend_lens_mesh(mesh, lens_.raytrace, lens_.jacobian_lens_equation, 4.0)
+    want, _, _ = xbuild(fn, jac, **fresh_equivalent(kw, 4.0))
+    assert_same(got, want)
+    traced = called_at(calls, "raytrace")
+    for c in (c_in, c_out):
+        d = np.hypot(*(traced - np.array(c)).T)
+        for r in (mesh.min_img_sep, mesh.min_img_sep / 4):
+            assert not np.isclose(d, r, rtol=0, atol=1e-12).any()
+
+
+def _in_any_triangle(points, triangles):
+    """True where an integer point lies in or on some integer triangle."""
+    a, b, c = triangles[:, 0], triangles[:, 1], triangles[:, 2]
+    p = points[:, None, :]
+
+    def cross(u, v, w):
+        return (v[..., 0] - u[..., 0]) * (w[..., 1] - u[..., 1]) - (
+            v[..., 1] - u[..., 1]
+        ) * (w[..., 0] - u[..., 0])
+
+    d = np.stack((cross(a, b, p), cross(b, c, p), cross(c, a, p)), axis=-1)
+    return ((d >= 0).all(axis=-1) | (d <= 0).all(axis=-1)).any(axis=1)
+
+
+def test_an_extension_calls_the_lens_only_in_the_ring_and_in_old_leaves_it_splits():
+    """No old vertex is sampled again, and every call strictly inside the old
+    domain lies in an old leaf the extension split, which ``ring_fold(2.0)``
+    makes it do. Raytrace and Jacobian are called on the same points."""
+    fn, jac = ring_fold(2.0)
+    mesh, lens_, calls = xbuild(fn, jac, 4.0, 4, 0.05)
+    calls.raytrace.clear()
+    calls.jacobian.clear()
+    ext = extend_lens_mesh(mesh, lens_.raytrace, lens_.jacobian_lens_equation, 6.0)
+    assert np.array_equal(called_at(calls, "raytrace"), called_at(calls, "jacobian"))
+    lat = ext.lattice
+    pad = lat.origin
+    lo, hi = pad, pad + mesh.lattice.n
+    ij = (
+        np.rint((called_at(calls, "raytrace") - to_np(lat.lo)) / lat.scale).astype(
+            np.int64
+        )
+        + lat.origin
+    )
+    old_vertices = to_np(mesh.vertices_ij) + pad
+    assert not set(map(tuple, ij.tolist())) & set(map(tuple, old_vertices.tolist()))
+    inner = ij[((ij > lo) & (ij < hi)).all(axis=1)]
+    kept = {
+        tuple(sorted(map(tuple, t)))
+        for t in to_np(ext.vertices_ij)[to_np(ext.origin_leaves)].tolist()
+    }
+    split = np.array(
+        [
+            t
+            for t in old_vertices[to_np(mesh.origin_leaves)].tolist()
+            if tuple(sorted(map(tuple, t))) not in kept
+        ]
+    )
+    assert inner.shape[0] > 0 and split.shape[0] > 0, "ring_fold must split old leaves"
+    assert _in_any_triangle(inner, split).all()
+
+
+@pytest.fixture
+def affine_mesh():
+    """``h0 = 0.5``: each ring adds ``1.0`` to the fov."""
+    return xbuild(affine, affine_jacobian, 4.0, 8, 0.05)
+
+
+@pytest.mark.parametrize(
+    "fov, want",
+    [
+        (5.9, 6.0),
+        (6.0, 6.0),
+        (6, 6.0),
+        (float(np.nextafter(6.0, np.inf)), 6.0),
+        (4.2, 5.0),
+    ],
+)
+def test_the_requested_fov_rounds_up_to_whole_cells(affine_mesh, fov, want):
+    mesh, lens_, _ = affine_mesh
+    ext = extend_lens_mesh(mesh, lens_.raytrace, lens_.jacobian_lens_equation, fov)
+    assert lattice_fov(ext.lattice) == want
+    assert lattice_init_res(ext.lattice) == round(want / 0.5)
+
+
+@pytest.mark.parametrize("fov", [4.0, 4.0 - 1e-12, 3.9])
+def test_a_fov_the_mesh_already_covers_returns_the_mesh_itself(affine_mesh, fov):
+    mesh, lens_, calls = affine_mesh
+    calls.raytrace.clear()
+    calls.jacobian.clear()
+    got = extend_lens_mesh(mesh, lens_.raytrace, lens_.jacobian_lens_equation, fov)
+    assert got is mesh
+    assert not calls.raytrace and not calls.jacobian
+
+
+def test_an_extension_int64_keys_cannot_hold_raises():
+    """At finest level 25 the lattice keys in int64 up to ``init_res = 45``."""
+    mesh, lens_, _ = xbuild(affine, affine_jacobian, 1.0, 1, 1e-7)
+    assert mesh.lattice.level - 1 == 25
+    rt, jac = lens_.raytrace, lens_.jacobian_lens_equation
+    assert lattice_init_res(extend_lens_mesh(mesh, rt, jac, 45.0).lattice) == 45
+    with pytest.raises(ValueError, match="lattice too fine.*Extend by less"):
+        extend_lens_mesh(mesh, rt, jac, 46.0)
+
+
+def _messages(record):
+    """The ``UserWarning`` messages recorded, in order."""
+    return [str(w.message) for w in record if issubclass(w.category, UserWarning)]
+
+
+def test_an_extension_warns_depth_limited_as_the_fresh_build_would():
+    kw = dict(fov=4.0, init_res=4, min_img_sep=0.05, max_depth=2)
+    with pytest.warns(UserWarning, match="depth-limited"):
+        mesh, lens_, _ = xbuild(localised_fold, localised_fold_jacobian, **kw)
+    with warnings.catch_warnings(record=True) as got:
+        warnings.simplefilter("always")
+        extend_lens_mesh(mesh, lens_.raytrace, lens_.jacobian_lens_equation, 6.0)
+    with warnings.catch_warnings(record=True) as want:
+        warnings.simplefilter("always")
+        xbuild(localised_fold, localised_fold_jacobian, **fresh_equivalent(kw, 6.0))
+    assert any("depth-limited" in m for m in _messages(got))
+    assert _messages(got) == _messages(want)
+
+
+def test_an_extension_closes_the_critical_curves_the_fov_cut():
+    """At fov 2 the tangential curve (radius ~1.18) crosses the domain's edge; at fov 3 it lies inside."""
+    kw = dict(fov=2.0, init_res=4, min_img_sep=0.05)
+    mesh, lens_, _ = xbuild(sie_like, sie_like_jacobian, **kw)
+    assert not to_np(mesh_critical_curves_and_caustics(mesh).closed).all()
+    ext = extend_lens_mesh(mesh, lens_.raytrace, lens_.jacobian_lens_equation, 3.0)
+    got = mesh_critical_curves_and_caustics(ext)
+    fresh, _, _ = xbuild(sie_like, sie_like_jacobian, **fresh_equivalent(kw, 3.0))
+    assert got.closed.shape[0] > 0 and to_np(got.closed).all()
+    assert_same(got, mesh_critical_curves_and_caustics(fresh))
+
+
+def test_an_extension_of_a_mesh_on_a_device_stays_on_it(device):
+    kw = dict(fov=4.0, init_res=4, min_img_sep=0.05, device=device)
+    mesh, lens_, _ = xbuild(localised_fold, localised_fold_jacobian, **kw)
+    got = extend_lens_mesh(mesh, lens_.raytrace, lens_.jacobian_lens_equation, 6.0)
+    want, _, _ = xbuild(
+        localised_fold, localised_fold_jacobian, **fresh_equivalent(kw, 6.0)
+    )
+    on = backend.device(backend.as_array([0.0], device=device))
+    assert backend.device(got.vertices_lens) == on
+    assert backend.device(got.leaves) == backend.device(want.leaves)
+    assert_same(got, want)
+
+
+def test_batch_size_reaches_every_path_an_extension_traces():
+    """``batch_size`` caps every lens call an extension makes -- the ring's, and
+    the midpoints of the old leaves the balance splits, which `edge_bump`
+    needs -- and the mesh still equals the fresh build."""
+    kw = dict(fov=4.0, init_res=4, min_img_sep=0.05, batch_size=5)
+    mesh, lens_, calls = xbuild(edge_bump, edge_bump_jacobian, **kw)
+    calls.raytrace.clear()
+    calls.jacobian.clear()
+    got = extend_lens_mesh(
+        mesh, lens_.raytrace, lens_.jacobian_lens_equation, 6.0, batch_size=5
+    )
+    assert (
+        calls.raytrace and max(len(xy) for xy in calls.raytrace + calls.jacobian) <= 5
+    )
+    want, _, _ = xbuild(edge_bump, edge_bump_jacobian, **fresh_equivalent(kw, 6.0))
+    assert_same(got, want)
+
+
+def closed_build(fn, jac, fov, init_res, min_img_sep, **kw):
+    """``build_closed_lens_mesh`` on a recording lens, with every warning kept."""
+    lens_, calls = numpy_lens(fn, jac)
+    with warnings.catch_warnings(record=True) as record:
+        warnings.simplefilter("always")
+        mesh, curves = build_closed_lens_mesh(
+            lens_.raytrace,
+            lens_.jacobian_lens_equation,
+            fov,
+            init_res,
+            min_img_sep,
+            **kw,
+        )
+    return mesh, curves, [str(w.message) for w in record], lens_, calls
+
+
+def fov_and_init_res(mesh):
+    return lattice_fov(mesh.lattice), lattice_init_res(mesh.lattice)
+
+
+def test_a_curve_the_fov_cuts_is_grown_until_it_closes():
+    """The tangential curve, radius ~1.18, crosses every side of the fov-2 domain.
+    With ``h0 = 0.125`` and ``growth = 1.05`` each step adds one cell a side:
+    fov 2 -> 2.25, still cut, -> 2.5, closed."""
+    kw = dict(fov=2.0, init_res=16, min_img_sep=0.05)
+    mesh, curves, messages, _, _ = closed_build(
+        sie_like, sie_like_jacobian, growth=1.05, **kw
+    )
+    assert fov_and_init_res(mesh) == (2.5, 20)
+    assert curves.closed.shape[0] > 0 and to_np(curves.closed).all()
+    assert messages == []
+    start, lens_, _ = xbuild(sie_like, sie_like_jacobian, **kw)
+    assert_same(
+        mesh, extend_lens_mesh(start, lens_.raytrace, lens_.jacobian_lens_equation, 2.5)
+    )
+    assert_same(curves, mesh_critical_curves_and_caustics(mesh))
+
+
+@pytest.mark.parametrize("x0, y0", [(0.5, 0.0), (-0.5, 0.0), (0.0, 0.5), (0.0, -0.5)])
+def test_a_curve_cut_by_any_one_side_of_the_fov_grows_it(x0, y0):
+    """Off-center by 0.5, only the fov-3 domain's near side cuts the curve; the
+    default ``growth`` asks for fov 4.5, two whole cells of ``h0 = 0.5`` a side."""
+    mesh, curves, messages, _, _ = closed_build(
+        sie_like, sie_like_jacobian, 3.0, 6, 0.05, x0=x0, y0=y0
+    )
+    assert fov_and_init_res(mesh) == (5.0, 10)
+    assert to_np(curves.closed).all()
+    assert messages == []
+
+
+def test_a_mesh_whose_fov_cuts_no_curve_is_the_plain_build():
+    kw = dict(fov=3.0, init_res=6, min_img_sep=0.05)
+    mesh, curves, messages, _, _ = closed_build(sie_like, sie_like_jacobian, **kw)
+    assert messages == []
+    want, _, _ = xbuild(sie_like, sie_like_jacobian, **kw)
+    assert_same(mesh, want)
+    assert_same(curves, mesh_critical_curves_and_caustics(want))
+
+
+def test_a_curve_open_inside_the_fov_does_not_grow_it():
+    """A non-finite strip across the tangential curve leaves it open inside the fov;
+    growing cannot close it, so the fov stays, and nothing warns."""
+    fn, jac = broken_where(
+        sie_like,
+        sie_like_jacobian,
+        lambda p: (p[:, 0] > 0.9) & (p[:, 0] < 1.3) & (np.abs(p[:, 1]) < 0.2),
+    )
+    mesh, curves, messages, _, _ = closed_build(fn, jac, 3.0, 6, 0.05)
+    assert not to_np(curves.closed).all()
+    assert fov_and_init_res(mesh) == (3.0, 6)
+    assert messages == []
+
+
+@pytest.mark.parametrize("max_iters, fov, init_res", [(0, 2.0, 16), (1, 2.25, 18)])
+def test_running_out_of_iterations_warns_and_returns_the_last_mesh(
+    max_iters, fov, init_res
+):
+    mesh, curves, messages, _, _ = closed_build(
+        sie_like, sie_like_jacobian, 2.0, 16, 0.05, growth=1.05, max_iters=max_iters
+    )
+    assert fov_and_init_res(mesh) == (fov, init_res)
+    assert not to_np(curves.closed).all()
+    assert len(messages) == 1 and "still cuts" in messages[0]
+    assert_same(curves, mesh_critical_curves_and_caustics(mesh))
+
+
+def test_build_options_reach_the_build_and_every_extension():
+    """``batch_size`` caps every raytrace and Jacobian call of the build and its
+    extensions, and the result equals the build extended by hand."""
+    kw = dict(fov=2.0, init_res=4, min_img_sep=0.05, batch_size=5)
+    mesh, _, messages, _, calls = closed_build(sie_like, sie_like_jacobian, **kw)
+    assert messages == []
+    assert max(len(xy) for xy in calls.raytrace + calls.jacobian) <= 5
+    start, lens_, _ = xbuild(sie_like, sie_like_jacobian, **kw)
+    want = extend_lens_mesh(
+        start, lens_.raytrace, lens_.jacobian_lens_equation, 3.0, batch_size=5
+    )
+    assert_same(mesh, want)
+
+
+def test_a_center_outside_the_fov_widens_it_before_the_build_and_warns():
+    """The hole at x = 1.8001, radius 0.025, needs a half-width above 1.8251: two
+    cells of ``h0 = 0.5`` a side. It happens before the build, even with ``max_iters = 0``.
+    """
+    c_out = (1.8001, 0.2003)
+    fn, jac = sis(C_IN, 0.6)
+    mesh, curves, messages, _, _ = closed_build(
+        fn, jac, 2.0, 4, 0.05, centers=[C_IN, c_out], max_iters=0
+    )
+    assert fov_and_init_res(mesh) == (4.0, 8)
+    assert len(messages) == 1
+    assert "fov=4" in messages[0] and "init_res=8" in messages[0]
+    assert to_np(curves.closed).all()
+    want, _, _ = xbuild(fn, jac, 4.0, 8, 0.05, centers=[C_IN, c_out])
+    assert_same(mesh, want)
+
+
+@pytest.mark.parametrize(
+    "edge",
+    [
+        pytest.param([(0.9901, 0.2003)], id="center-inside-hole-across"),
+        # Closer than twice the halved 0.05, so one hole: mean x 0.9601,
+        # radius 0.025 + 0.0225, reaching 1.0076.
+        pytest.param([(0.9601, 0.2003), (0.9601, 0.2453)], id="merged-pair"),
+    ],
+)
+def test_a_hole_across_the_fov_edge_widens_it(edge):
+    fn, jac = sis(C_IN, 0.6)
+    mesh, _, messages, _, _ = closed_build(fn, jac, 2.0, 4, 0.05, centers=[C_IN, *edge])
+    assert fov_and_init_res(mesh) == (3.0, 6)
+    assert len(messages) == 1 and "init_res=6" in messages[0]
+
+
+def test_holes_inside_the_fov_leave_it_alone():
+    """The hole at x = 0.9601 reaches 0.9851 with the build's halved radius 0.025: inside."""
+    fn, jac = sis(C_IN, 0.6)
+    centers = [C_IN, (0.9601, 0.2003)]
+    mesh, curves, messages, _, _ = closed_build(fn, jac, 2.0, 4, 0.05, centers=centers)
+    assert messages == []
+    assert to_np(curves.closed).all()
+    want, _, _ = xbuild(fn, jac, 2.0, 4, 0.05, centers=centers)
+    assert_same(mesh, want)

@@ -9,28 +9,45 @@ lens evaluation, and :func:`build_closed_lens_mesh` grows it until the fov
 cuts no critical curve.
 """
 
+import math
 from typing import NamedTuple
+from warnings import warn
 
 from ....backend_obj import ArrayLike, backend
-from .geometry import ROOT_CLASS, is_member, to_device
+from .geometry import ROOT_CLASS, build_device, is_member, to_device
 from .lattice import (
     Lattice,
     check_lattice_keys,
     depth_floor,
+    extend_lattice,
     initial_triangles,
+    lattice_fov,
     lattice_h0,
     lattice_ij_from_key,
+    lattice_init_res,
     lattice_key,
     lattice_xy,
     make_lattice,
     midpoint_ij,
+    ring_triangles,
     warn_depth_limited,
 )
-from .refine import add_roots, close, empty_cache, empty_store, refine, sample_points
+from .refine import (
+    LeafStore,
+    VertexCache,
+    add_roots,
+    cache_lookup,
+    close,
+    empty_cache,
+    empty_store,
+    refine,
+    sample_points,
+)
 from .index import MeshIndex, build_index
 from .criterion import LEAF_CONVERGED, lens_status
 from .band import CriticalBand, build_band, in_band
 from .holes import CentreHoles, merge_centres, sample_holes
+from .curves import mesh_critical_curves_and_caustics
 
 
 class LensMesh(NamedTuple):
@@ -355,3 +372,252 @@ def _freeze(
         min_img_sep=float(min_img_sep),
     )
     return to_device(mesh, device)
+
+
+def _seed(mesh, lat, k):
+    """
+    :func:`~.refine.refine`'s state, and :func:`_freeze`'s ``seed``, from a mesh on its lattice grown by ``k``.
+
+    The mesh's vertices are in lattice-key order, which a uniform shift
+    keeps, so they are the cache as they stand, every one a leaf vertex; its
+    origins are the store, row for row.
+    """
+    mesh = to_device(mesh, build_device())
+    int64 = backend.int64
+    ij = mesh.vertices_ij + (int(k) << lat.level)
+    n_vertices, n_origins = ij.shape[0], mesh.origin_leaves.shape[0]
+    cache = VertexCache(
+        keys=lattice_key(lat, ij),
+        slots=backend.arange(n_vertices, dtype=int64),
+        ij=ij,
+        values=backend.concatenate(
+            (mesh.vertices_source, backend.unsqueeze(mesh.vertices_det, -1)), dim=1
+        ),
+        active=backend.ones((n_vertices,), dtype=backend.bool),
+    )
+    store = LeafStore(
+        v=mesh.origin_leaves,
+        level=mesh.origin_level,
+        cls=mesh.origin_cls,
+        valid=backend.ones((n_origins,), dtype=backend.bool),
+    )
+    band = mesh.critical_band
+    bij = ij[mesh.origin_leaves[band.leaves]]
+    keys6 = backend.concatenate(
+        (lattice_key(lat, bij), lattice_key(lat, midpoint_ij(bij))), dim=1
+    )
+    # Band samples are numbered in ascending key order, so these keys ascend.
+    sample_keys = backend.fill_at_indices(
+        backend.zeros((band.det.shape[0],), dtype=int64),
+        band.samples.reshape(-1),
+        keys6.reshape(-1),
+    )
+    mid = backend.flatnonzero(cache_lookup(cache, sample_keys) < 0)
+    values = backend.concatenate((band.source, backend.unsqueeze(band.det, -1)), dim=1)
+    seed = (mesh.origin_status, band.leaves, sample_keys[mid], values[mid])
+    return cache, store, seed
+
+
+def extend_lens_mesh(mesh, raytrace, jacobian, fov, *, batch_size=None):
+    """
+    Grow a lens mesh to a larger fov about the same center, reusing its refinement.
+
+    Whole level-0 cells are added on every side: the fewest that reach
+    ``fov``, to within ``1e-9`` of a cell. The ring is refined as a fresh
+    build would refine it, and the balance settles the seam, so the result is
+    the mesh :func:`build_lens_mesh` gives on the grown lattice -- bit for bit
+    when the lens returns the same value at a point whatever batch it arrives
+    in, and the grown fov, center and cell size are dyadic. No old vertex or
+    band sample is sampled again.
+
+    Parameters
+    ----------
+    mesh: LensMesh
+    raytrace, jacobian:
+        The pair ``mesh`` was built from.
+    fov: float
+        Requested side length.
+
+        *Unit: arcsec*
+    batch_size: Optional[int]
+        As for :func:`build_lens_mesh`.
+
+    Returns
+    -------
+    LensMesh
+        ``mesh`` itself when ``fov`` needs no new cell.
+    """
+    h0 = lattice_h0(mesh.lattice)
+    k = max(0, math.ceil((float(fov) - lattice_fov(mesh.lattice)) / (2.0 * h0) - 1e-9))
+    if k == 0:
+        return mesh
+    lat = extend_lattice(to_device(mesh.lattice, build_device()), k)
+    init_res, max_level = lattice_init_res(lat), lat.level - 1
+    check_lattice_keys(
+        init_res,
+        max_level,
+        "Extend by less, or rebuild with a larger min_img_sep or a lower max_depth.",
+    )
+    _warn_depth_limited(h0, mesh.min_img_sep, max_level)
+    device = backend.device(mesh.vertices_lens)
+    sample = make_sampler(raytrace, jacobian, device)
+    cache, store, seed = _seed(mesh, lat, k)
+    ij, cls = ring_triangles(init_res, k, lat.level, ROOT_CLASS)
+    cache, store, rows = add_roots(cache, store, lat, ij, cls, sample, batch_size)
+    split = _lens_split(h0, mesh.min_img_sep)
+    cache, store = refine(cache, store, rows, lat, sample, split, max_level, batch_size)
+    return _freeze(
+        lat,
+        cache,
+        store,
+        sample,
+        mesh.min_img_sep,
+        mesh.holes,
+        device,
+        batch_size,
+        seed,
+    )
+
+
+def _hole_rings(fov, init_res, x0, y0, centers, min_img_sep):
+    """
+    Level-0 cells per side that put every center's hole strictly inside the fov.
+
+    The holes are :func:`merge_centers`'s, at the halved ``min_img_sep`` the
+    build gives it, so a merged hole reaches as far as its own radius. The
+    smallest ``k`` with ``fov / 2 + k * h0`` beyond every hole's reach --
+    its center's larger offset from ``(x0, y0)``, plus its radius.
+
+    Returns
+    -------
+    k: int
+        Zero when every hole already lies strictly inside.
+    outside: int
+        How many holes did not.
+    """
+    hole_centers, radius = merge_centres(centers, min_img_sep)
+    if hole_centers.shape[0] == 0:
+        return 0, 0
+    center = backend.as_array([x0, y0], dtype=backend.float64)
+    reach = backend.max(backend.abs(hole_centers - center), dim=1) + radius
+    outside = int(backend.to_numpy(backend.sum(reach >= fov / 2)))
+    if outside == 0:
+        return 0, 0
+    excess = float(backend.to_numpy(backend.max(reach))) - fov / 2
+    return math.floor(excess / (fov / init_res)) + 1, outside
+
+
+def _curves_cut_by_fov(mesh, curves):
+    """
+    How many open curves have an end on ``mesh``'s fov boundary.
+
+    Exact, with no tolerance: every vertex and band sample is placed by
+    :func:`lattice_xy` and cast to the mesh dtype alike, so the boundary is
+    the vertices' own extreme coordinates, and a crossing on a boundary child
+    edge, both of whose samples share that coordinate, reproduces it bit for
+    bit (:func:`~caustics.lenses.func.adaptive.curves.crossing_points`). An
+    end at a band gap inside the fov does not count.
+    """
+    open_curves = backend.flatnonzero(~curves.closed)
+    n_open = open_curves.shape[0]
+    if n_open == 0:
+        return 0
+    ends = backend.concatenate(
+        (curves.offsets[open_curves], curves.offsets[open_curves + 1] - 1)
+    )
+    xy = curves.lens[ends]
+    lo = backend.min(mesh.vertices_lens, dim=0)
+    hi = backend.max(mesh.vertices_lens, dim=0)
+    on_boundary = backend.any((xy == lo) | (xy == hi), dim=1)
+    cut = on_boundary[:n_open] | on_boundary[n_open:]
+    return int(backend.to_numpy(backend.sum(cut)))
+
+
+def build_closed_lens_mesh(
+    raytrace,
+    jacobian,
+    fov,
+    init_res,
+    min_img_sep,
+    max_depth=25,
+    *,
+    growth=1.5,
+    max_iters=10,
+    x0=0.0,
+    y0=0.0,
+    centers=None,
+    device=None,
+    batch_size=None,
+):
+    """
+    Build a lens mesh, then grow its fov until it cuts no critical curve.
+
+    When a hole around one of ``centers`` does not lie strictly inside
+    ``fov``, the fov is first widened by the fewest whole level-0 cells
+    that take every hole inside, with a warning. After the build, while an
+    open curve ends on the fov boundary and fewer than ``max_iters``
+    extensions have run, :func:`extend_lens_mesh` grows the fov by
+    ``growth``, rounded up to whole cells, and the curves are traced again.
+    A curve ending inside the fov -- next to a non-finite leaf, at an
+    unjoined hole, or where ``max_depth`` bound -- grows nothing.
+
+    Parameters
+    ----------
+    raytrace, jacobian, fov, init_res, min_img_sep, max_depth, x0, y0, centers, device, batch_size:
+        As for :func:`build_lens_mesh`.
+    growth: float
+        Factor each extension asks to multiply the fov by.
+    max_iters: int
+        Most extensions to run.
+
+    Returns
+    -------
+    mesh: LensMesh
+    curves: CriticalCurvesAndCaustics
+        The last mesh's critical curves and caustics.
+    """
+    k, outside = _hole_rings(fov, init_res, x0, y0, centers, min_img_sep / 2)
+    if k:
+        widened = fov + 2 * k * (fov / init_res)
+        warn(
+            f"{outside} hole(s) around centers reach outside fov={fov:g}; building "
+            f"at fov={widened:g}, init_res={init_res + 2 * k} so that every hole "
+            "lies inside it.",
+            stacklevel=2,
+        )
+        fov, init_res = widened, init_res + 2 * k
+    mesh = build_lens_mesh(
+        raytrace,
+        jacobian,
+        fov,
+        init_res,
+        min_img_sep,
+        max_depth,
+        x0=x0,
+        y0=y0,
+        centers=centers,
+        device=device,
+        batch_size=batch_size,
+    )
+    curves = mesh_critical_curves_and_caustics(mesh)
+    cut = _curves_cut_by_fov(mesh, curves)
+    for _ in range(max_iters):
+        if cut == 0:
+            break
+        mesh = extend_lens_mesh(
+            mesh,
+            raytrace,
+            jacobian,
+            growth * lattice_fov(mesh.lattice),
+            batch_size=batch_size,
+        )
+        curves = mesh_critical_curves_and_caustics(mesh)
+        cut = _curves_cut_by_fov(mesh, curves)
+    if cut:
+        warn(
+            f"The fov still cuts {cut} critical curve(s) after {max_iters} "
+            f"extension(s), at fov={lattice_fov(mesh.lattice):g}; raise max_iters "
+            "or growth to grow it further.",
+            stacklevel=2,
+        )
+    return mesh, curves

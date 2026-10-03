@@ -66,7 +66,24 @@ def build(fn, jac, fov=4.0, init_res=4, min_img_sep=0.25, **kw):
 
 
 def assert_same(a, b, path="mesh"):
-    """``a`` and ``b`` equal: NamedTuples field by field, arrays bit for bit."""
+    """
+    ``a`` and ``b`` equal: NamedTuples field by field, arrays bit for bit.
+
+    Two lattices are equal when they place every point alike: an extended
+    lattice keeps its ``lo`` and shifts ``origin`` where a fresh one starts
+    at its own corner.
+    """
+    from caustics.lenses.func.adaptive.lattice import Lattice, lattice_xy
+
+    if isinstance(a, Lattice):
+        assert (a.level, a.n, a.scale) == (b.level, b.n, b.scale), path
+        corners = i64([[0, 0], [a.n, a.n], [a.n // 3, 2 * a.n // 3]])
+        np.testing.assert_array_equal(
+            to_np(lattice_xy(a, corners)),
+            to_np(lattice_xy(b, corners)),
+            err_msg=path,
+        )
+        return
     if isinstance(a, tuple) and hasattr(a, "_fields"):
         assert type(a) is type(b), path
         for name in a._fields:

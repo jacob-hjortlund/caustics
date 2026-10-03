@@ -370,3 +370,22 @@ def test_close_reaches_the_count_equals_3_branch():
     )
     assert (np.bincount(to_np(leaf_origin)) == 4).any()
     assert tiles(lat, cache, used, leaves, leaf_origin, origin_leaves)
+
+
+def test_refining_the_roots_in_two_passes_gives_the_one_pass_mesh():
+    split = around(0.02, -0.57)
+    lat = make_lattice(FOV, 0.0, 0.0, INIT_RES, MAX_LEVEL + 1)
+    ij, cls = initial_triangles(INIT_RES, lat.level, ROOT_CLASS)
+    right_of_seam = backend.max(ij[:, :, 0], dim=1) > lat.n // 2
+    first = backend.flatnonzero(~right_of_seam)
+    second = backend.flatnonzero(right_of_seam)
+    cache, store, rows = add_roots(
+        empty_cache(2), empty_store(), lat, ij[first], cls[first], positions, None
+    )
+    cache, store = refine(cache, store, rows, lat, positions, split, MAX_LEVEL, None)
+    cache, store, rows = add_roots(
+        cache, store, lat, ij[second], cls[second], positions, None
+    )
+    cache, store = refine(cache, store, rows, lat, positions, split, MAX_LEVEL, None)
+    for a, b in zip(closed(*run(split)), closed(lat, cache, store)):
+        assert np.array_equal(a, b)
