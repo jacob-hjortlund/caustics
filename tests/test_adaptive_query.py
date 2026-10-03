@@ -1,4 +1,3 @@
-import warnings
 from types import SimpleNamespace
 
 import numpy as np
@@ -10,18 +9,14 @@ from caustics.lenses.func.adaptive import (
     LEAF_CONVERGENCE_FAILED,
     LEAF_JACOBIAN_NONFINITE,
     build_adaptive_mesh,
-    child_matrix_tables,
     contains,
     mesh_query,
     mesh_seeds,
     triangle_weights,
 )
-from caustics.lenses.func.adaptive.build import validate_build_args
 from caustics.lenses.func.adaptive.images import dedup_representatives
-from caustics.lenses.func.adaptive.lattice import depth_floor, make_lattice
-from caustics.lenses.func.adaptive.refinement import refine
-from caustics.lenses.func.adaptive.sampling import make_raytrace
-from caustics.lenses.func.adaptive.state import store_compact
+
+from adaptive_maps import sis_jacobian, sis_raytrace
 
 
 def _sie_like(x, y):
@@ -158,26 +153,6 @@ def make_counting_lens(fn, jac):
         raytrace=raytrace, jacobian_lens_equation=jacobian_lens_equation
     )
     return lens, calls
-
-
-def sis_raytrace(p, b=1.0):
-    """SIS deflection ``beta = theta (1 - b/|theta|)``, non-finite at ``theta = 0``.
-
-    A *point* non-finite set, unlike the half-plane fixtures: the origin is a
-    lattice vertex for even ``init_res``, so exactly one sample point in the
-    whole build is non-finite and the six level-0 triangles sharing it are the
-    ones the old terminate-on-non-finite policy condemned wholesale.
-    """
-    with np.errstate(divide="ignore", invalid="ignore"):
-        r = np.linalg.norm(p, axis=-1, keepdims=True)
-        return p * (1.0 - b / r)
-
-
-def sis_jacobian(p, b=1.0):
-    """``(1 - b/r) I + b theta theta^T / r**3``, non-finite at the origin too."""
-    with np.errstate(divide="ignore", invalid="ignore"):
-        r = np.linalg.norm(p, axis=-1)[:, None, None]
-        return (1.0 - b / r) * np.eye(2) + b * p[:, :, None] * p[:, None, :] / r**3
 
 
 def localised_fold(p):
@@ -465,143 +440,6 @@ def test_bary_reconstructs_beta_on_every_hit_leaf():
 # Where a kappa == 1 sheet leaves every leaf: it fails the deviation test
 # (``s == 0``) and has ``det A == 0`` at every sample.
 DEGENERATE = LEAF_CONVERGENCE_FAILED | LEAF_JACOBIAN_NONFINITE
-
-
-def test_centroid_fallback_on_a_totally_degenerate_leaf():
-    """kappa == 1 maps every leaf to a point: w and d are exactly zero.
-
-    With ``A == 0`` identically, no leaf passes the deviation test and the
-    forced Jacobian at ``max_level`` finds ``det A == 0`` at every sample, so
-    all 2048 leaves of this fixture end
-    ``LEAF_CONVERGENCE_FAILED | LEAF_JACOBIAN_NONFINITE`` and none is indexed.
-    ``mesh_query`` therefore returns nothing anywhere -- not just at the
-    origin queried below. The centroid fallback this test originally exercised
-    through a live query no longer arises this way; it stays covered directly
-    at the kernel level by
-    ``test_sanitize_bary_falls_back_to_the_centroid_on_total_degeneracy`` in
-    tests/test_adaptive_kernels.py.
-    """
-    mesh, _ = build(collapse, collapse_jacobian, fov=4.0, init_res=4, min_img_sep=0.5)
-    idx, off, bary = query_np(mesh, np.zeros((1, 2)))
-    assert idx.shape[0] == 0
-    assert off.tolist() == [0, 0]
-    assert bary.shape == (0, 3)
-    status = backend.to_numpy(mesh.leaf_status)
-    assert status.shape == (2048,)
-    assert (status == DEGENERATE).all()
-
-
-def test_coverage_does_not_drop_at_level_transitions():
-    """Spec test 28. Reports the gap rather than only thresholding it."""
-    fov, init_res, sep = 4.0, 4, 0.05
-    mesh, _ = build(
-        localised_fold,
-        localised_fold_jacobian,
-        fov=fov,
-        init_res=init_res,
-        min_img_sep=sep,
-    )
-    ml = mesh.max_level
-    assert ml >= 3 and len(set(backend.to_numpy(mesh.leaf_level).tolist())) > 1
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        uniform, _ = build(
-            localised_fold,
-            localised_fold_jacobian,
-            fov=fov,
-            init_res=init_res * 2**ml,
-            min_img_sep=sep,
-            max_depth=0,
-        )
-    grid = np.linspace(-0.9, 0.9, 120)
-    beta = np.stack(np.meshgrid(grid, grid, indexing="ij"), axis=-1).reshape(-1, 2)
-    _, off_a, _ = query_np(mesh, beta, batch_size=4096)
-    _, off_u, _ = query_np(uniform, beta, batch_size=4096)
-    hit_a = np.diff(off_a) > 0
-    hit_u = np.diff(off_u) > 0
-    gap = int((hit_u & ~hit_a).sum())
-    print(f"coverage gap at level transitions: {gap} / {int(hit_u.sum())} covered")
-    assert gap == 0
-
-
-def _build_with_counters(fn, jac, fov, init_res, min_img_sep, max_depth=25):
-    """
-    Recover the pre-closure termination counters the frozen oracle exposes as
-    ``Mesh.stats`` (a ``BuildStats``) -- dropped from ``AdaptiveMesh``, which
-    stores only the frozen result, not the build's own bookkeeping. Mirrors
-    ``build_adaptive_mesh``'s prologue exactly, up to the point those numbers
-    are available: the oracle computes
-    ``n_converged_at_level_0=int(ref.counters["converged_level0"])``,
-    ``n_deviation_splits=int(ref.counters["deviation_splits"])`` and
-    ``n_leaves_pre_closure=int(pre_v.shape[0])`` (old_adaptive.py's
-    ``build_adaptive_mesh``), and ``refine`` in ``func/adaptive.py`` returns
-    the same-keyed ``counters`` dict this helper reads directly.
-    """
-    lens, _ = make_counting_lens(fn, jac)
-    requested_min_img_sep = min_img_sep
-    min_img_sep = min_img_sep / 2
-    validate_build_args(fov, init_res, min_img_sep, max_depth, requested_min_img_sep)
-    d_floor = depth_floor(fov / init_res, min_img_sep)
-    max_level = min(int(max_depth), d_floor)
-    tables = child_matrix_tables()
-    lat = make_lattice(fov, 0.0, 0.0, init_res, max_level + 1)
-    raytrace_fn = make_raytrace(lens.raytrace, None)
-    _cache, _active, store, counters, _band = refine(
-        raytrace_fn,
-        lens.jacobian_lens_equation,
-        lat,
-        init_res,
-        fov / init_res,
-        min_img_sep,
-        max_level,
-        tables,
-        None,
-    )
-    pre_v, _pre_level, _pre_cls, _pre_status = store_compact(store)
-    return counters, int(pre_v.shape[0]), max_level
-
-
-def test_criterion_is_blind_to_structure_below_the_sampling_scale():
-    """Spec section 2.6, asserted in both directions.
-
-    The criterion reads six points per triangle and the centroid is 0.289*edge from
-    the nearest of them, so a perturbation supported inside that radius is exactly
-    invisible. Completeness is conditional on init_res resolving it.
-
-    ADAPTED: ``AdaptiveMesh`` does not carry the oracle's ``Mesh.stats``, so
-    the termination counters are recovered directly via
-    ``refine``/``store_compact`` in ``_build_with_counters`` above -- the same
-    internal calls ``build_adaptive_mesh`` itself makes to compute
-    ``n_converged_at_level_0``/``n_deviation_splits``/``n_leaves_pre_closure``.
-    """
-    centre = np.array([[-2.0, -2.0], [0.0, 0.0], [-2.0, 0.0]]).mean(axis=0)
-
-    def bumped(p):
-        r2 = ((p - centre) ** 2).sum(axis=-1)
-        bump = (2.0 * np.exp(-r2 / (2 * 0.08**2)))[:, None] * np.array([1.0, 0.0])
-        return p * 0.5 + bump
-
-    def bumped_jacobian(p):
-        d = p - centre
-        g = 2.0 * np.exp(-(d**2).sum(axis=-1) / (2 * 0.08**2))
-        grad = -(g / 0.08**2)[:, None] * d
-        return 0.5 * np.eye(2) + np.array([1.0, 0.0])[None, :, None] * grad[:, None, :]
-
-    # At init_res=2 the nearest of the six sample points is 0.47 from the bump
-    # centre, where the bump is 6e-8 -- far below the threshold. At init_res=32 the
-    # cell is 0.125 and the deviation is ~0.6, well above it.
-    sep = 0.05
-    coarse_counters, coarse_pre_closure, _ = _build_with_counters(
-        bumped, bumped_jacobian, 4.0, 2, sep
-    )
-    fine_counters, fine_pre_closure, fine_max_level = _build_with_counters(
-        bumped, bumped_jacobian, 4.0, 32, sep
-    )
-    assert fine_max_level >= 1, "fine build must actually run the criterion"
-    assert coarse_counters["converged_level0"] == coarse_pre_closure
-    assert coarse_counters["deviation_splits"] == 0
-    assert fine_counters["converged_level0"] < fine_pre_closure
-    assert fine_counters["deviation_splits"] > 0
 
 
 def test_seeds_lie_inside_their_lens_triangle(mesh, beta):

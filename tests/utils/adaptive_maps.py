@@ -28,3 +28,145 @@ def stack_2x2(a, b, c, d):
 def lens(raytrace, jacobian):
     """A stand-in for a caustics lens."""
     return SimpleNamespace(raytrace=raytrace, jacobian_lens_equation=jacobian)
+
+
+def numpy_lens(fn, jac):
+    """
+    A lens over numpy maps, recording every point each method is called on.
+
+    ``fn`` maps ``(N, 2) -> (N, 2)`` and ``jac`` gives its ``(N, 2, 2)``
+    Jacobian. Returns the lens and ``calls``, whose ``raytrace`` and
+    ``jacobian`` lists hold the numpy ``(N, 2)`` points of each call.
+    """
+    calls = SimpleNamespace(raytrace=[], jacobian=[])
+
+    def raytrace(x, y):
+        xy = np.stack((to_np(x), to_np(y)), axis=-1)
+        calls.raytrace.append(xy)
+        out = backend.as_array(fn(xy), dtype=x.dtype, device=backend.device(x))
+        return out[:, 0], out[:, 1]
+
+    def jacobian(x, y):
+        xy = np.stack((to_np(x), to_np(y)), axis=-1)
+        calls.jacobian.append(xy)
+        return backend.as_array(jac(xy), dtype=x.dtype, device=backend.device(x))
+
+    return lens(raytrace, jacobian), calls
+
+
+def build(fn, jac, fov=4.0, init_res=4, min_img_sep=0.25, **kw):
+    """``build_lens_mesh`` of numpy maps, and the recorded calls."""
+    from caustics.lenses.func.adaptive.lens_mesh import build_lens_mesh
+
+    lens_, calls = numpy_lens(fn, jac)
+    mesh = build_lens_mesh(
+        lens_.raytrace, lens_.jacobian_lens_equation, fov, init_res, min_img_sep, **kw
+    )
+    return mesh, calls
+
+
+def assert_same(a, b, path="mesh"):
+    """``a`` and ``b`` equal: NamedTuples field by field, arrays bit for bit."""
+    if isinstance(a, tuple) and hasattr(a, "_fields"):
+        assert type(a) is type(b), path
+        for name in a._fields:
+            assert_same(getattr(a, name), getattr(b, name), f"{path}.{name}")
+    elif hasattr(a, "shape"):
+        assert a.dtype == b.dtype and tuple(a.shape) == tuple(b.shape), path
+        np.testing.assert_array_equal(to_np(a), to_np(b), err_msg=path)
+    else:
+        assert a == b, path
+
+
+def localised_fold(p):
+    """Affine outside ``|y| < 0.5``; inside, ``beta_y = 0.6 y + y**2 - 0.25`` folds at ``y = -0.3``."""
+    y = p[:, 1]
+    bend = np.where(np.abs(y) < 0.5, y**2 - 0.25, 0.0)
+    return np.stack([p[:, 0], 0.6 * y + bend], axis=-1)
+
+
+def localised_fold_jacobian(p):
+    J = np.zeros((p.shape[0], 2, 2))
+    J[:, 0, 0] = 1.0
+    J[:, 1, 1] = np.where(np.abs(p[:, 1]) < 0.5, 0.6 + 2.0 * p[:, 1], 0.6)
+    return J
+
+
+def row_fold(p):
+    """``(x, y - y**2)``: ``det A = 1 - 2y`` is exactly zero on the lattice row ``y = 0.5``."""
+    return np.stack([p[:, 0], p[:, 1] - p[:, 1] ** 2], axis=-1)
+
+
+def row_fold_jacobian(p):
+    J = np.zeros((p.shape[0], 2, 2))
+    J[:, 0, 0] = 1.0
+    J[:, 1, 1] = 1.0 - 2.0 * p[:, 1]
+    return J
+
+
+def sie_like(p):
+    """A cored isothermal sphere: tangential curve at radius ~1.18, radial at ~0.32."""
+    r = np.sqrt(p[:, 0] ** 2 + p[:, 1] ** 2 + 0.05)
+    return p - 1.2 * p / r[:, None]
+
+
+def sie_like_jacobian(p):
+    x, y = p[:, 0], p[:, 1]
+    r = np.sqrt(x * x + y * y + 0.05)
+    k = 1.2 / r**3
+    J = np.empty((p.shape[0], 2, 2))
+    J[:, 0, 0] = 1.0 - 1.2 / r + k * x * x
+    J[:, 0, 1] = k * x * y
+    J[:, 1, 0] = k * x * y
+    J[:, 1, 1] = 1.0 - 1.2 / r + k * y * y
+    return J
+
+
+AFFINE = np.array([[0.7, 0.1], [-0.2, 0.9]])
+
+
+def affine(p):
+    return p @ AFFINE.T
+
+
+def affine_jacobian(p):
+    return np.tile(AFFINE, (p.shape[0], 1, 1))
+
+
+def collapse(p):
+    """A ``kappa == 1`` sheet: the whole lens plane maps to one point."""
+    return np.zeros_like(p)
+
+
+def collapse_jacobian(p):
+    return np.zeros((p.shape[0], 2, 2))
+
+
+def broken_where(fn, jac, where, value=np.nan):
+    """``fn`` and ``jac`` with ``value`` wherever ``where(p)`` holds."""
+
+    def broken(p):
+        out = fn(p)
+        out[where(p)] = value
+        return out
+
+    def broken_jacobian(p):
+        J = jac(p)
+        J[where(p)] = value
+        return J
+
+    return broken, broken_jacobian
+
+
+def sis_raytrace(p, b=1.0):
+    """SIS deflection ``beta = theta (1 - b/|theta|)``, non-finite at ``theta = 0``."""
+    with np.errstate(divide="ignore", invalid="ignore"):
+        r = np.linalg.norm(p, axis=-1, keepdims=True)
+        return p * (1.0 - b / r)
+
+
+def sis_jacobian(p, b=1.0):
+    """``(1 - b/r) I + b theta theta^T / r**3``, non-finite at the origin too."""
+    with np.errstate(divide="ignore", invalid="ignore"):
+        r = np.linalg.norm(p, axis=-1)[:, None, None]
+        return (1.0 - b / r) * np.eye(2) + b * p[:, :, None] * p[:, None, :] / r**3
