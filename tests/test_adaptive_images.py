@@ -165,11 +165,9 @@ def test_dedup_positions_are_within_min_img_sep_of_the_refined_roots(mesh):
 
 
 # ---------------------------------------------------------------------------
-# Ported from tests/test_adaptive_mesh.py (Task 15) -- see the task-15 report
-# for the three renames forced by a name collision with the Step-1 tests
-# above. The two SIE coverage tests below once excluded the central image,
-# which the oracle's criterion left uncovered; each docstring says why they
-# no longer need to.
+# Ported from tests/test_adaptive_mesh.py. The two SIE coverage tests below
+# once excluded the central image, which the oracle's criterion left
+# uncovered; each docstring says why they no longer need to.
 # ---------------------------------------------------------------------------
 
 

@@ -268,7 +268,7 @@ def test_every_indexed_leaf_has_finite_source_vertices():
 
 @pytest.mark.xfail(
     reason=(
-        "pre-existing index boundary edge case, see task-11 report: the test's "
+        "pre-existing index boundary edge case: the test's "
         "own `(q - lo) // cell` (floor-divide) can double-round differently from "
         "`_build_index`'s `((tri.min/max) - lo) / cell` then truncate at a cell "
         "quotient that lands exactly on a float64 boundary (32 of 6351 checks on "

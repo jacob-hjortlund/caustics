@@ -421,8 +421,8 @@ class SheetEdges(NamedTuple):
     lower vertex index first. ``dn`` is ``(E,)`` int64, never zero: summed
     over the edge's converged leaves, +1 for a leaf lying to the left of the
     edge directed from its lower vertex index to its higher, in the source
-    plane, and -1 for one to its right -- ``Delta n_e`` of the deposition
-    report. ``fov`` is ``(E,)`` bool, True on edges of the lens fov.
+    plane, and -1 for one to its right. ``fov`` is ``(E,)`` bool, True on
+    edges of the lens fov.
     """
 
     source: ArrayLike
