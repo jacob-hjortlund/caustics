@@ -94,7 +94,9 @@ class Lens(Module):
         lens equation. Individual lenses may implement more efficient methods.
         """
         A = self.jacobian_lens_equation(x, y, method=method, pixelscale=pixelscale)
-        I = backend.eye(2, device=A.device, dtype=A.dtype).reshape(  # noqa E741
+        I = backend.eye(
+            2, device=backend.device(A), dtype=A.dtype
+        ).reshape(  # noqa E741
             *[1] * len(A.shape[:-2]), 2, 2
         )
         negPsi = (
@@ -192,9 +194,9 @@ class Lens(Module):
             *Unit: arcsec*
         """
         if x0 is None:
-            x0 = backend.zeros((), device=bx.device, dtype=bx.dtype)
+            x0 = backend.zeros((), device=backend.device(bx), dtype=bx.dtype)
         if y0 is None:
-            y0 = backend.zeros((), device=by.device, dtype=by.dtype)
+            y0 = backend.zeros((), device=backend.device(by), dtype=by.dtype)
 
         return func.forward_raytrace(
             backend.stack((bx, by)),
@@ -455,7 +457,7 @@ class ThickLens(Lens):
         ax, ay = self.effective_reduced_deflection_angle(x, y)
 
         # Build Jacobian
-        J = backend.zeros((*ax.shape, 2, 2), device=ax.device, dtype=ax.dtype)
+        J = backend.zeros((*ax.shape, 2, 2), device=backend.device(ax), dtype=ax.dtype)
         grad_ax = backend.gradient(ax, spacing=pixelscale)
         grad_ay = backend.gradient(ay, spacing=pixelscale)
         J = backend.fill_at_indices(J, (Ellipsis, 0, 1), grad_ax[0])
@@ -533,7 +535,7 @@ class ThickLens(Lens):
         J = self._jacobian_effective_deflection_angle_finitediff(
             x, y, pixelscale, **kwargs
         )
-        return backend.to(backend.eye(2), device=J.device) - J
+        return backend.to(backend.eye(2), device=backend.device(J)) - J
 
     @forward
     def _jacobian_lens_equation_autograd(
@@ -548,7 +550,7 @@ class ThickLens(Lens):
         """
         # Build Jacobian
         J = self._jacobian_effective_deflection_angle_autograd(x, y, **kwargs)
-        return backend.to(backend.eye(2), device=J.device) - backend.detach(J)
+        return backend.to(backend.eye(2), device=backend.device(J)) - backend.detach(J)
 
     @forward
     def effective_convergence_div(
@@ -958,7 +960,7 @@ class ThinLens(Lens):
         ax, ay = self.reduced_deflection_angle(x, y)
 
         # Build Jacobian
-        J = backend.zeros((*ax.shape, 2, 2), device=ax.device, dtype=ax.dtype)
+        J = backend.zeros((*ax.shape, 2, 2), device=backend.device(ax), dtype=ax.dtype)
         grad_ax = backend.gradient(ax, spacing=pixelscale)
         grad_ay = backend.gradient(ay, spacing=pixelscale)
         J = backend.fill_at_indices(J, (Ellipsis, 0, 1), grad_ax[0])
@@ -1030,7 +1032,7 @@ class ThinLens(Lens):
         """
         # Build Jacobian
         J = self._jacobian_deflection_angle_finitediff(x, y, pixelscale, **kwargs)
-        return backend.to(backend.eye(2), device=J.device) - J
+        return backend.to(backend.eye(2), device=backend.device(J)) - J
 
     @forward
     def _jacobian_lens_equation_autograd(
@@ -1045,4 +1047,4 @@ class ThinLens(Lens):
         """
         # Build Jacobian
         J = self._jacobian_deflection_angle_autograd(x, y, **kwargs)
-        return backend.to(backend.eye(2), device=J.device) - backend.detach(J)
+        return backend.to(backend.eye(2), device=backend.device(J)) - backend.detach(J)
