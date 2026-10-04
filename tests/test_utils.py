@@ -346,3 +346,24 @@ def test_batch_lm_compiles_a_handful_of_programs_for_a_new_batch_size():
     before = len(compiles)
     _solve([[-1.2, 1.0], [0.99, 0.99], [0.5, 0.5]])
     assert len(compiles) - before <= 8
+
+
+@pytest.mark.skipif(backend.backend != "jax", reason="only jax compiles")
+def test_batch_lm_tests_termination_inside_the_jitted_step():
+    """A padded size the process has not seen costs about what a seen one does:
+    the per-iteration termination test is compiled with the step, not op by op."""
+    import jax
+
+    compiles = []
+    jax.monitoring.register_event_duration_secs_listener(
+        lambda event, duration, **kw: (
+            compiles.append(event)
+            if event == "/jax/core/compile/backend_compile_duration"
+            else None
+        )
+    )
+    jax.clear_caches()
+    _solve([[-1.2, 1.0], [0.99, 0.99]])
+    before = len(compiles)
+    _solve([[-1.2, 1.0]] * 100)  # padded to 128, a size not seen yet
+    assert len(compiles) - before <= 10

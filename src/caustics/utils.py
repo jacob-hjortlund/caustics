@@ -1615,24 +1615,22 @@ def batch_lm(
     if padded > B:
         X, Y, Cinv = (backend.pad_rows(a, padded) for a in (X, Y, Cinv))
 
-    v_lm_step = backend.jit(
-        backend.vmap(
-            partial(
-                _lm_step,
-                lambda x: f(x, *f_args, **f_kwargs),
-                Lup=L_up,
-                Ldn=L_dn,
-                epsilon=epsilon,
-                L_min=L_min,
-                L_max=L_max,
-            )
+    v_lm_step = backend.vmap(
+        partial(
+            _lm_step,
+            lambda x: f(x, *f_args, **f_kwargs),
+            Lup=L_up,
+            Ldn=L_dn,
+            epsilon=epsilon,
+            L_min=L_min,
+            L_max=L_max,
         )
     )
-    L = L * backend.ones(padded, device=backend.device(X), dtype=X.dtype)
-    for _ in range(max_iter):
+
+    # One iteration and its termination test, jitted together under jax.
+    def iterate(X, Y, Cinv, L):
         Xnew, L, C = v_lm_step(X, Y, Cinv, L)
         step = backend.max(backend.abs(Xnew - X), dim=-1)
-        X = Xnew
 
         # Termination is per element, then reduced -- never a majority vote.
         # Elements are mathematically independent and only the loop is shared, so
@@ -1653,7 +1651,13 @@ def batch_lm(
         # early keeps the loop from spinning until `max_iter` while a slower one
         # is still working. Either way `X` no longer moves.
         converged = (step < stopping) & (L < 1e-2)
-        if backend.all(converged | (L >= L_max)):
+        return Xnew, L, C, backend.all(converged | (L >= L_max))
+
+    iterate = backend.jit(iterate)
+    L = L * backend.ones(padded, device=backend.device(X), dtype=X.dtype)
+    for _ in range(max_iter):
+        X, L, C, done = iterate(X, Y, Cinv, L)
+        if done:
             break
 
     if padded > B:
