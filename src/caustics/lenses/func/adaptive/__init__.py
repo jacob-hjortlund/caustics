@@ -15,6 +15,8 @@ off it.
 
 The modules, lowest layer first; each imports only from those before it:
 
+- :mod:`.mesh_backend` -- the backend the bookkeeping runs on, and
+  conversions to and from the user's.
 - :mod:`.geometry` -- triangle maths, red-split tables, array helpers.
 - :mod:`.lattice` -- the dyadic integer lattice every vertex lives on.
 - :mod:`.refine` -- the refinement both meshes share: sample, split,

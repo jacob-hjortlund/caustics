@@ -8,6 +8,7 @@ source-plane lookup reads. Nothing here calls the lens or knows about a mesh.
 """
 
 from ....backend_obj import backend
+from .mesh_backend import map_arrays
 
 # Indices into the stacked six-point array [theta1, theta2, theta3, m1, m2, m3]
 # giving the four children in the orientation-preserving order
@@ -165,11 +166,7 @@ def to_device(value, device):
 
     Anything else is returned as it is.
     """
-    if isinstance(value, tuple) and hasattr(value, "_fields"):
-        return type(value)(*(to_device(v, device) for v in value))
-    if hasattr(value, "shape"):
-        return backend.to(value, device=device)
-    return value
+    return map_arrays(value, lambda a: backend.to(a, device=device))
 
 
 def is_member(sorted_values, values):
