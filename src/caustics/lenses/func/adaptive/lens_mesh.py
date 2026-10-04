@@ -126,30 +126,34 @@ class LensMesh(NamedTuple):
     min_img_sep: float
 
 
-def make_sampler(raytrace, jacobian, device):
+def make_sampler(raytrace, jacobian, device, batch_size=None):
     """
     The lens map as ``(N, 2) -> (N, 3)`` float64 ``(bx, by, det A)``, or ``(N, 2)`` images when ``jacobian`` is None.
 
     ``raytrace`` and ``jacobian`` receive the same float64 coordinates on
-    ``device``. Float64 matters: the criterion compares midpoint deviations
-    of ``O(fov)`` quantities, which cancel to exactly zero below about
+    ``device``, in the user's backend, padded to
+    ``backend.padded_size(N, batch_size)`` rows by repeating the last. Float64
+    matters: the criterion compares midpoint deviations of ``O(fov)``
+    quantities, which cancel to exactly zero below about
     ``sqrt(8 * eps * fov)`` and would read as converged. ``det A`` is formed
     in the Jacobian's dtype, then cast; the values come back on the
-    positions' device.
+    positions' device, one row per position.
     """
-    f64 = mesh_backend.float64
+    f64 = backend.float64
 
     def sample(xy):
-        x = mesh_backend.as_array(xy[:, 0], dtype=f64, device=device)
-        y = mesh_backend.as_array(xy[:, 1], dtype=f64, device=device)
+        n = xy.shape[0]
+        size = backend.padded_size(n, batch_size)
+        padded = mesh_backend.pad_rows(xy, size) if size > n else xy
+        x = backend.as_array(to_user(padded[:, 0]), dtype=f64, device=device)
+        y = backend.as_array(to_user(padded[:, 1]), dtype=f64, device=device)
         columns = list(raytrace(x, y))
         if jacobian is not None:
             J = jacobian(x, y)
             columns.append(J[:, 0, 0] * J[:, 1, 1] - J[:, 0, 1] * J[:, 1, 0])
-        out = mesh_backend.stack(
-            [mesh_backend.to(c, dtype=f64) for c in columns], dim=-1
-        )
-        return mesh_backend.to(out, device=mesh_backend.device(xy))
+        out = backend.stack([backend.to(c, dtype=f64) for c in columns], dim=-1)
+        out = mesh_backend.to(to_mesh(out), device=mesh_backend.device(xy))
+        return out[:n] if size > n else out
 
     return sample
 
@@ -285,13 +289,13 @@ def _build_lens_mesh(
     lat = make_lattice(fov, x0, y0, init_res, max_level + 1)
     hole_centers, hole_radius = merge_centers(centers, min_img_sep)
     holes = sample_holes(
-        make_sampler(raytrace, None, device),
+        make_sampler(raytrace, None, device, batch_size),
         hole_centers,
         hole_radius,
         min_img_sep,
         batch_size,
     )
-    sample = make_sampler(raytrace, jacobian, device)
+    sample = make_sampler(raytrace, jacobian, device, batch_size)
     ij, cls = initial_triangles(init_res, lat.level, ROOT_CLASS)
     cache, store, rows = add_roots(
         empty_cache(3), empty_store(), lat, ij, cls, sample, batch_size
@@ -509,7 +513,7 @@ def _extend_lens_mesh(mesh, raytrace, jacobian, fov, *, device, batch_size):
         "Extend by less, or rebuild with a larger min_img_sep or a lower max_depth.",
     )
     _warn_depth_limited(h0, mesh.min_img_sep, max_level)
-    sample = make_sampler(raytrace, jacobian, device)
+    sample = make_sampler(raytrace, jacobian, device, batch_size)
     cache, store, seed = _seed(mesh, lat, k)
     ij, cls = ring_triangles(init_res, k, lat.level, ROOT_CLASS)
     cache, store, rows = add_roots(cache, store, lat, ij, cls, sample, batch_size)

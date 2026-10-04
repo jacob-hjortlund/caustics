@@ -1610,3 +1610,26 @@ def test_a_closed_build_warns_at_the_callers_line():
         )
     hits = [w for w in record if "still cuts" in str(w.message)]
     assert [w.filename for w in hits] == [__file__]
+
+
+@pytest.mark.parametrize("n, batch_size", [(37, None), (37, 40), (3, 3)])
+def test_the_sampler_hands_the_lens_padded_batches_and_returns_one_row_each(
+    n, batch_size
+):
+    seen = []
+
+    def raytrace(x, y):
+        seen.append(x.shape[0])
+        return 2.0 * x, 3.0 * y
+
+    def jacobian(x, y):
+        seen.append(x.shape[0])
+        one = backend.ones_like(x)
+        return stack_2x2(2.0 * one, 0.0 * one, 0.0 * one, 3.0 * one)
+
+    xy = np.random.default_rng(5).uniform(-1, 1, (n, 2))
+    out = to_np(make_sampler(raytrace, jacobian, None, batch_size)(f64(xy)))
+    assert seen == [backend.padded_size(n, batch_size)] * 2
+    np.testing.assert_array_equal(
+        out, np.column_stack([2 * xy[:, 0], 3 * xy[:, 1], np.full(n, 6.0)])
+    )

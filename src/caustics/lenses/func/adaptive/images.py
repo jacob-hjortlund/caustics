@@ -12,6 +12,7 @@ from .mesh_backend import mesh_backend, to_mesh, to_user
 from ....utils import batch_lm
 from .geometry import area2, contains, csr_offsets, sanitize_bary, triangle_weights
 from .index import as_points, index_hits
+from .lens_mesh import make_sampler
 
 
 def mesh_query(mesh, beta, batch_size=None):
@@ -209,22 +210,26 @@ def _block_sums(values, offsets):
     return csum[offsets[1:]] - csum[offsets[:-1]]
 
 
-def _images(mesh, beta, raytrace, tol, lm_kwargs):
-    """Images and their count per point, for one chunk of ``(B, 2)`` points."""
-    device = mesh_backend.device(mesh.vertices_lens)
+def _images(mesh, beta, raytrace, tol, lm_kwargs, device):
+    """Images and their count per point, for one chunk of ``(B, 2)`` points; ``device`` is the lens's."""
+    mesh_device = mesh_backend.device(mesh.vertices_lens)
     idx, offsets, bary = mesh_query(mesh, beta)
     seed = mesh_seeds(mesh, idx, bary)
     if seed.shape[0] == 0:
         return seed, mesh_backend.zeros(
-            (beta.shape[0],), dtype=mesh_backend.int64, device=device
+            (beta.shape[0],), dtype=mesh_backend.int64, device=mesh_device
         )
 
     def to_source(xy):
-        return mesh_backend.stack(raytrace(xy[..., 0], xy[..., 1]), dim=-1)
+        return backend.stack(raytrace(xy[..., 0], xy[..., 1]), dim=-1)
 
     target = mesh_backend.repeat(beta, offsets[1:] - offsets[:-1], axis=0)
-    root, _, _ = batch_lm(seed, target, to_source, **lm_kwargs)
-    converged = mesh_backend.sum((to_source(root) - target) ** 2, dim=-1) < tol * tol
+    root, _, _ = batch_lm(
+        to_user(seed, device), to_user(target, device), to_source, **lm_kwargs
+    )
+    root = mesh_backend.to(to_mesh(root), device=mesh_device)
+    trace = make_sampler(raytrace, None, device)
+    converged = mesh_backend.sum((trace(root) - target) ** 2, dim=-1) < tol * tol
     tri = mesh.vertices_lens[mesh.leaves[idx]]
     near = contains(triangle_weights(tri, root)) | (
         mesh_backend.sum((root - seed) ** 2, dim=-1) <= mesh.min_img_sep**2
@@ -286,6 +291,7 @@ def forward_raytrace(
         to_mesh(by),
         raytrace,
         to_mesh(mesh),
+        device=device,
         batch_size=batch_size,
         residual_tol=residual_tol,
         lm_kwargs=lm_kwargs,
@@ -293,18 +299,24 @@ def forward_raytrace(
     return to_user(found, device)
 
 
-def _forward_raytrace(bx, by, raytrace, mesh, *, batch_size, residual_tol, lm_kwargs):
-    """:func:`forward_raytrace` on ``mesh_backend`` arrays."""
-    device = mesh_backend.device(mesh.vertices_lens)
-    beta = as_points(bx, by, device)
+def _forward_raytrace(
+    bx, by, raytrace, mesh, *, device, batch_size, residual_tol, lm_kwargs
+):
+    """:func:`forward_raytrace` on ``mesh_backend`` arrays; ``device`` is the lens's."""
+    mesh_device = mesh_backend.device(mesh.vertices_lens)
+    beta = as_points(bx, by, mesh_device)
     tol = mesh.min_img_sep if residual_tol is None else float(residual_tol)
     lm_kwargs = {} if lm_kwargs is None else dict(lm_kwargs)
     n = beta.shape[0]
     step = max(n, 1) if batch_size is None else max(1, int(batch_size))
-    images = [mesh_backend.zeros((0, 2), dtype=mesh_backend.float64, device=device)]
-    counts = [mesh_backend.zeros((0,), dtype=mesh_backend.int64, device=device)]
+    images = [
+        mesh_backend.zeros((0, 2), dtype=mesh_backend.float64, device=mesh_device)
+    ]
+    counts = [mesh_backend.zeros((0,), dtype=mesh_backend.int64, device=mesh_device)]
     for lo in range(0, n, step):
-        found, count = _images(mesh, beta[lo : lo + step], raytrace, tol, lm_kwargs)
+        found, count = _images(
+            mesh, beta[lo : lo + step], raytrace, tol, lm_kwargs, device
+        )
         images.append(found)
         counts.append(count)
     images = mesh_backend.concatenate(images, dim=0)
