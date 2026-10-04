@@ -7,8 +7,7 @@ compares, and the containment test and barycentric coordinates every
 source-plane lookup reads. Nothing here calls the lens or knows about a mesh.
 """
 
-from ....backend_obj import backend
-from .mesh_backend import map_arrays
+from .mesh_backend import map_arrays, mesh_backend
 
 # Indices into the stacked six-point array [theta1, theta2, theta3, m1, m2, m3]
 # giving the four children in the orientation-preserving order
@@ -24,7 +23,9 @@ ROOT_SHAPES = (
 )
 
 # `CHILD_VERTEX_INDICES` as one int64 array, to gather all four children at once.
-_CHILD_VERTEX_INDEX_TABLE = backend.as_array(CHILD_VERTEX_INDICES, dtype=backend.int64)
+_CHILD_VERTEX_INDEX_TABLE = mesh_backend.as_array(
+    CHILD_VERTEX_INDICES, dtype=mesh_backend.int64
+)
 
 
 def shape_matrix(tri):
@@ -45,24 +46,28 @@ def shape_matrix(tri):
 
         *Unit: arcsec*
     """
-    return backend.stack(
+    return mesh_backend.stack(
         (tri[..., 1, :] - tri[..., 0, :], tri[..., 2, :] - tri[..., 0, :]), dim=-1
     )
 
 
 def _derive_child_matrices():
     """Recover ``M_k`` from the child ordering, where ``P_k = (1/2) P M_k``."""
-    parent = backend.as_array(
-        [[0.0, 0.0], [3.0, 2.0], [-1.0, 5.0]], dtype=backend.float64
+    parent = mesh_backend.as_array(
+        [[0.0, 0.0], [3.0, 2.0], [-1.0, 5.0]], dtype=mesh_backend.float64
     )
     t1, t2, t3 = parent
-    six = backend.stack([t1, t2, t3, (t2 + t3) / 2, (t3 + t1) / 2, (t1 + t2) / 2])
+    six = mesh_backend.stack([t1, t2, t3, (t2 + t3) / 2, (t3 + t1) / 2, (t1 + t2) / 2])
     P = shape_matrix(parent)
     rows = []
     for idx in CHILD_VERTEX_INDICES:
         Pk = shape_matrix(six[list(idx), :])
-        rows.append(backend.long(backend.round(2.0 * (backend.linalg.inv(P) @ Pk))))
-    return backend.stack(rows)
+        rows.append(
+            mesh_backend.long(
+                mesh_backend.round(2.0 * (mesh_backend.linalg.inv(P) @ Pk))
+            )
+        )
+    return mesh_backend.stack(rows)
 
 
 def child_matrix_tables():
@@ -91,42 +96,48 @@ def child_matrix_tables():
         ``(2,)`` int64 class index of each entry of :data:`ROOT_SHAPES`.
     """
     M = _derive_child_matrices()
-    eye = backend.eye(2, dtype=backend.int64)
-    G = backend.stack([eye, M[1], M[2], -eye, -M[1], -M[2]])
+    eye = mesh_backend.eye(2, dtype=mesh_backend.int64)
+    G = mesh_backend.stack([eye, M[1], M[2], -eye, -M[1], -M[2]])
 
-    lookup = {tuple(backend.to_numpy(G[c]).reshape(-1).tolist()): c for c in range(6)}
+    lookup = {
+        tuple(mesh_backend.to_numpy(G[c]).reshape(-1).tolist()): c for c in range(6)
+    }
     compose_rows = []
     for c in range(6):
         row = []
         for k in range(4):
             product = G[c] @ M[k]
-            row.append(lookup[tuple(backend.to_numpy(product).reshape(-1).tolist())])
+            row.append(
+                lookup[tuple(mesh_backend.to_numpy(product).reshape(-1).tolist())]
+            )
         compose_rows.append(row)
-    COMPOSE = backend.as_array(compose_rows, dtype=backend.int64)
+    COMPOSE = mesh_backend.as_array(compose_rows, dtype=mesh_backend.int64)
 
-    R = shape_matrix(backend.as_array(ROOT_SHAPES[0], dtype=backend.float64))
-    PINV0 = backend.stack(
+    R = shape_matrix(mesh_backend.as_array(ROOT_SHAPES[0], dtype=mesh_backend.float64))
+    PINV0 = mesh_backend.stack(
         [
-            backend.linalg.inv(R @ backend.to(G[c], dtype=backend.float64))
+            mesh_backend.linalg.inv(
+                R @ mesh_backend.to(G[c], dtype=mesh_backend.float64)
+            )
             for c in range(6)
         ]
     )
 
     root_class_values = []
     for shape in ROOT_SHAPES:
-        target = shape_matrix(backend.as_array(shape, dtype=backend.float64))
+        target = shape_matrix(mesh_backend.as_array(shape, dtype=mesh_backend.float64))
         root_class_values.append(
             next(
                 c
                 for c in range(6)
                 if bool(
-                    backend.allclose(
-                        R @ backend.to(G[c], dtype=backend.float64), target
+                    mesh_backend.allclose(
+                        R @ mesh_backend.to(G[c], dtype=mesh_backend.float64), target
                     )
                 )
             )
         )
-    ROOT_CLASS = backend.as_array(root_class_values, dtype=backend.int64)
+    ROOT_CLASS = mesh_backend.as_array(root_class_values, dtype=mesh_backend.int64)
     return M, G, COMPOSE, PINV0, ROOT_CLASS
 
 
@@ -157,7 +168,7 @@ def area2(tri):
 
 def build_device():
     """The backend's default device, where every build runs."""
-    return backend.device(backend.zeros((0,)))
+    return mesh_backend.device(mesh_backend.zeros((0,)))
 
 
 def to_device(value, device):
@@ -166,26 +177,28 @@ def to_device(value, device):
 
     Anything else is returned as it is.
     """
-    return map_arrays(value, lambda a: backend.to(a, device=device))
+    return map_arrays(value, lambda a: mesh_backend.to(a, device=device))
 
 
 def is_member(sorted_values, values):
     """True where each of ``values`` is in the ascending ``sorted_values``."""
     if sorted_values.shape[0] == 0:
-        return backend.zeros(
-            values.shape, dtype=backend.bool, device=backend.device(values)
+        return mesh_backend.zeros(
+            values.shape, dtype=mesh_backend.bool, device=mesh_backend.device(values)
         )
-    pos = backend.clamp(
-        backend.searchsorted(sorted_values, values), 0, sorted_values.shape[0] - 1
+    pos = mesh_backend.clamp(
+        mesh_backend.searchsorted(sorted_values, values), 0, sorted_values.shape[0] - 1
     )
     return sorted_values[pos] == values
 
 
 def csr_offsets(counts):
     """CSR offsets ``(n + 1,)`` of blocks of ``counts`` ``(n,)`` rows each."""
-    zero = backend.zeros((1,), dtype=backend.int64, device=backend.device(counts))
-    return backend.concatenate(
-        (zero, backend.cumsum(backend.long(counts), dim=0)), dim=0
+    zero = mesh_backend.zeros(
+        (1,), dtype=mesh_backend.int64, device=mesh_backend.device(counts)
+    )
+    return mesh_backend.concatenate(
+        (zero, mesh_backend.cumsum(mesh_backend.long(counts), dim=0)), dim=0
     )
 
 
@@ -210,15 +223,16 @@ def sigma_min_2x2(A):
         Shape ``(...)``. Exactly ``0.0`` where ``A == 0``; ``NaN`` where ``A`` is
         non-finite, so the criterion fails closed.
     """
-    F = backend.sum(A**2, dim=(-2, -1))
-    D = backend.abs(A[..., 0, 0] * A[..., 1, 1] - A[..., 0, 1] * A[..., 1, 0])
+    F = mesh_backend.sum(A**2, dim=(-2, -1))
+    D = mesh_backend.abs(A[..., 0, 0] * A[..., 1, 1] - A[..., 0, 1] * A[..., 1, 0])
     sigma_max = (
-        backend.sqrt(F + 2 * D) + backend.sqrt(backend.clamp(F - 2 * D, 0.0, None))
+        mesh_backend.sqrt(F + 2 * D)
+        + mesh_backend.sqrt(mesh_backend.clamp(F - 2 * D, 0.0, None))
     ) / 2
     zero = sigma_max == 0
     # Double `where` keeps the division away from 0/0 without masking a NaN input:
     # a NaN sigma_max fails the `== 0` test, so NaN reaches the output.
-    return backend.where(zero, 0.0, D / backend.where(zero, 1.0, sigma_max))
+    return mesh_backend.where(zero, 0.0, D / mesh_backend.where(zero, 1.0, sigma_max))
 
 
 def triangle_weights(tri, beta):
@@ -251,7 +265,7 @@ def triangle_weights(tri, beta):
     q1 = tri[:, 0, :] - beta
     q2 = tri[:, 1, :] - beta
     q3 = tri[:, 2, :] - beta
-    return backend.stack(
+    return mesh_backend.stack(
         (
             q2[:, 0] * q3[:, 1] - q2[:, 1] * q3[:, 0],
             q3[:, 0] * q1[:, 1] - q3[:, 1] * q1[:, 0],
@@ -304,18 +318,18 @@ def sanitize_bary(w, d):
     ArrayLike
         Shape ``(K, 3)``, guaranteed to lie in the simplex.
     """
-    bary = backend.clamp(w / backend.unsqueeze(d, -1), 0.0, 1.0)
+    bary = mesh_backend.clamp(w / mesh_backend.unsqueeze(d, -1), 0.0, 1.0)
     total = bary[..., 0] + bary[..., 1] + bary[..., 2]
     ok = (
         (total > 0)
-        & backend.isfinite(bary[..., 0])
-        & backend.isfinite(bary[..., 1])
-        & backend.isfinite(bary[..., 2])
+        & mesh_backend.isfinite(bary[..., 0])
+        & mesh_backend.isfinite(bary[..., 1])
+        & mesh_backend.isfinite(bary[..., 2])
     )
-    safe = backend.where(ok, total, backend.ones_like(total))
-    normed = bary / backend.unsqueeze(safe, -1)
-    third = backend.ones_like(bary) / 3
-    return backend.where(backend.unsqueeze(ok, -1), normed, third)
+    safe = mesh_backend.where(ok, total, mesh_backend.ones_like(total))
+    normed = bary / mesh_backend.unsqueeze(safe, -1)
+    third = mesh_backend.ones_like(bary) / 3
+    return mesh_backend.where(mesh_backend.unsqueeze(ok, -1), normed, third)
 
 
 def min_angle(tri):
@@ -332,10 +346,10 @@ def min_angle(tri):
     ArrayLike
         Shape ``(n,)``. Degenerate triangles give ``0.0`` rather than ``NaN``.
     """
-    a = backend.norm(tri[:, 2] - tri[:, 1], dim=-1)
-    b = backend.norm(tri[:, 0] - tri[:, 2], dim=-1)
-    c = backend.norm(tri[:, 1] - tri[:, 0], dim=-1)
-    cosines = backend.stack(
+    a = mesh_backend.norm(tri[:, 2] - tri[:, 1], dim=-1)
+    b = mesh_backend.norm(tri[:, 0] - tri[:, 2], dim=-1)
+    c = mesh_backend.norm(tri[:, 1] - tri[:, 0], dim=-1)
+    cosines = mesh_backend.stack(
         (
             (b * b + c * c - a * a) / (2 * b * c),
             (c * c + a * a - b * b) / (2 * c * a),
@@ -343,5 +357,5 @@ def min_angle(tri):
         ),
         dim=1,
     )
-    angles = backend.arccos(backend.clamp(cosines, -1.0, 1.0))
-    return backend.nan_to_num(backend.min(angles, dim=1))
+    angles = mesh_backend.arccos(mesh_backend.clamp(cosines, -1.0, 1.0))
+    return mesh_backend.nan_to_num(mesh_backend.min(angles, dim=1))

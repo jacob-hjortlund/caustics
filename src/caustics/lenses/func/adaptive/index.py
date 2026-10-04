@@ -8,7 +8,8 @@ lookup per point finds every triangle that can contain it.
 import math
 from typing import NamedTuple
 
-from ....backend_obj import ArrayLike, backend
+from ....backend_obj import ArrayLike
+from .mesh_backend import mesh_backend
 from .geometry import contains, csr_offsets, triangle_weights
 
 
@@ -68,53 +69,55 @@ def build_index(vertices, triangles, rows):
     -------
     MeshIndex
     """
-    device = backend.device(vertices)
-    f64, int64 = backend.float64, backend.int64
-    tri = backend.to(vertices[triangles[rows]], dtype=f64)
+    device = mesh_backend.device(vertices)
+    f64, int64 = mesh_backend.float64, mesh_backend.int64
+    tri = mesh_backend.to(vertices[triangles[rows]], dtype=f64)
     if tri.shape[0] == 0:
         return MeshIndex(
-            lo=backend.zeros((2,), dtype=f64, device=device),
-            hi=backend.ones((2,), dtype=f64, device=device),
-            cell=backend.ones((2,), dtype=f64, device=device),
+            lo=mesh_backend.zeros((2,), dtype=f64, device=device),
+            hi=mesh_backend.ones((2,), dtype=f64, device=device),
+            cell=mesh_backend.ones((2,), dtype=f64, device=device),
             nx=1,
             ny=1,
-            cell_offsets=backend.zeros((2,), dtype=int64, device=device),
-            cell_leaves=backend.zeros((0,), dtype=int64, device=device),
+            cell_offsets=mesh_backend.zeros((2,), dtype=int64, device=device),
+            cell_leaves=mesh_backend.zeros((0,), dtype=int64, device=device),
         )
     flat = tri.reshape(-1, 2)
-    lo, hi = backend.min(flat, dim=0), backend.max(flat, dim=0)
-    span = backend.where(hi > lo, hi - lo, 1.0)  # a degenerate axis is one cell
+    lo, hi = mesh_backend.min(flat, dim=0), mesh_backend.max(flat, dim=0)
+    span = mesh_backend.where(hi > lo, hi - lo, 1.0)  # a degenerate axis is one cell
 
-    span_np = backend.to_numpy(span)
+    span_np = mesh_backend.to_numpy(span)
     c = float(math.sqrt(span_np[0] * span_np[1] / tri.shape[0]))
-    c = max(c, float(backend.finfo(f64).tiny))
+    c = max(c, float(mesh_backend.finfo(f64).tiny))
     nx = max(1, int(math.ceil(span_np[0] / c)))
     ny = max(1, int(math.ceil(span_np[1] / c)))
-    cell = span / backend.as_array([nx, ny], dtype=f64, device=device)
+    cell = span / mesh_backend.as_array([nx, ny], dtype=f64, device=device)
 
-    upper = backend.as_array([nx - 1, ny - 1], dtype=int64, device=device)
-    lower = backend.zeros((2,), dtype=int64, device=device)
-    i0 = backend.clamp(
-        backend.long((backend.min(tri, dim=1) - lo) / cell), lower, upper
+    upper = mesh_backend.as_array([nx - 1, ny - 1], dtype=int64, device=device)
+    lower = mesh_backend.zeros((2,), dtype=int64, device=device)
+    i0 = mesh_backend.clamp(
+        mesh_backend.long((mesh_backend.min(tri, dim=1) - lo) / cell), lower, upper
     )
-    i1 = backend.clamp(
-        backend.long((backend.max(tri, dim=1) - lo) / cell), lower, upper
+    i1 = mesh_backend.clamp(
+        mesh_backend.long((mesh_backend.max(tri, dim=1) - lo) / cell), lower, upper
     )
     tall = i1[:, 1] - i0[:, 1] + 1
     counts = (i1[:, 0] - i0[:, 0] + 1) * tall
-    owner = backend.repeat(
-        backend.arange(counts.shape[0], dtype=int64, device=device), counts, axis=0
+    owner = mesh_backend.repeat(
+        mesh_backend.arange(counts.shape[0], dtype=int64, device=device), counts, axis=0
     )
-    total_pairs = int(backend.to_numpy(backend.sum(counts)))
-    within = backend.arange(total_pairs, dtype=int64, device=device) - backend.repeat(
-        backend.cumsum(counts, dim=0) - counts, counts, axis=0
-    )
+    total_pairs = int(mesh_backend.to_numpy(mesh_backend.sum(counts)))
+    within = mesh_backend.arange(
+        total_pairs, dtype=int64, device=device
+    ) - mesh_backend.repeat(mesh_backend.cumsum(counts, dim=0) - counts, counts, axis=0)
     cell_id = (i0[owner, 0] + within // tall[owner]) * ny + (
         i0[owner, 1] + within % tall[owner]
     )
     # A stable sort keeps each cell's triangles in ascending row order.
-    order = backend.argsort(cell_id)
-    counts_per_cell = backend.long(backend.bincount(cell_id, minlength=nx * ny))
+    order = mesh_backend.argsort(cell_id)
+    counts_per_cell = mesh_backend.long(
+        mesh_backend.bincount(cell_id, minlength=nx * ny)
+    )
     cell_offsets = csr_offsets(counts_per_cell)
     return MeshIndex(
         lo=lo,
@@ -160,44 +163,46 @@ def index_hits(index, vertices, triangles, beta):
     w: ArrayLike
         ``(K, 3)`` :func:`~.geometry.triangle_weights` of each hit.
     """
-    int64 = backend.int64
-    device = backend.device(beta)
+    int64 = mesh_backend.int64
+    device = mesh_backend.device(beta)
     b = beta.shape[0]
-    u = backend.long(backend.floor((beta - index.lo) / index.cell))
+    u = mesh_backend.long(mesh_backend.floor((beta - index.lo) / index.cell))
     inside = (
         (beta[:, 0] >= index.lo[0])
         & (beta[:, 0] <= index.hi[0])
         & (beta[:, 1] >= index.lo[1])
         & (beta[:, 1] <= index.hi[1])
     )
-    cell = backend.clamp(u[:, 0], 0, index.nx - 1) * index.ny + backend.clamp(
+    cell = mesh_backend.clamp(u[:, 0], 0, index.nx - 1) * index.ny + mesh_backend.clamp(
         u[:, 1], 0, index.ny - 1
     )
     start = index.cell_offsets[cell]
-    count = backend.where(
-        inside, index.cell_offsets[cell + 1] - start, backend.zeros_like(start)
+    count = mesh_backend.where(
+        inside, index.cell_offsets[cell + 1] - start, mesh_backend.zeros_like(start)
     )
-    total = int(backend.to_numpy(backend.sum(count)))
+    total = int(mesh_backend.to_numpy(mesh_backend.sum(count)))
     if total == 0:
         return (
-            backend.zeros((0,), dtype=int64, device=device),
-            backend.zeros((0,), dtype=int64, device=device),
-            backend.zeros((0, 3), dtype=vertices.dtype, device=device),
+            mesh_backend.zeros((0,), dtype=int64, device=device),
+            mesh_backend.zeros((0,), dtype=int64, device=device),
+            mesh_backend.zeros((0, 3), dtype=vertices.dtype, device=device),
         )
-    qidx = backend.repeat(backend.arange(b, dtype=int64, device=device), count, axis=0)
-    base = backend.cumsum(count, dim=0) - count
-    within = backend.arange(total, dtype=int64, device=device) - backend.repeat(
-        base, count, axis=0
+    qidx = mesh_backend.repeat(
+        mesh_backend.arange(b, dtype=int64, device=device), count, axis=0
     )
+    base = mesh_backend.cumsum(count, dim=0) - count
+    within = mesh_backend.arange(
+        total, dtype=int64, device=device
+    ) - mesh_backend.repeat(base, count, axis=0)
     cand = index.cell_leaves[start[qidx] + within]
     w = triangle_weights(vertices[triangles[cand]], beta[qidx])
-    hit = backend.flatnonzero(contains(w))
+    hit = mesh_backend.flatnonzero(contains(w))
     return qidx[hit], cand[hit], w[hit]
 
 
 def as_points(bx, by, device):
     """``bx`` and ``by``, flattened, as ``(B, 2)`` float64 points on ``device``."""
-    f64 = backend.float64
-    x = backend.as_array(bx, dtype=f64, device=device).reshape(-1)
-    y = backend.as_array(by, dtype=f64, device=device).reshape(-1)
-    return backend.stack((x, y), dim=-1)
+    f64 = mesh_backend.float64
+    x = mesh_backend.as_array(bx, dtype=f64, device=device).reshape(-1)
+    y = mesh_backend.as_array(by, dtype=f64, device=device).reshape(-1)
+    return mesh_backend.stack((x, y), dim=-1)

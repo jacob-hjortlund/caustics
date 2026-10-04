@@ -10,7 +10,7 @@ as infinitely magnified. Nothing here calls the lens.
 
 import math
 
-from ....backend_obj import backend
+from .mesh_backend import mesh_backend
 from .geometry import _CHILD_VERTEX_INDEX_TABLE, area2, csr_offsets, sanitize_bary
 from .criterion import LEAF_CONVERGED
 from .index import as_points, build_index, index_hits
@@ -41,7 +41,7 @@ def hit_magnification(mesh, leaves, bary):
     """
     d3 = mesh.vertices_det[mesh.leaves[leaves]]
     det = bary[:, 0] * d3[:, 0] + bary[:, 1] * d3[:, 1] + bary[:, 2] * d3[:, 2]
-    return 1.0 / backend.abs(det)
+    return 1.0 / mesh_backend.abs(det)
 
 
 def counts_once(tri, w, area2):
@@ -80,14 +80,16 @@ def counts_once(tri, w, area2):
         ``(K,)`` bool.
     """
     positive = area2 > 0
-    ok = backend.ones((tri.shape[0],), dtype=backend.bool, device=backend.device(tri))
+    ok = mesh_backend.ones(
+        (tri.shape[0],), dtype=mesh_backend.bool, device=mesh_backend.device(tri)
+    )
     for k in range(3):
         j, l = (k + 1) % 3, (k + 2) % 3
         e = tri[:, l] - tri[:, j]
         # The left normal (-e_y, e_x) points inward on a counter-clockwise
         # triangle, the right one on a clockwise triangle.
-        nx = backend.where(positive, -e[:, 1], e[:, 1])
-        ny = backend.where(positive, e[:, 0], -e[:, 0])
+        nx = mesh_backend.where(positive, -e[:, 1], e[:, 1])
+        ny = mesh_backend.where(positive, e[:, 0], -e[:, 0])
         inward = (nx > 0) | ((nx == 0) & (ny > 0))
         ok = ok & ((w[:, k] != 0) | inward)
     return ok
@@ -106,8 +108,10 @@ def band_cover(mesh):
     """
     band = mesh.critical_band
     triangles = band.samples[:, _CHILD_VERTEX_INDEX_TABLE].reshape(-1, 3)
-    finite = backend.all(backend.isfinite(band.source[triangles]), dim=(1, 2))
-    return triangles, build_index(band.source, triangles, backend.flatnonzero(finite))
+    finite = mesh_backend.all(mesh_backend.isfinite(band.source[triangles]), dim=(1, 2))
+    return triangles, build_index(
+        band.source, triangles, mesh_backend.flatnonzero(finite)
+    )
 
 
 def band_magnification_floor(band):
@@ -130,8 +134,8 @@ def band_magnification_floor(band):
     """
     if band.leaves.shape[0] == 0:
         return math.inf
-    largest = backend.max(backend.abs(band.det[band.samples]), dim=1)
-    return float(backend.to_numpy(backend.min(1.0 / largest)))
+    largest = mesh_backend.max(mesh_backend.abs(band.det[band.samples]), dim=1)
+    return float(mesh_backend.to_numpy(mesh_backend.min(1.0 / largest)))
 
 
 def _per_point_sum(qidx, values, n_points):
@@ -142,18 +146,21 @@ def _per_point_sum(qidx, values, n_points):
     torch and jax disagree on a scatter-add -- and summed in rank order, so a
     point's sum does not depend on its chunk.
     """
-    device = backend.device(qidx)
-    counts = backend.long(backend.bincount(qidx, minlength=n_points))
-    total = backend.zeros((n_points,), dtype=backend.float64, device=device)
+    device = mesh_backend.device(qidx)
+    counts = mesh_backend.long(mesh_backend.bincount(qidx, minlength=n_points))
+    total = mesh_backend.zeros((n_points,), dtype=mesh_backend.float64, device=device)
     if qidx.shape[0] == 0:
         return total, counts
-    width = int(backend.to_numpy(backend.max(counts)))
-    starts = backend.cumsum(counts, dim=0) - counts
+    width = int(mesh_backend.to_numpy(mesh_backend.max(counts)))
+    starts = mesh_backend.cumsum(counts, dim=0) - counts
     rank = (
-        backend.arange(qidx.shape[0], dtype=backend.int64, device=device) - starts[qidx]
+        mesh_backend.arange(qidx.shape[0], dtype=mesh_backend.int64, device=device)
+        - starts[qidx]
     )
-    dense = backend.fill_at_indices(
-        backend.zeros((n_points * width,), dtype=backend.float64, device=device),
+    dense = mesh_backend.fill_at_indices(
+        mesh_backend.zeros(
+            (n_points * width,), dtype=mesh_backend.float64, device=device
+        ),
         qidx * width + rank,
         values,
     ).reshape(n_points, width)
@@ -168,13 +175,13 @@ def _total(mesh, cover, beta):
     qidx, cand, w = index_hits(mesh.index, mesh.vertices_source, mesh.leaves, beta)
     tri = mesh.vertices_source[mesh.leaves[cand]]
     a2 = area2(tri)
-    once = backend.flatnonzero(counts_once(tri, w, a2))
+    once = mesh_backend.flatnonzero(counts_once(tri, w, a2))
     qidx, cand, w, a2 = qidx[once], cand[once], w[once], a2[once]
     mu, n = _per_point_sum(qidx, hit_magnification(mesh, cand, sanitize_bary(w, a2)), b)
     triangles, index = cover
     band, _, _ = index_hits(index, mesh.critical_band.source, triangles, beta)
-    in_band = backend.bincount(band, minlength=b) > 0
-    return backend.where(in_band, backend.inf, mu), n
+    in_band = mesh_backend.bincount(band, minlength=b) > 0
+    return mesh_backend.where(in_band, mesh_backend.inf, mu), n
 
 
 def total_magnification(bx, by, mesh, *, batch_size=None):
@@ -208,18 +215,18 @@ def total_magnification(bx, by, mesh, *, batch_size=None):
     n: ArrayLike
         ``(B,)`` int64.
     """
-    device = backend.device(mesh.vertices_lens)
+    device = mesh_backend.device(mesh.vertices_lens)
     beta = as_points(bx, by, device)
     cover = band_cover(mesh)
     n_points = beta.shape[0]
     step = max(n_points, 1) if batch_size is None else max(1, int(batch_size))
-    mus = [backend.zeros((0,), dtype=backend.float64, device=device)]
-    ns = [backend.zeros((0,), dtype=backend.int64, device=device)]
+    mus = [mesh_backend.zeros((0,), dtype=mesh_backend.float64, device=device)]
+    ns = [mesh_backend.zeros((0,), dtype=mesh_backend.int64, device=device)]
     for lo in range(0, n_points, step):
         mu, n = _total(mesh, cover, beta[lo : lo + step])
         mus.append(mu)
         ns.append(n)
-    return backend.concatenate(mus, dim=0), backend.concatenate(ns, dim=0)
+    return mesh_backend.concatenate(mus, dim=0), mesh_backend.concatenate(ns, dim=0)
 
 
 def magnification_sampler(mesh):
@@ -229,12 +236,14 @@ def magnification_sampler(mesh):
     The band cover is built once.
     """
     cover = band_cover(mesh)
-    device = backend.device(mesh.vertices_lens)
+    device = mesh_backend.device(mesh.vertices_lens)
 
     def sample(xy):
-        mu, n = _total(mesh, cover, backend.to(xy, device=device))
-        out = backend.stack((mu, backend.to(n, dtype=backend.float64)), dim=-1)
-        return backend.to(out, device=backend.device(xy))
+        mu, n = _total(mesh, cover, mesh_backend.to(xy, device=device))
+        out = mesh_backend.stack(
+            (mu, mesh_backend.to(n, dtype=mesh_backend.float64)), dim=-1
+        )
+        return mesh_backend.to(out, device=mesh_backend.device(xy))
 
     return sample
 
@@ -263,15 +272,21 @@ def sheet_edges(mesh):
     n_vertices = vs.shape[0]
     a = leaves.reshape(-1)
     b = leaves[:, [1, 2, 0]].reshape(-1)
-    key = backend.minimum(a, b) * n_vertices + backend.maximum(a, b)
-    converged = backend.long(mesh.origin_status[mesh.leaf_origin] == LEAF_CONVERGED)
-    side = backend.long(backend.where(area2(vs[leaves]) > 0, 1, -1)) * converged
-    eps = backend.repeat(side, 3, axis=0) * backend.long(backend.where(a < b, 1, -1))
-    keys, inverse = backend.unique(key, return_inverse=True)
-    counts = backend.long(backend.bincount(inverse, minlength=keys.shape[0]))
-    csum = csr_offsets(eps[backend.argsort(inverse)])
-    ends = backend.cumsum(counts, dim=0)
+    key = mesh_backend.minimum(a, b) * n_vertices + mesh_backend.maximum(a, b)
+    converged = mesh_backend.long(
+        mesh.origin_status[mesh.leaf_origin] == LEAF_CONVERGED
+    )
+    side = (
+        mesh_backend.long(mesh_backend.where(area2(vs[leaves]) > 0, 1, -1)) * converged
+    )
+    eps = mesh_backend.repeat(side, 3, axis=0) * mesh_backend.long(
+        mesh_backend.where(a < b, 1, -1)
+    )
+    keys, inverse = mesh_backend.unique(key, return_inverse=True)
+    counts = mesh_backend.long(mesh_backend.bincount(inverse, minlength=keys.shape[0]))
+    csum = csr_offsets(eps[mesh_backend.argsort(inverse)])
+    ends = mesh_backend.cumsum(counts, dim=0)
     dn = csum[ends] - csum[ends - counts]
-    sheet = backend.flatnonzero(dn != 0)
+    sheet = mesh_backend.flatnonzero(dn != 0)
     lo, hi = keys[sheet] // n_vertices, keys[sheet] % n_vertices
-    return backend.stack((vs[lo], vs[hi]), dim=1), counts[sheet] == 1
+    return mesh_backend.stack((vs[lo], vs[hi]), dim=1), counts[sheet] == 1

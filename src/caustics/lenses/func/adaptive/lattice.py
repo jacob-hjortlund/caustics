@@ -10,7 +10,8 @@ import math
 from typing import NamedTuple
 from warnings import warn
 
-from ....backend_obj import ArrayLike, backend
+from ....backend_obj import ArrayLike
+from .mesh_backend import mesh_backend
 from .geometry import ROOT_SHAPES
 
 MAX_KEY = 2**63 - 1
@@ -154,7 +155,9 @@ def make_lattice(fov, x0, y0, init_res, lattice_level):
     level = int(lattice_level)
     n = int(init_res) * (1 << level)
     scale = float(fov) / n
-    lo = backend.as_array([x0 - fov / 2.0, y0 - fov / 2.0], dtype=backend.float64)
+    lo = mesh_backend.as_array(
+        [x0 - fov / 2.0, y0 - fov / 2.0], dtype=mesh_backend.float64
+    )
     return Lattice(level=level, n=n, scale=scale, lo=lo, origin=0)
 
 
@@ -190,7 +193,7 @@ def lattice_key(lat, ij):
 def lattice_ij_from_key(lat, key):
     """Inverse of :func:`lattice_key`, shape ``(...) -> (..., 2)``."""
     stride = lat.n + 1
-    return backend.stack((key // stride, key % stride), dim=-1)
+    return mesh_backend.stack((key // stride, key % stride), dim=-1)
 
 
 def lattice_xy(lat, ij):
@@ -198,7 +201,10 @@ def lattice_xy(lat, ij):
 
     *Unit: arcsec*
     """
-    return lat.lo + backend.to(ij - lat.origin, dtype=backend.float64) * lat.scale
+    return (
+        lat.lo
+        + mesh_backend.to(ij - lat.origin, dtype=mesh_backend.float64) * lat.scale
+    )
 
 
 def lattice_on_boundary(lat, ij):
@@ -235,17 +241,22 @@ def initial_triangles(init_res, lattice_level, root_class):
         ``(2 * init_res**2,)`` int64 orientation classes.
     """
     step = 1 << int(lattice_level)
-    axis = backend.arange(init_res, dtype=backend.int64)
-    i, j = backend.meshgrid(axis, axis, indexing="ij")
-    base = backend.stack((i.reshape(-1), j.reshape(-1)), dim=-1) * step  # (r**2, 2)
+    axis = mesh_backend.arange(init_res, dtype=mesh_backend.int64)
+    i, j = mesh_backend.meshgrid(axis, axis, indexing="ij")
+    base = (
+        mesh_backend.stack((i.reshape(-1), j.reshape(-1)), dim=-1) * step
+    )  # (r**2, 2)
     blocks, classes = [], []
     for s, shape in enumerate(ROOT_SHAPES):
-        offs = backend.as_array(shape, dtype=backend.int64) * step  # (3, 2)
+        offs = mesh_backend.as_array(shape, dtype=mesh_backend.int64) * step  # (3, 2)
         blocks.append(base[:, None, :] + offs[None, :, :])
         classes.append(
-            backend.zeros((base.shape[0],), dtype=backend.int64) + root_class[s]
+            mesh_backend.zeros((base.shape[0],), dtype=mesh_backend.int64)
+            + root_class[s]
         )
-    return backend.concatenate(blocks, dim=0), backend.concatenate(classes, dim=0)
+    return mesh_backend.concatenate(blocks, dim=0), mesh_backend.concatenate(
+        classes, dim=0
+    )
 
 
 def ring_triangles(init_res, k, lattice_level, root_class):
@@ -278,7 +289,7 @@ def ring_triangles(init_res, k, lattice_level, root_class):
     # Both root shapes put theta_1 at their cell's (0, 0) corner.
     cell = ij[:, 0, :] // (1 << int(lattice_level))
     inner = (cell >= k) & (cell < init_res - k)
-    keep = backend.flatnonzero(~(inner[:, 0] & inner[:, 1]))
+    keep = mesh_backend.flatnonzero(~(inner[:, 0] & inner[:, 1]))
     return ij[keep], cls[keep]
 
 
@@ -300,7 +311,7 @@ def midpoint_ij(ij):
     ArrayLike
         Shape ``(n, 3, 2)`` int64.
     """
-    return backend.stack(
+    return mesh_backend.stack(
         (
             (ij[:, 1] + ij[:, 2]) // 2,
             (ij[:, 2] + ij[:, 0]) // 2,

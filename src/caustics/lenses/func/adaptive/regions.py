@@ -16,7 +16,8 @@ critical band's ``+inf`` to 0, so nothing special-cases infinity.
 
 from typing import NamedTuple
 
-from ....backend_obj import ArrayLike, backend
+from ....backend_obj import ArrayLike
+from .mesh_backend import mesh_backend
 from .geometry import shape_matrix
 from .lattice import lattice_on_boundary
 from .index import as_points, index_hits
@@ -97,7 +98,7 @@ def magnified_regions(mag, mu_min):
     MagnifiedRegions
     """
     g = region_field(mag, mu_min)
-    leaves = mag.leaves[backend.flatnonzero(~mag.incomplete)]
+    leaves = mag.leaves[mesh_backend.flatnonzero(~mag.incomplete)]
     start, end = triangle_segments(leaves, g >= 0)
     edges, offsets, closed = chain_segments(start, end, mag.vertices.shape[0])
     (points,) = edge_zeros(edges, g, (mag.vertices,))
@@ -108,14 +109,16 @@ def _inside_area(mag, g, area, complete, boundary):
     """The area where the interpolated ``g >= 0`` over complete leaves, and whether it is whole."""
     corners = g[mag.leaves]
     inside = corners >= 0
-    n_in = backend.sum(backend.long(inside), dim=1)
+    n_in = mesh_backend.sum(mesh_backend.long(inside), dim=1)
     odd_inside = n_in == 1
-    odd = backend.argmax(
-        backend.long(backend.where(backend.unsqueeze(odd_inside, -1), inside, ~inside)),
+    odd = mesh_backend.argmax(
+        mesh_backend.long(
+            mesh_backend.where(mesh_backend.unsqueeze(odd_inside, -1), inside, ~inside)
+        ),
         1,
     )
-    rows = backend.arange(
-        corners.shape[0], dtype=backend.int64, device=backend.device(corners)
+    rows = mesh_backend.arange(
+        corners.shape[0], dtype=mesh_backend.int64, device=mesh_backend.device(corners)
     )
     g_i = corners[rows, odd]
     g_j = corners[rows, (odd + 1) % 3]
@@ -124,13 +127,15 @@ def _inside_area(mag, g, area, complete, boundary):
     # crossings; on a leaf of one class this is 0/0, masked below.
     corner = (g_i / (g_i - g_j)) * (g_i / (g_i - g_k)) * area
     mixed = (n_in == 1) | (n_in == 2)
-    zero = backend.zeros_like(area)
-    part = backend.where(n_in == 3, area, zero)
-    part = backend.where(mixed, backend.where(odd_inside, corner, area - corner), part)
-    total = backend.sum(backend.where(complete, part, zero))
-    reaches = backend.any(inside[backend.flatnonzero(~complete)]) | backend.any(
-        (g >= 0) & boundary
+    zero = mesh_backend.zeros_like(area)
+    part = mesh_backend.where(n_in == 3, area, zero)
+    part = mesh_backend.where(
+        mixed, mesh_backend.where(odd_inside, corner, area - corner), part
     )
+    total = mesh_backend.sum(mesh_backend.where(complete, part, zero))
+    reaches = mesh_backend.any(
+        inside[mesh_backend.flatnonzero(~complete)]
+    ) | mesh_backend.any((g >= 0) & boundary)
     return total, ~reaches
 
 
@@ -164,18 +169,20 @@ def magnified_area(mag, mu_min):
         ``incomplete`` leaf or on the window's boundary -- where the region
         runs into missing data and its curves come back open.
     """
-    thresholds = backend.as_array(mu_min, dtype=backend.float64)
+    thresholds = mesh_backend.as_array(mu_min, dtype=mesh_backend.float64)
     P = shape_matrix(mag.vertices[mag.leaves])
     area = 0.5 * (P[:, 0, 0] * P[:, 1, 1] - P[:, 0, 1] * P[:, 1, 0])
     complete = ~mag.incomplete
     boundary = lattice_on_boundary(mag.lattice, mag.vertices_ij)
     areas, flags = [], []
-    for t in backend.to_numpy(thresholds).reshape(-1).tolist():
+    for t in mesh_backend.to_numpy(thresholds).reshape(-1).tolist():
         a, c = _inside_area(mag, region_field(mag, t), area, complete, boundary)
         areas.append(a)
         flags.append(c)
     shape = tuple(thresholds.shape)
-    return backend.stack(areas).reshape(shape), backend.stack(flags).reshape(shape)
+    return mesh_backend.stack(areas).reshape(shape), mesh_backend.stack(flags).reshape(
+        shape
+    )
 
 
 def in_magnified_region(bx, by, mag, mu_min):
@@ -205,27 +212,27 @@ def in_magnified_region(bx, by, mag, mu_min):
         ``(B,)`` bool, False for a point in an ``incomplete`` leaf or outside
         the window, where the answer is not known.
     """
-    device = backend.device(mag.vertices)
+    device = mesh_backend.device(mag.vertices)
     beta = as_points(bx, by, device)
     b = beta.shape[0]
-    inside = backend.zeros((b,), dtype=backend.bool, device=device)
-    complete = backend.zeros((b,), dtype=backend.bool, device=device)
+    inside = mesh_backend.zeros((b,), dtype=mesh_backend.bool, device=device)
+    complete = mesh_backend.zeros((b,), dtype=mesh_backend.bool, device=device)
     qidx, tri, w = index_hits(mag.index, mag.vertices, mag.leaves, beta)
     if qidx.shape[0] == 0:
         return inside, complete
-    first = backend.flatnonzero(
-        backend.concatenate(
+    first = mesh_backend.flatnonzero(
+        mesh_backend.concatenate(
             (
-                backend.ones((1,), dtype=backend.bool, device=device),
+                mesh_backend.ones((1,), dtype=mesh_backend.bool, device=device),
                 qidx[1:] != qidx[:-1],
             ),
             dim=0,
         )
     )
     q, t, w = qidx[first], tri[first], w[first]
-    bary = w / backend.unsqueeze(backend.sum(w, dim=1), -1)
-    value = backend.sum(bary * region_field(mag, mu_min)[mag.leaves[t]], dim=1)
+    bary = w / mesh_backend.unsqueeze(mesh_backend.sum(w, dim=1), -1)
+    value = mesh_backend.sum(bary * region_field(mag, mu_min)[mag.leaves[t]], dim=1)
     known = ~mag.incomplete[t]
-    complete = backend.fill_at_indices(complete, q, known)
-    inside = backend.fill_at_indices(inside, q, known & (value >= 0))
+    complete = mesh_backend.fill_at_indices(complete, q, known)
+    inside = mesh_backend.fill_at_indices(inside, q, known & (value >= 0))
     return inside, complete

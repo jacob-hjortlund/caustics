@@ -13,7 +13,8 @@ call is made.
 from typing import NamedTuple
 from warnings import warn
 
-from ....backend_obj import ArrayLike, backend
+from ....backend_obj import ArrayLike
+from .mesh_backend import mesh_backend
 from .geometry import ROOT_CLASS, build_device, is_member, to_device
 from .lattice import (
     Lattice,
@@ -31,15 +32,15 @@ from .magnification import band_magnification_floor, magnification_sampler, shee
 
 def _expand(start, count):
     """Each ``start[e] + 0 .. count[e] - 1``, with its owner ``e``."""
-    int64 = backend.int64
-    device = backend.device(count)
-    total = int(backend.to_numpy(backend.sum(count)))
-    owner = backend.repeat(
-        backend.arange(count.shape[0], dtype=int64, device=device), count, axis=0
+    int64 = mesh_backend.int64
+    device = mesh_backend.device(count)
+    total = int(mesh_backend.to_numpy(mesh_backend.sum(count)))
+    owner = mesh_backend.repeat(
+        mesh_backend.arange(count.shape[0], dtype=int64, device=device), count, axis=0
     )
-    within = backend.arange(total, dtype=int64, device=device) - backend.repeat(
-        backend.cumsum(count, dim=0) - count, count, axis=0
-    )
+    within = mesh_backend.arange(
+        total, dtype=int64, device=device
+    ) - mesh_backend.repeat(mesh_backend.cumsum(count, dim=0) - count, count, axis=0)
     return owner, start[owner] + within
 
 
@@ -82,51 +83,65 @@ def segment_cells(a, b, lo, size, n_cells, pad):
         ``(K,)`` int64 cell ids ``i * n_cells + j``, ``i`` along x, unique and
         ascending.
     """
-    f64 = backend.float64
+    f64 = mesh_backend.float64
     hi = lo + size * n_cells
-    xa, xb = backend.minimum(a[:, 0], b[:, 0]), backend.maximum(a[:, 0], b[:, 0])
-    ya, yb = backend.minimum(a[:, 1], b[:, 1]), backend.maximum(a[:, 1], b[:, 1])
+    xa, xb = mesh_backend.minimum(a[:, 0], b[:, 0]), mesh_backend.maximum(
+        a[:, 0], b[:, 0]
+    )
+    ya, yb = mesh_backend.minimum(a[:, 1], b[:, 1]), mesh_backend.maximum(
+        a[:, 1], b[:, 1]
+    )
     meets = (
         (xb + pad >= lo[0])
         & (xa - pad <= hi[0])
         & (yb + pad >= lo[1])
         & (ya - pad <= hi[1])
     )
-    keep = backend.flatnonzero(meets)
+    keep = mesh_backend.flatnonzero(meets)
     if keep.shape[0] == 0:
-        return backend.zeros((0,), dtype=backend.int64, device=backend.device(a))
+        return mesh_backend.zeros(
+            (0,), dtype=mesh_backend.int64, device=mesh_backend.device(a)
+        )
     a, b, xa, xb = a[keep], b[keep], xa[keep], xb[keep]
     top = n_cells - 1
-    i0 = backend.clamp(backend.long(backend.floor((xa - pad - lo[0]) / size)), 0, top)
-    i1 = backend.clamp(backend.long(backend.floor((xb + pad - lo[0]) / size)), 0, top)
+    i0 = mesh_backend.clamp(
+        mesh_backend.long(mesh_backend.floor((xa - pad - lo[0]) / size)), 0, top
+    )
+    i1 = mesh_backend.clamp(
+        mesh_backend.long(mesh_backend.floor((xb + pad - lo[0]) / size)), 0, top
+    )
     seg, col = _expand(i0, i1 - i0 + 1)
 
     # Clip each segment to its column's padded slab.
-    x_lo = lo[0] + backend.to(col, dtype=f64) * size - pad
+    x_lo = lo[0] + mesh_backend.to(col, dtype=f64) * size - pad
     x_hi = x_lo + size + 2.0 * pad
     ax, ay = a[seg, 0], a[seg, 1]
     dx, dy = b[seg, 0] - ax, b[seg, 1] - ay
     vertical = dx == 0
-    safe = backend.where(vertical, backend.ones_like(dx), dx)
+    safe = mesh_backend.where(vertical, mesh_backend.ones_like(dx), dx)
     ta, tb = (x_lo - ax) / safe, (x_hi - ax) / safe
-    t0 = backend.where(
+    t0 = mesh_backend.where(
         vertical,
-        backend.zeros_like(dx),
-        backend.clamp(backend.minimum(ta, tb), 0.0, 1.0),
+        mesh_backend.zeros_like(dx),
+        mesh_backend.clamp(mesh_backend.minimum(ta, tb), 0.0, 1.0),
     )
-    t1 = backend.where(
+    t1 = mesh_backend.where(
         vertical,
-        backend.ones_like(dx),
-        backend.clamp(backend.maximum(ta, tb), 0.0, 1.0),
+        mesh_backend.ones_like(dx),
+        mesh_backend.clamp(mesh_backend.maximum(ta, tb), 0.0, 1.0),
     )
     y0, y1 = ay + t0 * dy, ay + t1 * dy
-    y_lo = backend.minimum(y0, y1) - pad
-    y_hi = backend.maximum(y0, y1) + pad
-    rows = backend.flatnonzero((y_hi >= lo[1]) & (y_lo <= hi[1]))
-    j0 = backend.clamp(backend.long(backend.floor((y_lo[rows] - lo[1]) / size)), 0, top)
-    j1 = backend.clamp(backend.long(backend.floor((y_hi[rows] - lo[1]) / size)), 0, top)
+    y_lo = mesh_backend.minimum(y0, y1) - pad
+    y_hi = mesh_backend.maximum(y0, y1) + pad
+    rows = mesh_backend.flatnonzero((y_hi >= lo[1]) & (y_lo <= hi[1]))
+    j0 = mesh_backend.clamp(
+        mesh_backend.long(mesh_backend.floor((y_lo[rows] - lo[1]) / size)), 0, top
+    )
+    j1 = mesh_backend.clamp(
+        mesh_backend.long(mesh_backend.floor((y_hi[rows] - lo[1]) / size)), 0, top
+    )
     owner, row = _expand(j0, j1 - j0 + 1)
-    return backend.unique(col[rows][owner] * n_cells + row)
+    return mesh_backend.unique(col[rows][owner] * n_cells + row)
 
 
 def level_cells(lat, segments, pad, level):
@@ -186,7 +201,7 @@ def triangle_cells(lat, ij, level):
         ``(n,)`` int64 cell ids, as :func:`level_cells` numbers them.
     """
     shift = lat.level - level
-    corner = backend.min(ij, dim=1) // (1 << shift)
+    corner = mesh_backend.min(ij, dim=1) // (1 << shift)
     return corner[:, 0] * (lat.n >> shift) + corner[:, 1]
 
 
@@ -221,12 +236,14 @@ def split_mask(mu6, touched, targets, rtol):
     split = touched
     for t in targets:
         inside = mu6 >= t
-        split = split | (backend.any(inside, dim=1) & backend.any(~inside, dim=1))
+        split = split | (
+            mesh_backend.any(inside, dim=1) & mesh_backend.any(~inside, dim=1)
+        )
     if rtol is not None:
-        log_mu = backend.log(1.0 + mu6)
+        log_mu = mesh_backend.log(1.0 + mu6)
         lv, lm = log_mu[:, :3], log_mu[:, 3:]
-        dev = backend.abs(lm - 0.5 * (lv[:, [1, 2, 0]] + lv[:, [2, 0, 1]]))
-        split = split | ~backend.all(dev < rtol, dim=1)
+        dev = mesh_backend.abs(lm - 0.5 * (lv[:, [1, 2, 0]] + lv[:, [2, 0, 1]]))
+        split = split | ~mesh_backend.all(dev < rtol, dim=1)
     return split
 
 
@@ -234,7 +251,9 @@ def _targets(mu_min):
     """``mu_min`` as a tuple of floats: ``()`` for ``None``."""
     if mu_min is None:
         return ()
-    values = backend.to_numpy(backend.as_array(mu_min, dtype=backend.float64))
+    values = mesh_backend.to_numpy(
+        mesh_backend.as_array(mu_min, dtype=mesh_backend.float64)
+    )
     return tuple(float(v) for v in values.reshape(-1).tolist())
 
 
@@ -277,11 +296,11 @@ class MagnificationMap(NamedTuple):
 
 def _touches(lat, cells, ij, level):
     """True where a triangle ``ij`` ``(n, 3, 2)`` lies in a cell of ``cells[level]``, its level's ascending cell ids."""
-    hit = backend.zeros((ij.shape[0],), dtype=backend.bool)
-    for d in backend.to_numpy(backend.unique(level)).tolist():
-        at = backend.flatnonzero(level == d)
+    hit = mesh_backend.zeros((ij.shape[0],), dtype=mesh_backend.bool)
+    for d in mesh_backend.to_numpy(mesh_backend.unique(level)).tolist():
+        at = mesh_backend.flatnonzero(level == d)
         cell_ids = triangle_cells(lat, ij[at], int(d))
-        hit = backend.fill_at_indices(hit, at, is_member(cells[int(d)], cell_ids))
+        hit = mesh_backend.fill_at_indices(hit, at, is_member(cells[int(d)], cell_ids))
     return hit
 
 
@@ -343,10 +362,10 @@ def build_magnification_map(
     -------
     MagnificationMap
     """
-    f64 = backend.float64
+    f64 = mesh_backend.float64
     targets = _targets(mu_min)
-    (lx, ly), (hx, hy) = backend.to_numpy(
-        backend.stack((mesh.index.lo, mesh.index.hi))
+    (lx, ly), (hx, hy) = mesh_backend.to_numpy(
+        mesh_backend.stack((mesh.index.lo, mesh.index.hi))
     ).tolist()
     fov = max(hx - lx, hy - ly) if fov is None else float(fov)
     x0 = 0.5 * (lx + hx) if x0 is None else float(x0)
@@ -371,13 +390,13 @@ def build_magnification_map(
 
     lat = make_lattice(fov, x0, y0, init_res, max_level + 1)
     segments, on_fov = sheet_edges(mesh)
-    segments = to_device(backend.to(segments, dtype=f64), build_device())
+    segments = to_device(mesh_backend.to(segments, dtype=f64), build_device())
     on_fov = to_device(on_fov, build_device())
     # A few ulps of the window's coordinates keep the rasterization
     # conservative under rounding at every level.
-    pad = 64.0 * float(backend.finfo(f64).eps) * (fov + max(abs(x0), abs(y0)))
-    inner = segments[backend.flatnonzero(~on_fov)]
-    outer = segments[backend.flatnonzero(on_fov)]
+    pad = 64.0 * float(mesh_backend.finfo(f64).eps) * (fov + max(abs(x0), abs(y0)))
+    inner = segments[mesh_backend.flatnonzero(~on_fov)]
+    outer = segments[mesh_backend.flatnonzero(on_fov)]
     inner_cells = [level_cells(lat, inner, pad, d) for d in range(max_level + 1)]
     outer_cells = [level_cells(lat, outer, pad, d) for d in range(max_level + 1)]
 
@@ -400,11 +419,13 @@ def build_magnification_map(
         vertices_ij=cache.ij[used],
         vertices=vertices,
         mu=cache.values[used][:, 0],
-        n=backend.long(cache.values[used][:, 1]),
+        n=mesh_backend.long(cache.values[used][:, 1]),
         leaves=leaves,
         incomplete=incomplete[leaf_origin],
         index=build_index(
-            vertices, leaves, backend.arange(leaves.shape[0], dtype=backend.int64)
+            vertices,
+            leaves,
+            mesh_backend.arange(leaves.shape[0], dtype=mesh_backend.int64),
         ),
     )
-    return to_device(mag, backend.device(mesh.vertices_lens))
+    return to_device(mag, mesh_backend.device(mesh.vertices_lens))

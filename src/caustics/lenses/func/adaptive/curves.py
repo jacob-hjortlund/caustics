@@ -24,7 +24,8 @@ of the mesh alone.
 import math
 from typing import NamedTuple
 
-from ....backend_obj import ArrayLike, backend
+from ....backend_obj import ArrayLike
+from .mesh_backend import mesh_backend
 from .geometry import _CHILD_VERTEX_INDEX_TABLE, csr_offsets
 
 
@@ -76,7 +77,9 @@ class CriticalCurvesAndCaustics(NamedTuple):
 
 def _sorted_pair(a, b):
     """``(min, max)`` of two index arrays, shape ``(K,) -> (K, 2)``."""
-    return backend.stack((backend.minimum(a, b), backend.maximum(a, b)), dim=-1)
+    return mesh_backend.stack(
+        (mesh_backend.minimum(a, b), mesh_backend.maximum(a, b)), dim=-1
+    )
 
 
 def triangle_segments(tri, positive):
@@ -108,22 +111,22 @@ def triangle_segments(tri, positive):
         Their ending edges, shape ``(M, 2)``, in the same form.
     """
     pos = positive[tri]
-    n_positive = backend.sum(backend.long(pos), dim=1)
-    mixed = backend.flatnonzero((n_positive == 1) | (n_positive == 2))
+    n_positive = mesh_backend.sum(mesh_backend.long(pos), dim=1)
+    mixed = mesh_backend.flatnonzero((n_positive == 1) | (n_positive == 2))
     tri, pos = tri[mixed], pos[mixed]
     odd_positive = n_positive[mixed] == 1
     # The odd corner is the one True entry of `pos` where one corner is
     # positive, and the one False entry where two are.
-    odd_mask = backend.where(backend.unsqueeze(odd_positive, -1), pos, ~pos)
-    odd = backend.argmax(backend.long(odd_mask), 1)
-    rows = backend.arange(tri.shape[0], dtype=backend.int64)
+    odd_mask = mesh_backend.where(mesh_backend.unsqueeze(odd_positive, -1), pos, ~pos)
+    odd = mesh_backend.argmax(mesh_backend.long(odd_mask), 1)
+    rows = mesh_backend.arange(tri.shape[0], dtype=mesh_backend.int64)
     p_i = tri[rows, odd]
     p_j = tri[rows, (odd + 1) % 3]
     p_k = tri[rows, (odd + 2) % 3]
     e_ij = _sorted_pair(p_i, p_j)
     e_ki = _sorted_pair(p_k, p_i)
-    flip = backend.unsqueeze(odd_positive, -1)
-    return backend.where(flip, e_ij, e_ki), backend.where(flip, e_ki, e_ij)
+    flip = mesh_backend.unsqueeze(odd_positive, -1)
+    return mesh_backend.where(flip, e_ij, e_ki), mesh_backend.where(flip, e_ki, e_ij)
 
 
 def child_segments(samples, det):
@@ -182,11 +185,11 @@ def edge_zeros(edges, field, planes):
         *Unit: arcsec*
     """
     p, q = edges[:, 0], edges[:, 1]
-    t = backend.unsqueeze(field[p] / (field[p] - field[q]), -1)
+    t = mesh_backend.unsqueeze(field[p] / (field[p] - field[q]), -1)
     points = []
     for plane in planes:
-        x = backend.to(plane, dtype=backend.float64)
-        points.append(backend.to(x[p] + t * (x[q] - x[p]), dtype=plane.dtype))
+        x = mesh_backend.to(plane, dtype=mesh_backend.float64)
+        points.append(mesh_backend.to(x[p] + t * (x[q] - x[p]), dtype=plane.dtype))
     return tuple(points)
 
 
@@ -226,43 +229,43 @@ def chain_order(succ):
         ``(C,)`` bool, True where the curve is a cycle.
     """
     k = succ.shape[0]
-    device = backend.device(succ)
-    int64 = backend.int64
+    device = mesh_backend.device(succ)
+    int64 = mesh_backend.int64
     if k == 0:
         return (
-            backend.zeros((0,), dtype=int64, device=device),
-            backend.zeros((1,), dtype=int64, device=device),
-            backend.zeros((0,), dtype=backend.bool, device=device),
+            mesh_backend.zeros((0,), dtype=int64, device=device),
+            mesh_backend.zeros((1,), dtype=int64, device=device),
+            mesh_backend.zeros((0,), dtype=mesh_backend.bool, device=device),
         )
-    node = backend.arange(k, dtype=int64, device=device)
+    node = mesh_backend.arange(k, dtype=int64, device=device)
     has_next = succ >= 0
-    pred = backend.fill_at_indices(
-        backend.zeros((k,), dtype=int64, device=device) - 1,
+    pred = mesh_backend.fill_at_indices(
+        mesh_backend.zeros((k,), dtype=int64, device=device) - 1,
         succ[has_next],
         node[has_next],
     )
     rounds = math.ceil(math.log2(max(k, 2)))
 
-    nxt = backend.where(has_next, succ, node)
+    nxt = mesh_backend.where(has_next, succ, node)
     low = node
     for _ in range(rounds):
-        low = backend.minimum(low, low[nxt])
+        low = mesh_backend.minimum(low, low[nxt])
         nxt = nxt[nxt]
     on_cycle = has_next[nxt]
 
     start = (pred < 0) | (on_cycle & (low == node))
-    pred = backend.where(start, -1, pred)
+    pred = mesh_backend.where(start, -1, pred)
 
-    back = backend.where(pred >= 0, pred, node)
-    dist = backend.long(pred >= 0)
+    back = mesh_backend.where(pred >= 0, pred, node)
+    dist = mesh_backend.long(pred >= 0)
     for _ in range(rounds):
         dist = dist + dist[back]
         back = back[back]
 
     # `lexsort`'s last key is primary: group by start node, then travel order.
-    order = backend.lexsort([dist, back])
-    starts = backend.flatnonzero(start)
-    counts = backend.bincount(back, minlength=k)[starts]
+    order = mesh_backend.lexsort([dist, back])
+    starts = mesh_backend.flatnonzero(start)
+    counts = mesh_backend.bincount(back, minlength=k)[starts]
     return order, csr_offsets(counts), on_cycle[starts]
 
 
@@ -292,39 +295,39 @@ def chain_segments(start, end, n_samples):
     closed: ArrayLike
         ``(C,)`` bool, True where the curve is a loop.
     """
-    int64 = backend.int64
-    device = backend.device(start)
+    int64 = mesh_backend.int64
+    device = mesh_backend.device(start)
     k = start.shape[0]
     if k == 0:
         return (
-            backend.zeros((0, 2), dtype=int64, device=device),
-            backend.zeros((1,), dtype=int64, device=device),
-            backend.zeros((0,), dtype=backend.bool, device=device),
+            mesh_backend.zeros((0, 2), dtype=int64, device=device),
+            mesh_backend.zeros((1,), dtype=int64, device=device),
+            mesh_backend.zeros((0,), dtype=mesh_backend.bool, device=device),
         )
     s = n_samples
-    keys = backend.concatenate(
+    keys = mesh_backend.concatenate(
         (start[:, 0] * s + start[:, 1], end[:, 0] * s + end[:, 1]), dim=0
     )
-    nodes, inverse = backend.unique(keys, return_inverse=True)
+    nodes, inverse = mesh_backend.unique(keys, return_inverse=True)
     frm, to = inverse[:k], inverse[k:]
     n = nodes.shape[0]
-    succ = backend.fill_at_indices(
-        backend.zeros((n,), dtype=int64, device=device) - 1, frm, to
+    succ = mesh_backend.fill_at_indices(
+        mesh_backend.zeros((n,), dtype=int64, device=device) - 1, frm, to
     )
     order, offsets, closed = chain_order(succ)
     ordered = nodes[order]
-    return backend.stack((ordered // s, ordered % s), dim=-1), offsets, closed
+    return mesh_backend.stack((ordered // s, ordered % s), dim=-1), offsets, closed
 
 
 def _no_curves(band):
     """The :class:`CriticalCurvesAndCaustics` of a band with no crossing."""
-    device = backend.device(band.det)
+    device = mesh_backend.device(band.det)
     return CriticalCurvesAndCaustics(
-        lens=backend.zeros((0, 2), dtype=band.lens.dtype, device=device),
-        source=backend.zeros((0, 2), dtype=band.source.dtype, device=device),
-        offsets=backend.zeros((1,), dtype=backend.int64, device=device),
-        closed=backend.zeros((0,), dtype=backend.bool, device=device),
-        hole=backend.zeros((0,), dtype=backend.int64, device=device),
+        lens=mesh_backend.zeros((0, 2), dtype=band.lens.dtype, device=device),
+        source=mesh_backend.zeros((0, 2), dtype=band.source.dtype, device=device),
+        offsets=mesh_backend.zeros((1,), dtype=mesh_backend.int64, device=device),
+        closed=mesh_backend.zeros((0,), dtype=mesh_backend.bool, device=device),
+        hole=mesh_backend.zeros((0,), dtype=mesh_backend.int64, device=device),
     )
 
 
@@ -352,13 +355,15 @@ def trace_band(band):
         return _no_curves(band)
     edges, offsets, closed = chain_segments(start, end, band.lens.shape[0])
     lens_points, source_points = edge_zeros(edges, band.det, (band.lens, band.source))
-    device = backend.device(band.det)
+    device = mesh_backend.device(band.det)
     return CriticalCurvesAndCaustics(
         lens=lens_points,
         source=source_points,
         offsets=offsets,
         closed=closed,
-        hole=backend.zeros((lens_points.shape[0],), dtype=backend.int64, device=device)
+        hole=mesh_backend.zeros(
+            (lens_points.shape[0],), dtype=mesh_backend.int64, device=device
+        )
         - 1,
     )
 
@@ -366,7 +371,7 @@ def trace_band(band):
 def _turn(angle):
     """``angle`` wrapped into ``[0, 2 pi)``."""
     two_pi = 2.0 * math.pi
-    return angle - two_pi * backend.floor(angle / two_pi)
+    return angle - two_pi * mesh_backend.floor(angle / two_pi)
 
 
 def join_at_holes(curves, holes):
@@ -413,30 +418,32 @@ def join_at_holes(curves, holes):
     n_holes = holes.centers.shape[0]
     if n_points == 0 or n_holes == 0:
         return curves
-    device = backend.device(curves.lens)
-    int64, f64 = backend.int64, backend.float64
-    lens = backend.to(curves.lens, dtype=f64)
-    centers = backend.to(holes.centers, dtype=f64)
+    device = mesh_backend.device(curves.lens)
+    int64, f64 = mesh_backend.int64, mesh_backend.float64
+    lens = mesh_backend.to(curves.lens, dtype=f64)
+    centers = mesh_backend.to(holes.centers, dtype=f64)
 
     # 1. Tag every point strictly inside a hole's disk; disks are disjoint.
-    inside = backend.norm(
-        backend.unsqueeze(lens, 1) - backend.unsqueeze(centers, 0), dim=-1
-    ) < backend.unsqueeze(holes.radius, 0)
-    tag = backend.where(
-        backend.any(inside, dim=1), backend.argmax(backend.long(inside), 1), -1
+    inside = mesh_backend.norm(
+        mesh_backend.unsqueeze(lens, 1) - mesh_backend.unsqueeze(centers, 0), dim=-1
+    ) < mesh_backend.unsqueeze(holes.radius, 0)
+    tag = mesh_backend.where(
+        mesh_backend.any(inside, dim=1),
+        mesh_backend.argmax(mesh_backend.long(inside), 1),
+        -1,
     )
 
     # Per-point curve bookkeeping.
     counts = curves.offsets[1:] - curves.offsets[:-1]
-    curve = backend.repeat(
-        backend.arange(counts.shape[0], dtype=int64, device=device), counts, axis=0
+    curve = mesh_backend.repeat(
+        mesh_backend.arange(counts.shape[0], dtype=int64, device=device), counts, axis=0
     )
     first = curves.offsets[:-1][curve]
     last = curves.offsets[1:][curve] - 1
-    point = backend.arange(n_points, dtype=int64, device=device)
+    point = mesh_backend.arange(n_points, dtype=int64, device=device)
     curve_closed = curves.closed[curve]
-    prev = backend.where(point == first, last, point - 1)
-    nxt = backend.where(point == last, first, point + 1)
+    prev = mesh_backend.where(point == first, last, point - 1)
+    nxt = mesh_backend.where(point == last, first, point + 1)
 
     # 1b. A lone untagged point between two points of one hole, left by the
     # tracer's zigzag along its circle, counts as inside it.
@@ -444,40 +451,42 @@ def join_at_holes(curves, holes):
     has_prev = (point != first) | curve_closed
     has_next = (point != last) | curve_closed
     lone = ~tagged & has_prev & has_next & (tag[prev] >= 0) & (tag[prev] == tag[nxt])
-    tag = backend.where(lone, tag[prev], tag)
+    tag = mesh_backend.where(lone, tag[prev], tag)
     tagged = tag >= 0
 
     # 2. Rotate each closed curve that enters a hole to start right after a
     # tagged run, so that no run of untagged points wraps round its end.
-    after_run = backend.flatnonzero(~tagged & tagged[prev] & curve_closed)
-    start = backend.copy(curves.offsets[:-1])
+    after_run = mesh_backend.flatnonzero(~tagged & tagged[prev] & curve_closed)
+    start = mesh_backend.copy(curves.offsets[:-1])
     if after_run.shape[0]:
         run_curve = curve[after_run]
-        lead = backend.concatenate(
+        lead = mesh_backend.concatenate(
             (
-                backend.ones((1,), dtype=backend.bool, device=device),
+                mesh_backend.ones((1,), dtype=mesh_backend.bool, device=device),
                 run_curve[1:] != run_curve[:-1],
             ),
             dim=0,
         )
-        start = backend.fill_at_indices(start, run_curve[lead], after_run[lead])
+        start = mesh_backend.fill_at_indices(start, run_curve[lead], after_run[lead])
     perm = first + (start[curve] - first + point - first) % counts[curve]
     tag = tag[perm]
     tagged = tag >= 0
 
     # 3. Segments: the maximal runs of untagged points of each curve, already
     # numbered by their first traced point in rotated order.
-    is_first = ~tagged & ((point == first) | tagged[backend.clamp(point - 1, 0, None)])
-    is_last = ~tagged & (
-        (point == last) | tagged[backend.clamp(point + 1, None, n_points - 1)]
+    is_first = ~tagged & (
+        (point == first) | tagged[mesh_backend.clamp(point - 1, 0, None)]
     )
-    seg_first = backend.flatnonzero(is_first)
-    seg_last = backend.flatnonzero(is_last)
+    is_last = ~tagged & (
+        (point == last) | tagged[mesh_backend.clamp(point + 1, None, n_points - 1)]
+    )
+    seg_first = mesh_backend.flatnonzero(is_first)
+    seg_last = mesh_backend.flatnonzero(is_last)
     if seg_first.shape[0] == 0:
         return CriticalCurvesAndCaustics(
             lens=curves.lens[:0],
             source=curves.source[:0],
-            offsets=backend.zeros((1,), dtype=int64, device=device),
+            offsets=mesh_backend.zeros((1,), dtype=int64, device=device),
             closed=curves.closed[:0],
             hole=curves.hole[:0],
         )
@@ -486,107 +495,119 @@ def join_at_holes(curves, holes):
     # the step's second point back to its first, with no point of its own.
     # They are numbered after every real segment, so a cycle holding a real
     # segment still starts at one.
-    tag_next = tag[backend.clamp(point + 1, None, n_points - 1)]
-    has_segment = backend.bincount(curve[seg_first], minlength=counts.shape[0]) > 0
-    bridge = backend.flatnonzero(
+    tag_next = tag[mesh_backend.clamp(point + 1, None, n_points - 1)]
+    has_segment = mesh_backend.bincount(curve[seg_first], minlength=counts.shape[0]) > 0
+    bridge = mesh_backend.flatnonzero(
         (point != last)
         & tagged
         & (tag_next >= 0)
         & (tag_next != tag)
         & has_segment[curve]
     )
-    seg_first = backend.concatenate((seg_first, bridge + 1), dim=0)
-    seg_last = backend.concatenate((seg_last, bridge), dim=0)
+    seg_first = mesh_backend.concatenate((seg_first, bridge + 1), dim=0)
+    seg_last = mesh_backend.concatenate((seg_last, bridge), dim=0)
     n_seg = seg_first.shape[0]
     seg_closed = curves.closed[curve[seg_first]]
     starts_curve = seg_first == first[seg_first]
     ends_curve = seg_last == last[seg_last]
-    before = backend.where(starts_curve, last[seg_first], seg_first - 1)
-    after = backend.where(ends_curve, first[seg_last], seg_last + 1)
-    departs = backend.where(starts_curve & ~seg_closed, -1, tag[before])
-    arrives = backend.where(ends_curve & ~seg_closed, -1, tag[after])
+    before = mesh_backend.where(starts_curve, last[seg_first], seg_first - 1)
+    after = mesh_backend.where(ends_curve, first[seg_last], seg_last + 1)
+    departs = mesh_backend.where(starts_curve & ~seg_closed, -1, tag[before])
+    arrives = mesh_backend.where(ends_curve & ~seg_closed, -1, tag[after])
     # A closed curve that never enters a hole is one segment, its own successor.
     whole = seg_closed & starts_curve & ends_curve
-    succ = backend.where(whole, backend.arange(n_seg, dtype=int64, device=device), -1)
+    succ = mesh_backend.where(
+        whole, mesh_backend.arange(n_seg, dtype=int64, device=device), -1
+    )
 
     # 4. On each circle, join every arriving end to the next end clockwise.
     lens_rot = lens[perm]
-    hole_offsets = backend.to_numpy(holes.offsets).tolist()
+    hole_offsets = mesh_backend.to_numpy(holes.offsets).tolist()
     arcs = {}
     for h in range(n_holes):
-        arr = backend.flatnonzero(arrives == h)
-        dep = backend.flatnonzero(departs == h)
+        arr = mesh_backend.flatnonzero(arrives == h)
+        dep = mesh_backend.flatnonzero(departs == h)
         m = arr.shape[0] + dep.shape[0]
         if m == 0:
             continue
-        seg = backend.concatenate((arr, dep), dim=0)
-        arriving = backend.concatenate(
+        seg = mesh_backend.concatenate((arr, dep), dim=0)
+        arriving = mesh_backend.concatenate(
             (
-                backend.ones((arr.shape[0],), dtype=backend.bool, device=device),
-                backend.zeros((dep.shape[0],), dtype=backend.bool, device=device),
+                mesh_backend.ones(
+                    (arr.shape[0],), dtype=mesh_backend.bool, device=device
+                ),
+                mesh_backend.zeros(
+                    (dep.shape[0],), dtype=mesh_backend.bool, device=device
+                ),
             ),
             dim=0,
         )
-        rel = lens_rot[backend.concatenate((seg_last[arr], seg_first[dep]), dim=0)]
+        rel = lens_rot[mesh_backend.concatenate((seg_last[arr], seg_first[dep]), dim=0)]
         rel = rel - centers[h]
-        phi = _turn(backend.arctan2(rel[:, 1], rel[:, 0]))
-        o = backend.argsort(phi)
+        phi = _turn(mesh_backend.arctan2(rel[:, 1], rel[:, 0]))
+        o = mesh_backend.argsort(phi)
         seg, arriving, phi = seg[o], arriving[o], phi[o]
-        if m % 2 or bool(backend.any(arriving == backend.roll(arriving, 1, 0))):
+        if m % 2 or bool(
+            mesh_backend.any(arriving == mesh_backend.roll(arriving, 1, 0))
+        ):
             continue
-        k_arr = backend.flatnonzero(arriving)
+        k_arr = mesh_backend.flatnonzero(arriving)
         k_dep = (k_arr - 1) % m
-        succ = backend.fill_at_indices(succ, seg[k_arr], seg[k_dep])
+        succ = mesh_backend.fill_at_indices(succ, seg[k_arr], seg[k_dep])
         lo, hi = hole_offsets[h], hole_offsets[h + 1]
         angle = holes.angle[lo:hi]
         for ka, kd in zip(
-            backend.to_numpy(k_arr).tolist(), backend.to_numpy(k_dep).tolist()
+            mesh_backend.to_numpy(k_arr).tolist(), mesh_backend.to_numpy(k_dep).tolist()
         ):
             span = _turn(phi[ka] - phi[kd])
             delta = _turn(phi[ka] - angle)
-            pick = backend.flatnonzero((delta > 0) & (delta < span))
-            pick = pick[backend.argsort(delta[pick])]
-            arcs[int(backend.to_numpy(seg[ka]))] = lo + pick
+            pick = mesh_backend.flatnonzero((delta > 0) & (delta < span))
+            pick = pick[mesh_backend.argsort(delta[pick])]
+            arcs[int(mesh_backend.to_numpy(seg[ka]))] = lo + pick
     # 5. Chain the segments through their joins into curves.
     order, seg_offsets, closed = chain_order(succ)
 
     # 6. Assemble: every segment's points, then its join's arc.
-    pool_lens = backend.concatenate(
-        (curves.lens[perm], backend.to(holes.lens, dtype=curves.lens.dtype)), dim=0
+    pool_lens = mesh_backend.concatenate(
+        (curves.lens[perm], mesh_backend.to(holes.lens, dtype=curves.lens.dtype)), dim=0
     )
-    pool_source = backend.concatenate(
-        (curves.source[perm], backend.to(holes.source, dtype=curves.source.dtype)),
+    pool_source = mesh_backend.concatenate(
+        (curves.source[perm], mesh_backend.to(holes.source, dtype=curves.source.dtype)),
         dim=0,
     )
     samples = holes.offsets[1:] - holes.offsets[:-1]
-    pool_hole = backend.concatenate(
+    pool_hole = mesh_backend.concatenate(
         (
-            backend.zeros((n_points,), dtype=int64, device=device) - 1,
-            backend.repeat(
-                backend.arange(n_holes, dtype=int64, device=device), samples, axis=0
+            mesh_backend.zeros((n_points,), dtype=int64, device=device) - 1,
+            mesh_backend.repeat(
+                mesh_backend.arange(n_holes, dtype=int64, device=device),
+                samples,
+                axis=0,
             ),
         ),
         dim=0,
     )
-    first_host = backend.to_numpy(seg_first).tolist()
-    last_host = backend.to_numpy(seg_last).tolist()
+    first_host = mesh_backend.to_numpy(seg_first).tolist()
+    last_host = mesh_backend.to_numpy(seg_last).tolist()
     pieces, sizes = [], []
-    for s in backend.to_numpy(order).tolist():
+    for s in mesh_backend.to_numpy(order).tolist():
         pieces.append(
-            backend.arange(first_host[s], last_host[s] + 1, dtype=int64, device=device)
+            mesh_backend.arange(
+                first_host[s], last_host[s] + 1, dtype=int64, device=device
+            )
         )
         size = last_host[s] + 1 - first_host[s]
         if s in arcs:
             pieces.append(n_points + arcs[s])
             size += int(arcs[s].shape[0])
         sizes.append(size)
-    gather = backend.concatenate(pieces, dim=0)
-    csum = csr_offsets(backend.as_array(sizes, dtype=int64, device=device))
+    gather = mesh_backend.concatenate(pieces, dim=0)
+    csum = csr_offsets(mesh_backend.as_array(sizes, dtype=int64, device=device))
     offsets = csum[seg_offsets]
     # A curve of bridges alone whose joins inserted no sample has no point.
-    kept = backend.flatnonzero(offsets[1:] > offsets[:-1])
+    kept = mesh_backend.flatnonzero(offsets[1:] > offsets[:-1])
     if kept.shape[0] < closed.shape[0]:
-        offsets = backend.concatenate((offsets[:1], offsets[1:][kept]), dim=0)
+        offsets = mesh_backend.concatenate((offsets[:1], offsets[1:][kept]), dim=0)
         closed = closed[kept]
     return CriticalCurvesAndCaustics(
         lens=pool_lens[gather],

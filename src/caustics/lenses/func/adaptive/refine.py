@@ -13,7 +13,8 @@ the result conforming.
 import math
 from typing import NamedTuple
 
-from ....backend_obj import ArrayLike, backend
+from ....backend_obj import ArrayLike
+from .mesh_backend import mesh_backend
 from .geometry import COMPOSE, _CHILD_VERTEX_INDEX_TABLE, min_angle
 from .lattice import lattice_ij_from_key, lattice_key, lattice_xy, midpoint_ij
 
@@ -68,24 +69,24 @@ class LeafStore(NamedTuple):
 
 def empty_cache(n_values):
     """A :class:`VertexCache` with no point, for ``n_values`` sample columns."""
-    int64 = backend.int64
+    int64 = mesh_backend.int64
     return VertexCache(
-        keys=backend.zeros((0,), dtype=int64),
-        slots=backend.zeros((0,), dtype=int64),
-        ij=backend.zeros((0, 2), dtype=int64),
-        values=backend.zeros((0, n_values), dtype=backend.float64),
-        active=backend.zeros((0,), dtype=backend.bool),
+        keys=mesh_backend.zeros((0,), dtype=int64),
+        slots=mesh_backend.zeros((0,), dtype=int64),
+        ij=mesh_backend.zeros((0, 2), dtype=int64),
+        values=mesh_backend.zeros((0, n_values), dtype=mesh_backend.float64),
+        active=mesh_backend.zeros((0,), dtype=mesh_backend.bool),
     )
 
 
 def empty_store():
     """A :class:`LeafStore` with no row."""
-    int64 = backend.int64
+    int64 = mesh_backend.int64
     return LeafStore(
-        v=backend.zeros((0, 3), dtype=int64),
-        level=backend.zeros((0,), dtype=int64),
-        cls=backend.zeros((0,), dtype=int64),
-        valid=backend.zeros((0,), dtype=backend.bool),
+        v=mesh_backend.zeros((0, 3), dtype=int64),
+        level=mesh_backend.zeros((0,), dtype=int64),
+        cls=mesh_backend.zeros((0,), dtype=int64),
+        valid=mesh_backend.zeros((0,), dtype=mesh_backend.bool),
     )
 
 
@@ -93,9 +94,9 @@ def cache_lookup(cache, keys):
     """Slot of each of ``keys``, ``-1`` where it is not cached."""
     n = cache.keys.shape[0]
     if n == 0:
-        return backend.zeros_like(keys) - 1
-    pos = backend.clamp(backend.searchsorted(cache.keys, keys), 0, n - 1)
-    return backend.where(cache.keys[pos] == keys, cache.slots[pos], -1)
+        return mesh_backend.zeros_like(keys) - 1
+    pos = mesh_backend.clamp(mesh_backend.searchsorted(cache.keys, keys), 0, n - 1)
+    return mesh_backend.where(cache.keys[pos] == keys, cache.slots[pos], -1)
 
 
 def sample_points(xy, sample, batch_size):
@@ -107,8 +108,8 @@ def sample_points(xy, sample, batch_size):
     """
     if batch_size is None or xy.shape[0] <= batch_size:
         return sample(xy)
-    chunks = backend.chunk(xy, math.ceil(xy.shape[0] / batch_size), dim=0)
-    return backend.concatenate([sample(chunk) for chunk in chunks], dim=0)
+    chunks = mesh_backend.chunk(xy, math.ceil(xy.shape[0] / batch_size), dim=0)
+    return mesh_backend.concatenate([sample(chunk) for chunk in chunks], dim=0)
 
 
 def evaluate(cache, lat, keys, sample, batch_size):
@@ -119,33 +120,39 @@ def evaluate(cache, lat, keys, sample, batch_size):
     all keys being distinct, a new key lands at its ``searchsorted``
     position plus its rank among the new keys.
     """
-    new = backend.unique(keys)
+    new = mesh_backend.unique(keys)
     new = new[cache_lookup(cache, new) < 0]
     k = new.shape[0]
     if k == 0:
         return cache
-    int64 = backend.int64
+    int64 = mesh_backend.int64
     ij = lattice_ij_from_key(lat, new)
     values = sample_points(lattice_xy(lat, ij), sample, batch_size)
     start = cache.ij.shape[0]
     total = cache.keys.shape[0] + k
-    dest = backend.searchsorted(cache.keys, new) + backend.arange(k, dtype=int64)
-    rest = backend.flatnonzero(
-        backend.fill_at_indices(backend.ones((total,), dtype=backend.bool), dest, False)
+    dest = mesh_backend.searchsorted(cache.keys, new) + mesh_backend.arange(
+        k, dtype=int64
     )
-    keys_out = backend.fill_at_indices(backend.zeros((total,), dtype=int64), dest, new)
-    slots_out = backend.fill_at_indices(
-        backend.zeros((total,), dtype=int64),
+    rest = mesh_backend.flatnonzero(
+        mesh_backend.fill_at_indices(
+            mesh_backend.ones((total,), dtype=mesh_backend.bool), dest, False
+        )
+    )
+    keys_out = mesh_backend.fill_at_indices(
+        mesh_backend.zeros((total,), dtype=int64), dest, new
+    )
+    slots_out = mesh_backend.fill_at_indices(
+        mesh_backend.zeros((total,), dtype=int64),
         dest,
-        backend.arange(start, start + k, dtype=int64),
+        mesh_backend.arange(start, start + k, dtype=int64),
     )
     return VertexCache(
-        keys=backend.fill_at_indices(keys_out, rest, cache.keys),
-        slots=backend.fill_at_indices(slots_out, rest, cache.slots),
-        ij=backend.concatenate((cache.ij, ij), dim=0),
-        values=backend.concatenate((cache.values, values), dim=0),
-        active=backend.concatenate(
-            (cache.active, backend.zeros((k,), dtype=backend.bool)), dim=0
+        keys=mesh_backend.fill_at_indices(keys_out, rest, cache.keys),
+        slots=mesh_backend.fill_at_indices(slots_out, rest, cache.slots),
+        ij=mesh_backend.concatenate((cache.ij, ij), dim=0),
+        values=mesh_backend.concatenate((cache.values, values), dim=0),
+        active=mesh_backend.concatenate(
+            (cache.active, mesh_backend.zeros((k,), dtype=mesh_backend.bool)), dim=0
         ),
     )
 
@@ -153,7 +160,9 @@ def evaluate(cache, lat, keys, sample, batch_size):
 def activate(cache, slots):
     """``cache`` with ``slots`` marked as leaf vertices; ``cache`` itself is untouched."""
     return cache._replace(
-        active=backend.fill_at_indices(backend.copy(cache.active), slots, True)
+        active=mesh_backend.fill_at_indices(
+            mesh_backend.copy(cache.active), slots, True
+        )
     )
 
 
@@ -161,14 +170,14 @@ def add_leaves(store, v, level, cls):
     """``store`` with rows ``v`` appended, and the new rows' indices."""
     start, k = store.v.shape[0], v.shape[0]
     store = LeafStore(
-        v=backend.concatenate((store.v, v), dim=0),
-        level=backend.concatenate((store.level, level), dim=0),
-        cls=backend.concatenate((store.cls, cls), dim=0),
-        valid=backend.concatenate(
-            (store.valid, backend.ones((k,), dtype=backend.bool)), dim=0
+        v=mesh_backend.concatenate((store.v, v), dim=0),
+        level=mesh_backend.concatenate((store.level, level), dim=0),
+        cls=mesh_backend.concatenate((store.cls, cls), dim=0),
+        valid=mesh_backend.concatenate(
+            (store.valid, mesh_backend.ones((k,), dtype=mesh_backend.bool)), dim=0
         ),
     )
-    return store, backend.arange(start, start + k, dtype=backend.int64)
+    return store, mesh_backend.arange(start, start + k, dtype=mesh_backend.int64)
 
 
 def add_roots(cache, store, lat, ij, cls, sample, batch_size):
@@ -192,7 +201,7 @@ def add_roots(cache, store, lat, ij, cls, sample, batch_size):
     keys = lattice_key(lat, ij)
     cache = evaluate(cache, lat, keys.reshape(-1), sample, batch_size)
     v = cache_lookup(cache, keys)
-    level = backend.zeros((v.shape[0],), dtype=backend.int64)
+    level = mesh_backend.zeros((v.shape[0],), dtype=mesh_backend.int64)
     store, rows = add_leaves(store, v, level, cls)
     return activate(cache, v.reshape(-1)), store, rows
 
@@ -215,7 +224,7 @@ def red_split(v, m, cls):
     child_cls: ArrayLike
         ``(4n,)`` int64 orientation classes.
     """
-    six = backend.concatenate((v, m), dim=1)
+    six = mesh_backend.concatenate((v, m), dim=1)
     return six[:, _CHILD_VERTEX_INDEX_TABLE].reshape(-1, 3), COMPOSE[cls].reshape(-1)
 
 
@@ -229,9 +238,9 @@ def split_rows(cache, store, lat, rows):
     v = store.v[rows]
     m = cache_lookup(cache, lattice_key(lat, midpoint_ij(cache.ij[v])))
     kid_v, kid_cls = red_split(v, m, store.cls[rows])
-    kid_level = backend.repeat(store.level[rows] + 1, 4, axis=0)
+    kid_level = mesh_backend.repeat(store.level[rows] + 1, 4, axis=0)
     store = store._replace(
-        valid=backend.fill_at_indices(backend.copy(store.valid), rows, False)
+        valid=mesh_backend.fill_at_indices(mesh_backend.copy(store.valid), rows, False)
     )
     store, kids = add_leaves(store, kid_v, kid_level, kid_cls)
     return activate(cache, kid_v.reshape(-1)), store, kids
@@ -243,9 +252,9 @@ def _split_failures(cache, store, lat, rows, sample, split, batch_size):
     ij = cache.ij[v]
     mid = lattice_key(lat, midpoint_ij(ij))
     cache = evaluate(cache, lat, mid.reshape(-1), sample, batch_size)
-    six = backend.concatenate((v, cache_lookup(cache, mid)), dim=1)
+    six = mesh_backend.concatenate((v, cache_lookup(cache, mid)), dim=1)
     fail = split(ij, cache.values[six], store.cls[rows], store.level[rows])
-    return split_rows(cache, store, lat, rows[backend.flatnonzero(fail)])
+    return split_rows(cache, store, lat, rows[mesh_backend.flatnonzero(fail)])
 
 
 def unbalanced(cache, store, lat, max_level):
@@ -256,17 +265,19 @@ def unbalanced(cache, store, lat, max_level):
     at ``level <= max_level - 2`` can have one, and its quarter points are
     lattice points.
     """
-    rows = backend.flatnonzero(store.valid & (store.level <= max_level - 2))
+    rows = mesh_backend.flatnonzero(store.valid & (store.level <= max_level - 2))
     if rows.shape[0] == 0:
         return rows
     ij = cache.ij[store.v[rows]]
-    hit = backend.zeros((rows.shape[0],), dtype=backend.bool)
+    hit = mesh_backend.zeros((rows.shape[0],), dtype=mesh_backend.bool)
     for e in range(3):
         a, b = ij[:, e], ij[:, (e + 1) % 3]
         delta = (b - a) // 4
         for quarter in (a + delta, b - delta):
             slot = cache_lookup(cache, lattice_key(lat, quarter))
-            hit = hit | ((slot >= 0) & cache.active[backend.where(slot >= 0, slot, 0)])
+            hit = hit | (
+                (slot >= 0) & cache.active[mesh_backend.where(slot >= 0, slot, 0)]
+            )
     return rows[hit]
 
 
@@ -286,11 +297,11 @@ def balance(cache, store, lat, max_level, sample, batch_size):
     created: ArrayLike
         Rows created, some of which a later round may have split again.
     """
-    created = [backend.zeros((0,), dtype=backend.int64)]
+    created = [mesh_backend.zeros((0,), dtype=mesh_backend.int64)]
     while True:
         rows = unbalanced(cache, store, lat, max_level)
         if rows.shape[0] == 0:
-            return cache, store, backend.concatenate(created, dim=0)
+            return cache, store, mesh_backend.concatenate(created, dim=0)
         mid = lattice_key(lat, midpoint_ij(cache.ij[store.v[rows]]))
         cache = evaluate(cache, lat, mid.reshape(-1), sample, batch_size)
         cache, store, kids = split_rows(cache, store, lat, rows)
@@ -349,8 +360,8 @@ def refine(cache, store, untested, lat, sample, split, max_level, batch_size):
 
 def canonical_order(lat, cache, v):
     """Permutation sorting leaves ``v`` ``(n, 3)`` by their sorted vertex keys, which identify a triangle."""
-    keys = backend.sort(lattice_key(lat, cache.ij[v]), dim=1)
-    return backend.lexsort([keys[:, 2], keys[:, 1], keys[:, 0]])
+    keys = mesh_backend.sort(lattice_key(lat, cache.ij[v]), dim=1)
+    return mesh_backend.lexsort([keys[:, 2], keys[:, 1], keys[:, 0]])
 
 
 def close(lat, cache, store):
@@ -380,72 +391,78 @@ def close(lat, cache, store):
     origin_leaves: ArrayLike
         ``(N, 3)`` int64 their vertices, indices into ``used``.
     """
-    int64 = backend.int64
-    origin = backend.flatnonzero(store.valid)
+    int64 = mesh_backend.int64
+    origin = mesh_backend.flatnonzero(store.valid)
     origin = origin[canonical_order(lat, cache, store.v[origin])]
     v = store.v[origin]
     m = cache_lookup(cache, lattice_key(lat, midpoint_ij(cache.ij[v])))
-    hanging = (m >= 0) & cache.active[backend.where(m >= 0, m, 0)]
-    count = backend.sum(backend.long(hanging), dim=1)
+    hanging = (m >= 0) & cache.active[mesh_backend.where(m >= 0, m, 0)]
+    count = mesh_backend.sum(mesh_backend.long(hanging), dim=1)
     n_children = count + 1
-    offsets = backend.cumsum(n_children, dim=0) - n_children
-    total = int(backend.to_numpy(backend.sum(n_children)))
-    leaves = backend.zeros((total, 3), dtype=int64)
-    leaf_origin = backend.repeat(
-        backend.arange(v.shape[0], dtype=int64), n_children, axis=0
+    offsets = mesh_backend.cumsum(n_children, dim=0) - n_children
+    total = int(mesh_backend.to_numpy(mesh_backend.sum(n_children)))
+    leaves = mesh_backend.zeros((total, 3), dtype=int64)
+    leaf_origin = mesh_backend.repeat(
+        mesh_backend.arange(v.shape[0], dtype=int64), n_children, axis=0
     )
 
     def xy(slots):
         return lattice_xy(lat, cache.ij[slots])
 
-    sel = backend.flatnonzero(count == 0)
-    leaves = backend.fill_at_indices(leaves, offsets[sel], v[sel])
+    sel = mesh_backend.flatnonzero(count == 0)
+    leaves = mesh_backend.fill_at_indices(leaves, offsets[sel], v[sel])
     for i in range(3):
         j, k = (i + 1) % 3, (i + 2) % 3
-        sel = backend.flatnonzero((count == 1) & hanging[:, i])
+        sel = mesh_backend.flatnonzero((count == 1) & hanging[:, i])
         if sel.shape[0] == 0:
             continue
         o = offsets[sel]
-        leaves = backend.fill_at_indices(
-            leaves, o, backend.stack((v[sel, i], v[sel, j], m[sel, i]), dim=1)
+        leaves = mesh_backend.fill_at_indices(
+            leaves, o, mesh_backend.stack((v[sel, i], v[sel, j], m[sel, i]), dim=1)
         )
-        leaves = backend.fill_at_indices(
-            leaves, o + 1, backend.stack((v[sel, i], m[sel, i], v[sel, k]), dim=1)
+        leaves = mesh_backend.fill_at_indices(
+            leaves, o + 1, mesh_backend.stack((v[sel, i], m[sel, i], v[sel, k]), dim=1)
         )
     for c in range(3):
         a, b = (c + 1) % 3, (c + 2) % 3
-        sel = backend.flatnonzero((count == 2) & ~hanging[:, c])
+        sel = mesh_backend.flatnonzero((count == 2) & ~hanging[:, c])
         if sel.shape[0] == 0:
             continue
         o = offsets[sel]
-        leaves = backend.fill_at_indices(
-            leaves, o, backend.stack((v[sel, c], m[sel, b], m[sel, a]), dim=1)
+        leaves = mesh_backend.fill_at_indices(
+            leaves, o, mesh_backend.stack((v[sel, c], m[sel, b], m[sel, a]), dim=1)
         )
-        a1 = backend.stack((v[sel, a], v[sel, b], m[sel, a]), dim=1)
-        a2 = backend.stack((v[sel, a], m[sel, a], m[sel, b]), dim=1)
-        b1 = backend.stack((v[sel, a], v[sel, b], m[sel, b]), dim=1)
-        b2 = backend.stack((v[sel, b], m[sel, a], m[sel, b]), dim=1)
-        score_a = backend.minimum(min_angle(xy(a1)), min_angle(xy(a2)))
-        score_b = backend.minimum(min_angle(xy(b1)), min_angle(xy(b2)))
-        use_b = backend.unsqueeze(score_b > score_a, -1)
-        leaves = backend.fill_at_indices(leaves, o + 1, backend.where(use_b, b1, a1))
-        leaves = backend.fill_at_indices(leaves, o + 2, backend.where(use_b, b2, a2))
-    sel = backend.flatnonzero(count == 3)
+        a1 = mesh_backend.stack((v[sel, a], v[sel, b], m[sel, a]), dim=1)
+        a2 = mesh_backend.stack((v[sel, a], m[sel, a], m[sel, b]), dim=1)
+        b1 = mesh_backend.stack((v[sel, a], v[sel, b], m[sel, b]), dim=1)
+        b2 = mesh_backend.stack((v[sel, b], m[sel, a], m[sel, b]), dim=1)
+        score_a = mesh_backend.minimum(min_angle(xy(a1)), min_angle(xy(a2)))
+        score_b = mesh_backend.minimum(min_angle(xy(b1)), min_angle(xy(b2)))
+        use_b = mesh_backend.unsqueeze(score_b > score_a, -1)
+        leaves = mesh_backend.fill_at_indices(
+            leaves, o + 1, mesh_backend.where(use_b, b1, a1)
+        )
+        leaves = mesh_backend.fill_at_indices(
+            leaves, o + 2, mesh_backend.where(use_b, b2, a2)
+        )
+    sel = mesh_backend.flatnonzero(count == 3)
     if sel.shape[0]:
-        kids = backend.concatenate((v[sel], m[sel]), dim=1)[
+        kids = mesh_backend.concatenate((v[sel], m[sel]), dim=1)[
             :, _CHILD_VERTEX_INDEX_TABLE
         ]
         for t in range(4):
-            leaves = backend.fill_at_indices(leaves, offsets[sel] + t, kids[:, t])
+            leaves = mesh_backend.fill_at_indices(leaves, offsets[sel] + t, kids[:, t])
 
     n_slots = cache.ij.shape[0]
-    used_mask = backend.fill_at_indices(
-        backend.zeros((n_slots,), dtype=backend.bool), leaves.reshape(-1), True
+    used_mask = mesh_backend.fill_at_indices(
+        mesh_backend.zeros((n_slots,), dtype=mesh_backend.bool),
+        leaves.reshape(-1),
+        True,
     )
     used = cache.slots[used_mask[cache.slots]]
-    remap = backend.fill_at_indices(
-        backend.zeros((n_slots,), dtype=int64),
+    remap = mesh_backend.fill_at_indices(
+        mesh_backend.zeros((n_slots,), dtype=int64),
         used,
-        backend.arange(used.shape[0], dtype=int64),
+        mesh_backend.arange(used.shape[0], dtype=int64),
     )
     return used, remap[leaves], leaf_origin, origin, remap[v]

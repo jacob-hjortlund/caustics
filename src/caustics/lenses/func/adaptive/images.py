@@ -7,7 +7,7 @@ source-plane image contains the point (:func:`mesh_query`,
 merges near-coincident roots (:func:`dedup_representatives`).
 """
 
-from ....backend_obj import backend
+from .mesh_backend import mesh_backend
 from ....utils import batch_lm
 from .geometry import area2, contains, csr_offsets, sanitize_bary, triangle_weights
 from .index import as_points, index_hits
@@ -40,24 +40,26 @@ def mesh_query(mesh, beta, batch_size=None):
         ``(K, 3)`` float64 barycentric coordinates of each point in its
         leaf's image, in the simplex.
     """
-    device = backend.device(mesh.vertices_lens)
-    beta = backend.as_array(beta, dtype=backend.float64, device=device)
+    device = mesh_backend.device(mesh.vertices_lens)
+    beta = mesh_backend.as_array(beta, dtype=mesh_backend.float64, device=device)
     n = beta.shape[0]
     step = max(n, 1) if batch_size is None else max(1, int(batch_size))
-    leaves = [backend.zeros((0,), dtype=backend.int64, device=device)]
-    bary = [backend.zeros((0, 3), dtype=backend.float64, device=device)]
-    counts = [backend.zeros((0,), dtype=backend.int64, device=device)]
+    leaves = [mesh_backend.zeros((0,), dtype=mesh_backend.int64, device=device)]
+    bary = [mesh_backend.zeros((0, 3), dtype=mesh_backend.float64, device=device)]
+    counts = [mesh_backend.zeros((0,), dtype=mesh_backend.int64, device=device)]
     for lo in range(0, n, step):
         chunk = beta[lo : lo + step]
         qidx, cand, w = index_hits(mesh.index, mesh.vertices_source, mesh.leaves, chunk)
-        counts.append(backend.long(backend.bincount(qidx, minlength=chunk.shape[0])))
+        counts.append(
+            mesh_backend.long(mesh_backend.bincount(qidx, minlength=chunk.shape[0]))
+        )
         leaves.append(cand)
         tri = mesh.vertices_source[mesh.leaves[cand]]
         bary.append(sanitize_bary(w, area2(tri)))
     return (
-        backend.concatenate(leaves, dim=0),
-        csr_offsets(backend.concatenate(counts, dim=0)),
-        backend.concatenate(bary, dim=0),
+        mesh_backend.concatenate(leaves, dim=0),
+        csr_offsets(mesh_backend.concatenate(counts, dim=0)),
+        mesh_backend.concatenate(bary, dim=0),
     )
 
 
@@ -71,7 +73,7 @@ def mesh_seeds(mesh, leaf_indices, bary):
     *Unit: arcsec*
     """
     tri = mesh.vertices_lens[mesh.leaves[leaf_indices]]
-    return backend.sum(tri * backend.unsqueeze(bary, -1), dim=1)
+    return mesh_backend.sum(tri * mesh_backend.unsqueeze(bary, -1), dim=1)
 
 
 def dedup_block_group(points, rows, n_blocks, m, tol):
@@ -102,23 +104,25 @@ def dedup_block_group(points, rows, n_blocks, m, tol):
     ArrayLike
         ``(n_blocks * m,)`` bool, in the order of ``rows``.
     """
-    device = backend.device(points)
-    int64 = backend.int64
-    p = points[backend.as_array(rows, dtype=int64, device=device)]
+    device = mesh_backend.device(points)
+    int64 = mesh_backend.int64
+    p = points[mesh_backend.as_array(rows, dtype=int64, device=device)]
     p = p.reshape(n_blocks, m, 2)
 
-    delta = backend.unsqueeze(p, 2) - backend.unsqueeze(p, 1)
+    delta = mesh_backend.unsqueeze(p, 2) - mesh_backend.unsqueeze(p, 1)
     # Exact on the diagonal: every point is its own neighbour.
-    adjacent = backend.long(backend.sum(delta * delta, dim=-1) < tol * tol)
+    adjacent = mesh_backend.long(mesh_backend.sum(delta * delta, dim=-1) < tol * tol)
 
     # Min-label propagation. `m` is the sentinel for "no label": it exceeds
     # every real slot index, so it never wins a minimum against a neighbour.
-    index = backend.unsqueeze(backend.arange(m, dtype=int64, device=device), 0)
-    labels = index + backend.zeros((n_blocks, m), dtype=int64, device=device)
+    index = mesh_backend.unsqueeze(
+        mesh_backend.arange(m, dtype=int64, device=device), 0
+    )
+    labels = index + mesh_backend.zeros((n_blocks, m), dtype=int64, device=device)
     for _ in range(m):
-        neighbour = adjacent * backend.unsqueeze(labels, 1) + (1 - adjacent) * m
-        updated = backend.min(neighbour, dim=2)
-        if bool(backend.to_numpy(backend.all(updated == labels))):
+        neighbour = adjacent * mesh_backend.unsqueeze(labels, 1) + (1 - adjacent) * m
+        updated = mesh_backend.min(neighbour, dim=2)
+        if bool(mesh_backend.to_numpy(mesh_backend.all(updated == labels))):
             break
         labels = updated
 
@@ -159,40 +163,42 @@ def dedup_representatives(points, counts, tol):
     ArrayLike
         ``(K,)`` bool, True on exactly one point per cluster.
     """
-    device = backend.device(points)
-    counts = backend.as_array(counts, dtype=backend.int64, device=device)
-    total = int(backend.to_numpy(backend.sum(counts)))
+    device = mesh_backend.device(points)
+    counts = mesh_backend.as_array(counts, dtype=mesh_backend.int64, device=device)
+    total = int(mesh_backend.to_numpy(mesh_backend.sum(counts)))
     if total == 0:
-        return backend.zeros((0,), dtype=backend.bool, device=device)
+        return mesh_backend.zeros((0,), dtype=mesh_backend.bool, device=device)
 
-    starts = backend.cumsum(counts, dim=0) - counts
+    starts = mesh_backend.cumsum(counts, dim=0) - counts
     row_groups, keep_groups = [], []
 
     # A block of one point is its own representative.
-    singles = backend.flatnonzero(counts == 1)
+    singles = mesh_backend.flatnonzero(counts == 1)
     if singles.shape[0] > 0:
         row_groups.append(starts[singles])
         keep_groups.append(
-            backend.ones((singles.shape[0],), dtype=backend.bool, device=device)
+            mesh_backend.ones(
+                (singles.shape[0],), dtype=mesh_backend.bool, device=device
+            )
         )
 
     # The rest run grouped by size; there are a handful of distinct sizes.
-    distinct = backend.to_numpy(backend.unique(counts[counts > 1])).tolist()
+    distinct = mesh_backend.to_numpy(mesh_backend.unique(counts[counts > 1])).tolist()
     for m in distinct:
-        blocks = backend.flatnonzero(counts == m)
+        blocks = mesh_backend.flatnonzero(counts == m)
         rows = (
-            backend.unsqueeze(starts[blocks], 1)
-            + backend.unsqueeze(
-                backend.arange(m, dtype=backend.int64, device=device), 0
+            mesh_backend.unsqueeze(starts[blocks], 1)
+            + mesh_backend.unsqueeze(
+                mesh_backend.arange(m, dtype=mesh_backend.int64, device=device), 0
             )
         ).reshape(-1)
         row_groups.append(rows)
         keep_groups.append(dedup_block_group(points, rows, blocks.shape[0], m, tol))
 
     # Every row is in exactly one group, so `perm` is a permutation.
-    perm = backend.concatenate(row_groups, dim=0)
-    inverse = backend.argsort(perm)
-    stacked = backend.concatenate(keep_groups, dim=0)
+    perm = mesh_backend.concatenate(row_groups, dim=0)
+    inverse = mesh_backend.argsort(perm)
+    stacked = mesh_backend.concatenate(keep_groups, dim=0)
     return stacked[inverse]
 
 
@@ -204,27 +210,29 @@ def _block_sums(values, offsets):
 
 def _images(mesh, beta, raytrace, tol, lm_kwargs):
     """Images and their count per point, for one chunk of ``(B, 2)`` points."""
-    device = backend.device(mesh.vertices_lens)
+    device = mesh_backend.device(mesh.vertices_lens)
     idx, offsets, bary = mesh_query(mesh, beta)
     seed = mesh_seeds(mesh, idx, bary)
     if seed.shape[0] == 0:
-        return seed, backend.zeros((beta.shape[0],), dtype=backend.int64, device=device)
+        return seed, mesh_backend.zeros(
+            (beta.shape[0],), dtype=mesh_backend.int64, device=device
+        )
 
     def to_source(xy):
-        return backend.stack(raytrace(xy[..., 0], xy[..., 1]), dim=-1)
+        return mesh_backend.stack(raytrace(xy[..., 0], xy[..., 1]), dim=-1)
 
-    target = backend.repeat(beta, offsets[1:] - offsets[:-1], axis=0)
+    target = mesh_backend.repeat(beta, offsets[1:] - offsets[:-1], axis=0)
     root, _, _ = batch_lm(seed, target, to_source, **lm_kwargs)
-    converged = backend.sum((to_source(root) - target) ** 2, dim=-1) < tol * tol
+    converged = mesh_backend.sum((to_source(root) - target) ** 2, dim=-1) < tol * tol
     tri = mesh.vertices_lens[mesh.leaves[idx]]
     near = contains(triangle_weights(tri, root)) | (
-        backend.sum((root - seed) ** 2, dim=-1) <= mesh.min_img_sep**2
+        mesh_backend.sum((root - seed) ** 2, dim=-1) <= mesh.min_img_sep**2
     )
     keep = converged & near
-    kept = _block_sums(backend.long(keep), offsets)
-    root = root[backend.flatnonzero(keep)]
+    kept = _block_sums(mesh_backend.long(keep), offsets)
+    root = root[mesh_backend.flatnonzero(keep)]
     unique = dedup_representatives(root, kept, mesh.min_img_sep)
-    return root[unique], _block_sums(backend.long(unique), csr_offsets(kept))
+    return root[unique], _block_sums(mesh_backend.long(unique), csr_offsets(kept))
 
 
 def forward_raytrace(
@@ -271,17 +279,17 @@ def forward_raytrace(
     counts: ArrayLike
         ``(B,)`` int64 images per source.
     """
-    device = backend.device(mesh.vertices_lens)
+    device = mesh_backend.device(mesh.vertices_lens)
     beta = as_points(bx, by, device)
     tol = mesh.min_img_sep if residual_tol is None else float(residual_tol)
     lm_kwargs = {} if lm_kwargs is None else dict(lm_kwargs)
     n = beta.shape[0]
     step = max(n, 1) if batch_size is None else max(1, int(batch_size))
-    images = [backend.zeros((0, 2), dtype=backend.float64, device=device)]
-    counts = [backend.zeros((0,), dtype=backend.int64, device=device)]
+    images = [mesh_backend.zeros((0, 2), dtype=mesh_backend.float64, device=device)]
+    counts = [mesh_backend.zeros((0,), dtype=mesh_backend.int64, device=device)]
     for lo in range(0, n, step):
         found, count = _images(mesh, beta[lo : lo + step], raytrace, tol, lm_kwargs)
         images.append(found)
         counts.append(count)
-    images = backend.concatenate(images, dim=0)
-    return images[:, 0], images[:, 1], backend.concatenate(counts, dim=0)
+    images = mesh_backend.concatenate(images, dim=0)
+    return images[:, 0], images[:, 1], mesh_backend.concatenate(counts, dim=0)

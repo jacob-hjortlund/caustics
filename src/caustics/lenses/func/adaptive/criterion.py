@@ -6,7 +6,7 @@ affine model of the lens map is accurate to ``min_img_sep`` and whether a
 critical curve runs between its samples.
 """
 
-from ....backend_obj import backend
+from .mesh_backend import mesh_backend
 from .geometry import (
     CHILD_VERTEX_INDICES,
     COMPOSE,
@@ -65,7 +65,7 @@ def midpoint_deviation(beta_v, beta_m):
         *Unit: arcsec*
     """
     predicted = 0.5 * (beta_v[:, [1, 2, 0], :] + beta_v[:, [2, 0, 1], :])
-    return backend.norm(predicted - beta_m, dim=-1)
+    return mesh_backend.norm(predicted - beta_m, dim=-1)
 
 
 def converged_from_deviation(r, s, min_img_sep):
@@ -96,7 +96,7 @@ def converged_from_deviation(r, s, min_img_sep):
     ArrayLike
         Shape ``(n,)`` bool.
     """
-    return backend.all(r < (s * min_img_sep)[:, None], dim=1)
+    return mesh_backend.all(r < (s * min_img_sep)[:, None], dim=1)
 
 
 def child_shape_matrices(beta_v, beta_m):
@@ -121,12 +121,12 @@ def child_shape_matrices(beta_v, beta_m):
         Shape ``(n, 4, 2, 2)``, child index in :data:`CHILD_VERTEX_INDICES`
         order.
     """
-    stacked = backend.concatenate([beta_v, beta_m], dim=1)  # (n, 6, 2)
+    stacked = mesh_backend.concatenate([beta_v, beta_m], dim=1)  # (n, 6, 2)
     idx0, idx1, idx2 = zip(*CHILD_VERTEX_INDICES)  # each length 4
     q1 = stacked[:, list(idx0), :]
     q2 = stacked[:, list(idx1), :]
     q3 = stacked[:, list(idx2), :]
-    return backend.stack((q2 - q1, q3 - q1), dim=-1)  # (n, 4, 2, 2)
+    return mesh_backend.stack((q2 - q1, q3 - q1), dim=-1)  # (n, 4, 2, 2)
 
 
 def parity_from_children(Q):
@@ -149,8 +149,8 @@ def parity_from_children(Q):
         Shape ``(n,)`` bool.
     """
     det_q = Q[..., 0, 0] * Q[..., 1, 1] - Q[..., 0, 1] * Q[..., 1, 0]
-    sign_q = backend.sign(det_q)
-    return backend.all(sign_q == sign_q[:, :1], dim=1)
+    sign_q = mesh_backend.sign(det_q)
+    return mesh_backend.all(sign_q == sign_q[:, :1], dim=1)
 
 
 def lens_status(beta6, det6, cls, level, h0, min_img_sep):
@@ -200,20 +200,20 @@ def lens_status(beta6, det6, cls, level, h0, min_img_sep):
     beta_v, beta_m = beta6[:, :3], beta6[:, 3:]
     Q = child_shape_matrices(beta_v, beta_m)
     s = (
-        backend.min(sigma_min_2x2(Q @ PINV0[COMPOSE[cls]]), dim=1)
-        * backend.to(2 ** (level + 1), dtype=backend.float64)
+        mesh_backend.min(sigma_min_2x2(Q @ PINV0[COMPOSE[cls]]), dim=1)
+        * mesh_backend.to(2 ** (level + 1), dtype=mesh_backend.float64)
         / h0
     )
     deviation_ok = converged_from_deviation(
         midpoint_deviation(beta_v, beta_m), s, min_img_sep
     )
-    det_ok = backend.all(backend.isfinite(det6) & (det6 != 0), dim=1)
-    one_sign = backend.all(det6 > 0, dim=1) | backend.all(det6 < 0, dim=1)
+    det_ok = mesh_backend.all(mesh_backend.isfinite(det6) & (det6 != 0), dim=1)
+    one_sign = mesh_backend.all(det6 > 0, dim=1) | mesh_backend.all(det6 < 0, dim=1)
     status = (
-        backend.long(~parity_from_children(Q)) * LEAF_APPROX_PARITY_UNRESOLVED
-        | backend.long(~deviation_ok) * LEAF_CONVERGENCE_FAILED
-        | backend.long(~det_ok) * LEAF_JACOBIAN_NONFINITE
-        | backend.long(det_ok & ~one_sign) * LEAF_JACOBIAN_PARITY_UNRESOLVED
+        mesh_backend.long(~parity_from_children(Q)) * LEAF_APPROX_PARITY_UNRESOLVED
+        | mesh_backend.long(~deviation_ok) * LEAF_CONVERGENCE_FAILED
+        | mesh_backend.long(~det_ok) * LEAF_JACOBIAN_NONFINITE
+        | mesh_backend.long(det_ok & ~one_sign) * LEAF_JACOBIAN_PARITY_UNRESOLVED
     )
-    finite = backend.all(backend.isfinite(beta6), dim=(1, 2))
-    return backend.where(finite, status, LEAF_RAYTRACE_NONFINITE)
+    finite = mesh_backend.all(mesh_backend.isfinite(beta6), dim=(1, 2))
+    return mesh_backend.where(finite, status, LEAF_RAYTRACE_NONFINITE)

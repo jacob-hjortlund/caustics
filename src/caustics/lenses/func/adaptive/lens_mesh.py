@@ -13,7 +13,8 @@ import math
 from typing import NamedTuple
 from warnings import warn
 
-from ....backend_obj import ArrayLike, backend
+from ....backend_obj import ArrayLike
+from .mesh_backend import mesh_backend
 from .geometry import ROOT_CLASS, build_device, is_member, to_device
 from .lattice import (
     Lattice,
@@ -136,17 +137,19 @@ def make_sampler(raytrace, jacobian, device):
     in the Jacobian's dtype, then cast; the values come back on the
     positions' device.
     """
-    f64 = backend.float64
+    f64 = mesh_backend.float64
 
     def sample(xy):
-        x = backend.as_array(xy[:, 0], dtype=f64, device=device)
-        y = backend.as_array(xy[:, 1], dtype=f64, device=device)
+        x = mesh_backend.as_array(xy[:, 0], dtype=f64, device=device)
+        y = mesh_backend.as_array(xy[:, 1], dtype=f64, device=device)
         columns = list(raytrace(x, y))
         if jacobian is not None:
             J = jacobian(x, y)
             columns.append(J[:, 0, 0] * J[:, 1, 1] - J[:, 0, 1] * J[:, 1, 0])
-        out = backend.stack([backend.to(c, dtype=f64) for c in columns], dim=-1)
-        return backend.to(out, device=backend.device(xy))
+        out = mesh_backend.stack(
+            [mesh_backend.to(c, dtype=f64) for c in columns], dim=-1
+        )
+        return mesh_backend.to(out, device=mesh_backend.device(xy))
 
     return sample
 
@@ -289,45 +292,45 @@ def _freeze(
     rows of the old band, and the old band's midpoint samples, read here
     rather than sampled again.
     """
-    int64, f64 = backend.int64, backend.float64
+    int64, f64 = mesh_backend.int64, mesh_backend.float64
     used, leaves, leaf_origin, origin, origin_leaves = close(lat, cache, store)
     n_rows = store.v.shape[0]
     if seed is None:
         seed = (
-            backend.zeros((0,), dtype=int64),
-            backend.zeros((0,), dtype=int64),
-            backend.zeros((0,), dtype=int64),
-            backend.zeros((0, 3), dtype=f64),
+            mesh_backend.zeros((0,), dtype=int64),
+            mesh_backend.zeros((0,), dtype=int64),
+            mesh_backend.zeros((0,), dtype=int64),
+            mesh_backend.zeros((0, 3), dtype=f64),
         )
     seed_status, band_rows, mid_keys, mid_values = seed
     n_seed = seed_status.shape[0]
-    status = backend.concatenate(
-        (seed_status, backend.zeros((n_rows - n_seed,), dtype=int64)), dim=0
+    status = mesh_backend.concatenate(
+        (seed_status, mesh_backend.zeros((n_rows - n_seed,), dtype=int64)), dim=0
     )
-    row = backend.arange(n_rows, dtype=int64)
-    fresh = backend.flatnonzero(
+    row = mesh_backend.arange(n_rows, dtype=int64)
+    fresh = mesh_backend.flatnonzero(
         store.valid & (store.level == lat.level - 1) & (row >= n_seed)
     )
 
     ij = cache.ij[store.v[fresh]]
     mid = lattice_key(lat, midpoint_ij(ij))
-    todo = backend.unique(mid.reshape(-1))
+    todo = mesh_backend.unique(mid.reshape(-1))
     todo = todo[~is_member(mid_keys, todo)]
     if todo.shape[0]:
         xy = lattice_xy(lat, lattice_ij_from_key(lat, todo))
         new_values = sample_points(xy, sample, batch_size)
     else:
-        new_values = backend.zeros((0, 3), dtype=f64)
-    table_keys = backend.concatenate((cache.keys, mid_keys, todo), dim=0)
-    table_values = backend.concatenate(
+        new_values = mesh_backend.zeros((0, 3), dtype=f64)
+    table_keys = mesh_backend.concatenate((cache.keys, mid_keys, todo), dim=0)
+    table_values = mesh_backend.concatenate(
         (cache.values[cache.slots], mid_values, new_values), dim=0
     )
-    order = backend.argsort(table_keys)
+    order = mesh_backend.argsort(table_keys)
     table_keys, table_values = table_keys[order], table_values[order]
 
-    keys6 = backend.concatenate((lattice_key(lat, ij), mid), dim=1)
-    values6 = table_values[backend.searchsorted(table_keys, keys6)]
-    status = backend.fill_at_indices(
+    keys6 = mesh_backend.concatenate((lattice_key(lat, ij), mid), dim=1)
+    values6 = table_values[mesh_backend.searchsorted(table_keys, keys6)]
+    status = mesh_backend.fill_at_indices(
         status,
         fresh,
         lens_status(
@@ -339,27 +342,27 @@ def _freeze(
             min_img_sep,
         ),
     )
-    band_rows = backend.concatenate(
-        (band_rows, fresh[backend.flatnonzero(in_band(values6[..., 2]))]), dim=0
+    band_rows = mesh_backend.concatenate(
+        (band_rows, fresh[mesh_backend.flatnonzero(in_band(values6[..., 2]))]), dim=0
     )
 
-    origin_of_row = backend.fill_at_indices(
-        backend.zeros((n_rows,), dtype=int64) - 1,
+    origin_of_row = mesh_backend.fill_at_indices(
+        mesh_backend.zeros((n_rows,), dtype=int64) - 1,
         origin,
-        backend.arange(origin.shape[0], dtype=int64),
+        mesh_backend.arange(origin.shape[0], dtype=int64),
     )
     band_leaves = origin_of_row[band_rows]
-    order = backend.argsort(band_leaves)
+    order = mesh_backend.argsort(band_leaves)
     band_leaves, band_rows = band_leaves[order], band_rows[order]
     bij = cache.ij[store.v[band_rows]]
-    band_keys6 = backend.concatenate(
+    band_keys6 = mesh_backend.concatenate(
         (lattice_key(lat, bij), lattice_key(lat, midpoint_ij(bij))), dim=1
     )
     band = build_band(lat, band_leaves, band_keys6, table_keys, table_values)
 
     origin_status = status[origin]
     vertices_source = cache.values[used][:, :2]
-    converged = backend.flatnonzero(origin_status[leaf_origin] == LEAF_CONVERGED)
+    converged = mesh_backend.flatnonzero(origin_status[leaf_origin] == LEAF_CONVERGED)
     mesh = LensMesh(
         lattice=lat,
         vertices_ij=cache.ij[used],
@@ -389,37 +392,39 @@ def _seed(mesh, lat, k):
     origins are the store, row for row.
     """
     mesh = to_device(mesh, build_device())
-    int64 = backend.int64
+    int64 = mesh_backend.int64
     ij = mesh.vertices_ij + (int(k) << lat.level)
     n_vertices, n_origins = ij.shape[0], mesh.origin_leaves.shape[0]
     cache = VertexCache(
         keys=lattice_key(lat, ij),
-        slots=backend.arange(n_vertices, dtype=int64),
+        slots=mesh_backend.arange(n_vertices, dtype=int64),
         ij=ij,
-        values=backend.concatenate(
-            (mesh.vertices_source, backend.unsqueeze(mesh.vertices_det, -1)), dim=1
+        values=mesh_backend.concatenate(
+            (mesh.vertices_source, mesh_backend.unsqueeze(mesh.vertices_det, -1)), dim=1
         ),
-        active=backend.ones((n_vertices,), dtype=backend.bool),
+        active=mesh_backend.ones((n_vertices,), dtype=mesh_backend.bool),
     )
     store = LeafStore(
         v=mesh.origin_leaves,
         level=mesh.origin_level,
         cls=mesh.origin_cls,
-        valid=backend.ones((n_origins,), dtype=backend.bool),
+        valid=mesh_backend.ones((n_origins,), dtype=mesh_backend.bool),
     )
     band = mesh.critical_band
     bij = ij[mesh.origin_leaves[band.leaves]]
-    keys6 = backend.concatenate(
+    keys6 = mesh_backend.concatenate(
         (lattice_key(lat, bij), lattice_key(lat, midpoint_ij(bij))), dim=1
     )
     # Band samples are numbered in ascending key order, so these keys ascend.
-    sample_keys = backend.fill_at_indices(
-        backend.zeros((band.det.shape[0],), dtype=int64),
+    sample_keys = mesh_backend.fill_at_indices(
+        mesh_backend.zeros((band.det.shape[0],), dtype=int64),
         band.samples.reshape(-1),
         keys6.reshape(-1),
     )
-    mid = backend.flatnonzero(cache_lookup(cache, sample_keys) < 0)
-    values = backend.concatenate((band.source, backend.unsqueeze(band.det, -1)), dim=1)
+    mid = mesh_backend.flatnonzero(cache_lookup(cache, sample_keys) < 0)
+    values = mesh_backend.concatenate(
+        (band.source, mesh_backend.unsqueeze(band.det, -1)), dim=1
+    )
     seed = (mesh.origin_status, band.leaves, sample_keys[mid], values[mid])
     return cache, store, seed
 
@@ -465,7 +470,7 @@ def extend_lens_mesh(mesh, raytrace, jacobian, fov, *, batch_size=None):
         "Extend by less, or rebuild with a larger min_img_sep or a lower max_depth.",
     )
     _warn_depth_limited(h0, mesh.min_img_sep, max_level)
-    device = backend.device(mesh.vertices_lens)
+    device = mesh_backend.device(mesh.vertices_lens)
     sample = make_sampler(raytrace, jacobian, device)
     cache, store, seed = _seed(mesh, lat, k)
     ij, cls = ring_triangles(init_res, k, lat.level, ROOT_CLASS)
@@ -504,12 +509,12 @@ def _hole_rings(fov, init_res, x0, y0, centers, min_img_sep):
     hole_centers, radius = merge_centers(centers, min_img_sep)
     if hole_centers.shape[0] == 0:
         return 0, 0
-    center = backend.as_array([x0, y0], dtype=backend.float64)
-    reach = backend.max(backend.abs(hole_centers - center), dim=1) + radius
-    outside = int(backend.to_numpy(backend.sum(reach >= fov / 2)))
+    center = mesh_backend.as_array([x0, y0], dtype=mesh_backend.float64)
+    reach = mesh_backend.max(mesh_backend.abs(hole_centers - center), dim=1) + radius
+    outside = int(mesh_backend.to_numpy(mesh_backend.sum(reach >= fov / 2)))
     if outside == 0:
         return 0, 0
-    excess = float(backend.to_numpy(backend.max(reach))) - fov / 2
+    excess = float(mesh_backend.to_numpy(mesh_backend.max(reach))) - fov / 2
     return math.floor(excess / (fov / init_res)) + 1, outside
 
 
@@ -524,19 +529,19 @@ def _curves_cut_by_fov(mesh, curves):
     (:func:`~.curves.edge_zeros`). An end at a band gap inside the fov does
     not count.
     """
-    open_curves = backend.flatnonzero(~curves.closed)
+    open_curves = mesh_backend.flatnonzero(~curves.closed)
     n_open = open_curves.shape[0]
     if n_open == 0:
         return 0
-    ends = backend.concatenate(
+    ends = mesh_backend.concatenate(
         (curves.offsets[open_curves], curves.offsets[open_curves + 1] - 1)
     )
     xy = curves.lens[ends]
-    lo = backend.min(mesh.vertices_lens, dim=0)
-    hi = backend.max(mesh.vertices_lens, dim=0)
-    on_boundary = backend.any((xy == lo) | (xy == hi), dim=1)
+    lo = mesh_backend.min(mesh.vertices_lens, dim=0)
+    hi = mesh_backend.max(mesh.vertices_lens, dim=0)
+    on_boundary = mesh_backend.any((xy == lo) | (xy == hi), dim=1)
     cut = on_boundary[:n_open] | on_boundary[n_open:]
-    return int(backend.to_numpy(backend.sum(cut)))
+    return int(mesh_backend.to_numpy(mesh_backend.sum(cut)))
 
 
 def build_closed_lens_mesh(

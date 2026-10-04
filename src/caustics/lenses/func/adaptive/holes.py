@@ -13,7 +13,8 @@ import math
 from typing import NamedTuple
 from warnings import warn
 
-from ....backend_obj import ArrayLike, backend
+from ....backend_obj import ArrayLike
+from .mesh_backend import mesh_backend
 from .geometry import build_device, csr_offsets, to_device
 from .refine import sample_points
 
@@ -97,15 +98,15 @@ class CenterHoles(NamedTuple):
 def empty_holes(device=None):
     """A :class:`CenterHoles` with no hole."""
     return CenterHoles(
-        centers=backend.zeros((0, 2), dtype=backend.float64, device=device),
-        radius=backend.zeros((0,), dtype=backend.float64, device=device),
-        offsets=backend.zeros((1,), dtype=backend.int64, device=device),
-        angle=backend.zeros((0,), dtype=backend.float64, device=device),
-        lens=backend.zeros((0, 2), dtype=backend.float64, device=device),
-        source=backend.zeros((0, 2), dtype=backend.float64, device=device),
-        growth=backend.zeros((0,), dtype=backend.float64, device=device),
-        growth_err=backend.zeros((0,), dtype=backend.float64, device=device),
-        pseudo_caustic=backend.zeros((0,), dtype=backend.bool, device=device),
+        centers=mesh_backend.zeros((0, 2), dtype=mesh_backend.float64, device=device),
+        radius=mesh_backend.zeros((0,), dtype=mesh_backend.float64, device=device),
+        offsets=mesh_backend.zeros((1,), dtype=mesh_backend.int64, device=device),
+        angle=mesh_backend.zeros((0,), dtype=mesh_backend.float64, device=device),
+        lens=mesh_backend.zeros((0, 2), dtype=mesh_backend.float64, device=device),
+        source=mesh_backend.zeros((0, 2), dtype=mesh_backend.float64, device=device),
+        growth=mesh_backend.zeros((0,), dtype=mesh_backend.float64, device=device),
+        growth_err=mesh_backend.zeros((0,), dtype=mesh_backend.float64, device=device),
+        pseudo_caustic=mesh_backend.zeros((0,), dtype=mesh_backend.bool, device=device),
     )
 
 
@@ -119,11 +120,13 @@ def _components(link):
     component.
     """
     n = link.shape[0]
-    label = backend.arange(n, dtype=backend.int64)
-    reach = link | backend.eye(n, dtype=backend.bool)
+    label = mesh_backend.arange(n, dtype=mesh_backend.int64)
+    reach = link | mesh_backend.eye(n, dtype=mesh_backend.bool)
     while True:
-        new = backend.min(backend.where(reach, backend.unsqueeze(label, 0), n), dim=1)
-        if bool(backend.all(new == label)):
+        new = mesh_backend.min(
+            mesh_backend.where(reach, mesh_backend.unsqueeze(label, 0), n), dim=1
+        )
+        if bool(mesh_backend.all(new == label)):
             return label
         label = new
 
@@ -164,39 +167,47 @@ def merge_centers(centers, min_img_sep):
 
         *Unit: arcsec*
     """
-    f64 = backend.float64
+    f64 = mesh_backend.float64
     if centers is None:
-        return backend.zeros((0, 2), dtype=f64), backend.zeros((0,), dtype=f64)
-    c = to_device(backend.as_array(centers, dtype=f64), build_device())
+        return mesh_backend.zeros((0, 2), dtype=f64), mesh_backend.zeros(
+            (0,), dtype=f64
+        )
+    c = to_device(mesh_backend.as_array(centers, dtype=f64), build_device())
     if c.reshape(-1).shape[0] == 0:
-        return backend.zeros((0, 2), dtype=f64), backend.zeros((0,), dtype=f64)
-    c = c[backend.lexsort([c[:, 1], c[:, 0]])]
+        return mesh_backend.zeros((0, 2), dtype=f64), mesh_backend.zeros(
+            (0,), dtype=f64
+        )
+    c = c[mesh_backend.lexsort([c[:, 1], c[:, 0]])]
     link = (
-        backend.norm(backend.unsqueeze(c, 1) - backend.unsqueeze(c, 0), dim=-1)
+        mesh_backend.norm(
+            mesh_backend.unsqueeze(c, 1) - mesh_backend.unsqueeze(c, 0), dim=-1
+        )
         < 2.0 * min_img_sep
     )
     while True:
-        _, member = backend.unique(_components(link), return_inverse=True)
-        k = int(backend.to_numpy(backend.max(member))) + 1
-        onehot = backend.unsqueeze(
-            backend.arange(k, dtype=backend.int64), 1
-        ) == backend.unsqueeze(member, 0)
-        weight = backend.to(onehot, dtype=f64)
-        mean = (weight @ c) / backend.unsqueeze(backend.sum(weight, dim=1), 1)
-        spread = backend.norm(
-            backend.unsqueeze(c, 0) - backend.unsqueeze(mean, 1), dim=-1
+        _, member = mesh_backend.unique(_components(link), return_inverse=True)
+        k = int(mesh_backend.to_numpy(mesh_backend.max(member))) + 1
+        onehot = mesh_backend.unsqueeze(
+            mesh_backend.arange(k, dtype=mesh_backend.int64), 1
+        ) == mesh_backend.unsqueeze(member, 0)
+        weight = mesh_backend.to(onehot, dtype=f64)
+        mean = (weight @ c) / mesh_backend.unsqueeze(mesh_backend.sum(weight, dim=1), 1)
+        spread = mesh_backend.norm(
+            mesh_backend.unsqueeze(c, 0) - mesh_backend.unsqueeze(mean, 1), dim=-1
         )
-        radius = min_img_sep + backend.max(backend.where(onehot, spread, 0.0), dim=1)
-        gap = backend.norm(
-            backend.unsqueeze(mean, 1) - backend.unsqueeze(mean, 0), dim=-1
+        radius = min_img_sep + mesh_backend.max(
+            mesh_backend.where(onehot, spread, 0.0), dim=1
+        )
+        gap = mesh_backend.norm(
+            mesh_backend.unsqueeze(mean, 1) - mesh_backend.unsqueeze(mean, 0), dim=-1
         )
         overlap = (
-            gap < backend.unsqueeze(radius, 1) + backend.unsqueeze(radius, 0)
-        ) & ~backend.eye(k, dtype=backend.bool)
-        if not bool(backend.any(overlap)):
+            gap < mesh_backend.unsqueeze(radius, 1) + mesh_backend.unsqueeze(radius, 0)
+        ) & ~mesh_backend.eye(k, dtype=mesh_backend.bool)
+        if not bool(mesh_backend.any(overlap)):
             break
         link = link | overlap[member][:, member]
-    order = backend.lexsort([mean[:, 1], mean[:, 0]])
+    order = mesh_backend.lexsort([mean[:, 1], mean[:, 0]])
     return mean[order], radius[order]
 
 
@@ -214,8 +225,9 @@ def hole_circle(centers, radius, hole, angle):
     *Unit: arcsec*
     """
     c, r = centers[hole], radius[hole]
-    return backend.stack(
-        (c[:, 0] + r * backend.cos(angle), c[:, 1] + r * backend.sin(angle)), dim=-1
+    return mesh_backend.stack(
+        (c[:, 0] + r * mesh_backend.cos(angle), c[:, 1] + r * mesh_backend.sin(angle)),
+        dim=-1,
     )
 
 
@@ -232,11 +244,13 @@ def _trace_hole_points(trace, centers, radius, hole, angle, batch_size, scale=1.
     source = sample_points(
         hole_circle(centers, radius * scale, hole, angle), trace, batch_size
     )
-    bad = backend.flatnonzero(~backend.all(backend.isfinite(source), dim=1))
+    bad = mesh_backend.flatnonzero(
+        ~mesh_backend.all(mesh_backend.isfinite(source), dim=1)
+    )
     if bad.shape[0]:
-        h = int(backend.to_numpy(hole[bad[0]]))
-        x, y = backend.to_numpy(centers[h]).tolist()
-        r = float(backend.to_numpy(radius[h])) * scale
+        h = int(mesh_backend.to_numpy(hole[bad[0]]))
+        x, y = mesh_backend.to_numpy(centers[h]).tolist()
+        r = float(mesh_backend.to_numpy(radius[h])) * scale
         raise ValueError(
             f"the lens is not finite on the hole circle of radius {r:g} around "
             f"({x:g}, {y:g}); a hole's boundary must lie where the lens is finite"
@@ -246,7 +260,9 @@ def _trace_hole_points(trace, centers, radius, hole, angle, batch_size, scale=1.
 
 def _extent(points):
     """Diagonal of each row's bounding box, ``(H, K, 2) -> (H,)``."""
-    return backend.norm(backend.max(points, dim=1) - backend.min(points, dim=1), dim=-1)
+    return mesh_backend.norm(
+        mesh_backend.max(points, dim=1) - mesh_backend.min(points, dim=1), dim=-1
+    )
 
 
 def sample_holes(trace, centers, radius, min_img_sep, batch_size):
@@ -311,45 +327,49 @@ def sample_holes(trace, centers, radius, min_img_sep, batch_size):
     n_holes = centers.shape[0]
     if n_holes == 0:
         return empty_holes()
-    int64, f64 = backend.int64, backend.float64
+    int64, f64 = mesh_backend.int64, mesh_backend.float64
     two_pi = 2.0 * math.pi
-    ids = backend.arange(n_holes, dtype=int64)
+    ids = mesh_backend.arange(n_holes, dtype=int64)
 
-    hole = backend.repeat(ids, HOLE_INITIAL_SAMPLES, axis=0)
-    step = backend.arange(n_holes * HOLE_INITIAL_SAMPLES, dtype=int64)
-    angle = backend.to(step % HOLE_INITIAL_SAMPLES, dtype=f64) * (
+    hole = mesh_backend.repeat(ids, HOLE_INITIAL_SAMPLES, axis=0)
+    step = mesh_backend.arange(n_holes * HOLE_INITIAL_SAMPLES, dtype=int64)
+    angle = mesh_backend.to(step % HOLE_INITIAL_SAMPLES, dtype=f64) * (
         two_pi / HOLE_INITIAL_SAMPLES
     )
     source = _trace_hole_points(trace, centers, radius, hole, angle, batch_size)
-    capped = backend.zeros((n_holes,), dtype=backend.bool)
+    capped = mesh_backend.zeros((n_holes,), dtype=mesh_backend.bool)
     while True:
-        counts = backend.bincount(hole, minlength=n_holes)
-        starts = backend.cumsum(counts, dim=0) - counts
-        i = backend.arange(hole.shape[0], dtype=int64)
+        counts = mesh_backend.bincount(hole, minlength=n_holes)
+        starts = mesh_backend.cumsum(counts, dim=0) - counts
+        i = mesh_backend.arange(hole.shape[0], dtype=int64)
         wrap = i == starts[hole] + counts[hole] - 1
-        nxt = backend.where(wrap, starts[hole], i + 1)
-        chord = backend.norm(source[nxt] - source, dim=-1)
-        bad = backend.flatnonzero(chord > min_img_sep)
-        wanted = backend.bincount(hole[bad], minlength=n_holes)
+        nxt = mesh_backend.where(wrap, starts[hole], i + 1)
+        chord = mesh_backend.norm(source[nxt] - source, dim=-1)
+        bad = mesh_backend.flatnonzero(chord > min_img_sep)
+        wanted = mesh_backend.bincount(hole[bad], minlength=n_holes)
         capped = capped | ((wanted > 0) & (counts + wanted > HOLE_MAX_SAMPLES))
-        rows = bad[backend.flatnonzero(~capped[hole[bad]])]
+        rows = bad[mesh_backend.flatnonzero(~capped[hole[bad]])]
         if rows.shape[0] == 0:
             break
-        upper = backend.where(wrap[rows], angle[nxt[rows]] + two_pi, angle[nxt[rows]])
+        upper = mesh_backend.where(
+            wrap[rows], angle[nxt[rows]] + two_pi, angle[nxt[rows]]
+        )
         mid = 0.5 * (angle[rows] + upper)
-        mid = backend.where(mid >= two_pi, mid - two_pi, mid)
+        mid = mesh_backend.where(mid >= two_pi, mid - two_pi, mid)
         new_hole = hole[rows]
         new_source = _trace_hole_points(
             trace, centers, radius, new_hole, mid, batch_size
         )
-        hole = backend.concatenate((hole, new_hole), dim=0)
-        angle = backend.concatenate((angle, mid), dim=0)
-        source = backend.concatenate((source, new_source), dim=0)
-        order = backend.lexsort([angle, hole])
+        hole = mesh_backend.concatenate((hole, new_hole), dim=0)
+        angle = mesh_backend.concatenate((angle, mid), dim=0)
+        source = mesh_backend.concatenate((source, new_source), dim=0)
+        order = mesh_backend.lexsort([angle, hole])
         hole, angle, source = hole[order], angle[order], source[order]
-    for h in backend.to_numpy(backend.flatnonzero(capped)).tolist():
-        x, y = backend.to_numpy(centers[h]).tolist()
-        n = int(backend.to_numpy(backend.bincount(hole, minlength=n_holes)[h]))
+    for h in mesh_backend.to_numpy(mesh_backend.flatnonzero(capped)).tolist():
+        x, y = mesh_backend.to_numpy(centers[h]).tolist()
+        n = int(
+            mesh_backend.to_numpy(mesh_backend.bincount(hole, minlength=n_holes)[h])
+        )
         warn(
             f"the hole curve around ({x:g}, {y:g}) stopped at {n} samples "
             f"(cap {HOLE_MAX_SAMPLES}) before every chord fell below "
@@ -357,9 +377,9 @@ def sample_holes(trace, centers, radius, min_img_sep, batch_size):
             "coarser than min_img_sep between them"
         )
 
-    g_hole = backend.repeat(ids, HOLE_GROWTH_SAMPLES, axis=0)
-    g_step = backend.arange(n_holes * HOLE_GROWTH_SAMPLES, dtype=int64)
-    g_angle = backend.to(g_step % HOLE_GROWTH_SAMPLES, dtype=f64) * (
+    g_hole = mesh_backend.repeat(ids, HOLE_GROWTH_SAMPLES, axis=0)
+    g_step = mesh_backend.arange(n_holes * HOLE_GROWTH_SAMPLES, dtype=int64)
+    g_angle = mesh_backend.to(g_step % HOLE_GROWTH_SAMPLES, dtype=f64) * (
         two_pi / HOLE_GROWTH_SAMPLES
     )
     shape = (n_holes, HOLE_GROWTH_SAMPLES, 2)
@@ -374,12 +394,12 @@ def sample_holes(trace, centers, radius, min_img_sep, batch_size):
     # `step[k] / log(4)` is the slope between circles k and k + 1. Scale, never
     # divide: jax turns a division by a constant into a multiply by its
     # reciprocal for some shapes only, so a quotient would depend on H.
-    step = [backend.log(size[k] / size[k + 1]) for k in range(3)]
+    step = [mesh_backend.log(size[k] / size[k + 1]) for k in range(3)]
     scale = 1.0 / (3.0 * math.log(4.0))
     growth = (4.0 * step[2] - step[1]) * scale
-    growth_err = backend.abs(5.0 * step[1] - step[0] - 4.0 * step[2]) * scale
+    growth_err = mesh_backend.abs(5.0 * step[1] - step[0] - 4.0 * step[2]) * scale
 
-    counts = backend.bincount(hole, minlength=n_holes)
+    counts = mesh_backend.bincount(hole, minlength=n_holes)
     offsets = csr_offsets(counts)
     return CenterHoles(
         centers=centers,
@@ -390,5 +410,5 @@ def sample_holes(trace, centers, radius, min_img_sep, batch_size):
         source=source,
         growth=growth,
         growth_err=growth_err,
-        pseudo_caustic=backend.abs(growth) <= growth_err,
+        pseudo_caustic=mesh_backend.abs(growth) <= growth_err,
     )

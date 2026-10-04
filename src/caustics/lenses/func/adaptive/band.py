@@ -8,7 +8,8 @@ traces it.
 
 from typing import NamedTuple
 
-from ....backend_obj import ArrayLike, backend
+from ....backend_obj import ArrayLike
+from .mesh_backend import mesh_backend
 from .lattice import lattice_ij_from_key, lattice_xy
 
 
@@ -63,9 +64,9 @@ def in_band(det6):
     """
     positive = det6 >= 0
     return (
-        backend.all(backend.isfinite(det6), dim=1)
-        & backend.any(positive, dim=1)
-        & backend.any(~positive, dim=1)
+        mesh_backend.all(mesh_backend.isfinite(det6), dim=1)
+        & mesh_backend.any(positive, dim=1)
+        & mesh_backend.any(~positive, dim=1)
     )
 
 
@@ -91,8 +92,8 @@ def build_band(lat, leaves, keys6, table_keys, table_values):
     CriticalBand
         With samples numbered in ascending key order.
     """
-    keys, samples = backend.unique(keys6.reshape(-1), return_inverse=True)
-    values = table_values[backend.searchsorted(table_keys, keys)]
+    keys, samples = mesh_backend.unique(keys6.reshape(-1), return_inverse=True)
+    values = table_values[mesh_backend.searchsorted(table_keys, keys)]
     return CriticalBand(
         leaves=leaves,
         samples=samples.reshape(-1, 6),
