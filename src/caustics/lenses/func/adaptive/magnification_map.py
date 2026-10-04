@@ -364,14 +364,14 @@ def build_magnification_map(
     """
     mag = _build_magnification_map(
         to_mesh(mesh),
-        init_res,
-        src_tol,
-        max_depth,
+        to_mesh(init_res),
+        to_mesh(src_tol),
+        to_mesh(max_depth),
         mu_min=to_mesh(mu_min),
-        rtol=rtol,
-        fov=fov,
-        x0=x0,
-        y0=y0,
+        rtol=to_mesh(rtol),
+        fov=to_mesh(fov),
+        x0=to_mesh(x0),
+        y0=to_mesh(y0),
         batch_size=batch_size,
     )
     return to_user(mag, backend.device(mesh.vertices_lens))

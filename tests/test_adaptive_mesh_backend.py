@@ -6,10 +6,19 @@ import caskade as ck
 import numpy as np
 import pytest
 
-from adaptive_maps import f64, numpy_lens, sie_like, sie_like_jacobian, stack_2x2, to_np
+from adaptive_maps import (
+    assert_same,
+    f64,
+    numpy_lens,
+    sie_like,
+    sie_like_jacobian,
+    stack_2x2,
+    to_np,
+)
 
 from caustics.backend_obj import backend
 from caustics.lenses.func.adaptive import (
+    build_closed_lens_mesh,
     build_lens_mesh,
     build_magnification_map,
     critical_curves_and_caustics,
@@ -188,3 +197,33 @@ def test_a_handed_back_array_shares_no_memory_with_the_bookkeeping():
     got = to_user(a)
     a[0] = 99.0  # the bookkeeping writes in place
     assert to_np(got)[0] == 0.0
+
+
+def test_scalars_of_the_users_backend_build_what_plain_floats_do():
+    """A lens parameter's value is a 0-d array of the user's backend: as a
+    number, and inside a list of centers."""
+    lens_, _ = numpy_lens(sie_like, sie_like_jacobian)
+
+    def scalar(v):
+        return backend.as_array(v, dtype=backend.float64)
+
+    def built(number):
+        kw = dict(x0=number(0.0), y0=number(0.0), centers=[(number(0.0), number(0.0))])
+        args = (lens_.raytrace, lens_.jacobian_lens_equation, number(4.0), 4)
+        mesh = build_lens_mesh(*args, number(0.1), **kw)
+        closed, _ = build_closed_lens_mesh(
+            *args, number(0.1), growth=number(1.5), max_iters=1, **kw
+        )
+        mag = build_magnification_map(
+            mesh,
+            4,
+            number(0.1),
+            rtol=number(0.5),
+            fov=number(1.0),
+            x0=number(0.0),
+            y0=number(0.0),
+        )
+        return mesh, closed, mag
+
+    for got, want in zip(built(scalar), built(float)):
+        assert_same(got, want)

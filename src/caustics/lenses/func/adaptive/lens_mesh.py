@@ -251,12 +251,12 @@ def build_lens_mesh(
     mesh = _build_lens_mesh(
         raytrace,
         jacobian,
-        fov,
-        init_res,
-        min_img_sep,
-        max_depth,
-        x0=x0,
-        y0=y0,
+        to_mesh(fov),
+        to_mesh(init_res),
+        to_mesh(min_img_sep),
+        to_mesh(max_depth),
+        x0=to_mesh(x0),
+        y0=to_mesh(y0),
         centers=to_mesh(centers),
         device=device,
         batch_size=batch_size,
@@ -494,7 +494,7 @@ def extend_lens_mesh(mesh, raytrace, jacobian, fov, *, batch_size=None):
     device = backend.device(mesh.vertices_lens)
     on_mesh = to_mesh(mesh)
     out = _extend_lens_mesh(
-        on_mesh, raytrace, jacobian, fov, device=device, batch_size=batch_size
+        on_mesh, raytrace, jacobian, to_mesh(fov), device=device, batch_size=batch_size
     )
     return mesh if out is on_mesh else to_user(out, device)
 
@@ -631,14 +631,14 @@ def build_closed_lens_mesh(
     mesh, curves = _build_closed_lens_mesh(
         raytrace,
         jacobian,
-        fov,
-        init_res,
-        min_img_sep,
-        max_depth,
-        growth=growth,
+        to_mesh(fov),
+        to_mesh(init_res),
+        to_mesh(min_img_sep),
+        to_mesh(max_depth),
+        growth=to_mesh(growth),
         max_iters=max_iters,
-        x0=x0,
-        y0=y0,
+        x0=to_mesh(x0),
+        y0=to_mesh(y0),
         centers=to_mesh(centers),
         device=device,
         batch_size=batch_size,
