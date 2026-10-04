@@ -24,8 +24,8 @@ of the mesh alone.
 import math
 from typing import NamedTuple
 
-from ....backend_obj import ArrayLike
-from .mesh_backend import mesh_backend
+from ....backend_obj import ArrayLike, backend
+from .mesh_backend import mesh_backend, to_mesh, to_user
 from .geometry import _CHILD_VERTEX_INDEX_TABLE, csr_offsets
 
 
@@ -640,6 +640,14 @@ def critical_curves_and_caustics(mesh):
     -------
     CriticalCurvesAndCaustics
     """
+    return to_user(
+        _critical_curves_and_caustics(to_mesh(mesh)),
+        backend.device(mesh.vertices_lens),
+    )
+
+
+def _critical_curves_and_caustics(mesh):
+    """:func:`critical_curves_and_caustics` on ``mesh_backend`` arrays."""
     curves = trace_band(mesh.critical_band)
     if mesh.holes.centers.shape[0] == 0:
         return curves

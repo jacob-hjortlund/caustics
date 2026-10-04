@@ -16,8 +16,8 @@ critical band's ``+inf`` to 0, so nothing special-cases infinity.
 
 from typing import NamedTuple
 
-from ....backend_obj import ArrayLike
-from .mesh_backend import mesh_backend
+from ....backend_obj import ArrayLike, backend
+from .mesh_backend import mesh_backend, to_mesh, to_user
 from .geometry import shape_matrix
 from .lattice import lattice_on_boundary
 from .index import as_points, index_hits
@@ -97,6 +97,13 @@ def magnified_regions(mag, mu_min):
     -------
     MagnifiedRegions
     """
+    return to_user(
+        _magnified_regions(to_mesh(mag), to_mesh(mu_min)), backend.device(mag.vertices)
+    )
+
+
+def _magnified_regions(mag, mu_min):
+    """:func:`magnified_regions` on ``mesh_backend`` arrays."""
     g = region_field(mag, mu_min)
     leaves = mag.leaves[mesh_backend.flatnonzero(~mag.incomplete)]
     start, end = triangle_segments(leaves, g >= 0)
@@ -169,6 +176,13 @@ def magnified_area(mag, mu_min):
         ``incomplete`` leaf or on the window's boundary -- where the region
         runs into missing data and its curves come back open.
     """
+    return to_user(
+        _magnified_area(to_mesh(mag), to_mesh(mu_min)), backend.device(mag.vertices)
+    )
+
+
+def _magnified_area(mag, mu_min):
+    """:func:`magnified_area` on ``mesh_backend`` arrays."""
     thresholds = mesh_backend.as_array(mu_min, dtype=mesh_backend.float64)
     P = shape_matrix(mag.vertices[mag.leaves])
     area = 0.5 * (P[:, 0, 0] * P[:, 1, 1] - P[:, 0, 1] * P[:, 1, 0])
@@ -212,6 +226,14 @@ def in_magnified_region(bx, by, mag, mu_min):
         ``(B,)`` bool, False for a point in an ``incomplete`` leaf or outside
         the window, where the answer is not known.
     """
+    return to_user(
+        _in_magnified_region(to_mesh(bx), to_mesh(by), to_mesh(mag), to_mesh(mu_min)),
+        backend.device(mag.vertices),
+    )
+
+
+def _in_magnified_region(bx, by, mag, mu_min):
+    """:func:`in_magnified_region` on ``mesh_backend`` arrays."""
     device = mesh_backend.device(mag.vertices)
     beta = as_points(bx, by, device)
     b = beta.shape[0]

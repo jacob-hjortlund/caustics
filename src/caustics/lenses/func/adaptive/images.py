@@ -7,7 +7,8 @@ source-plane image contains the point (:func:`mesh_query`,
 merges near-coincident roots (:func:`dedup_representatives`).
 """
 
-from .mesh_backend import mesh_backend
+from ....backend_obj import backend
+from .mesh_backend import mesh_backend, to_mesh, to_user
 from ....utils import batch_lm
 from .geometry import area2, contains, csr_offsets, sanitize_bary, triangle_weights
 from .index import as_points, index_hits
@@ -279,6 +280,21 @@ def forward_raytrace(
     counts: ArrayLike
         ``(B,)`` int64 images per source.
     """
+    device = backend.device(mesh.vertices_lens)
+    found = _forward_raytrace(
+        to_mesh(bx),
+        to_mesh(by),
+        raytrace,
+        to_mesh(mesh),
+        batch_size=batch_size,
+        residual_tol=residual_tol,
+        lm_kwargs=lm_kwargs,
+    )
+    return to_user(found, device)
+
+
+def _forward_raytrace(bx, by, raytrace, mesh, *, batch_size, residual_tol, lm_kwargs):
+    """:func:`forward_raytrace` on ``mesh_backend`` arrays."""
     device = mesh_backend.device(mesh.vertices_lens)
     beta = as_points(bx, by, device)
     tol = mesh.min_img_sep if residual_tol is None else float(residual_tol)

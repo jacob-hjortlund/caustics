@@ -13,8 +13,8 @@ call is made.
 from typing import NamedTuple
 from warnings import warn
 
-from ....backend_obj import ArrayLike
-from .mesh_backend import mesh_backend
+from ....backend_obj import ArrayLike, backend
+from .mesh_backend import mesh_backend, to_mesh, to_user
 from .geometry import ROOT_CLASS, build_device, is_member, to_device
 from .lattice import (
     Lattice,
@@ -362,6 +362,25 @@ def build_magnification_map(
     -------
     MagnificationMap
     """
+    mag = _build_magnification_map(
+        to_mesh(mesh),
+        init_res,
+        src_tol,
+        max_depth,
+        mu_min=to_mesh(mu_min),
+        rtol=rtol,
+        fov=fov,
+        x0=x0,
+        y0=y0,
+        batch_size=batch_size,
+    )
+    return to_user(mag, backend.device(mesh.vertices_lens))
+
+
+def _build_magnification_map(
+    mesh, init_res, src_tol, max_depth, *, mu_min, rtol, fov, x0, y0, batch_size
+):
+    """:func:`build_magnification_map` on ``mesh_backend`` arrays, on the build device."""
     f64 = mesh_backend.float64
     targets = _targets(mu_min)
     (lx, ly), (hx, hy) = mesh_backend.to_numpy(
@@ -428,4 +447,4 @@ def build_magnification_map(
             mesh_backend.arange(leaves.shape[0], dtype=mesh_backend.int64),
         ),
     )
-    return to_device(mag, mesh_backend.device(mesh.vertices_lens))
+    return mag

@@ -1162,9 +1162,7 @@ def test_seeding_a_mesh_and_freezing_it_again_reproduces_it():
     lat = to_device(mesh.lattice, build_device())
     cache, store, seed = _seed(mesh, lat, 0)
     sample = make_sampler(lens_.raytrace, lens_.jacobian_lens_equation, None)
-    again = _freeze(
-        lat, cache, store, sample, mesh.min_img_sep, mesh.holes, None, None, seed
-    )
+    again = _freeze(lat, cache, store, sample, mesh.min_img_sep, mesh.holes, None, seed)
     assert_same(again, mesh)
     assert not calls.raytrace and not calls.jacobian
 
@@ -1596,3 +1594,19 @@ def test_holes_inside_the_fov_leave_it_alone():
     assert to_np(curves.closed).all()
     want, _, _ = xbuild(fn, jac, 2.0, 4, 0.05, centers=centers)
     assert_same(mesh, want)
+
+
+def test_a_closed_build_warns_at_the_callers_line():
+    lens_, _ = numpy_lens(sie_like, sie_like_jacobian)
+    with pytest.warns(UserWarning, match="still cuts") as record:
+        build_closed_lens_mesh(
+            lens_.raytrace,
+            lens_.jacobian_lens_equation,
+            2.0,
+            16,
+            0.05,
+            growth=1.05,
+            max_iters=0,
+        )
+    hits = [w for w in record if "still cuts" in str(w.message)]
+    assert [w.filename for w in hits] == [__file__]

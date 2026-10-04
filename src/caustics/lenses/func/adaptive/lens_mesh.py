@@ -13,8 +13,8 @@ import math
 from typing import NamedTuple
 from warnings import warn
 
-from ....backend_obj import ArrayLike
-from .mesh_backend import mesh_backend
+from ....backend_obj import ArrayLike, backend
+from .mesh_backend import mesh_backend, to_mesh, to_user
 from .geometry import ROOT_CLASS, build_device, is_member, to_device
 from .lattice import (
     Lattice,
@@ -48,7 +48,7 @@ from .index import MeshIndex, build_index
 from .criterion import LEAF_CONVERGED, lens_status
 from .band import CriticalBand, build_band, in_band
 from .holes import CenterHoles, merge_centers, sample_holes
-from .curves import critical_curves_and_caustics
+from .curves import _critical_curves_and_caustics
 
 
 class LensMesh(NamedTuple):
@@ -244,6 +244,37 @@ def build_lens_mesh(
     -------
     LensMesh
     """
+    mesh = _build_lens_mesh(
+        raytrace,
+        jacobian,
+        fov,
+        init_res,
+        min_img_sep,
+        max_depth,
+        x0=x0,
+        y0=y0,
+        centers=to_mesh(centers),
+        device=device,
+        batch_size=batch_size,
+    )
+    return to_user(mesh, device)
+
+
+def _build_lens_mesh(
+    raytrace,
+    jacobian,
+    fov,
+    init_res,
+    min_img_sep,
+    max_depth,
+    *,
+    x0,
+    y0,
+    centers,
+    device,
+    batch_size,
+):
+    """:func:`build_lens_mesh` on ``mesh_backend`` arrays, on the build device."""
     min_img_sep = min_img_sep / 2
     h0 = fov / init_res
     max_level = min(int(max_depth), depth_floor(h0, min_img_sep))
@@ -275,12 +306,10 @@ def build_lens_mesh(
         max_level,
         batch_size,
     )
-    return _freeze(lat, cache, store, sample, min_img_sep, holes, device, batch_size)
+    return _freeze(lat, cache, store, sample, min_img_sep, holes, batch_size)
 
 
-def _freeze(
-    lat, cache, store, sample, min_img_sep, holes, device, batch_size, seed=None
-):
+def _freeze(lat, cache, store, sample, min_img_sep, holes, batch_size, seed=None):
     """
     Close and index a refinement, finishing its finest level.
 
@@ -380,7 +409,7 @@ def _freeze(
         holes=holes,
         min_img_sep=float(min_img_sep),
     )
-    return to_device(mesh, device)
+    return mesh
 
 
 def _seed(mesh, lat, k):
@@ -458,6 +487,16 @@ def extend_lens_mesh(mesh, raytrace, jacobian, fov, *, batch_size=None):
     LensMesh
         ``mesh`` itself when ``fov`` needs no new cell.
     """
+    device = backend.device(mesh.vertices_lens)
+    on_mesh = to_mesh(mesh)
+    out = _extend_lens_mesh(
+        on_mesh, raytrace, jacobian, fov, device=device, batch_size=batch_size
+    )
+    return mesh if out is on_mesh else to_user(out, device)
+
+
+def _extend_lens_mesh(mesh, raytrace, jacobian, fov, *, device, batch_size):
+    """:func:`extend_lens_mesh` on ``mesh_backend`` arrays; ``device`` is the lens's."""
     h0 = lattice_h0(mesh.lattice)
     k = max(0, math.ceil((float(fov) - lattice_fov(mesh.lattice)) / (2.0 * h0) - 1e-9))
     if k == 0:
@@ -470,7 +509,6 @@ def extend_lens_mesh(mesh, raytrace, jacobian, fov, *, batch_size=None):
         "Extend by less, or rebuild with a larger min_img_sep or a lower max_depth.",
     )
     _warn_depth_limited(h0, mesh.min_img_sep, max_level)
-    device = mesh_backend.device(mesh.vertices_lens)
     sample = make_sampler(raytrace, jacobian, device)
     cache, store, seed = _seed(mesh, lat, k)
     ij, cls = ring_triangles(init_res, k, lat.level, ROOT_CLASS)
@@ -484,7 +522,6 @@ def extend_lens_mesh(mesh, raytrace, jacobian, fov, *, batch_size=None):
         sample,
         mesh.min_img_sep,
         mesh.holes,
-        device,
         batch_size,
         seed,
     )
@@ -587,6 +624,41 @@ def build_closed_lens_mesh(
     curves: CriticalCurvesAndCaustics
         The last mesh's critical curves and caustics.
     """
+    mesh, curves = _build_closed_lens_mesh(
+        raytrace,
+        jacobian,
+        fov,
+        init_res,
+        min_img_sep,
+        max_depth,
+        growth=growth,
+        max_iters=max_iters,
+        x0=x0,
+        y0=y0,
+        centers=to_mesh(centers),
+        device=device,
+        batch_size=batch_size,
+    )
+    return to_user(mesh, device), to_user(curves, device)
+
+
+def _build_closed_lens_mesh(
+    raytrace,
+    jacobian,
+    fov,
+    init_res,
+    min_img_sep,
+    max_depth,
+    *,
+    growth,
+    max_iters,
+    x0,
+    y0,
+    centers,
+    device,
+    batch_size,
+):
+    """:func:`build_closed_lens_mesh` on ``mesh_backend`` arrays, on the build device."""
     k, outside = _hole_rings(fov, init_res, x0, y0, centers, min_img_sep / 2)
     if k:
         widened = fov + 2 * k * (fov / init_res)
@@ -594,10 +666,10 @@ def build_closed_lens_mesh(
             f"{outside} hole(s) around centers reach outside fov={fov:g}; building "
             f"at fov={widened:g}, init_res={init_res + 2 * k} so that every hole "
             "lies inside it.",
-            stacklevel=2,
+            stacklevel=3,
         )
         fov, init_res = widened, init_res + 2 * k
-    mesh = build_lens_mesh(
+    mesh = _build_lens_mesh(
         raytrace,
         jacobian,
         fov,
@@ -610,25 +682,26 @@ def build_closed_lens_mesh(
         device=device,
         batch_size=batch_size,
     )
-    curves = critical_curves_and_caustics(mesh)
+    curves = _critical_curves_and_caustics(mesh)
     cut = _curves_cut_by_fov(mesh, curves)
     for _ in range(max_iters):
         if cut == 0:
             break
-        mesh = extend_lens_mesh(
+        mesh = _extend_lens_mesh(
             mesh,
             raytrace,
             jacobian,
             growth * lattice_fov(mesh.lattice),
+            device=device,
             batch_size=batch_size,
         )
-        curves = critical_curves_and_caustics(mesh)
+        curves = _critical_curves_and_caustics(mesh)
         cut = _curves_cut_by_fov(mesh, curves)
     if cut:
         warn(
             f"The fov still cuts {cut} critical curve(s) after {max_iters} "
             f"extension(s), at fov={lattice_fov(mesh.lattice):g}; raise max_iters "
             "or growth to grow it further.",
-            stacklevel=2,
+            stacklevel=3,
         )
     return mesh, curves

@@ -10,7 +10,8 @@ as infinitely magnified. Nothing here calls the lens.
 
 import math
 
-from .mesh_backend import mesh_backend
+from ....backend_obj import backend
+from .mesh_backend import mesh_backend, to_mesh, to_user
 from .geometry import _CHILD_VERTEX_INDEX_TABLE, area2, csr_offsets, sanitize_bary
 from .criterion import LEAF_CONVERGED
 from .index import as_points, build_index, index_hits
@@ -215,6 +216,14 @@ def total_magnification(bx, by, mesh, *, batch_size=None):
     n: ArrayLike
         ``(B,)`` int64.
     """
+    found = _total_magnification(
+        to_mesh(bx), to_mesh(by), to_mesh(mesh), batch_size=batch_size
+    )
+    return to_user(found, backend.device(mesh.vertices_lens))
+
+
+def _total_magnification(bx, by, mesh, *, batch_size):
+    """:func:`total_magnification` on ``mesh_backend`` arrays."""
     device = mesh_backend.device(mesh.vertices_lens)
     beta = as_points(bx, by, device)
     cover = band_cover(mesh)
