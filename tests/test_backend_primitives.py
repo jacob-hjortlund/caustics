@@ -121,3 +121,35 @@ def test_all_and_any_without_dim_still_reduce_everything():
     x = backend.as_array(np.array([[True, False]]))
     assert bool(backend.to_numpy(backend.all(x))) is False
     assert bool(backend.to_numpy(backend.any(x))) is True
+
+
+_JAX_PADDED = {
+    (0, None): 0,
+    (1, None): 64,
+    (63, None): 64,
+    (64, None): 64,
+    (65, None): 128,
+    (1000, None): 1024,
+    (65, 100): 100,
+    (3, 3): 3,
+    (1000, 1000): 1000,
+}
+
+
+@pytest.mark.parametrize("n, cap", list(_JAX_PADDED))
+def test_padded_size_is_n_under_torch_and_a_power_of_two_from_64_under_jax(n, cap):
+    want = n if backend.backend == "torch" else _JAX_PADDED[(n, cap)]
+    assert backend.padded_size(n, cap) == want
+
+
+@pytest.mark.parametrize("shape", [(3,), (3, 2), (3, 2, 2)])
+def test_pad_rows_repeats_the_last_row(shape):
+    x = np.arange(np.prod(shape), dtype=np.float64).reshape(shape)
+    got = backend.to_numpy(backend.pad_rows(backend.as_array(x), 5))
+    np.testing.assert_array_equal(got, np.concatenate([x, x[-1:], x[-1:]]))
+
+
+def test_pad_rows_to_its_own_length_changes_nothing():
+    x = np.arange(6, dtype=np.int64).reshape(3, 2)
+    got = backend.to_numpy(backend.pad_rows(backend.as_array(x), 3))
+    np.testing.assert_array_equal(got, x)

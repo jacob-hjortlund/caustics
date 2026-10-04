@@ -107,6 +107,8 @@ class Backend:
         self.lexsort = self._lexsort_torch
         self.all = self._all_torch
         self.any = self._any_torch
+        self.padded_size = self._padded_size_torch
+        self.pad_rows = self._pad_rows_torch
 
     def setup_jax(self):
         self.jax = importlib.import_module("jax")
@@ -178,6 +180,8 @@ class Backend:
         self.lexsort = self._lexsort_jax
         self.all = self._all_jax
         self.any = self._any_jax
+        self.padded_size = self._padded_size_jax
+        self.pad_rows = self._pad_rows_jax
 
         self.key = self.jax.random.key(
             np.random.randint(0, 2**31 - 1)
@@ -698,6 +702,26 @@ class Backend:
 
     def _any_jax(self, array, dim=None):
         return self.module.any(array, axis=dim)
+
+    def _padded_size_torch(self, n, cap=None):
+        return n
+
+    def _padded_size_jax(self, n, cap=None):
+        # Eager jax compiles each op for each new shape, so a batch is padded
+        # to one of a few sizes. From 64 rows on, XLA also gives a point the
+        # same lens value whatever the batch size.
+        if n == 0:
+            return 0
+        size = 1 << (max(n, 64) - 1).bit_length()
+        return size if cap is None else min(size, cap)
+
+    def _pad_rows_torch(self, array, n):
+        last = array[-1:].expand(n - array.shape[0], *array.shape[1:])
+        return self.module.cat((array, last), dim=0)
+
+    def _pad_rows_jax(self, array, n):
+        widths = [(0, n - array.shape[0])] + [(0, 0)] * (array.ndim - 1)
+        return self.module.pad(array, widths, mode="edge")
 
     def _jit_torch(self, func, **kwargs):
         return func
