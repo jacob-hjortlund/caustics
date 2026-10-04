@@ -1609,18 +1609,26 @@ def batch_lm(
         Cinv = backend.linalg.inv(C)
     Cinv = backend.to(Cinv, dtype=X.dtype)
 
-    v_lm_step = backend.vmap(
-        partial(
-            _lm_step,
-            lambda x: f(x, *f_args, **f_kwargs),
-            Lup=L_up,
-            Ldn=L_dn,
-            epsilon=epsilon,
-            L_min=L_min,
-            L_max=L_max,
+    # Under jax the batch is padded to one of a few sizes, so the jitted step
+    # compiles once per size. Padded rows repeat the last one and finish with it.
+    padded = backend.padded_size(B)
+    if padded > B:
+        X, Y, Cinv = (backend.pad_rows(a, padded) for a in (X, Y, Cinv))
+
+    v_lm_step = backend.jit(
+        backend.vmap(
+            partial(
+                _lm_step,
+                lambda x: f(x, *f_args, **f_kwargs),
+                Lup=L_up,
+                Ldn=L_dn,
+                epsilon=epsilon,
+                L_min=L_min,
+                L_max=L_max,
+            )
         )
     )
-    L = L * backend.ones(B, device=backend.device(X), dtype=X.dtype)
+    L = L * backend.ones(padded, device=backend.device(X), dtype=X.dtype)
     for _ in range(max_iter):
         Xnew, L, C = v_lm_step(X, Y, Cinv, L)
         step = backend.max(backend.abs(Xnew - X), dim=-1)
@@ -1648,6 +1656,8 @@ def batch_lm(
         if backend.all(converged | (L >= L_max)):
             break
 
+    if padded > B:
+        X, L, C = X[:B], L[:B], C[:B]
     return X, L, C
 
 

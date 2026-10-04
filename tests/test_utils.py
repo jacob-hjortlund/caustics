@@ -314,3 +314,35 @@ def test_batch_lm_is_independent_of_batch_composition():
         assert np.allclose(
             alone, together, atol=1e-6
         ), f"same element gave {alone} alone and {together} with {len(companions)} companions"
+
+
+def test_batch_lm_returns_one_row_per_element_whatever_the_padding():
+    """Under jax three elements run padded to 64 rows; three come back."""
+    X = backend.as_array(np.asarray([[-1.2, 1.0], [0.99, 0.99], [0.5, 0.5]]))
+    Y = backend.as_array(np.zeros((3, 2)))
+    root, L, chi2 = batch_lm(X, Y, _rosenbrock)
+    assert tuple(root.shape) == (3, 2)
+    assert tuple(L.shape) == (3,) and tuple(chi2.shape) == (3,)
+    assert np.allclose(backend.to_numpy(root), 1.0, atol=1e-4)
+
+
+@pytest.mark.skipif(backend.backend != "jax", reason="only jax compiles")
+def test_batch_lm_compiles_a_handful_of_programs_for_a_new_batch_size():
+    """The step is jitted over a padded batch, so a batch size it has not seen
+    costs a few compiles rather than one for every primitive of the step."""
+    import jax
+
+    compiles = []
+    jax.monitoring.register_event_duration_secs_listener(
+        lambda event, duration, **kw: (
+            compiles.append(event)
+            if event == "/jax/core/compile/backend_compile_duration"
+            else None
+        )
+    )
+    # Another test may have compiled these very shapes already.
+    jax.clear_caches()
+    _solve([[-1.2, 1.0], [0.99, 0.99]])
+    before = len(compiles)
+    _solve([[-1.2, 1.0], [0.99, 0.99], [0.5, 0.5]])
+    assert len(compiles) - before <= 8
