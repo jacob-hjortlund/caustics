@@ -1594,6 +1594,7 @@ def batch_lm(
     stopping=1e-4,
     f_args=(),
     f_kwargs={},
+    jit=False,  # jit each iteration over a padded batch (jax): f is traced once per call
 ):
     B, Din = X.shape
     B, Dout = Y.shape
@@ -1609,9 +1610,11 @@ def batch_lm(
         Cinv = backend.linalg.inv(C)
     Cinv = backend.to(Cinv, dtype=X.dtype)
 
-    # Under jax the batch is padded to one of a few sizes, so the jitted step
+    # Jitted under jax, the batch is padded to one of a few sizes, so the step
     # compiles once per size. Padded rows repeat the last one and finish with it.
-    padded = backend.padded_size(B)
+    # Not by default: a caller handing over a fresh `f` every call, as
+    # `forward_raytrace` does, would compile the step anew each time.
+    padded = backend.padded_size(B) if jit else B
     if padded > B:
         X, Y, Cinv = (backend.pad_rows(a, padded) for a in (X, Y, Cinv))
 
@@ -1653,7 +1656,8 @@ def batch_lm(
         converged = (step < stopping) & (L < 1e-2)
         return Xnew, L, C, backend.all(converged | (L >= L_max))
 
-    iterate = backend.jit(iterate)
+    if jit:
+        iterate = backend.jit(iterate)
     L = L * backend.ones(padded, device=backend.device(X), dtype=X.dtype)
     for _ in range(max_iter):
         X, L, C, done = iterate(X, Y, Cinv, L)

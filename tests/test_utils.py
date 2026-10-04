@@ -275,10 +275,10 @@ def _rosenbrock(x):
     return backend.stack((10 * (x[..., 1] - x[..., 0] ** 2), 1 - x[..., 0]), dim=-1)
 
 
-def _solve(starts):
+def _solve(starts, **kw):
     X = backend.as_array(np.asarray(starts, dtype=np.float64))
     Y = backend.as_array(np.zeros((len(starts), 2)))
-    root, _, _ = batch_lm(X, Y, _rosenbrock)
+    root, _, _ = batch_lm(X, Y, _rosenbrock, **kw)
     return backend.to_numpy(root)
 
 
@@ -320,7 +320,7 @@ def test_batch_lm_returns_one_row_per_element_whatever_the_padding():
     """Under jax three elements run padded to 64 rows; three come back."""
     X = backend.as_array(np.asarray([[-1.2, 1.0], [0.99, 0.99], [0.5, 0.5]]))
     Y = backend.as_array(np.zeros((3, 2)))
-    root, L, chi2 = batch_lm(X, Y, _rosenbrock)
+    root, L, chi2 = batch_lm(X, Y, _rosenbrock, jit=True)
     assert tuple(root.shape) == (3, 2)
     assert tuple(L.shape) == (3,) and tuple(chi2.shape) == (3,)
     assert np.allclose(backend.to_numpy(root), 1.0, atol=1e-4)
@@ -342,9 +342,9 @@ def test_batch_lm_compiles_a_handful_of_programs_for_a_new_batch_size():
     )
     # Another test may have compiled these very shapes already.
     jax.clear_caches()
-    _solve([[-1.2, 1.0], [0.99, 0.99]])
+    _solve([[-1.2, 1.0], [0.99, 0.99]], jit=True)
     before = len(compiles)
-    _solve([[-1.2, 1.0], [0.99, 0.99], [0.5, 0.5]])
+    _solve([[-1.2, 1.0], [0.99, 0.99], [0.5, 0.5]], jit=True)
     assert len(compiles) - before <= 8
 
 
@@ -363,7 +363,27 @@ def test_batch_lm_tests_termination_inside_the_jitted_step():
         )
     )
     jax.clear_caches()
+    _solve([[-1.2, 1.0], [0.99, 0.99]], jit=True)
+    before = len(compiles)
+    _solve([[-1.2, 1.0]] * 100, jit=True)  # padded to 128, a size not seen yet
+    assert len(compiles) - before <= 10
+
+
+@pytest.mark.skipif(backend.backend != "jax", reason="only jax compiles")
+def test_batch_lm_runs_eagerly_unless_asked_to_jit():
+    """``lens.forward_raytrace`` hands ``batch_lm`` a fresh closure every call: a
+    jitted step would compile again each time, where eager ops reuse jax's cache."""
+    import jax
+
+    compiles = []
+    jax.monitoring.register_event_duration_secs_listener(
+        lambda event, duration, **kw: (
+            compiles.append(event)
+            if event == "/jax/core/compile/backend_compile_duration"
+            else None
+        )
+    )
     _solve([[-1.2, 1.0], [0.99, 0.99]])
     before = len(compiles)
-    _solve([[-1.2, 1.0]] * 100)  # padded to 128, a size not seen yet
-    assert len(compiles) - before <= 10
+    _solve([[-1.2, 1.0], [0.99, 0.99]])
+    assert len(compiles) == before

@@ -306,7 +306,7 @@ def _forward_raytrace(
     mesh_device = mesh_backend.device(mesh.vertices_lens)
     beta = as_points(bx, by, mesh_device)
     tol = mesh.min_img_sep if residual_tol is None else float(residual_tol)
-    lm_kwargs = {} if lm_kwargs is None else dict(lm_kwargs)
+    lm_kwargs = {"jit": True, **(lm_kwargs or {})}
     n = beta.shape[0]
     step = max(n, 1) if batch_size is None else max(1, int(batch_size))
     images = [
