@@ -160,3 +160,31 @@ def test_a_jax_build_compiles_only_for_its_padded_lens_batches():
     before = len(compiles)
     build_lens_mesh(lens_.raytrace, lens_.jacobian_lens_equation, 4.0, 4, 0.1)
     assert len(compiles) - before <= 150
+
+
+@pytest.mark.skipif(backend.backend != "jax", reason="only jax compiles")
+def test_handing_back_an_array_of_a_new_shape_compiles_nothing():
+    """Every public result is handed back array by array, each of a shape new to jax."""
+    import jax
+
+    compiles = []
+    jax.monitoring.register_event_duration_secs_listener(
+        lambda event, duration, **kw: (
+            compiles.append(event)
+            if event == "/jax/core/compile/backend_compile_duration"
+            else None
+        )
+    )
+    a = mesh_backend.as_array(np.arange(3 * 1237).reshape(1237, 3))
+    before = len(compiles)
+    got = to_user(a)
+    assert len(compiles) == before
+    np.testing.assert_array_equal(to_np(got), to_np(a))
+
+
+@pytest.mark.skipif(backend.backend != "jax", reason="under torch nothing is copied")
+def test_a_handed_back_array_shares_no_memory_with_the_bookkeeping():
+    a = mesh_backend.as_array(np.arange(6.0))
+    got = to_user(a)
+    a[0] = 99.0  # the bookkeeping writes in place
+    assert to_np(got)[0] == 0.0

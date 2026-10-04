@@ -72,10 +72,12 @@ else:
 
     def to_user(value, device=None):
         """``value`` with its arrays as ``backend`` arrays on ``device``, copied."""
+        # Copied on the host, so no later in-place write reaches it, then put:
+        # ``jnp.array`` and ``jnp.asarray`` compile a program for every new shape.
         return map_arrays(
             value,
             lambda a: (
-                backend.to(backend.make_array(a.numpy()), device=device)
+                backend.to(a.numpy().copy(), device=device)
                 if isinstance(a, _Tensor)
                 else a
             ),
