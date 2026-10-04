@@ -5,18 +5,26 @@ from types import SimpleNamespace
 import numpy as np
 
 from caustics.backend_obj import backend
+from caustics.lenses.func.adaptive.mesh_backend import mesh_backend, to_mesh
 
 
 def to_np(x):
-    return backend.to_numpy(x)
+    """Any array, from either backend, as numpy."""
+    if hasattr(x, "detach"):
+        return x.detach().cpu().numpy()
+    return np.asarray(x)
 
 
 def f64(x):
-    return backend.as_array(np.asarray(x, dtype=np.float64), dtype=backend.float64)
+    return mesh_backend.as_array(
+        np.asarray(x, dtype=np.float64), dtype=mesh_backend.float64
+    )
 
 
 def i64(x):
-    return backend.as_array(np.asarray(x, dtype=np.int64), dtype=backend.int64)
+    return mesh_backend.as_array(
+        np.asarray(x, dtype=np.int64), dtype=mesh_backend.int64
+    )
 
 
 def stack_2x2(a, b, c, d):
@@ -28,6 +36,23 @@ def stack_2x2(a, b, c, d):
 def lens(raytrace, jacobian):
     """A stand-in for a caustics lens."""
     return SimpleNamespace(raytrace=raytrace, jacobian_lens_equation=jacobian)
+
+
+def requested(xy):
+    """
+    The rows of a lens call the mesh asked for, ``(N, 2)``.
+
+    Under jax the sampler pads a batch by repeating its last row
+    (``backend.padded_size``); those copies are dropped. The bookkeeping is
+    the same torch code under both backends, so the torch run still sees
+    every row.
+    """
+    if backend.backend != "jax":
+        return xy
+    n = len(xy)
+    while n > 1 and (xy[n - 1] == xy[n - 2]).all():
+        n -= 1
+    return xy[:n]
 
 
 def numpy_lens(fn, jac):
@@ -42,13 +67,13 @@ def numpy_lens(fn, jac):
 
     def raytrace(x, y):
         xy = np.stack((to_np(x), to_np(y)), axis=-1)
-        calls.raytrace.append(xy)
+        calls.raytrace.append(requested(xy))
         out = backend.as_array(fn(xy), dtype=x.dtype, device=backend.device(x))
         return out[:, 0], out[:, 1]
 
     def jacobian(x, y):
         xy = np.stack((to_np(x), to_np(y)), axis=-1)
-        calls.jacobian.append(xy)
+        calls.jacobian.append(requested(xy))
         return backend.as_array(jac(xy), dtype=x.dtype, device=backend.device(x))
 
     return lens(raytrace, jacobian), calls
@@ -62,7 +87,7 @@ def build(fn, jac, fov=4.0, init_res=4, min_img_sep=0.25, **kw):
     mesh = build_lens_mesh(
         lens_.raytrace, lens_.jacobian_lens_equation, fov, init_res, min_img_sep, **kw
     )
-    return mesh, calls
+    return to_mesh(mesh), calls
 
 
 def assert_same(a, b, path="mesh"):
@@ -73,6 +98,7 @@ def assert_same(a, b, path="mesh"):
     lattice keeps its ``lo`` and shifts ``origin`` where a fresh one starts
     at its own corner.
     """
+    a, b = to_mesh(a), to_mesh(b)
     from caustics.lenses.func.adaptive.lattice import Lattice, lattice_xy
 
     if isinstance(a, Lattice):

@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 from caustics.backend_obj import backend
+from caustics.lenses.func.adaptive.mesh_backend import mesh_backend
 from caustics.lenses.func.adaptive.criterion import (
     child_shape_matrices,
     converged_from_deviation,
@@ -100,7 +101,7 @@ def _same_lattice(a, b):
 
 def test_sigma_min_of_zero_matrix_is_exactly_zero():
     A = np.zeros((4, 2, 2))
-    got = backend.to_numpy(sigma_min_2x2(_arr(A)))
+    got = to_np(sigma_min_2x2(_arr(A)))
     assert (got == 0.0).all()
     assert not np.isnan(got).any()
 
@@ -108,15 +109,13 @@ def test_sigma_min_of_zero_matrix_is_exactly_zero():
 def test_sigma_min_propagates_nan():
     A = np.zeros((1, 2, 2))
     A[0, 0, 0] = np.nan
-    assert np.isnan(backend.to_numpy(sigma_min_2x2(_arr(A)))).all()
+    assert np.isnan(to_np(sigma_min_2x2(_arr(A)))).all()
 
 
 def test_sigma_min_matches_svd():
     A = RNG.normal(size=(2000, 2, 2))
     expected = np.linalg.svd(A, compute_uv=False)[:, -1]
-    assert np.allclose(
-        backend.to_numpy(sigma_min_2x2(_arr(A))), expected, rtol=1e-9, atol=1e-12
-    )
+    assert np.allclose(to_np(sigma_min_2x2(_arr(A))), expected, rtol=1e-9, atol=1e-12)
 
 
 def test_sigma_min_near_and_exactly_singular():
@@ -127,12 +126,12 @@ def test_sigma_min_near_and_exactly_singular():
     # which tests the degenerate branch, not the near-degenerate one.
     for eps in (1e-4, 1e-7):
         A = np.stack([a, a + eps * perp], axis=1)
-        got = backend.to_numpy(sigma_min_2x2(_arr(A)))
+        got = to_np(sigma_min_2x2(_arr(A)))
         expected = np.linalg.svd(A, compute_uv=False)[:, -1]
         assert np.isfinite(got).all()
         assert np.allclose(got, expected, rtol=1e-5, atol=0.0)
     exact = np.stack([a, 2.0 * a], axis=1)  # rank 1: det is exactly 0 in IEEE
-    assert (backend.to_numpy(sigma_min_2x2(_arr(exact))) == 0.0).all()
+    assert (to_np(sigma_min_2x2(_arr(exact))) == 0.0).all()
 
 
 def test_sigma_min_handles_conformal_ulp_negativity():
@@ -150,22 +149,22 @@ def test_sigma_min_handles_conformal_ulp_negativity():
     F = (A.astype(np.float32) ** 2).sum(axis=(-2, -1))
     D = np.abs(A[:, 0, 0] * A[:, 1, 1] - A[:, 0, 1] * A[:, 1, 0])
     assert (F - 2 * D < 0).any(), "test fixture no longer exercises the guard"
-    got = backend.to_numpy(sigma_min_2x2(_arr(A.astype(np.float64))))
+    got = to_np(sigma_min_2x2(_arr(A.astype(np.float64))))
     assert np.isfinite(got).all()
 
 
 def test_group_tables_close_and_have_order_six():
     M, G, COMPOSE, PINV0, ROOT_CLASS = child_matrix_tables()
-    assert M.dtype == backend.int64
-    assert G.dtype == backend.int64
-    assert COMPOSE.dtype == backend.int64
-    assert PINV0.dtype == backend.float64
-    assert ROOT_CLASS.dtype == backend.int64
+    assert M.dtype == mesh_backend.int64
+    assert G.dtype == mesh_backend.int64
+    assert COMPOSE.dtype == mesh_backend.int64
+    assert PINV0.dtype == mesh_backend.float64
+    assert ROOT_CLASS.dtype == mesh_backend.int64
     M, G, COMPOSE, ROOT_CLASS = (
-        backend.to_numpy(M),
-        backend.to_numpy(G),
-        backend.to_numpy(COMPOSE),
-        backend.to_numpy(ROOT_CLASS),
+        to_np(M),
+        to_np(G),
+        to_np(COMPOSE),
+        to_np(ROOT_CLASS),
     )
     assert M.shape == (4, 2, 2) and G.shape == (6, 2, 2)
     dets = M[:, 0, 0] * M[:, 1, 1] - M[:, 0, 1] * M[:, 1, 0]
@@ -177,8 +176,8 @@ def test_group_tables_close_and_have_order_six():
     # exactly six distinct elements
     assert len({G[c].tobytes() for c in range(6)}) == 6
     # both root shapes lie in one orbit
-    R0 = backend.to_numpy(shape_matrix(_arr(ROOT_SHAPES[0])))
-    R1 = backend.to_numpy(shape_matrix(_arr(ROOT_SHAPES[1])))
+    R0 = to_np(shape_matrix(_arr(ROOT_SHAPES[0])))
+    R1 = to_np(shape_matrix(_arr(ROOT_SHAPES[1])))
     assert np.allclose(R0 @ G[ROOT_CLASS[1]], R1)
 
 
@@ -200,9 +199,9 @@ def test_children_preserve_orientation_and_quarter_the_area(flip):
 def test_pinv_table_scales_by_two_to_the_level():
     M, G, COMPOSE, PINV0, ROOT_CLASS = child_matrix_tables()
     COMPOSE, PINV0, ROOT_CLASS = (
-        backend.to_numpy(COMPOSE),
-        backend.to_numpy(PINV0),
-        backend.to_numpy(ROOT_CLASS),
+        to_np(COMPOSE),
+        to_np(PINV0),
+        to_np(ROOT_CLASS),
     )
     h0 = 0.05
     for shape_idx in (0, 1):
@@ -212,9 +211,7 @@ def test_pinv_table_scales_by_two_to_the_level():
         for _ in range(5):
             kids = np_red_split(tri)
             for k in range(4):
-                direct = backend.to_numpy(
-                    backend.linalg.inv(shape_matrix(_arr(kids[k])))
-                )
+                direct = to_np(mesh_backend.linalg.inv(shape_matrix(_arr(kids[k]))))
                 table = (2.0 ** (level + 1) / h0) * PINV0[COMPOSE[cls, k]]
                 assert np.allclose(direct, table, rtol=1e-12, atol=1e-12)
             tri, cls, level = kids[0], COMPOSE[cls, 0], level + 1
@@ -223,9 +220,9 @@ def test_pinv_table_scales_by_two_to_the_level():
 def test_the_inverse_table_recovers_the_affine_map():
     M, G, COMPOSE, PINV0, ROOT_CLASS = child_matrix_tables()
     COMPOSE, PINV0, ROOT_CLASS = (
-        backend.to_numpy(COMPOSE),
-        backend.to_numpy(PINV0),
-        backend.to_numpy(ROOT_CLASS),
+        to_np(COMPOSE),
+        to_np(PINV0),
+        to_np(ROOT_CLASS),
     )
     h0 = 0.05
     tri = np.asarray(ROOT_SHAPES[1], dtype=np.float64) * h0
@@ -234,24 +231,20 @@ def test_the_inverse_table_recovers_the_affine_map():
     lens_map = RNG.normal(size=(2, 2))
     for k in range(4):
         q = kids[k] @ lens_map.T
-        Q = backend.to_numpy(shape_matrix(_arr(q)))
+        Q = to_np(shape_matrix(_arr(q)))
         table = Q @ ((2.0 ** (level + 1) / h0) * PINV0[COMPOSE[cls, k]])
         assert np.allclose(table, lens_map, rtol=1e-10, atol=1e-12)
 
 
 def test_converged_from_deviation_fails_closed():
     r = np.zeros((3, 3))
-    assert backend.to_numpy(
-        converged_from_deviation(_arr(r), _arr([1.0, 1.0, 1.0]), 1.0)
-    ).all()
+    assert to_np(converged_from_deviation(_arr(r), _arr([1.0, 1.0, 1.0]), 1.0)).all()
     # NaN must take the split branch, not the converged branch
-    assert not backend.to_numpy(
+    assert not to_np(
         converged_from_deviation(_arr(r), _arr(np.full(3, np.nan)), 1.0)
     ).any()
     # s == 0 with r == 0 gives 0 < 0, False, split -- the conservative direction
-    assert not backend.to_numpy(
-        converged_from_deviation(_arr(r), _arr(np.zeros(3)), 1.0)
-    ).any()
+    assert not to_np(converged_from_deviation(_arr(r), _arr(np.zeros(3)), 1.0)).any()
 
 
 def test_child_shape_matrices_match_shape_matrix_of_each_child():
@@ -265,17 +258,17 @@ def test_child_shape_matrices_match_shape_matrix_of_each_child():
     rng = np.random.default_rng(0)
     beta_v = rng.normal(size=(5, 3, 2))
     beta_m = rng.normal(size=(5, 3, 2))
-    Q = backend.to_numpy(child_shape_matrices(_arr(beta_v), _arr(beta_m)))
+    Q = to_np(child_shape_matrices(_arr(beta_v), _arr(beta_m)))
     assert Q.shape == (5, 4, 2, 2)
     six = np.concatenate([beta_v, beta_m], axis=1)
     for k, idx in enumerate(CHILD_VERTEX_INDICES):
-        expected = backend.to_numpy(shape_matrix(_arr(six[:, list(idx)])))
+        expected = to_np(shape_matrix(_arr(six[:, list(idx)])))
         assert np.array_equal(Q[:, k], expected)
 
 
 def test_parity_from_children_accepts_a_constant_sign():
     Q = np.tile(np.eye(2), (2, 4, 1, 1))
-    assert backend.to_numpy(parity_from_children(_arr(Q))).tolist() == [
+    assert to_np(parity_from_children(_arr(Q))).tolist() == [
         True,
         True,
     ]
@@ -284,13 +277,13 @@ def test_parity_from_children_accepts_a_constant_sign():
 def test_parity_from_children_rejects_a_sign_change():
     Q = np.tile(np.eye(2), (1, 4, 1, 1))
     Q[0, 2] = np.array([[0.0, 1.0], [1.0, 0.0]])  # det -1 among three det +1
-    assert backend.to_numpy(parity_from_children(_arr(Q))).tolist() == [False]
+    assert to_np(parity_from_children(_arr(Q))).tolist() == [False]
 
 
 def test_parity_from_children_condemns_a_lone_degenerate_child():
     Q = np.tile(np.eye(2), (1, 4, 1, 1))
     Q[0, 3] = 0.0  # sign 0 differs from +1
-    assert backend.to_numpy(parity_from_children(_arr(Q))).tolist() == [False]
+    assert to_np(parity_from_children(_arr(Q))).tolist() == [False]
 
 
 def test_parity_from_children_passes_an_entirely_degenerate_triangle():
@@ -300,7 +293,7 @@ def test_parity_from_children_passes_an_entirely_degenerate_triangle():
     sheet is the fixture that reaches it.
     """
     Q = np.zeros((1, 4, 2, 2))
-    assert backend.to_numpy(parity_from_children(_arr(Q))).tolist() == [True]
+    assert to_np(parity_from_children(_arr(Q))).tolist() == [True]
 
 
 @pytest.mark.parametrize(
@@ -314,24 +307,24 @@ def test_parity_from_children_rejects_nan_determinants(determinants):
     Q = np.zeros((1, 4, 2, 2))
     Q[0, :, 0, 0] = determinants
     Q[0, :, 1, 1] = 1.0
-    assert backend.to_numpy(parity_from_children(_arr(Q))).tolist() == [False]
+    assert to_np(parity_from_children(_arr(Q))).tolist() == [False]
 
 
 def test_midpoint_deviation_pairs_midpoint_with_opposite_edge():
     v = np.array([[[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]]])
     m = np.array([[[0.5, 0.5], [0.0, 0.5], [0.5, 0.0]]])  # exact affine images
-    assert np.allclose(backend.to_numpy(midpoint_deviation(_arr(v), _arr(m))), 0.0)
+    assert np.allclose(to_np(midpoint_deviation(_arr(v), _arr(m))), 0.0)
     shifted = m.copy()
     shifted[0, 1] += np.array([0.0, 0.25])
-    got = backend.to_numpy(midpoint_deviation(_arr(v), _arr(shifted)))
+    got = to_np(midpoint_deviation(_arr(v), _arr(shifted)))
     assert np.allclose(got, [[0.0, 0.25, 0.0]])
 
 
 def test_weights_sum_to_twice_the_signed_area():
     tri = RNG.normal(size=(500, 3, 2))
     beta = RNG.normal(size=(500, 2))
-    w = backend.to_numpy(triangle_weights(_arr(tri), _arr(beta)))
-    P = backend.to_numpy(shape_matrix(_arr(tri)))
+    w = to_np(triangle_weights(_arr(tri), _arr(beta)))
+    P = to_np(shape_matrix(_arr(tri)))
     d = P[:, 0, 0] * P[:, 1, 1] - P[:, 0, 1] * P[:, 1, 0]
     assert np.allclose(w.sum(axis=1), d, rtol=1e-9, atol=1e-12)
 
@@ -343,7 +336,7 @@ def test_containment_agrees_with_barycentric_truth_on_both_parities(flip):
         tri = tri[:, ::-1, :]
     pts = RNG.uniform(-0.5, 1.5, size=(4000, 2))
     tiled = np.repeat(tri, len(pts), axis=0)
-    hit = backend.to_numpy(contains(triangle_weights(_arr(tiled), _arr(pts))))
+    hit = to_np(contains(triangle_weights(_arr(tiled), _arr(pts))))
     truth = (pts[:, 0] >= 0) & (pts[:, 1] >= 0) & (pts[:, 0] + pts[:, 1] <= 1)
     assert (hit == truth).all()
 
@@ -354,8 +347,8 @@ def test_shared_edge_weights_are_exactly_negated():
     left = verts[[0, 1, 2]][None]
     right = verts[[1, 3, 2]][None]  # shares the edge (1, 2), opposite traversal
     beta = np.array([[0.62, 0.71]])
-    wl = backend.to_numpy(triangle_weights(_arr(left), _arr(beta)))
-    wr = backend.to_numpy(triangle_weights(_arr(right), _arr(beta)))
+    wl = to_np(triangle_weights(_arr(left), _arr(beta)))
+    wr = to_np(triangle_weights(_arr(right), _arr(beta)))
     # left's weight opposite vertex 0 uses the (1, 2) edge; right's opposite
     # vertex 3 uses (2, 1). They must be bit-exact negatives.
     assert wl[0, 0] == -wr[0, 1]
@@ -370,7 +363,7 @@ def test_sanitize_bary_is_always_in_the_simplex():
     """
     w = RNG.normal(size=(1000, 3)) * 1e-300
     d = w.sum(axis=1)
-    bary = backend.to_numpy(sanitize_bary(_arr(w), _arr(d)))
+    bary = to_np(sanitize_bary(_arr(w), _arr(d)))
     assert np.isfinite(bary).all()
     assert (bary >= 0).all() and (bary <= 1).all()
     assert np.allclose(bary.sum(axis=1), 1.0, rtol=0, atol=1e-12)
@@ -379,7 +372,7 @@ def test_sanitize_bary_is_always_in_the_simplex():
 def test_sanitize_bary_falls_back_to_the_centroid_on_total_degeneracy():
     w = np.zeros((4, 3))
     d = np.zeros(4)
-    bary = backend.to_numpy(sanitize_bary(_arr(w), _arr(d)))
+    bary = to_np(sanitize_bary(_arr(w), _arr(d)))
     assert np.array_equal(bary, np.full((4, 3), 1.0 / 3.0))
 
 
@@ -392,7 +385,7 @@ def test_sanitize_bary_selects_per_row_between_normalized_and_centroid():
     """
     w = _arr([[3.0, 1.5, 1.5], [0.0, 0.0, 0.0], [2.0, 1.0, 1.0], [0.0, 0.0, 0.0]])
     d = _arr([6.0, 0.0, 4.0, 0.0])
-    bary = backend.to_numpy(sanitize_bary(w, d))
+    bary = to_np(sanitize_bary(w, d))
     assert np.allclose(bary[[0, 2]], [[0.5, 0.25, 0.25], [0.5, 0.25, 0.25]])
     assert np.allclose(bary[[1, 3]], 1.0 / 3.0)
     assert np.allclose(bary.sum(axis=1), 1.0, rtol=0, atol=1e-12)
@@ -403,7 +396,7 @@ def test_sanitize_bary_recovers_ordinary_coordinates():
     beta = np.array([[0.5, 0.75]])
     w = triangle_weights(_arr(tri), _arr(beta))
     d = _arr([2.0 * 3.0])
-    bary = backend.to_numpy(sanitize_bary(w, d))
+    bary = to_np(sanitize_bary(w, d))
     assert np.allclose(bary @ tri[0], beta, rtol=1e-12, atol=1e-14)
 
 
@@ -418,12 +411,12 @@ def test_lattice_key_roundtrip_and_geometry():
     lat = make_lattice(4.0, 0.0, 0.0, 4, 3)
     assert lat.n == 32
     ij_np = np.array([[0, 0], [32, 32], [7, 19]], dtype=np.int64)
-    ij = backend.as_array(ij_np, dtype=backend.int64)
+    ij = mesh_backend.as_array(ij_np, dtype=mesh_backend.int64)
     key = lattice_key(lat, ij)
-    assert backend.to_numpy(lattice_ij_from_key(lat, key)).tolist() == ij_np.tolist()
-    assert np.allclose(backend.to_numpy(lattice_xy(lat, ij[0])), [-2.0, -2.0])
-    assert np.allclose(backend.to_numpy(lattice_xy(lat, ij[1])), [2.0, 2.0])
-    assert backend.to_numpy(lattice_on_boundary(lat, ij)).tolist() == [
+    assert to_np(lattice_ij_from_key(lat, key)).tolist() == ij_np.tolist()
+    assert np.allclose(to_np(lattice_xy(lat, ij[0])), [-2.0, -2.0])
+    assert np.allclose(to_np(lattice_xy(lat, ij[1])), [2.0, 2.0])
+    assert to_np(lattice_on_boundary(lat, ij)).tolist() == [
         True,
         True,
         False,
@@ -449,10 +442,10 @@ def test_widening_the_lattice_does_not_move_any_vertex():
         np.meshgrid(np.arange(narrow.n + 1), np.arange(narrow.n + 1), indexing="ij"),
         axis=-1,
     ).reshape(-1, 2)
-    ij = backend.as_array(ij_np, dtype=backend.int64)
+    ij = mesh_backend.as_array(ij_np, dtype=mesh_backend.int64)
     assert np.array_equal(
-        backend.to_numpy(lattice_xy(narrow, ij)),
-        backend.to_numpy(lattice_xy(wide, 2 * ij)),
+        to_np(lattice_xy(narrow, ij)),
+        to_np(lattice_xy(wide, 2 * ij)),
     )
 
 
@@ -466,20 +459,18 @@ def test_initial_triangles_tile_the_square_and_are_positively_oriented():
     init_res, max_level = 4, 2
     ij, cls = initial_triangles(init_res, max_level, root_class)
     assert ij.shape == (2 * init_res**2, 3, 2)
-    P = shape_matrix(backend.to(ij, dtype=backend.float64))
+    P = shape_matrix(mesh_backend.to(ij, dtype=mesh_backend.float64))
     area = P[..., 0, 0] * P[..., 1, 1] - P[..., 0, 1] * P[..., 1, 0]
-    assert bool(backend.all(area > 0))
+    assert bool(mesh_backend.all(area > 0))
     step = 1 << max_level
-    assert np.isclose(float(backend.sum(area)) / 2, (init_res * step) ** 2)
-    assert set(backend.to_numpy(cls).tolist()) == set(
-        backend.to_numpy(root_class).tolist()
-    )
+    assert np.isclose(float(mesh_backend.sum(area)) / 2, (init_res * step) ** 2)
+    assert set(to_np(cls).tolist()) == set(to_np(root_class).tolist())
 
 
 def test_midpoints_are_exact_integers_and_opposite_their_vertex():
     ij = np.array([[[0, 0], [4, 0], [0, 4]]], dtype=np.int64)
     m = midpoint_ij(_i64(ij))
-    assert backend.to_numpy(m)[0].tolist() == [[2, 2], [0, 2], [2, 0]]
+    assert to_np(m)[0].tolist() == [[2, 2], [0, 2], [2, 0]]
 
 
 def test_midpoints_are_exact_at_max_level_on_the_widened_lattice():
@@ -499,15 +490,15 @@ def test_midpoints_are_exact_at_max_level_on_the_widened_lattice():
     # Descend to max_level by taking child C_4 (the middle child) each time.
     for _ in range(max_level):
         ij = midpoint_ij(ij)
-    assert bool(backend.all(ij % 2 == 0)), "max_level vertices are even"
+    assert bool(mesh_backend.all(ij % 2 == 0)), "max_level vertices are even"
 
     mid = midpoint_ij(ij)
     # Exact: the floor division threw nothing away.
     assert bool(
-        backend.all((ij[:, [1, 2, 0]] + ij[:, [2, 0, 1]]) % 2 == 0)
+        mesh_backend.all((ij[:, [1, 2, 0]] + ij[:, [2, 0, 1]]) % 2 == 0)
     ), "edge endpoint sums must be even for the midpoint to be exact"
     # Every midpoint has an odd coordinate, so it is not a vertex of any level.
-    assert bool(backend.all(backend.any(mid % 2 == 1, dim=-1)))
+    assert bool(mesh_backend.all(mesh_backend.any(mid % 2 == 1, dim=-1)))
 
 
 def test_check_lattice_keys_rejects_a_lattice_too_fine_to_key():
@@ -603,18 +594,18 @@ def test_extend_lattice_chains_and_accepts_zero():
 
 
 def test_min_angle_of_an_equilateral_triangle():
-    tri = backend.as_array(
+    tri = mesh_backend.as_array(
         np.array([[[0.0, 0.0], [1.0, 0.0], [0.5, np.sqrt(3) / 2]]]),
-        dtype=backend.float64,
+        dtype=mesh_backend.float64,
     )
-    assert backend.to_numpy(min_angle(tri))[0] == pytest.approx(np.pi / 3)
+    assert to_np(min_angle(tri))[0] == pytest.approx(np.pi / 3)
 
 
 def test_min_angle_of_a_degenerate_triangle_is_zero_not_nan():
-    tri = backend.as_array(
-        np.array([[[0.0, 0.0], [0.0, 0.0], [0.0, 0.0]]]), dtype=backend.float64
+    tri = mesh_backend.as_array(
+        np.array([[[0.0, 0.0], [0.0, 0.0], [0.0, 0.0]]]), dtype=mesh_backend.float64
     )
-    assert backend.to_numpy(min_angle(tri))[0] == 0.0
+    assert to_np(min_angle(tri))[0] == 0.0
 
 
 def test_the_table_constants_are_child_matrix_tables():
@@ -648,7 +639,7 @@ def test_is_member_reads_an_ascending_array():
 
 def test_to_device_maps_every_array_field_of_nested_named_tuples():
     lat = make_lattice(4.0, 0.0, 0.0, 2, 3)
-    moved = to_device(lat, backend.device(lat.lo))
+    moved = to_device(lat, mesh_backend.device(lat.lo))
     assert moved.n == lat.n and moved.scale == lat.scale
     assert np.array_equal(to_np(moved.lo), to_np(lat.lo))
 
@@ -737,7 +728,7 @@ def test_build_index_leaves_are_ascending_within_every_cell():
 
 def test_as_points_flattens_any_shape_into_float64_rows():
     got = as_points(2.0, 3.0, None)
-    assert got.dtype == backend.float64 and to_np(got).tolist() == [[2.0, 3.0]]
+    assert got.dtype == mesh_backend.float64 and to_np(got).tolist() == [[2.0, 3.0]]
     got = as_points(f64([[0.0, 1.0]]), f64([[2.0, 3.0]]), None)
     assert to_np(got).tolist() == [[0.0, 2.0], [1.0, 3.0]]
     assert as_points(f64([]), f64([]), None).shape == (0, 2)

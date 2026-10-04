@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 from caustics.backend_obj import backend
+from caustics.lenses.func.adaptive.mesh_backend import mesh_backend, to_mesh
 from caustics.cosmology import FlatLambdaCDM
 from caustics.lenses import SIE
 from caustics.lenses.func.adaptive.band import (
@@ -278,7 +279,9 @@ def sie_mesh():
         Rein=1.0,
         s=1e-3,
     )
-    return build_lens_mesh(lens.raytrace, lens.jacobian_lens_equation, 5.0, 32, 1e-2)
+    return to_mesh(
+        build_lens_mesh(lens.raytrace, lens.jacobian_lens_equation, 5.0, 32, 1e-2)
+    )
 
 
 def test_the_sampler_hands_both_callbacks_the_same_float64_points_on_the_device(device):
@@ -299,7 +302,9 @@ def test_the_sampler_hands_both_callbacks_the_same_float64_points_on_the_device(
     (rd, rdev, rx, ry), (jd, jdev, jx, jy) = seen
     assert rd == jd == backend.float64 and rdev == jdev == want
     assert np.array_equal(rx, jx) and np.array_equal(ry, jy)
-    assert out.dtype == backend.float64 and backend.device(out) == backend.device(xy)
+    assert out.dtype == mesh_backend.float64 and mesh_backend.device(
+        out
+    ) == mesh_backend.device(xy)
     assert to_np(out).tolist() == [[0.0, 0.5, 0.25], [1.0, -1.5, 0.25]]
 
 
@@ -317,7 +322,7 @@ def test_float32_callbacks_give_float64_values_with_det_a_formed_in_float32():
     out = make_sampler(raytrace, jacobian, None)(f64([[1.0, 2.0]]))
     J = backend.as_array(A32[None])
     det32 = J[:, 0, 0] * J[:, 1, 1] - J[:, 0, 1] * J[:, 1, 0]
-    assert out.dtype == backend.float64
+    assert out.dtype == mesh_backend.float64
     assert to_np(out)[0, 2] == to_np(backend.to(det32, dtype=backend.float64))[0]
 
 
@@ -717,7 +722,7 @@ def test_a_mesh_survives_a_pickle_round_trip():
 
 def test_every_vertex_carries_det_a_as_float64():
     mesh, _ = build(localised_fold, localised_fold_jacobian, min_img_sep=0.05)
-    assert mesh.vertices_det.dtype == backend.float64
+    assert mesh.vertices_det.dtype == mesh_backend.float64
     J = localised_fold_jacobian(to_np(mesh.vertices_lens))
     want = J[:, 0, 0] * J[:, 1, 1] - J[:, 0, 1] * J[:, 1, 0]
     assert np.array_equal(to_np(mesh.vertices_det), want)
@@ -1005,7 +1010,7 @@ def xbuild(fn, jac, fov, init_res, min_img_sep, **kw):
     mesh = build_lens_mesh(
         lens_.raytrace, lens_.jacobian_lens_equation, fov, init_res, min_img_sep, **kw
     )
-    return mesh, lens_, calls
+    return to_mesh(mesh), lens_, calls
 
 
 def called_at(calls, method):
@@ -1465,7 +1470,13 @@ def closed_build(fn, jac, fov, init_res, min_img_sep, **kw):
             min_img_sep,
             **kw,
         )
-    return mesh, curves, [str(w.message) for w in record], lens_, calls
+    return (
+        to_mesh(mesh),
+        to_mesh(curves),
+        [str(w.message) for w in record],
+        lens_,
+        calls,
+    )
 
 
 def fov_and_init_res(mesh):

@@ -9,6 +9,7 @@ import pytest
 from scipy.spatial import cKDTree
 
 from caustics.backend_obj import backend
+from caustics.lenses.func.adaptive.mesh_backend import mesh_backend, to_mesh
 from caustics.cosmology import FlatLambdaCDM
 from caustics.lenses import SIE, SinglePlane
 from caustics.lenses.func.adaptive import (
@@ -38,22 +39,23 @@ from caustics.lenses.func.adaptive.holes import (
     sample_holes,
 )
 from caustics.lenses.func.adaptive.lens_mesh import make_sampler
-
-
-def to_np(x):
-    return backend.to_numpy(x)
+from adaptive_maps import requested, to_np
 
 
 def _arr(x):
-    return backend.as_array(np.asarray(x, dtype=np.float64), dtype=backend.float64)
+    return mesh_backend.as_array(
+        np.asarray(x, dtype=np.float64), dtype=mesh_backend.float64
+    )
 
 
 def _band(samples, lens, det, source=None):
     """A hand-built `CriticalBand`; ``source`` defaults to ``lens``."""
     samples = np.asarray(samples, dtype=np.int64)
     return CriticalBand(
-        leaves=backend.as_array(np.arange(samples.shape[0]), dtype=backend.int64),
-        samples=backend.as_array(samples, dtype=backend.int64),
+        leaves=mesh_backend.as_array(
+            np.arange(samples.shape[0]), dtype=mesh_backend.int64
+        ),
+        samples=mesh_backend.as_array(samples, dtype=mesh_backend.int64),
         lens=_arr(lens),
         source=_arr(lens if source is None else source),
         det=_arr(det),
@@ -130,7 +132,8 @@ def test_chain_order_matches_a_python_walk(seed):
     cyclic = rng.random(12) < 0.5
     succ = _random_chains(rng, sizes, cyclic)
     order, offsets, closed = (
-        to_np(x) for x in chain_order(backend.as_array(succ, dtype=backend.int64))
+        to_np(x)
+        for x in chain_order(mesh_backend.as_array(succ, dtype=mesh_backend.int64))
     )
     want = _walk(succ)
     assert offsets.tolist() == np.cumsum([0] + [len(c) for _, c, _ in want]).tolist()
@@ -149,7 +152,7 @@ def test_chain_order_matches_a_python_walk(seed):
     ids=["empty", "lone node", "two-cycle", "path"],
 )
 def test_chain_order_small_cases(succ, order, offsets, closed):
-    got = chain_order(backend.as_array(np.asarray(succ, dtype=np.int64)))
+    got = chain_order(mesh_backend.as_array(np.asarray(succ, dtype=np.int64)))
     assert to_np(got[0]).tolist() == order
     assert to_np(got[1]).tolist() == offsets
     assert to_np(got[2]).tolist() == closed
@@ -181,8 +184,8 @@ def test_child_segments_keep_positive_det_on_the_left(signs):
     classes = det[children] >= 0
     mixed = classes.any(axis=1) & ~classes.all(axis=1)
     assert start.shape[0] == int(mixed.sum())
-    p, _ = edge_zeros(backend.as_array(start), band.det, (band.lens, band.source))
-    q, _ = edge_zeros(backend.as_array(end), band.det, (band.lens, band.source))
+    p, _ = edge_zeros(mesh_backend.as_array(start), band.det, (band.lens, band.source))
+    q, _ = edge_zeros(mesh_backend.as_array(end), band.det, (band.lens, band.source))
     p, q = to_np(p), to_np(q)
     for a, b, s, e in zip(p, q, start, end):
         corners = set(s.tolist()) | set(e.tolist())
@@ -278,13 +281,13 @@ def _one_hole(radius=0.1, n=64, shift=(5.0, 0.0)):
     return CenterHoles(
         centers=_arr([[0.0, 0.0]]),
         radius=_arr([radius]),
-        offsets=backend.as_array(np.array([0, n]), dtype=backend.int64),
+        offsets=mesh_backend.as_array(np.array([0, n]), dtype=mesh_backend.int64),
         angle=_arr(angle),
         lens=_arr(lens),
         source=_arr(lens + np.array(shift)),
         growth=_arr([0.0]),
         growth_err=_arr([0.0]),
-        pseudo_caustic=backend.as_array(np.array([True]), dtype=backend.bool),
+        pseudo_caustic=mesh_backend.as_array(np.array([True]), dtype=mesh_backend.bool),
     )
 
 
@@ -298,9 +301,11 @@ def _traced(*curves):
     return CriticalCurvesAndCaustics(
         lens=_arr(pts),
         source=_arr(2.0 * pts),
-        offsets=backend.as_array(offsets, dtype=backend.int64),
-        closed=backend.as_array(np.array([c for _, c in curves]), dtype=backend.bool),
-        hole=backend.as_array(np.full(len(pts), -1), dtype=backend.int64),
+        offsets=mesh_backend.as_array(offsets, dtype=mesh_backend.int64),
+        closed=mesh_backend.as_array(
+            np.array([c for _, c in curves]), dtype=mesh_backend.bool
+        ),
+        hole=mesh_backend.as_array(np.full(len(pts), -1), dtype=mesh_backend.int64),
     )
 
 
@@ -473,13 +478,17 @@ def _hole_pair(n=64):
     return CenterHoles(
         centers=_arr([_A, _B]),
         radius=_arr([0.1, 0.1]),
-        offsets=backend.as_array(np.array([0, n, 2 * n]), dtype=backend.int64),
+        offsets=mesh_backend.as_array(
+            np.array([0, n, 2 * n]), dtype=mesh_backend.int64
+        ),
         angle=_arr(np.concatenate([angle, angle])),
         lens=_arr(lens),
         source=_arr(lens + shift),
         growth=_arr([0.0, 0.0]),
         growth_err=_arr([0.0, 0.0]),
-        pseudo_caustic=backend.as_array(np.array([True, True]), dtype=backend.bool),
+        pseudo_caustic=mesh_backend.as_array(
+            np.array([True, True]), dtype=mesh_backend.bool
+        ),
     )
 
 
@@ -742,12 +751,14 @@ def test_cored_isothermal_curves_match_the_analytic_answers():
 
 
 def test_without_holes_the_curves_are_trace_band_s_and_follow_no_hole():
-    mesh = build_lens_mesh(
-        CORED.raytrace,
-        CORED.jacobian_lens_equation,
-        fov=4.0,
-        init_res=16,
-        min_img_sep=1e-2,
+    mesh = to_mesh(
+        build_lens_mesh(
+            CORED.raytrace,
+            CORED.jacobian_lens_equation,
+            fov=4.0,
+            init_res=16,
+            min_img_sep=1e-2,
+        )
     )
     got = critical_curves_and_caustics(mesh)
     raw = trace_band(mesh.critical_band)
@@ -1007,8 +1018,10 @@ def _brute_counts(fn, grid, lo, hi, h, singular, excl):
 @pytest.fixture(scope="module")
 def two_sis():
     lens = _sis_pair(TWO_SIS)
-    mesh = build_lens_mesh(
-        lens.raytrace, lens.jacobian_lens_equation, **TWO_SIS_BUILD, centers=TWO_SIS
+    mesh = to_mesh(
+        build_lens_mesh(
+            lens.raytrace, lens.jacobian_lens_equation, **TWO_SIS_BUILD, centers=TWO_SIS
+        )
     )
     return mesh, _with_holes(critical_curves_and_caustics(mesh), mesh.holes)
 
@@ -1051,8 +1064,10 @@ def test_moving_a_center_off_the_lattice_leaves_the_count_unchanged(two_sis):
     _, curves = two_sis
     shifted = [(0.0003, 0.0002), TWO_SIS[1]]
     lens = _sis_pair(shifted)
-    mesh = build_lens_mesh(
-        lens.raytrace, lens.jacobian_lens_equation, **TWO_SIS_BUILD, centers=shifted
+    mesh = to_mesh(
+        build_lens_mesh(
+            lens.raytrace, lens.jacobian_lens_equation, **TWO_SIS_BUILD, centers=shifted
+        )
     )
     moved = _with_holes(critical_curves_and_caustics(mesh), mesh.holes)
     grid = _grid_of(curves)
@@ -1079,7 +1094,7 @@ WITH_COMPANION_B = [1.0, 1.0, 0.02]
 
 def _hole_to_hole_steps(mesh):
     """How many traced steps of ``mesh``'s band go from one hole's disk straight into another's."""
-    raw = trace_band(mesh.critical_band)
+    raw = trace_band(to_mesh(mesh).critical_band)
     lens, off = to_np(raw.lens), to_np(raw.offsets)
     centers, radius = to_np(mesh.holes.centers), to_np(mesh.holes.radius)
     inside = np.hypot(*(lens[:, None, :] - centers[None]).transpose(2, 0, 1)) < radius
@@ -1188,8 +1203,10 @@ def test_curves_bridged_to_a_regular_center_come_out_closed_and_chord_free():
     """
     centers = TWO_SIS + [(-0.01241, 0.01688)]
     lens = _sis_pair(TWO_SIS)
-    mesh = build_lens_mesh(
-        lens.raytrace, lens.jacobian_lens_equation, **TWO_SIS_BUILD, centers=centers
+    mesh = to_mesh(
+        build_lens_mesh(
+            lens.raytrace, lens.jacobian_lens_equation, **TWO_SIS_BUILD, centers=centers
+        )
     )
     assert _hole_to_hole_steps(mesh) > 0
     _assert_closed_and_chord_free(mesh, critical_curves_and_caustics(mesh))
@@ -1197,8 +1214,8 @@ def test_curves_bridged_to_a_regular_center_come_out_closed_and_chord_free():
 
 def test_triangle_segments_keep_the_positive_side_on_the_left():
     # (0,0), (1,0), (0,1), positively oriented; only vertex 0 is positive.
-    tri = backend.as_array([[0, 1, 2]], dtype=backend.int64)
-    positive = backend.as_array([True, False, False])
+    tri = mesh_backend.as_array([[0, 1, 2]], dtype=mesh_backend.int64)
+    positive = mesh_backend.as_array([True, False, False])
     start, end = triangle_segments(tri, positive)
     # From edge (0, 1) to edge (2, 0): travelling from (0.5, 0) towards
     # (0, 0.5) keeps vertex 0 on the left.
@@ -1207,18 +1224,18 @@ def test_triangle_segments_keep_the_positive_side_on_the_left():
 
 
 def test_triangle_segments_skip_triangles_of_one_class():
-    tri = backend.as_array([[0, 1, 2]], dtype=backend.int64)
+    tri = mesh_backend.as_array([[0, 1, 2]], dtype=mesh_backend.int64)
     for value in (True, False):
-        start, _ = triangle_segments(tri, backend.as_array([value] * 3))
+        start, _ = triangle_segments(tri, mesh_backend.as_array([value] * 3))
         assert start.shape[0] == 0
 
 
 def test_chain_segments_close_a_fan_into_one_counter_clockwise_loop():
     # A unit square fanned about its center, vertex 4, the only positive one.
-    tri = backend.as_array(
-        [[0, 1, 4], [1, 2, 4], [2, 3, 4], [3, 0, 4]], dtype=backend.int64
+    tri = mesh_backend.as_array(
+        [[0, 1, 4], [1, 2, 4], [2, 3, 4], [3, 0, 4]], dtype=mesh_backend.int64
     )
-    positive = backend.as_array([False, False, False, False, True])
+    positive = mesh_backend.as_array([False, False, False, False, True])
     start, end = triangle_segments(tri, positive)
     edges, offsets, closed = chain_segments(start, end, 5)
     assert to_np(offsets).tolist() == [0, 4]
@@ -1229,7 +1246,7 @@ def test_chain_segments_close_a_fan_into_one_counter_clockwise_loop():
 
 
 def test_chain_segments_of_nothing_is_no_curve():
-    empty = backend.zeros((0, 2), dtype=backend.int64)
+    empty = mesh_backend.zeros((0, 2), dtype=mesh_backend.int64)
     edges, offsets, closed = chain_segments(empty, empty, 3)
     assert edges.shape == (0, 2)
     assert to_np(offsets).tolist() == [0]
@@ -1237,7 +1254,7 @@ def test_chain_segments_of_nothing_is_no_curve():
 
 
 def test_edge_zeros_interpolate_the_zero_in_every_plane():
-    edges = backend.as_array([[0, 1]], dtype=backend.int64)
+    edges = mesh_backend.as_array([[0, 1]], dtype=mesh_backend.int64)
     field = _arr([-1.0, 3.0])
     a = _arr([[0.0, 0.0], [4.0, 0.0]])
     b = _arr([[0.0, 1.0], [0.0, 5.0]])
@@ -1257,7 +1274,7 @@ def test_empty_holes_has_no_hole():
     assert tuple(holes.lens.shape) == (0, 2) and tuple(holes.source.shape) == (0, 2)
     for field in ("radius", "angle", "growth", "growth_err", "pseudo_caustic"):
         assert tuple(getattr(holes, field).shape) == (0,), field
-    assert holes.pseudo_caustic.dtype == backend.bool
+    assert holes.pseudo_caustic.dtype == mesh_backend.bool
     assert to_np(holes.offsets).tolist() == [0]
 
 
@@ -1405,11 +1422,11 @@ def sample(raytrace, centers, radius, min_img_sep, batch_size=None):
     calls = []
 
     def recorded(x, y):
-        calls.append(np.stack([to_np(x), to_np(y)], axis=-1))
+        calls.append(requested(np.stack([to_np(x), to_np(y)], axis=-1)))
         return raytrace(x, y)
 
     holes = sample_holes(
-        make_sampler(recorded, None, None),
+        make_sampler(recorded, None, None, batch_size),
         _arr(centers),
         _arr(radius),
         min_img_sep,
@@ -1648,8 +1665,10 @@ def test_a_build_without_centers_stores_empty_holes():
 def test_a_build_stores_the_merged_and_sampled_holes():
     lens = sis_lens(SIS_C, 1.0)
     centers = [SIS_C, SIS_C, (1.5, 1.5)]
-    mesh = build_lens_mesh(
-        lens.raytrace, lens.jacobian_lens_equation, **BUILD, centers=centers
+    mesh = to_mesh(
+        build_lens_mesh(
+            lens.raytrace, lens.jacobian_lens_equation, **BUILD, centers=centers
+        )
     )
     want = sample_holes(
         make_sampler(lens.raytrace, None, None),
@@ -1704,6 +1723,6 @@ def test_holes_land_on_the_mesh_device(device):
         device=device,
     )
     for field in CenterHoles._fields:
-        assert backend.device(getattr(mesh.holes, field)) == backend.device(
+        assert mesh_backend.device(getattr(mesh.holes, field)) == mesh_backend.device(
             mesh.vertices_lens
         ), field

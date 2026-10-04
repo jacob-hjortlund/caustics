@@ -25,8 +25,7 @@ class TorchMeshBackend(Backend):
         self._backend = "torch"
 
 
-# The bookkeeping stays on the user's backend until every boundary converts.
-mesh_backend = backend
+mesh_backend = backend if backend.backend == "torch" else TorchMeshBackend()
 
 
 def map_arrays(value, fn):

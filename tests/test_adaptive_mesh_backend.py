@@ -6,7 +6,20 @@ import caskade as ck
 import numpy as np
 import pytest
 
+from adaptive_maps import f64, numpy_lens, sie_like, sie_like_jacobian, stack_2x2, to_np
+
 from caustics.backend_obj import backend
+from caustics.lenses.func.adaptive import (
+    build_lens_mesh,
+    build_magnification_map,
+    critical_curves_and_caustics,
+    extend_lens_mesh,
+    forward_raytrace,
+    in_magnified_region,
+    magnified_area,
+    magnified_regions,
+    total_magnification,
+)
 from caustics.lenses.func.adaptive.mesh_backend import (
     TorchMeshBackend,
     map_arrays,
@@ -52,3 +65,98 @@ def test_under_torch_the_bookkeeping_is_the_users_backend_and_nothing_converts()
     assert mesh_backend is backend
     assert to_mesh(value) is value
     assert to_user(value) is value
+
+
+def _cored(x, y):
+    """A cored isothermal sphere in the user's backend, traceable for the root finding."""
+    r = backend.sqrt(x * x + y * y + 0.05)
+    return x - 1.2 * x / r, y - 1.2 * y / r
+
+
+def _cored_jacobian(x, y):
+    r = backend.sqrt(x * x + y * y + 0.05)
+    k = 1.2 / r**3
+    return stack_2x2(
+        1.0 - 1.2 / r + k * x * x, k * x * y, k * x * y, 1.0 - 1.2 / r + k * y * y
+    )
+
+
+def _arrays(value):
+    found = []
+    map_arrays(value, lambda a: found.append(a) or a)
+    return found
+
+
+def test_every_public_function_returns_the_users_arrays():
+    """0-d and empty results included: an affine lens has no critical curve."""
+    mesh = build_lens_mesh(_cored, _cored_jacobian, 4.0, 8, 0.1)
+    bx = backend.as_array([0.05, 0.3], dtype=backend.float64)
+    by = backend.as_array([0.02, -0.1], dtype=backend.float64)
+    mag = build_magnification_map(mesh, 8, 0.1, mu_min=3.0)
+    affine = build_lens_mesh(
+        lambda x, y: (0.7 * x, 0.9 * y),
+        lambda x, y: stack_2x2(
+            0.7 * backend.ones_like(x), 0.0 * x, 0.0 * x, 0.9 * backend.ones_like(x)
+        ),
+        4.0,
+        4,
+        0.25,
+    )
+    results = [
+        mesh,
+        critical_curves_and_caustics(mesh),
+        critical_curves_and_caustics(affine),
+        forward_raytrace(bx, by, _cored, mesh),
+        total_magnification(bx, by, mesh),
+        mag,
+        magnified_regions(mag, 3.0),
+        magnified_area(mag, 3.0),
+        in_magnified_region(bx, by, mag, 3.0),
+    ]
+    for value in results:
+        for a in _arrays(value):
+            assert isinstance(a, backend.array_type), type(a)
+    area, complete = magnified_area(mag, 3.0)
+    assert tuple(area.shape) == () and tuple(complete.shape) == ()
+    assert to_np(critical_curves_and_caustics(affine).lens).shape == (0, 2)
+
+
+def test_extending_a_mesh_leaves_the_mesh_it_was_given_unchanged():
+    mesh = build_lens_mesh(_cored, _cored_jacobian, 4.0, 4, 0.1)
+    before = [to_np(a).copy() for a in _arrays(mesh)]
+    extend_lens_mesh(mesh, _cored, _cored_jacobian, 6.0)
+    for a, b in zip(_arrays(mesh), before):
+        np.testing.assert_array_equal(to_np(a), b)
+
+
+def test_public_functions_take_numpy_sources_and_list_centers_alike():
+    lens_, _ = numpy_lens(sie_like, sie_like_jacobian)
+    mesh = build_lens_mesh(
+        lens_.raytrace, lens_.jacobian_lens_equation, 4.0, 4, 0.1, centers=[(0.0, 0.0)]
+    )
+    xs, ys = np.array([0.1, 0.25]), np.array([0.0, -0.1])
+    mu_np, n_np = total_magnification(xs, ys, mesh)
+    mu_b, n_b = total_magnification(f64(xs), f64(ys), mesh)
+    np.testing.assert_array_equal(to_np(mu_np), to_np(mu_b))
+    np.testing.assert_array_equal(to_np(n_np), to_np(n_b))
+    assert to_np(mesh.holes.centers).shape == (1, 2)
+
+
+@pytest.mark.skipif(backend.backend != "jax", reason="only jax compiles")
+def test_a_jax_build_compiles_only_for_its_padded_lens_batches():
+    """Before, every bookkeeping op compiled per new shape: thousands per build."""
+    import jax
+
+    compiles = []
+    jax.monitoring.register_event_duration_secs_listener(
+        lambda event, duration, **kw: (
+            compiles.append(event)
+            if event == "/jax/core/compile/backend_compile_duration"
+            else None
+        )
+    )
+    lens_, _ = numpy_lens(sie_like, sie_like_jacobian)
+    jax.clear_caches()
+    before = len(compiles)
+    build_lens_mesh(lens_.raytrace, lens_.jacobian_lens_equation, 4.0, 4, 0.1)
+    assert len(compiles) - before <= 150

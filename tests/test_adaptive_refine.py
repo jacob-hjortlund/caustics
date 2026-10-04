@@ -3,7 +3,7 @@
 import numpy as np
 import pytest
 
-from caustics.backend_obj import backend
+from caustics.lenses.func.adaptive.mesh_backend import mesh_backend
 from caustics.lenses.func.adaptive.geometry import COMPOSE, ROOT_CLASS, area2
 from caustics.lenses.func.adaptive.lattice import (
     initial_triangles,
@@ -32,7 +32,7 @@ FOV, INIT_RES, MAX_LEVEL = 4.0, 2, 4
 
 
 def positions(xy):
-    return backend.to(xy, dtype=backend.float64)
+    return mesh_backend.to(xy, dtype=mesh_backend.float64)
 
 
 def run(split, sample=positions, batch_size=None, max_level=MAX_LEVEL, order=None):
@@ -48,11 +48,11 @@ def run(split, sample=positions, batch_size=None, max_level=MAX_LEVEL, order=Non
 
 
 def never(ij, values6, cls, level):
-    return backend.zeros((ij.shape[0],), dtype=backend.bool)
+    return mesh_backend.zeros((ij.shape[0],), dtype=mesh_backend.bool)
 
 
 def always(ij, values6, cls, level):
-    return backend.ones((ij.shape[0],), dtype=backend.bool)
+    return mesh_backend.ones((ij.shape[0],), dtype=mesh_backend.bool)
 
 
 def around(px, py):
@@ -61,10 +61,10 @@ def around(px, py):
     def split(ij, values6, cls, level):
         x, y = values6[..., 0], values6[..., 1]
         return (
-            (backend.min(x, dim=1) <= px)
-            & (px <= backend.max(x, dim=1))
-            & (backend.min(y, dim=1) <= py)
-            & (py <= backend.max(y, dim=1))
+            (mesh_backend.min(x, dim=1) <= px)
+            & (px <= mesh_backend.max(x, dim=1))
+            & (mesh_backend.min(y, dim=1) <= py)
+            & (py <= mesh_backend.max(y, dim=1))
         )
 
     return split
@@ -73,17 +73,17 @@ def around(px, py):
 def seam_and_right_level_one(ij, values6, cls, level):
     """Left half to level 3; any level-1 triangle in the right half."""
     x = values6[..., 0]
-    left = backend.all(x <= 0.0, dim=1) & (level < 3)
-    right = backend.all(x >= 0.0, dim=1) & (level == 1)
+    left = mesh_backend.all(x <= 0.0, dim=1) & (level < 3)
+    right = mesh_backend.all(x >= 0.0, dim=1) & (level == 1)
     return left | right
 
 
 def final_split(lat, cache, store, split, max_level=MAX_LEVEL):
-    rows = backend.flatnonzero(store.valid & (store.level < max_level))
+    rows = mesh_backend.flatnonzero(store.valid & (store.level < max_level))
     v = store.v[rows]
     ij = cache.ij[v]
     m = cache_lookup(cache, lattice_key(lat, midpoint_ij(ij)))
-    values6 = cache.values[backend.concatenate((v, m), dim=1)]
+    values6 = cache.values[mesh_backend.concatenate((v, m), dim=1)]
     return to_np(split(ij, values6, store.cls[rows], store.level[rows]))
 
 
@@ -267,7 +267,7 @@ def test_evaluate_is_bit_identical_under_chunking():
 
     def curved(xy):
         x, y = xy[:, 0], xy[:, 1]
-        return backend.stack((x * x - y, y * y + x), dim=-1)
+        return mesh_backend.stack((x * x - y, y * y + x), dim=-1)
 
     keys = i64(np.arange((lat.n + 1) ** 2))
     whole = to_np(evaluate(empty_cache(2), lat, keys, curved, None).values)
@@ -300,7 +300,7 @@ def closed_parts(split=None, max_level=MAX_LEVEL):
 def hanging(lat, cache, ij):
     """True where an edge midpoint of a triangle ``ij`` ``(n, 3, 2)`` is a leaf vertex."""
     slot = cache_lookup(cache, lattice_key(lat, midpoint_ij(ij)))
-    return to_np((slot >= 0) & cache.active[backend.where(slot >= 0, slot, 0)])
+    return to_np((slot >= 0) & cache.active[mesh_backend.where(slot >= 0, slot, 0)])
 
 
 def tiles(lat, cache, used, leaves, leaf_origin, origin_leaves):
@@ -315,7 +315,7 @@ def tiles(lat, cache, used, leaves, leaf_origin, origin_leaves):
 
 def test_closure_leaves_no_hanging_node():
     lat, cache, store, used, leaves, _, _, _ = closed_parts()
-    pre = cache.ij[store.v[backend.flatnonzero(store.valid)]]
+    pre = cache.ij[store.v[mesh_backend.flatnonzero(store.valid)]]
     assert hanging(lat, cache, pre).any()
     assert not hanging(lat, cache, cache.ij[used][leaves]).any()
 
@@ -357,10 +357,10 @@ def test_closure_re_emits_every_origin_vertex():
 
 def all_but_one_to_level_two(ij, values6, cls, level):
     """Every triangle to level 2 but the level-1 corner child at ``(1/3, 2/3)``."""
-    cx = backend.sum(values6[:, :3, 0], dim=1) / 3
-    cy = backend.sum(values6[:, :3, 1], dim=1) / 3
-    spared = (level == 1) & (backend.abs(cx - 1 / 3) < 1e-9)
-    spared = spared & (backend.abs(cy - 2 / 3) < 1e-9)
+    cx = mesh_backend.sum(values6[:, :3, 0], dim=1) / 3
+    cy = mesh_backend.sum(values6[:, :3, 1], dim=1) / 3
+    spared = (level == 1) & (mesh_backend.abs(cx - 1 / 3) < 1e-9)
+    spared = spared & (mesh_backend.abs(cy - 2 / 3) < 1e-9)
     return (level < 2) & ~spared
 
 
@@ -376,9 +376,9 @@ def test_refining_the_roots_in_two_passes_gives_the_one_pass_mesh():
     split = around(0.02, -0.57)
     lat = make_lattice(FOV, 0.0, 0.0, INIT_RES, MAX_LEVEL + 1)
     ij, cls = initial_triangles(INIT_RES, lat.level, ROOT_CLASS)
-    right_of_seam = backend.max(ij[:, :, 0], dim=1) > lat.n // 2
-    first = backend.flatnonzero(~right_of_seam)
-    second = backend.flatnonzero(right_of_seam)
+    right_of_seam = mesh_backend.max(ij[:, :, 0], dim=1) > lat.n // 2
+    first = mesh_backend.flatnonzero(~right_of_seam)
+    second = mesh_backend.flatnonzero(right_of_seam)
     cache, store, rows = add_roots(
         empty_cache(2), empty_store(), lat, ij[first], cls[first], positions, None
     )

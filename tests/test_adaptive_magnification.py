@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 
 from caustics.backend_obj import backend
+from caustics.lenses.func.adaptive.mesh_backend import mesh_backend, to_mesh
 from caustics.lenses.func.adaptive.geometry import (
     _CHILD_VERTEX_INDEX_TABLE,
     area2,
@@ -56,13 +57,13 @@ _stack_2x2 = stack_2x2
 
 def total_mu(mesh, beta, batch_size=None):
     """`total_magnification` at ``(B, 2)`` points."""
-    beta = backend.as_array(beta, dtype=backend.float64)
+    beta = mesh_backend.as_array(beta, dtype=mesh_backend.float64)
     return total_magnification(beta[:, 0], beta[:, 1], mesh, batch_size=batch_size)
 
 
 def in_region(mag, mu_min, beta):
     """`in_magnified_region` at ``(B, 2)`` points."""
-    beta = backend.as_array(beta, dtype=backend.float64)
+    beta = mesh_backend.as_array(beta, dtype=mesh_backend.float64)
     return in_magnified_region(beta[:, 0], beta[:, 1], mag, mu_min)
 
 
@@ -246,68 +247,76 @@ def _brute_cells(a, b, n, size, grow=0.0):
 @pytest.fixture(scope="module")
 def half_mesh():
     # Affine: all 32 level-0 leaves converge, each mapping to a dyadic triangle.
-    return build_lens_mesh(_half, _half_jacobian, 4.0, 4, 0.25)
+    return to_mesh(build_lens_mesh(_half, _half_jacobian, 4.0, 4, 0.25))
 
 
 @pytest.fixture(scope="module")
 def fold_mesh():
-    return build_lens_mesh(_row_fold, _row_fold_jacobian, 4.0, 4, 0.25)
+    return to_mesh(build_lens_mesh(_row_fold, _row_fold_jacobian, 4.0, 4, 0.25))
 
 
 @pytest.fixture(scope="module")
 def fold_lens():
     # Lens plane x in [-1, 1], y in [-0.5, 1.5]: source x in [-1, 1],
     # beta_y in [-0.75, 0.25]; mu_tot >= 4 on the strip 3/16 <= beta_y <= 1/4.
-    return build_lens_mesh(_row_fold, _row_fold_jacobian, 2.0, 8, 0.02, y0=0.5)
+    return to_mesh(build_lens_mesh(_row_fold, _row_fold_jacobian, 2.0, 8, 0.02, y0=0.5))
 
 
 @pytest.fixture(scope="module")
 def fold_mag(fold_lens):
     # A window clear of the fov's image, which runs along x = +-1 and beta_y = -0.75.
-    return build_magnification_map(
-        fold_lens, 8, 0.02, mu_min=4.0, fov=1.0, x0=0.0, y0=0.0
+    return to_mesh(
+        build_magnification_map(fold_lens, 8, 0.02, mu_min=4.0, fov=1.0, x0=0.0, y0=0.0)
     )
 
 
 @pytest.fixture(scope="module")
 def wide_mag(fold_lens):
     # The default window takes in the image of the lens fov's boundary.
-    return build_magnification_map(fold_lens, 8, 0.05, mu_min=1.5)
+    return to_mesh(build_magnification_map(fold_lens, 8, 0.05, mu_min=1.5))
 
 
 @pytest.fixture(scope="module")
 def fold_lens_fine():
-    return build_lens_mesh(_row_fold, _row_fold_jacobian, 2.0, 8, 0.002, y0=0.5)
+    return to_mesh(
+        build_lens_mesh(_row_fold, _row_fold_jacobian, 2.0, 8, 0.002, y0=0.5)
+    )
 
 
 @pytest.fixture(scope="module")
 def cored_lens():
-    return build_lens_mesh(_cored, _cored_jacobian, 4.5, 9, 0.005)
+    return to_mesh(build_lens_mesh(_cored, _cored_jacobian, 4.5, 9, 0.005))
 
 
 @pytest.fixture(scope="module")
 def sis_lens():
-    return build_lens_mesh(_sis, _sis_jacobian, 4.0, 8, 0.005, centers=[(0.0, 0.0)])
+    return to_mesh(
+        build_lens_mesh(_sis, _sis_jacobian, 4.0, 8, 0.005, centers=[(0.0, 0.0)])
+    )
 
 
 @pytest.fixture(scope="module")
 def sis_mag(sis_lens):
-    return build_magnification_map(
-        sis_lens, 8, 0.005, mu_min=4.0, fov=1.5, x0=0.0, y0=0.0
+    return to_mesh(
+        build_magnification_map(sis_lens, 8, 0.005, mu_min=4.0, fov=1.5, x0=0.0, y0=0.0)
     )
 
 
 @pytest.fixture(scope="module")
 def sis_lens_coarse():
-    return build_lens_mesh(_sis, _sis_jacobian, 4.0, 8, 0.01, centers=[(0.0, 0.0)])
+    return to_mesh(
+        build_lens_mesh(_sis, _sis_jacobian, 4.0, 8, 0.01, centers=[(0.0, 0.0)])
+    )
 
 
 @pytest.fixture(scope="module")
 def sis_mag_coarse(sis_lens_coarse):
     # mu_tot >= 4 on the disk |beta| <= 0.5; the window stays inside the
     # image of the lens fov's boundary.
-    return build_magnification_map(
-        sis_lens_coarse, 8, 0.02, mu_min=4.0, fov=1.5, x0=0.0, y0=0.0
+    return to_mesh(
+        build_magnification_map(
+            sis_lens_coarse, 8, 0.02, mu_min=4.0, fov=1.5, x0=0.0, y0=0.0
+        )
     )
 
 
@@ -351,7 +360,7 @@ def test_points_in_the_critical_band_images_are_infinitely_magnified(fold_mesh):
     triangles, _ = band_cover(fold_mesh)
     assert triangles.shape[0] > 0
     source = fold_mesh.critical_band.source
-    centroid = backend.sum(source[triangles], dim=1) / 3.0
+    centroid = mesh_backend.sum(source[triangles], dim=1) / 3.0
     mu, _ = total_mu(fold_mesh, centroid)
     assert np.isposinf(to_np(mu)).all()
 
@@ -415,7 +424,7 @@ def test_the_corner_diagonal_of_a_one_cell_mesh_is_not_a_fov_edge():
     mesh = build_lens_mesh(
         _half_but_nan_top_left, _half_but_nan_top_left_jacobian, 2.0, 1, 6.0
     )
-    segments, on_fov = sheet_edges(mesh)
+    segments, on_fov = sheet_edges(to_mesh(mesh))
     src, fov = to_np(segments), to_np(on_fov)
     diagonal = np.isclose(src[:, 0, 0], src[:, 0, 1]) & np.isclose(
         src[:, 1, 0], src[:, 1, 1]
@@ -524,7 +533,7 @@ def test_a_hit_reads_the_same_magnification_in_a_call_of_any_size(fold_mesh):
     bary = rng.dirichlet(np.ones(3), 5000)
 
     def hits(lo, hi):
-        idx = backend.as_array(leaves[lo:hi], dtype=backend.int64)
+        idx = mesh_backend.as_array(leaves[lo:hi], dtype=mesh_backend.int64)
         return to_np(hit_magnification(fold_mesh, idx, _arr(bary[lo:hi])))
 
     full = hits(0, 5000)
@@ -609,7 +618,7 @@ def test_the_sis_total_magnification_is_accurate_to_a_fraction_of_a_per_cent(
     r = np.sqrt(rng.uniform(0.05**2, 0.9**2, 4000))
     a = rng.uniform(0.0, 2.0 * np.pi, 4000)
     beta = np.stack([r * np.cos(a), r * np.sin(a)], axis=1)
-    mu, n = total_mu(sis_lens, backend.as_array(beta))
+    mu, n = total_mu(sis_lens, mesh_backend.as_array(beta))
     two = to_np(n) == 2
     assert two.mean() > 0.95
     err = np.abs(to_np(mu)[two] * r[two] / 2.0 - 1.0)
@@ -730,7 +739,7 @@ def test_segment_cells_flag_every_cell_a_segment_touches_and_no_far_one():
 
 def test_segment_cells_of_no_segment_or_of_segments_outside_the_grid_are_empty():
     lo = _arr([0.0, 0.0])
-    empty = backend.zeros((0, 2), dtype=backend.float64)
+    empty = mesh_backend.zeros((0, 2), dtype=mesh_backend.float64)
     assert segment_cells(empty, empty, lo, 0.1, 10, 1e-9).shape[0] == 0
     a, b = _arr([[5.0, 5.0], [-3.0, 0.5]]), _arr([[6.0, 5.5], [-2.0, 0.6]])
     assert segment_cells(a, b, lo, 0.1, 10, 1e-9).shape[0] == 0
@@ -752,7 +761,7 @@ def test_every_lattice_triangle_is_half_of_its_level_cell():
         assert (pts[..., 1] <= ((cj + 1) * side)[:, None]).all()
         e1, e2 = pts[:, 1] - pts[:, 0], pts[:, 2] - pts[:, 0]
         assert (e1[:, 0] * e2[:, 1] - e1[:, 1] * e2[:, 0] == side * side).all()
-        six = backend.concatenate((ij, midpoint_ij(ij)), dim=1)
+        six = mesh_backend.concatenate((ij, midpoint_ij(ij)), dim=1)
         ij = six[:, _CHILD_VERTEX_INDEX_TABLE].reshape(-1, 3, 2)
 
 
@@ -798,7 +807,7 @@ def test_no_leaf_below_the_floor_is_touched_by_a_band_edge(fold_lens, fold_mag):
     level = leaf_levels(fold_mag)
     ij = fold_mag.vertices_ij[fold_mag.leaves]
     for d in sorted(set(level.tolist()) - {fold_mag.lattice.level - 1}):
-        at = backend.as_array(np.flatnonzero(level == d), dtype=backend.int64)
+        at = mesh_backend.as_array(np.flatnonzero(level == d), dtype=mesh_backend.int64)
         cells = to_np(level_cells(fold_mag.lattice, inner, 0.0, d))
         own = to_np(triangle_cells(fold_mag.lattice, ij[at], d))
         assert not np.isin(own, cells).any()
@@ -878,8 +887,8 @@ def test_in_magnified_region_reads_a_scalar_point_and_empty_points(sis_mag_coars
 
 def test_split_mask_splits_where_a_target_is_straddled_or_a_cell_touched():
     mu6 = f64([[1, 1, 1, 1, 1, 1], [1, 1, 5, 1, 3, 3]])
-    none = backend.zeros((2,), dtype=backend.bool)
-    every = backend.ones((2,), dtype=backend.bool)
+    none = mesh_backend.zeros((2,), dtype=mesh_backend.bool)
+    every = mesh_backend.ones((2,), dtype=mesh_backend.bool)
     assert to_np(split_mask(mu6, none, (4.0,), None)).tolist() == [False, True]
     assert to_np(split_mask(mu6, every, (), None)).tolist() == [True, True]
 
@@ -888,5 +897,5 @@ def test_split_mask_splits_on_a_log_deviation_and_on_nan():
     mu6 = f64(
         [[1, 1, 1, 1, 1, 1], [1, 1, 1, 9, 1, 1], [np.inf, np.inf, 1, 1, 1, np.inf]]
     )
-    none = backend.zeros((3,), dtype=backend.bool)
+    none = mesh_backend.zeros((3,), dtype=mesh_backend.bool)
     assert to_np(split_mask(mu6, none, (), 0.1)).tolist() == [False, True, True]
