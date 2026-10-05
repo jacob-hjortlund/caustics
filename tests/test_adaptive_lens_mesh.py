@@ -42,6 +42,7 @@ from caustics.lenses.func.adaptive.lattice import (
 )
 from caustics.lenses.func.adaptive.curves import critical_curves_and_caustics
 from caustics.lenses.func.adaptive.lens_mesh import (
+    _fov_boundary,
     _freeze,
     _seed,
     build_closed_lens_mesh,
@@ -1040,6 +1041,27 @@ def sis(c, b):
     return fn, jac
 
 
+def point_mass(c, b):
+    """A point mass of Einstein radius ``b`` at ``c``, and its Jacobian."""
+    c = np.asarray(c, dtype=np.float64)
+
+    def fn(p):
+        d = p - c
+        return p - b * b * d / np.sum(d * d, axis=1)[:, None]
+
+    def jac(p):
+        d = p - c
+        r2 = np.sum(d * d, axis=1)
+        k = 2.0 * b * b / r2**2
+        J = np.empty((p.shape[0], 2, 2))
+        J[:, 0, 0] = 1.0 - b * b / r2 + k * d[:, 0] ** 2
+        J[:, 0, 1] = J[:, 1, 0] = k * d[:, 0] * d[:, 1]
+        J[:, 1, 1] = 1.0 - b * b / r2 + k * d[:, 1] ** 2
+        return J
+
+    return fn, jac
+
+
 # An SIS whose tangential curve, radius 0.6 about C_IN, lies inside [-1, 1]**2.
 C_IN = (0.3001, -0.2003)
 
@@ -1483,6 +1505,27 @@ def fov_and_init_res(mesh):
     return lattice_fov(mesh.lattice), lattice_init_res(mesh.lattice)
 
 
+def test_the_fov_boundary_runs_counter_clockwise_along_leaf_edges_through_every_edge_vertex():
+    """`edge_bump` refines the right side alone, so the sides hold unequal numbers of vertices."""
+    mesh, _, _ = xbuild(edge_bump, edge_bump_jacobian, 4.0, 4, 0.05)
+    order = to_np(_fov_boundary(mesh))
+    xy = to_np(mesh.vertices_lens)
+    on_edge = np.flatnonzero((np.abs(xy[:, 0]) == 2.0) | (np.abs(xy[:, 1]) == 2.0))
+    assert (xy[on_edge, 0] == 2.0).sum() > (xy[on_edge, 0] == -2.0).sum()
+    assert sorted(order.tolist()) == on_edge.tolist()
+    leaves = to_np(mesh.leaves)
+    edges = {
+        (min(a, b), max(a, b))
+        for t in leaves.tolist()
+        for a, b in ((t[0], t[1]), (t[1], t[2]), (t[2], t[0]))
+    }
+    steps = zip(order.tolist(), np.roll(order, -1).tolist())
+    assert all((min(a, b), max(a, b)) in edges for a, b in steps)
+    x, y = xy[order, 0], xy[order, 1]
+    area = 0.5 * np.sum(x * np.roll(y, -1) - np.roll(x, -1) * y)
+    assert area == 16.0
+
+
 def test_a_curve_the_fov_cuts_is_grown_until_it_closes():
     """The tangential curve, radius ~1.18, crosses every side of the fov-2 domain.
     With ``h0 = 0.125`` and ``growth = 1.05`` each step adds one cell a side:
@@ -1597,14 +1640,60 @@ def test_a_hole_across_the_fov_edge_widens_it(edge):
 
 
 def test_holes_inside_the_fov_leave_it_alone():
-    """The hole at x = 0.9601 reaches 0.9851 with the build's halved radius 0.025: inside."""
-    fn, jac = sis(C_IN, 0.6)
+    """The hole at x = 0.9601 reaches 0.9851 with the build's halved radius 0.025: inside.
+    The SIS's boundary image stays 0.3999 or more from ``C_IN``, clear of its
+    hole curve, the circle of radius ``0.3 - 0.025``."""
+    fn, jac = sis(C_IN, 0.3)
     centers = [C_IN, (0.9601, 0.2003)]
     mesh, curves, messages, _, _ = closed_build(fn, jac, 2.0, 4, 0.05, centers=centers)
     assert messages == []
     assert to_np(curves.closed).all()
     want, _, _ = xbuild(fn, jac, 2.0, 4, 0.05, centers=centers)
     assert_same(mesh, want)
+
+
+def test_a_boundary_image_across_a_pseudo_caustic_grows_the_fov():
+    """The SIS maps a point ``d`` from ``C_IN`` to ``d - 0.4`` from it, and its hole
+    curve is the circle of radius ``0.4 - 0.025``. At fov 2 the critical curve,
+    radius 0.4, is closed, but the right side's image comes within 0.2999 of
+    ``C_IN`` and the far corner's lies 1.369 from it; at fov 3 the nearest is 0.7999."""
+    fn, jac = sis(C_IN, 0.4)
+    kw = dict(fov=2.0, init_res=4, min_img_sep=0.05, centers=[C_IN])
+    mesh, curves, messages, _, _ = closed_build(fn, jac, **kw)
+    assert fov_and_init_res(mesh) == (3.0, 6)
+    assert curves.closed.shape[0] > 0 and to_np(curves.closed).all()
+    assert messages == []
+    start, lens_, _ = xbuild(fn, jac, **kw)
+    assert_same(
+        mesh, extend_lens_mesh(start, lens_.raytrace, lens_.jacobian_lens_equation, 3.0)
+    )
+
+
+def test_the_crossing_test_finds_the_crossing_one_hole_segment_at_a_time(monkeypatch):
+    monkeypatch.setattr("caustics.lenses.func.adaptive.lens_mesh.CROSSING_PAIRS", 1)
+    fn, jac = sis(C_IN, 0.4)
+    mesh, _, _, _, _ = closed_build(fn, jac, 2.0, 4, 0.05, centers=[C_IN])
+    assert fov_and_init_res(mesh) == (3.0, 6)
+
+
+def test_a_hole_curve_that_is_no_pseudo_caustic_grows_nothing():
+    """A point mass's hole curve, a loop of radius ``0.15**2 / 0.025 - 0.025 = 0.875``
+    about ``C_IN``, crosses the boundary's image, which runs from 0.668 to 1.756
+    from it; its growth is -1, so it is no pseudo-caustic."""
+    fn, jac = point_mass(C_IN, 0.15)
+    mesh, _, messages, _, _ = closed_build(fn, jac, 2.0, 4, 0.05, centers=[C_IN])
+    assert not to_np(mesh.holes.pseudo_caustic).any()
+    assert fov_and_init_res(mesh) == (2.0, 4)
+    assert messages == []
+
+
+def test_running_out_of_iterations_with_a_pseudo_caustic_crossed_warns():
+    fn, jac = sis(C_IN, 0.4)
+    mesh, _, messages, _, _ = closed_build(
+        fn, jac, 2.0, 4, 0.05, centers=[C_IN], max_iters=0
+    )
+    assert fov_and_init_res(mesh) == (2.0, 4)
+    assert len(messages) == 1 and "pseudo-caustic" in messages[0]
 
 
 def test_a_closed_build_warns_at_the_callers_line():

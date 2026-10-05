@@ -6,7 +6,8 @@ model of the lens map is accurate to ``min_img_sep`` and no critical curve
 runs between its samples (:func:`~.criterion.lens_status`), down to a size
 floor. :func:`extend_lens_mesh` grows a mesh to a larger fov, reusing every
 lens evaluation, and :func:`build_closed_lens_mesh` grows it until the fov
-cuts no critical curve.
+cuts no critical curve and the image of its boundary crosses no
+pseudo-caustic.
 """
 
 import math
@@ -15,7 +16,7 @@ from warnings import warn
 
 from ....backend_obj import ArrayLike, backend
 from .mesh_backend import mesh_backend, to_mesh, to_user
-from .geometry import ROOT_CLASS, build_device, is_member, to_device
+from .geometry import ROOT_CLASS, build_device, is_member, segments_cross, to_device
 from .lattice import (
     Lattice,
     check_lattice_keys,
@@ -49,6 +50,9 @@ from .criterion import LEAF_CONVERGED, lens_status
 from .band import CriticalBand, build_band, in_band
 from .holes import CenterHoles, merge_centers, sample_holes
 from .curves import _critical_curves_and_caustics
+
+# Most segment pairs the closed build's crossing test holds at once.
+CROSSING_PAIRS = 1 << 18
 
 
 class LensMesh(NamedTuple):
@@ -559,6 +563,89 @@ def _hole_rings(fov, init_res, x0, y0, centers, min_img_sep):
     return math.floor(excess / (fov / init_res)) + 1, outside
 
 
+def _fov_boundary(mesh):
+    """
+    The vertices on ``mesh``'s fov boundary, counter-clockwise from its lower-left corner.
+
+    Exact: they are the vertices at the extreme lattice coordinates, ordered
+    by their integer distance along the perimeter, each corner on the side it
+    starts. The mesh is conforming, so each is joined to the next by a leaf
+    edge, and the last to the first.
+
+    Returns
+    -------
+    ArrayLike
+        ``(N,)`` int64 vertex indices.
+    """
+    ij = mesh.vertices_ij - mesh_backend.min(mesh.vertices_ij, dim=0)
+    i, j = ij[:, 0], ij[:, 1]
+    w, h = mesh_backend.max(i), mesh_backend.max(j)
+    where = mesh_backend.where
+    t = where(
+        (j == 0) & (i < w),
+        i,
+        where(
+            (i == w) & (j < h),
+            w + j,
+            where(
+                (j == h) & (i > 0),
+                2 * w + h - i,
+                where((i == 0) & (j > 0), 2 * (w + h) - j, -1),
+            ),
+        ),
+    )
+    on = mesh_backend.flatnonzero(t >= 0)
+    return on[mesh_backend.argsort(t[on])]
+
+
+def _pseudo_caustics_crossed(mesh):
+    """
+    How many pseudo-caustics the image of ``mesh``'s fov boundary crosses.
+
+    The boundary's image is the closed polyline through the images of
+    :func:`_fov_boundary`'s vertices, the mesh's own, affine on each leaf. A
+    pseudo-caustic is the hole curve of a hole whose ``pseudo_caustic`` is
+    True, closed through its wrap-around chord: the true pseudo-caustic to
+    within about the hole's radius. Boundary segments outside a hole curve's
+    bounding box cannot cross it; the rest are tested against it
+    (:func:`~.geometry.segments_cross`), at most :data:`CROSSING_PAIRS`
+    pairs at a time, until one crosses. A segment with a NaN end crosses
+    nothing: every comparison on it fails.
+    """
+    holes = mesh.holes
+    pseudo = mesh_backend.to_numpy(mesh_backend.flatnonzero(holes.pseudo_caustic))
+    if pseudo.shape[0] == 0:
+        return 0
+    b0 = mesh.vertices_source[_fov_boundary(mesh)]
+    b1 = mesh_backend.roll(b0, -1, 0)
+    lo_b, hi_b = mesh_backend.minimum(b0, b1), mesh_backend.maximum(b0, b1)
+    offsets = mesh_backend.to_numpy(holes.offsets).tolist()
+    crossed = 0
+    for h in pseudo.tolist():
+        c0 = holes.source[offsets[h] : offsets[h + 1]]
+        c1 = mesh_backend.roll(c0, -1, 0)
+        lo, hi = mesh_backend.min(c0, dim=0), mesh_backend.max(c0, dim=0)
+        near = mesh_backend.flatnonzero(
+            mesh_backend.all((lo_b <= hi) & (hi_b >= lo), dim=1)
+        )
+        if near.shape[0] == 0:
+            continue
+        n0 = mesh_backend.unsqueeze(b0[near], 0)
+        n1 = mesh_backend.unsqueeze(b1[near], 0)
+        step = max(1, CROSSING_PAIRS // near.shape[0])
+        for s in range(0, c0.shape[0], step):
+            hit = segments_cross(
+                mesh_backend.unsqueeze(c0[s : s + step], 1),
+                mesh_backend.unsqueeze(c1[s : s + step], 1),
+                n0,
+                n1,
+            )
+            if bool(mesh_backend.any(hit)):
+                crossed += 1
+                break
+    return crossed
+
+
 def _curves_cut_by_fov(mesh, curves):
     """
     How many open curves have an end on ``mesh``'s fov boundary.
@@ -602,16 +689,24 @@ def build_closed_lens_mesh(
     batch_size=None,
 ):
     """
-    Build a lens mesh, then grow its fov until it cuts no critical curve.
+    Build a lens mesh, then grow its fov until it cuts no critical curve and its boundary's image crosses no pseudo-caustic.
 
     When a hole around one of ``centers`` does not lie strictly inside
     ``fov``, the fov is first widened by the fewest whole level-0 cells
     that take every hole inside, with a warning. After the build, while an
-    open curve ends on the fov boundary and fewer than ``max_iters``
+    open curve ends on the fov boundary or the source-plane image of the
+    boundary crosses a pseudo-caustic, and fewer than ``max_iters``
     extensions have run, :func:`extend_lens_mesh` grows the fov by
-    ``growth``, rounded up to whole cells, and the curves are traced again.
+    ``growth``, rounded up to whole cells, and both are checked again.
     A curve ending inside the fov -- next to a non-finite leaf, at an
     unjoined hole, or where ``max_depth`` bound -- grows nothing.
+
+    The pseudo-caustics are the hole curves of the holes whose
+    ``pseudo_caustic`` is True, so only ``centers`` can give one. A source
+    inside an isothermal center's pseudo-caustic has an image far out from
+    it; while the boundary's image crosses the pseudo-caustic, some of those
+    images lie outside the fov. A hole curve that is no pseudo-caustic, such
+    as a point mass's loop, grows nothing.
 
     Parameters
     ----------
@@ -687,9 +782,9 @@ def _build_closed_lens_mesh(
         batch_size=batch_size,
     )
     curves = _critical_curves_and_caustics(mesh)
-    cut = _curves_cut_by_fov(mesh, curves)
+    cut, crossed = _curves_cut_by_fov(mesh, curves), _pseudo_caustics_crossed(mesh)
     for _ in range(max_iters):
-        if cut == 0:
+        if cut == 0 and crossed == 0:
             break
         mesh = _extend_lens_mesh(
             mesh,
@@ -700,12 +795,20 @@ def _build_closed_lens_mesh(
             batch_size=batch_size,
         )
         curves = _critical_curves_and_caustics(mesh)
-        cut = _curves_cut_by_fov(mesh, curves)
-    if cut:
+        cut, crossed = _curves_cut_by_fov(mesh, curves), _pseudo_caustics_crossed(mesh)
+    if cut or crossed:
+        why = []
+        if cut:
+            why.append(f"the fov still cuts {cut} critical curve(s)")
+        if crossed:
+            why.append(
+                f"the image of its boundary still crosses {crossed} pseudo-caustic(s)"
+            )
+        what = " and ".join(why)
         warn(
-            f"The fov still cuts {cut} critical curve(s) after {max_iters} "
-            f"extension(s), at fov={lattice_fov(mesh.lattice):g}; raise max_iters "
-            "or growth to grow it further.",
+            f"{what[0].upper()}{what[1:]} after {max_iters} extension(s), at "
+            f"fov={lattice_fov(mesh.lattice):g}; raise max_iters or growth to grow "
+            "it further.",
             stacklevel=3,
         )
     return mesh, curves

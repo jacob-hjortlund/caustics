@@ -26,6 +26,7 @@ from caustics.lenses.func.adaptive.geometry import (
     is_member,
     min_angle,
     sanitize_bary,
+    segments_cross,
     shape_matrix,
     sigma_min_2x2,
     to_device,
@@ -351,6 +352,40 @@ def test_shared_edge_weights_are_exactly_negated():
     # left's weight opposite vertex 0 uses the (1, 2) edge; right's opposite
     # vertex 3 uses (2, 1). They must be bit-exact negatives.
     assert wl[0, 0] == -wr[0, 1]
+
+
+# Pairs of segments, ((a0, a1), (b0, b1)), and whether they meet.
+SEGMENT_PAIRS = [
+    pytest.param(((0, 0), (2, 2)), ((0, 2), (2, 0)), True, id="proper-crossing"),
+    pytest.param(((0, 0), (1, 0)), ((2, -1), (2, 1)), False, id="short-of-the-line"),
+    pytest.param(((0, 0), (1, 0)), ((1, 0), (1, 1)), True, id="shared-end"),
+    pytest.param(((0, 0), (2, 0)), ((1, 0), (1, 1)), True, id="end-on-interior"),
+    pytest.param(((0, 0), (1, 0)), ((0, 1), (1, 1)), False, id="parallel"),
+    pytest.param(((0, 0), (2, 0)), ((1, 0), (3, 0)), True, id="collinear-overlap"),
+    pytest.param(((0, 0), (1, 0)), ((2, 0), (3, 0)), False, id="collinear-apart"),
+]
+
+
+@pytest.mark.parametrize("a, b, want", SEGMENT_PAIRS)
+def test_segments_cross_counts_a_touch_and_nothing_apart(a, b, want):
+    """Either segment, either way round, gives the same answer."""
+    cases = [(a, b), (a[::-1], b), (b, a), (b[::-1], a[::-1])]
+    a0, a1, b0, b1 = (_arr([c[k][e] for c in cases]) for k in (0, 1) for e in (0, 1))
+    assert to_np(segments_cross(a0, a1, b0, b1)).tolist() == [want] * 4
+
+
+def test_segments_cross_broadcasts_to_a_table_of_every_pair():
+    a = np.array([[[0, 0], [2, 2]], [[0, 0], [1, 0]]], dtype=np.float64)
+    b = np.array(
+        [[[0, 2], [2, 0]], [[1, 0], [1, 1]], [[5, 5], [6, 6]]], dtype=np.float64
+    )
+    got = segments_cross(
+        _arr(a[:, None, 0]),
+        _arr(a[:, None, 1]),
+        _arr(b[None, :, 0]),
+        _arr(b[None, :, 1]),
+    )
+    assert to_np(got).tolist() == [[True, True, False], [False, True, False]]
 
 
 def test_sanitize_bary_is_always_in_the_simplex():

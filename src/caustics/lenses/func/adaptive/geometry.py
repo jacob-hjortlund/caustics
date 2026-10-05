@@ -3,8 +3,9 @@ Triangle maths shared by both meshes, and small array helpers.
 
 The red-refinement child ordering and its integer group tables, the smallest
 singular value that scales the lens criterion, the minimum angle closure
-compares, and the containment test and barycentric coordinates every
-source-plane lookup reads. Nothing here calls the lens or knows about a mesh.
+compares, the containment test and barycentric coordinates every
+source-plane lookup reads, and the segment crossing test. Nothing here calls
+the lens or knows about a mesh.
 """
 
 from .mesh_backend import map_arrays, mesh_backend
@@ -296,6 +297,43 @@ def contains(w):
     nonneg = (w[..., 0] >= 0) & (w[..., 1] >= 0) & (w[..., 2] >= 0)
     nonpos = (w[..., 0] <= 0) & (w[..., 1] <= 0) & (w[..., 2] <= 0)
     return nonneg | nonpos
+
+
+def _side(p, q, r):
+    """Sign of the cross product ``(q - p) x (r - p)``: which side of ``p -> q`` each ``r`` is on."""
+    d, e = q - p, r - p
+    return mesh_backend.sign(d[..., 0] * e[..., 1] - d[..., 1] * e[..., 0])
+
+
+def segments_cross(a0, a1, b0, b1):
+    """
+    Whether segment ``a0 a1`` meets segment ``b0 b1``, touches counting.
+
+    Each segment's ends lie on opposite sides of the other's line, or on it,
+    and the two bounding boxes overlap -- which rejects collinear segments
+    that do not. Signs are multiplied, never the cross products, so nothing
+    underflows.
+
+    Parameters
+    ----------
+    a0, a1, b0, b1: ArrayLike
+        ``(..., 2)`` segment ends, broadcast against each other: ``(P, 1, 2)``
+        ends against ``(1, Q, 2)`` give every pair.
+
+        *Unit: arcsec*
+
+    Returns
+    -------
+    ArrayLike
+        bool, the broadcast shape without its last axis.
+    """
+    straddle = (_side(a0, a1, b0) * _side(a0, a1, b1) <= 0) & (
+        _side(b0, b1, a0) * _side(b0, b1, a1) <= 0
+    )
+    lo_a, hi_a = mesh_backend.minimum(a0, a1), mesh_backend.maximum(a0, a1)
+    lo_b, hi_b = mesh_backend.minimum(b0, b1), mesh_backend.maximum(b0, b1)
+    overlap = mesh_backend.all((lo_a <= hi_b) & (lo_b <= hi_a), dim=-1)
+    return straddle & overlap
 
 
 def sanitize_bary(w, d):
