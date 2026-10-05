@@ -207,16 +207,6 @@ def lattice_xy(lat, ij):
     )
 
 
-def lattice_on_boundary(lat, ij):
-    """True where the point lies on the edge of the domain."""
-    return (
-        (ij[..., 0] == 0)
-        | (ij[..., 0] == lat.n)
-        | (ij[..., 1] == 0)
-        | (ij[..., 1] == lat.n)
-    )
-
-
 def initial_triangles(init_res, lattice_level, root_class):
     """
     Level-0 triangles: two per cell, split on the ``(0,0)-(1,1)`` diagonal.

@@ -8,7 +8,6 @@ import pytest
 
 from adaptive_maps import (
     assert_same,
-    f64,
     numpy_lens,
     sie_like,
     sie_like_jacobian,
@@ -20,14 +19,9 @@ from caustics.backend_obj import backend
 from caustics.lenses.func.adaptive import (
     build_closed_lens_mesh,
     build_lens_mesh,
-    build_magnification_map,
     critical_curves_and_caustics,
     extend_lens_mesh,
     forward_raytrace,
-    in_magnified_region,
-    magnified_area,
-    magnified_regions,
-    total_magnification,
 )
 from caustics.lenses.func.adaptive.mesh_backend import (
     TorchMeshBackend,
@@ -101,7 +95,6 @@ def test_every_public_function_returns_the_users_arrays():
     mesh = build_lens_mesh(_cored, _cored_jacobian, 4.0, 8, 0.1)
     bx = backend.as_array([0.05, 0.3], dtype=backend.float64)
     by = backend.as_array([0.02, -0.1], dtype=backend.float64)
-    mag = build_magnification_map(mesh, 8, 0.1, mu_min=3.0)
     affine = build_lens_mesh(
         lambda x, y: (0.7 * x, 0.9 * y),
         lambda x, y: stack_2x2(
@@ -116,17 +109,10 @@ def test_every_public_function_returns_the_users_arrays():
         critical_curves_and_caustics(mesh),
         critical_curves_and_caustics(affine),
         forward_raytrace(bx, by, _cored, mesh),
-        total_magnification(bx, by, mesh),
-        mag,
-        magnified_regions(mag, 3.0),
-        magnified_area(mag, 3.0),
-        in_magnified_region(bx, by, mag, 3.0),
     ]
     for value in results:
         for a in _arrays(value):
             assert isinstance(a, backend.array_type), type(a)
-    area, complete = magnified_area(mag, 3.0)
-    assert tuple(area.shape) == () and tuple(complete.shape) == ()
     assert to_np(critical_curves_and_caustics(affine).lens).shape == (0, 2)
 
 
@@ -143,11 +129,6 @@ def test_public_functions_take_numpy_sources_and_list_centers_alike():
     mesh = build_lens_mesh(
         lens_.raytrace, lens_.jacobian_lens_equation, 4.0, 4, 0.1, centers=[(0.0, 0.0)]
     )
-    xs, ys = np.array([0.1, 0.25]), np.array([0.0, -0.1])
-    mu_np, n_np = total_magnification(xs, ys, mesh)
-    mu_b, n_b = total_magnification(f64(xs), f64(ys), mesh)
-    np.testing.assert_array_equal(to_np(mu_np), to_np(mu_b))
-    np.testing.assert_array_equal(to_np(n_np), to_np(n_b))
     assert to_np(mesh.holes.centers).shape == (1, 2)
 
 
@@ -214,16 +195,7 @@ def test_scalars_of_the_users_backend_build_what_plain_floats_do():
         closed, _ = build_closed_lens_mesh(
             *args, number(0.1), growth=number(1.5), max_iters=1, **kw
         )
-        mag = build_magnification_map(
-            mesh,
-            4,
-            number(0.1),
-            rtol=number(0.5),
-            fov=number(1.0),
-            x0=number(0.0),
-            y0=number(0.0),
-        )
-        return mesh, closed, mag
+        return mesh, closed
 
     for got, want in zip(built(scalar), built(float)):
         assert_same(got, want)

@@ -42,7 +42,6 @@ from caustics.lenses.func.adaptive.lattice import (
     lattice_ij_from_key,
     lattice_init_res,
     lattice_key,
-    lattice_on_boundary,
     lattice_xy,
     make_lattice,
     midpoint_ij,
@@ -416,11 +415,6 @@ def test_lattice_key_roundtrip_and_geometry():
     assert to_np(lattice_ij_from_key(lat, key)).tolist() == ij_np.tolist()
     assert np.allclose(to_np(lattice_xy(lat, ij[0])), [-2.0, -2.0])
     assert np.allclose(to_np(lattice_xy(lat, ij[1])), [2.0, 2.0])
-    assert to_np(lattice_on_boundary(lat, ij)).tolist() == [
-        True,
-        True,
-        False,
-    ]
 
 
 def test_widening_the_lattice_does_not_move_any_vertex():

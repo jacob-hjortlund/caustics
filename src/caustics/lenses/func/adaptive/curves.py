@@ -275,8 +275,7 @@ def chain_segments(start, end, n_samples):
 
     Each distinct edge is one node, keyed by its sample pair; each segment
     links its starting node to its ending one; :func:`chain_order` orders
-    the result. Shared by :func:`trace_band` and
-    :func:`~caustics.lenses.func.adaptive.regions.magnified_regions`.
+    the result. Used by :func:`trace_band`.
 
     Parameters
     ----------

@@ -51,14 +51,6 @@ from .lens_mesh import (
     extend_lens_mesh,
 )
 from .images import forward_raytrace
-from .magnification import total_magnification
-from .magnification_map import MagnificationMap, build_magnification_map
-from .regions import (
-    MagnifiedRegions,
-    in_magnified_region,
-    magnified_area,
-    magnified_regions,
-)
 
 __all__ = (
     "build_lens_mesh",
@@ -66,17 +58,10 @@ __all__ = (
     "build_closed_lens_mesh",
     "forward_raytrace",
     "critical_curves_and_caustics",
-    "total_magnification",
-    "build_magnification_map",
-    "magnified_regions",
-    "magnified_area",
-    "in_magnified_region",
     "LensMesh",
     "CriticalBand",
     "CenterHoles",
     "CriticalCurvesAndCaustics",
-    "MagnificationMap",
-    "MagnifiedRegions",
     "LEAF_CONVERGED",
     "LEAF_CONVERGENCE_FAILED",
     "LEAF_APPROX_PARITY_UNRESOLVED",
