@@ -11,6 +11,7 @@ their seed and inside the fov, and merges near-coincident roots
 from ....backend_obj import backend
 from .mesh_backend import mesh_backend, to_mesh, to_user
 from ....utils import batch_lm
+from .criterion import affine_error
 from .geometry import (
     area2,
     contains,
@@ -100,6 +101,41 @@ def mesh_seeds(mesh, leaf_indices, bary):
     """
     tri = mesh.vertices_lens[mesh.leaves[leaf_indices]]
     return mesh_backend.sum(tri * mesh_backend.unsqueeze(bary, -1), dim=1)
+
+
+def near_seed(mesh, idx, seed, root):
+    """
+    True where each root lies in its seed's leaf, or within ``max(r, min_img_sep)`` of its seed.
+
+    ``r`` is the leaf's :func:`~.criterion.affine_error`, how far its affine
+    model's seed can lie from the image it approximates. On a converged leaf
+    it is below ``min_img_sep``, so the radius is ``min_img_sep``.
+
+    Parameters
+    ----------
+    mesh: LensMesh
+    idx: ArrayLike
+        ``(K,)`` int64 leaf of each seed.
+    seed, root: ArrayLike
+        ``(K, 2)`` seeds and the roots found from them.
+
+        *Unit: arcsec*
+
+    Returns
+    -------
+    ArrayLike
+        ``(K,)`` bool.
+    """
+    origin = mesh.leaf_origin[idx]
+    radius = mesh_backend.clamp(
+        affine_error(mesh.origin_deviation[origin], mesh.origin_sigma_min[origin]),
+        mesh.min_img_sep,
+        None,
+    )
+    tri = mesh.vertices_lens[mesh.leaves[idx]]
+    return contains(triangle_weights(tri, root)) | (
+        mesh_backend.sum((root - seed) ** 2, dim=-1) <= radius**2
+    )
 
 
 def dedup_block_group(points, rows, n_blocks, m, tol):
@@ -254,11 +290,7 @@ def _images(mesh, beta, raytrace, tol, lm_kwargs, device):
     root = mesh_backend.to(to_mesh(root), device=mesh_device)
     trace = make_sampler(raytrace, None, device)
     converged = mesh_backend.sum((trace(root) - target) ** 2, dim=-1) < tol * tol
-    tri = mesh.vertices_lens[mesh.leaves[idx]]
-    near = contains(triangle_weights(tri, root)) | (
-        mesh_backend.sum((root - seed) ** 2, dim=-1) <= mesh.min_img_sep**2
-    )
-    keep = converged & near
+    keep = converged & near_seed(mesh, idx, seed, root)
     kept = _block_sums(mesh_backend.long(keep), offsets)
     root = root[mesh_backend.flatnonzero(keep)]
     unique = dedup_representatives(root, kept, mesh.min_img_sep)
@@ -271,13 +303,16 @@ def forward_raytrace(
     """
     Lens-plane positions of every image of each source-plane point.
 
-    Each leaf whose source-plane image contains the point seeds
-    Levenberg-Marquardt (:func:`~caustics.utils.batch_lm`) with the point's
-    preimage under the leaf's affine map, accurate to ``min_img_sep``. A
-    root is kept when it maps to within ``residual_tol`` of the point and
-    lies in its seed's leaf or within ``min_img_sep`` of the seed: near a
-    fold, a small residual alone admits points far from any image. Kept
-    roots closer than ``min_img_sep`` are one image.
+    Each leaf with a finite raytrace and Jacobian whose source-plane
+    triangle contains the point, or, for a leaf that did not converge,
+    reaches it (:func:`mesh_query`), seeds Levenberg-Marquardt
+    (:func:`~caustics.utils.batch_lm`) with the preimage under the leaf's
+    affine map. A root is kept when it maps to within ``residual_tol`` of
+    the point and lies in its seed's leaf or within ``max(r, min_img_sep)``
+    of the seed, ``r`` the leaf's :func:`~.criterion.affine_error`
+    (:func:`near_seed`): near a fold, a small residual alone admits points
+    far from any image. Kept roots closer than ``min_img_sep`` are one
+    image.
 
     Parameters
     ----------

@@ -12,6 +12,7 @@ from caustics.lenses.func.adaptive.criterion import (
     LEAF_CONVERGED,
     LEAF_JACOBIAN_NONFINITE,
     LEAF_RAYTRACE_NONFINITE,
+    affine_error,
 )
 from caustics.lenses.func.adaptive.geometry import area2, contains, triangle_weights
 from caustics.lenses.func.adaptive.images import (
@@ -19,6 +20,7 @@ from caustics.lenses.func.adaptive.images import (
     forward_raytrace,
     mesh_query,
     mesh_seeds,
+    near_seed,
 )
 from caustics.lenses.func.adaptive.index import index_hits
 from caustics.lenses.func.adaptive.lens_mesh import build_lens_mesh, leaf_grow
@@ -30,6 +32,7 @@ from adaptive_maps import (
     affine_jacobian,
     build,
     f64,
+    i64,
     lens,
     localised_fold,
     localised_fold_jacobian,
@@ -397,7 +400,6 @@ def test_forward_raytrace_covers_every_sie_image(sie):
         assert worst < 1e-2, f"{sp}: uncovered image, worst distance {worst:.3e}"
 
 
-@pytest.mark.xfail(strict=True, reason="no seed near the center; fixed on this branch")
 def test_forward_raytrace_finds_every_sis_inner_image_beyond_min_img_sep():
     """Every inner image more than ``min_img_sep`` from the SIS center comes back.
 
@@ -424,9 +426,6 @@ def test_forward_raytrace_finds_every_sis_inner_image_beyond_min_img_sep():
     ), f"{len(missed)} of 600 inner images missed, at k = {np.round(k[missed], 3).tolist()[:10]}"
 
 
-@pytest.mark.xfail(
-    strict=True, reason="no seed in failing leaves; fixed on this branch"
-)
 def test_forward_raytrace_finds_every_sie_image_beyond_min_img_sep_of_a_critical_curve(
     sie,
 ):
@@ -926,3 +925,39 @@ def test_forward_raytrace_reads_a_scalar_source_and_empty_sources(mesh):
     assert x.shape == y.shape == (int(to_np(counts)[0]),)
     x, y, counts = forward_raytrace(f64([]), f64([]), _sie_like, mesh)
     assert x.shape == y.shape == (0,) and counts.shape == (0,)
+
+
+def test_near_seed_accepts_a_root_within_the_leaf_s_radius_and_rejects_one_beyond(mesh):
+    """The radius is ``max(r, min_img_sep)``: ``r`` on a failing leaf whose ``r``
+    is large, ``min_img_sep`` on a converged leaf. The roots lie outside their
+    leaves, so the leaf test cannot pass them."""
+    status = leaf_status(mesh)
+    sep = mesh.min_img_sep
+    r = to_np(affine_error(mesh.origin_deviation, mesh.origin_sigma_min))[
+        to_np(mesh.leaf_origin)
+    ]
+    lens_tri = to_np(mesh.vertices_lens)[to_np(mesh.leaves)]
+    diameter = np.linalg.norm(lens_tri - lens_tri[:, [1, 2, 0]], axis=-1).max(axis=1)
+    finite = (status & NONFINITE) == 0
+    wide = np.flatnonzero(
+        finite & (status != LEAF_CONVERGED) & np.isfinite(r) & (r > 2 * sep)
+    )
+    # NOTE: the brief's selector read `diameter < 0.5 * sep`. Under this module's
+    # BUILD (max_depth=6, fov=6, init_res=4) the finest achievable leaf diagonal
+    # is sqrt(2) * (fov / init_res) / 2**6 ~= 0.0331, strictly above 0.5 * sep ==
+    # 0.025 for every leaf in the mesh (converged or not) -- a geometric floor
+    # independent of near_seed. Loosened to `sep` (still well below the smallest
+    # converged leaf's reach from its centroid, so the geometry the assertions
+    # below rely on still holds; 1656 converged leaves satisfy it here).
+    tight = np.flatnonzero((status == LEAF_CONVERGED) & (diameter < sep))
+    assert wide.size and tight.size, "fixture must have both kinds of leaf"
+    chosen = np.concatenate((wide[:10], tight[:10]))
+    radius = np.maximum(r[chosen], sep)
+    seed = lens_tri[chosen].mean(axis=1)
+
+    def near(scale):
+        root = seed + (scale * radius)[:, None] * np.array([1.0, 0.0])
+        return to_np(near_seed(mesh, i64(chosen), f64(seed), f64(root)))
+
+    assert near(0.9).all()
+    assert not near(1.1).any()
