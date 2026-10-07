@@ -1,8 +1,9 @@
 """
 A uniform-grid spatial index over source-plane triangles, and lookups in it.
 
-A triangle is registered in every cell its bounding box covers, so one cell
-lookup per point finds every triangle that can contain it.
+A triangle is registered in every cell its bounding box covers, grown by
+how far the triangle reaches beyond itself, so one cell lookup per point
+finds every triangle that can contain it or reach it.
 """
 
 import math
@@ -10,7 +11,7 @@ from typing import NamedTuple
 
 from ....backend_obj import ArrayLike
 from .mesh_backend import mesh_backend
-from .geometry import contains, csr_offsets, triangle_weights
+from .geometry import contains, csr_offsets, edge_nearest, triangle_weights
 
 
 class MeshIndex(NamedTuple):
@@ -47,9 +48,9 @@ class MeshIndex(NamedTuple):
     cell_leaves: ArrayLike
 
 
-def build_index(vertices, triangles, rows):
+def build_index(vertices, triangles, rows, grow=None):
     """
-    The :class:`MeshIndex` over the bounding boxes of ``triangles[rows]``.
+    The :class:`MeshIndex` over the bounding boxes of ``triangles[rows]``, each grown by its ``grow``.
 
     Cells are sized from the mean triangle density, and the cell arithmetic
     is float64 so that it agrees exactly with :func:`index_hits`'.
@@ -64,6 +65,12 @@ def build_index(vertices, triangles, rows):
         ``(T, 3)`` int64 vertex indices.
     rows: ArrayLike
         ``(K,)`` int64 ascending rows of ``triangles`` to index.
+    grow: Optional[ArrayLike]
+        ``(K,)`` float64, how far each of ``triangles[rows]`` reaches beyond
+        itself: its bounding box is grown by it on every side. None grows
+        nothing.
+
+        *Unit: arcsec*
 
     Returns
     -------
@@ -82,8 +89,11 @@ def build_index(vertices, triangles, rows):
             cell_offsets=mesh_backend.zeros((2,), dtype=int64, device=device),
             cell_leaves=mesh_backend.zeros((0,), dtype=int64, device=device),
         )
-    flat = tri.reshape(-1, 2)
-    lo, hi = mesh_backend.min(flat, dim=0), mesh_backend.max(flat, dim=0)
+    box_lo, box_hi = mesh_backend.min(tri, dim=1), mesh_backend.max(tri, dim=1)
+    if grow is not None:
+        reach = mesh_backend.unsqueeze(mesh_backend.to(grow, dtype=f64), -1)
+        box_lo, box_hi = box_lo - reach, box_hi + reach
+    lo, hi = mesh_backend.min(box_lo, dim=0), mesh_backend.max(box_hi, dim=0)
     span = mesh_backend.where(hi > lo, hi - lo, 1.0)  # a degenerate axis is one cell
 
     span_np = mesh_backend.to_numpy(span)
@@ -95,12 +105,8 @@ def build_index(vertices, triangles, rows):
 
     upper = mesh_backend.as_array([nx - 1, ny - 1], dtype=int64, device=device)
     lower = mesh_backend.zeros((2,), dtype=int64, device=device)
-    i0 = mesh_backend.clamp(
-        mesh_backend.long((mesh_backend.min(tri, dim=1) - lo) / cell), lower, upper
-    )
-    i1 = mesh_backend.clamp(
-        mesh_backend.long((mesh_backend.max(tri, dim=1) - lo) / cell), lower, upper
-    )
+    i0 = mesh_backend.clamp(mesh_backend.long((box_lo - lo) / cell), lower, upper)
+    i1 = mesh_backend.clamp(mesh_backend.long((box_hi - lo) / cell), lower, upper)
     tall = i1[:, 1] - i0[:, 1] + 1
     counts = (i1[:, 0] - i0[:, 0] + 1) * tall
     owner = mesh_backend.repeat(
@@ -130,12 +136,15 @@ def build_index(vertices, triangles, rows):
     )
 
 
-def index_hits(index, vertices, triangles, beta):
+def index_hits(index, vertices, triangles, beta, grow=None):
     """
-    Triangles of ``index`` whose image contains each point, zeros counting as inside.
+    Triangles of ``index`` whose image contains each point, zeros counting as inside, or reaches it.
 
     One cell lookup per point, then :func:`~.geometry.contains` on that
-    cell's triangles. A point is tested against the stored ``hi``, never a
+    cell's triangles. With ``grow``, a triangle that does not contain the
+    point is a hit when the point lies within its ``grow`` of it
+    (:func:`~.geometry.edge_nearest`); the index must have been built with
+    the same ``grow``. A point is tested against the stored ``hi``, never a
     recomputed ``lo + cell * n``, so a point on the upper edge of the
     bounding box still finds the triangles registered in the last column.
 
@@ -151,6 +160,11 @@ def index_hits(index, vertices, triangles, beta):
         ``(T, 3)`` int64 vertex indices.
     beta: ArrayLike
         ``(B, 2)`` points.
+
+        *Unit: arcsec*
+    grow: Optional[ArrayLike]
+        ``(T,)`` float64, how far each triangle reaches beyond itself. None
+        reaches nothing.
 
         *Unit: arcsec*
 
@@ -195,8 +209,13 @@ def index_hits(index, vertices, triangles, beta):
         total, dtype=int64, device=device
     ) - mesh_backend.repeat(base, count, axis=0)
     cand = index.cell_leaves[start[qidx] + within]
-    w = triangle_weights(vertices[triangles[cand]], beta[qidx])
-    hit = mesh_backend.flatnonzero(contains(w))
+    tri = vertices[triangles[cand]]
+    w = triangle_weights(tri, beta[qidx])
+    hit = contains(w)
+    if grow is not None:
+        dist, _ = edge_nearest(tri, beta[qidx])
+        hit = hit | (dist <= grow[cand])
+    hit = mesh_backend.flatnonzero(hit)
     return qidx[hit], cand[hit], w[hit]
 
 

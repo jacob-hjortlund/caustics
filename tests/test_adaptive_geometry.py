@@ -34,7 +34,7 @@ from caustics.lenses.func.adaptive.geometry import (
     triangle_weights,
     winding_number,
 )
-from caustics.lenses.func.adaptive.index import as_points, build_index
+from caustics.lenses.func.adaptive.index import as_points, build_index, index_hits
 from caustics.lenses.func.adaptive.lattice import (
     check_lattice_keys,
     depth_floor,
@@ -52,7 +52,7 @@ from caustics.lenses.func.adaptive.lattice import (
     warn_depth_limited,
 )
 
-from adaptive_maps import f64, i64, to_np
+from adaptive_maps import assert_same, f64, i64, to_np
 
 RNG = np.random.default_rng(20260918)
 
@@ -837,3 +837,51 @@ def test_winding_number_of_a_nan_point_or_past_a_nan_vertex_is_zero():
     assert to_np(winding_number(f64(SQUARE), f64([[np.nan, 0.5]]))).tolist() == [0]
     broken = f64([[0.0, 0.0], [1.0, 0.0], [np.nan, np.nan], [0.0, 1.0]])
     assert to_np(winding_number(broken, f64([[0.5, 0.5]]))).tolist() == [0]
+
+
+def test_build_index_with_a_zero_grow_is_the_plain_index():
+    rng = np.random.default_rng(11)
+    vs = f64(rng.uniform(-1, 1, (90, 2)))
+    leaves = i64(np.arange(90).reshape(30, 3))
+    rows = i64(np.arange(30))
+    assert_same(
+        build_index(vs, leaves, rows, f64(np.zeros(30))), build_index(vs, leaves, rows)
+    )
+
+
+def test_build_index_registers_a_triangle_in_every_cell_its_grown_box_covers():
+    rng = np.random.default_rng(12)
+    corner = rng.uniform(-1, 1, (200, 2))
+    tri = corner[:, None, :] + 0.01 * np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])
+    grow = np.zeros(200)
+    grow[0] = 0.3
+    idx = build_index(
+        f64(tri.reshape(-1, 2)),
+        i64(np.arange(600).reshape(200, 3)),
+        i64(np.arange(200)),
+        f64(grow),
+    )
+    lo, cell = to_np(idx.lo), to_np(idx.cell)
+    offs, cells = to_np(idx.cell_offsets), to_np(idx.cell_leaves)
+    top = np.array([idx.nx - 1, idx.ny - 1])
+    i0 = np.clip(np.trunc((tri[0].min(axis=0) - 0.3 - lo) / cell), 0, top).astype(int)
+    i1 = np.clip(np.trunc((tri[0].max(axis=0) + 0.3 - lo) / cell), 0, top).astype(int)
+    assert (i1 - i0 >= 2).all(), "the grown box must span several cells"
+    for ix in range(i0[0], i1[0] + 1):
+        for iy in range(i0[1], i1[1] + 1):
+            c = ix * idx.ny + iy
+            assert 0 in cells[offs[c] : offs[c + 1]]
+
+
+def test_index_hits_with_grow_returns_a_point_within_grow_of_a_triangle_and_not_beyond():
+    vs = f64([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [5.0, 5.0], [6.0, 5.0], [5.0, 6.0]])
+    leaves = i64([[0, 1, 2], [3, 4, 5]])
+    grow = f64([0.2, 0.0])
+    idx = build_index(vs, leaves, i64([0, 1]), grow)
+    beta = f64([[0.5, -0.1], [0.5, -0.3], [0.25, 0.25], [5.5, 4.9]])
+    qidx, tri, w = index_hits(idx, vs, leaves, beta, grow)
+    assert list(zip(to_np(qidx).tolist(), to_np(tri).tolist())) == [(0, 0), (2, 0)]
+    expected = triangle_weights(vs[leaves[tri]], beta[qidx])
+    assert np.array_equal(to_np(w), to_np(expected))
+    plain_q, plain_t, _ = index_hits(idx, vs, leaves, beta)
+    assert list(zip(to_np(plain_q).tolist(), to_np(plain_t).tolist())) == [(2, 0)]
