@@ -21,7 +21,8 @@ from .geometry import (
 # reads its origin's status.
 #
 # - `LEAF_CONVERGENCE_FAILED`: a mapped midpoint strays from its affine
-#   prediction by more than `min_img_sep` allows.
+#   prediction by more than `min_img_sep` allows, carried to the source plane
+#   by the children's affine maps or by the Jacobian at the six samples.
 # - `LEAF_APPROX_PARITY_UNRESOLVED`: the four red-split children disagree on
 #   their orientation in the source plane.
 # - `LEAF_JACOBIAN_PARITY_UNRESOLVED`: `det A` changes sign between the six
@@ -85,7 +86,7 @@ def converged_from_deviation(r, s, min_img_sep):
         *Unit: arcsec*
 
     s: ArrayLike
-        Smallest singular value over the four children, shape ``(n,)``.
+        A smallest singular value per row, shape ``(n,)``.
     min_img_sep: float
         Lens-plane tolerance.
 
@@ -153,7 +154,36 @@ def parity_from_children(Q):
     return mesh_backend.all(sign_q == sign_q[:, :1], dim=1)
 
 
-def lens_status(beta6, det6, cls, level, h0, min_img_sep):
+def children_sigma_min(Q, cls, level, h0):
+    """
+    Smallest singular value over the four red-split children's affine maps, ``(n,)``.
+
+    A child's affine map is its ``Q_k`` times the inverse of its lens-plane
+    edge matrix: ``PINV0[COMPOSE[cls]]`` at unit size, scaled by
+    ``2**(level + 1) / h0``.
+
+    Parameters
+    ----------
+    Q: ArrayLike
+        Child edge matrices from :func:`child_shape_matrices`, shape
+        ``(n, 4, 2, 2)``.
+    cls: ArrayLike
+        ``(n,)`` int64 orientation classes.
+    level: ArrayLike
+        ``(n,)`` int64 refinement levels.
+    h0: float
+        Level-0 cell size.
+
+        *Unit: arcsec*
+    """
+    return (
+        mesh_backend.min(sigma_min_2x2(Q @ PINV0[COMPOSE[cls]]), dim=1)
+        * mesh_backend.to(2 ** (level + 1), dtype=mesh_backend.float64)
+        / h0
+    )
+
+
+def lens_status(beta6, det6, sigma6, cls, level, h0, min_img_sep):
     """
     Why each triangle's affine model of the lens map is not trusted, as a ``LEAF_*`` bitmask.
 
@@ -164,8 +194,9 @@ def lens_status(beta6, det6, cls, level, h0, min_img_sep):
     - the four red-split children's source-plane edge matrices share a
       sign of determinant (``LEAF_APPROX_PARITY_UNRESOLVED``);
     - every mapped midpoint lies within ``s * min_img_sep`` of its affine
-      prediction, ``s`` the smallest singular value of the children's
-      affine maps (``LEAF_CONVERGENCE_FAILED``);
+      prediction, both for ``s`` the smallest singular value of the
+      children's affine maps and for ``s`` the smallest ``sigma_min(A)`` at
+      the six samples (``LEAF_CONVERGENCE_FAILED``);
     - ``det A`` is finite and nonzero at all six samples
       (``LEAF_JACOBIAN_NONFINITE``) and of one sign
       (``LEAF_JACOBIAN_PARITY_UNRESOLVED``).
@@ -179,6 +210,8 @@ def lens_status(beta6, det6, cls, level, h0, min_img_sep):
         *Unit: arcsec*
     det6: ArrayLike
         ``(n, 6)`` ``det A`` at the same samples.
+    sigma6: ArrayLike
+        ``(n, 6)`` smallest singular value of ``A`` at the same samples.
     cls: ArrayLike
         ``(n,)`` int64 orientation classes.
     level: ArrayLike
@@ -199,13 +232,11 @@ def lens_status(beta6, det6, cls, level, h0, min_img_sep):
     """
     beta_v, beta_m = beta6[:, :3], beta6[:, 3:]
     Q = child_shape_matrices(beta_v, beta_m)
-    s = (
-        mesh_backend.min(sigma_min_2x2(Q @ PINV0[COMPOSE[cls]]), dim=1)
-        * mesh_backend.to(2 ** (level + 1), dtype=mesh_backend.float64)
-        / h0
-    )
+    deviation = midpoint_deviation(beta_v, beta_m)
     deviation_ok = converged_from_deviation(
-        midpoint_deviation(beta_v, beta_m), s, min_img_sep
+        deviation, children_sigma_min(Q, cls, level, h0), min_img_sep
+    ) & converged_from_deviation(
+        deviation, mesh_backend.min(sigma6, dim=1), min_img_sep
     )
     det_ok = mesh_backend.all(mesh_backend.isfinite(det6) & (det6 != 0), dim=1)
     one_sign = mesh_backend.all(det6 > 0, dim=1) | mesh_backend.all(det6 < 0, dim=1)

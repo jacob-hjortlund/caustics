@@ -32,10 +32,10 @@ class CriticalBand(NamedTuple):
     leaves: ArrayLike
         Shape ``(F,)`` int64 index into ``LensMesh.origin_leaves``.
     samples: ArrayLike
-        Shape ``(F, 6)`` int64 index into ``lens``, ``source`` and ``det``:
-        each leaf's ``theta_1, theta_2, theta_3, m_1, m_2, m_3``, the vertices
-        in the leaf's own order and ``m_i`` opposite ``theta_i``.
-        Samples are numbered in ascending lattice-key order.
+        Shape ``(F, 6)`` int64 index into ``lens``, ``source``, ``det`` and
+        ``sigma_min``: each leaf's ``theta_1, theta_2, theta_3, m_1, m_2,
+        m_3``, the vertices in the leaf's own order and ``m_i`` opposite
+        ``theta_i``. Samples are numbered in ascending lattice-key order.
     lens: ArrayLike
         Shape ``(S, 2)`` float64 lens-plane position of each sample.
 
@@ -46,6 +46,9 @@ class CriticalBand(NamedTuple):
         *Unit: arcsec*
     det: ArrayLike
         Shape ``(S,)`` float64 ``det A`` at each sample.
+    sigma_min: ArrayLike
+        Shape ``(S,)`` float64 smallest singular value of ``A`` at each
+        sample, which an extension's criterion reads.
     """
 
     leaves: ArrayLike
@@ -53,6 +56,7 @@ class CriticalBand(NamedTuple):
     lens: ArrayLike
     source: ArrayLike
     det: ArrayLike
+    sigma_min: ArrayLike
 
 
 def in_band(det6):
@@ -85,7 +89,7 @@ def build_band(lat, leaves, keys6, table_keys, table_values):
     table_keys: ArrayLike
         ``(T,)`` int64 ascending keys, holding every key of ``keys6``.
     table_values: ArrayLike
-        ``(T, 3)`` float64 ``(bx, by, det A)`` at ``table_keys``.
+        ``(T, 4)`` float64 ``(bx, by, det A, sigma_min A)`` at ``table_keys``.
 
     Returns
     -------
@@ -100,4 +104,5 @@ def build_band(lat, leaves, keys6, table_keys, table_values):
         lens=lattice_xy(lat, lattice_ij_from_key(lat, keys)),
         source=values[:, :2],
         det=values[:, 2],
+        sigma_min=values[:, 3],
     )

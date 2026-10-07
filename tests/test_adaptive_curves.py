@@ -59,6 +59,7 @@ def _band(samples, lens, det, source=None):
         lens=_arr(lens),
         source=_arr(lens if source is None else source),
         det=_arr(det),
+        sigma_min=_arr(np.ones(np.shape(det))),
     )
 
 

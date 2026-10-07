@@ -16,7 +16,14 @@ from warnings import warn
 
 from ....backend_obj import ArrayLike, backend
 from .mesh_backend import mesh_backend, to_mesh, to_user
-from .geometry import ROOT_CLASS, build_device, is_member, segments_cross, to_device
+from .geometry import (
+    ROOT_CLASS,
+    build_device,
+    is_member,
+    segments_cross,
+    sigma_min_2x2,
+    to_device,
+)
 from .lattice import (
     Lattice,
     check_lattice_keys,
@@ -85,6 +92,8 @@ class LensMesh(NamedTuple):
         *Unit: arcsec*
     vertices_det: ArrayLike
         ``(V,)`` ``det A`` of the lens Jacobian at each vertex.
+    vertices_sigma_min: ArrayLike
+        ``(V,)`` smallest singular value of the lens Jacobian at each vertex.
     leaves: ArrayLike
         ``(L, 3)`` int64 vertex indices of the closed, conforming leaves,
         positively oriented in the lens plane.
@@ -118,6 +127,7 @@ class LensMesh(NamedTuple):
     vertices_lens: ArrayLike
     vertices_source: ArrayLike
     vertices_det: ArrayLike
+    vertices_sigma_min: ArrayLike
     leaves: ArrayLike
     leaf_origin: ArrayLike
     origin_leaves: ArrayLike
@@ -132,7 +142,7 @@ class LensMesh(NamedTuple):
 
 def make_sampler(raytrace, jacobian, device, batch_size=None):
     """
-    The lens map as ``(N, 2) -> (N, 3)`` float64 ``(bx, by, det A)``, or ``(N, 2)`` images when ``jacobian`` is None.
+    The lens map as ``(N, 2) -> (N, 4)`` float64 ``(bx, by, det A, sigma_min A)``, or ``(N, 2)`` images when ``jacobian`` is None.
 
     ``raytrace`` and ``jacobian`` receive the same float64 coordinates on
     ``device``, in the user's backend, padded to
@@ -140,8 +150,10 @@ def make_sampler(raytrace, jacobian, device, batch_size=None):
     matters: the criterion compares midpoint deviations of ``O(fov)``
     quantities, which cancel to exactly zero below about
     ``sqrt(8 * eps * fov)`` and would read as converged. ``det A`` is formed
-    in the Jacobian's dtype, then cast; the values come back on the
-    positions' device, one row per position.
+    in the Jacobian's dtype, then cast; ``sigma_min A``
+    (:func:`~.geometry.sigma_min_2x2`) is formed on the mesh backend from the
+    Jacobian's entries cast to float64, which travel with the other columns.
+    The values come back on the positions' device, one row per position.
     """
     f64 = backend.float64
 
@@ -155,8 +167,14 @@ def make_sampler(raytrace, jacobian, device, batch_size=None):
         if jacobian is not None:
             J = jacobian(x, y)
             columns.append(J[:, 0, 0] * J[:, 1, 1] - J[:, 0, 1] * J[:, 1, 0])
+            columns.extend((J[:, 0, 0], J[:, 0, 1], J[:, 1, 0], J[:, 1, 1]))
         out = backend.stack([backend.to(c, dtype=f64) for c in columns], dim=-1)
         out = mesh_backend.to(to_mesh(out), device=mesh_backend.device(xy))
+        if jacobian is not None:
+            sigma = sigma_min_2x2(out[:, 3:].reshape(-1, 2, 2))
+            out = mesh_backend.concatenate(
+                (out[:, :3], mesh_backend.unsqueeze(sigma, -1)), dim=1
+            )
         return out[:n] if size > n else out
 
     return sample
@@ -167,7 +185,13 @@ def _lens_split(h0, min_img_sep):
 
     def split(ij, values6, cls, level):
         status = lens_status(
-            values6[..., :2], values6[..., 2], cls, level, h0, min_img_sep
+            values6[..., :2],
+            values6[..., 2],
+            values6[..., 3],
+            cls,
+            level,
+            h0,
+            min_img_sep,
         )
         return status != LEAF_CONVERGED
 
@@ -302,7 +326,7 @@ def _build_lens_mesh(
     sample = make_sampler(raytrace, jacobian, device, batch_size)
     ij, cls = initial_triangles(init_res, lat.level, ROOT_CLASS)
     cache, store, rows = add_roots(
-        empty_cache(3), empty_store(), lat, ij, cls, sample, batch_size
+        empty_cache(4), empty_store(), lat, ij, cls, sample, batch_size
     )
     cache, store = refine(
         cache,
@@ -337,7 +361,7 @@ def _freeze(lat, cache, store, sample, min_img_sep, holes, batch_size, seed=None
             mesh_backend.zeros((0,), dtype=int64),
             mesh_backend.zeros((0,), dtype=int64),
             mesh_backend.zeros((0,), dtype=int64),
-            mesh_backend.zeros((0, 3), dtype=f64),
+            mesh_backend.zeros((0, 4), dtype=f64),
         )
     seed_status, band_rows, mid_keys, mid_values = seed
     n_seed = seed_status.shape[0]
@@ -357,7 +381,7 @@ def _freeze(lat, cache, store, sample, min_img_sep, holes, batch_size, seed=None
         xy = lattice_xy(lat, lattice_ij_from_key(lat, todo))
         new_values = sample_points(xy, sample, batch_size)
     else:
-        new_values = mesh_backend.zeros((0, 3), dtype=f64)
+        new_values = mesh_backend.zeros((0, 4), dtype=f64)
     table_keys = mesh_backend.concatenate((cache.keys, mid_keys, todo), dim=0)
     table_values = mesh_backend.concatenate(
         (cache.values[cache.slots], mid_values, new_values), dim=0
@@ -373,6 +397,7 @@ def _freeze(lat, cache, store, sample, min_img_sep, holes, batch_size, seed=None
         lens_status(
             values6[..., :2],
             values6[..., 2],
+            values6[..., 3],
             store.cls[fresh],
             store.level[fresh],
             lattice_h0(lat),
@@ -406,6 +431,7 @@ def _freeze(lat, cache, store, sample, min_img_sep, holes, batch_size, seed=None
         vertices_lens=lattice_xy(lat, cache.ij[used]),
         vertices_source=vertices_source,
         vertices_det=cache.values[used][:, 2],
+        vertices_sigma_min=cache.values[used][:, 3],
         leaves=leaves,
         leaf_origin=leaf_origin,
         origin_leaves=origin_leaves,
@@ -437,7 +463,12 @@ def _seed(mesh, lat, k):
         slots=mesh_backend.arange(n_vertices, dtype=int64),
         ij=ij,
         values=mesh_backend.concatenate(
-            (mesh.vertices_source, mesh_backend.unsqueeze(mesh.vertices_det, -1)), dim=1
+            (
+                mesh.vertices_source,
+                mesh_backend.unsqueeze(mesh.vertices_det, -1),
+                mesh_backend.unsqueeze(mesh.vertices_sigma_min, -1),
+            ),
+            dim=1,
         ),
         active=mesh_backend.ones((n_vertices,), dtype=mesh_backend.bool),
     )
@@ -460,7 +491,12 @@ def _seed(mesh, lat, k):
     )
     mid = mesh_backend.flatnonzero(cache_lookup(cache, sample_keys) < 0)
     values = mesh_backend.concatenate(
-        (band.source, mesh_backend.unsqueeze(band.det, -1)), dim=1
+        (
+            band.source,
+            mesh_backend.unsqueeze(band.det, -1),
+            mesh_backend.unsqueeze(band.sigma_min, -1),
+        ),
+        dim=1,
     )
     seed = (mesh.origin_status, band.leaves, sample_keys[mid], values[mid])
     return cache, store, seed

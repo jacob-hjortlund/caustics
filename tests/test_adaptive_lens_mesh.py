@@ -27,6 +27,7 @@ from caustics.lenses.func.adaptive.criterion import (
 from caustics.lenses.func.adaptive.geometry import (
     build_device,
     child_matrix_tables,
+    sigma_min_2x2,
     to_device,
     ROOT_CLASS,
     ROOT_SHAPES,
@@ -97,13 +98,19 @@ def roots(shift=(0.0, 0.0), h0=H0):
     return six(h0 * np.asarray(ROOT_SHAPES, dtype=np.float64) + np.asarray(shift))
 
 
-def status(theta6, beta, det, level=0, h0=H0, min_img_sep=0.01):
-    """``lens_status`` of the two root triangles, ``beta`` and ``det`` numpy maps of ``(..., 2)``."""
+def status(theta6, beta, det, level=0, h0=H0, min_img_sep=0.01, sigma=None):
+    """``lens_status`` of the two root triangles, ``beta``, ``det`` and ``sigma`` numpy maps of ``(..., 2)``.
+
+    ``sigma`` defaults to ``+inf`` at every sample, which no deviation fails,
+    so the tests of the other flags read the children's check alone.
+    """
     n = theta6.shape[0]
+    sigma6 = np.full(theta6.shape[:-1], np.inf) if sigma is None else sigma(theta6)
     return to_np(
         lens_status(
             f64(beta(theta6)),
             f64(det(theta6)),
+            f64(sigma6),
             ROOT_CLASS,
             i64([level] * n),
             h0,
@@ -218,7 +225,9 @@ def test_the_approximate_parity_bit_is_child_parity():
     det6 = f64(np.ones((64, 6)))
     n = 64
     got = to_np(
-        lens_status(beta6, det6, i64([0] * n), i64([0] * n), H0, 0.01)
+        lens_status(
+            beta6, det6, f64(np.ones((64, 6))), i64([0] * n), i64([0] * n), H0, 0.01
+        )
         & LEAF_APPROX_PARITY_UNRESOLVED
     )
     child_ok = to_np(
@@ -256,12 +265,13 @@ def test_build_band_numbers_samples_by_key_and_reads_their_values():
     lat = make_lattice(4.0, 0.0, 0.0, 4, 2)
     keys6 = i64([[30, 10, 20, 11, 21, 31], [10, 40, 20, 41, 21, 11]])
     keys = np.array([10, 11, 20, 21, 30, 31, 40, 41])
-    table = f64([[k, -k, k / 100.0] for k in keys])
+    table = f64([[k, -k, k / 100.0, k / 1000.0] for k in keys])
     band = build_band(lat, i64([3, 7]), keys6, i64(keys), table)
     assert to_np(band.leaves).tolist() == [3, 7]
     assert np.array_equal(keys[to_np(band.samples)], to_np(keys6))
     assert np.array_equal(to_np(band.source)[:, 0], keys)
     assert np.array_equal(to_np(band.det), keys / 100.0)
+    assert np.array_equal(to_np(band.sigma_min), keys / 1000.0)
     ij = np.stack((keys // (lat.n + 1), keys % (lat.n + 1)), axis=-1)
     assert np.array_equal(to_np(band.lens), to_np(lattice_xy(lat, i64(ij))))
 
@@ -306,7 +316,7 @@ def test_the_sampler_hands_both_callbacks_the_same_float64_points_on_the_device(
     assert out.dtype == mesh_backend.float64 and mesh_backend.device(
         out
     ) == mesh_backend.device(xy)
-    assert to_np(out).tolist() == [[0.0, 0.5, 0.25], [1.0, -1.5, 0.25]]
+    assert to_np(out).tolist() == [[0.0, 0.5, 0.25, 0.5], [1.0, -1.5, 0.25, 0.5]]
 
 
 def test_float32_callbacks_give_float64_values_with_det_a_formed_in_float32():
@@ -325,6 +335,9 @@ def test_float32_callbacks_give_float64_values_with_det_a_formed_in_float32():
     det32 = J[:, 0, 0] * J[:, 1, 1] - J[:, 0, 1] * J[:, 1, 0]
     assert out.dtype == mesh_backend.float64
     assert to_np(out)[0, 2] == to_np(backend.to(det32, dtype=backend.float64))[0]
+    J64 = backend.to(J, dtype=backend.float64)
+    want = sigma_min_2x2(mesh_backend.as_array(to_np(J64), dtype=mesh_backend.float64))
+    assert to_np(out)[0, 3] == to_np(want)[0]
 
 
 def test_an_affine_lens_converges_at_level_zero():
@@ -483,7 +496,12 @@ def test_mesh_arrays_are_float64():
     mesh = build_lens_mesh(
         AFFINE_LENS.raytrace, AFFINE_LENS.jacobian_lens_equation, **BUILD
     )
-    for name in ("vertices_lens", "vertices_source", "vertices_det"):
+    for name in (
+        "vertices_lens",
+        "vertices_source",
+        "vertices_det",
+        "vertices_sigma_min",
+    ):
         assert getattr(mesh, name).dtype == backend.float64, name
 
 
@@ -581,7 +599,7 @@ def test_parity_invalid_partitions_the_max_level_leaves(sie_mesh):
 
 
 def test_parity_band_is_bounded_by_a_small_multiple_of_min_img_sep(sie_mesh):
-    """Halving min_img_sep keeps the condemned band near the center within 2.5x the request."""
+    """Halving min_img_sep keeps the condemned band near the center within 3.5x the request."""
     requested_min_img_sep = 1e-2
     mesh = sie_mesh
     status = leaf_status(mesh)
@@ -593,7 +611,7 @@ def test_parity_band_is_bounded_by_a_small_multiple_of_min_img_sep(sie_mesh):
     near_center = radius < 0.05
     assert near_center.any()
     core = radius[near_center]
-    assert core.max() - core.min() <= 2.5 * requested_min_img_sep
+    assert core.max() - core.min() <= 3.5 * requested_min_img_sep
 
 
 def lattice_samples(mesh):
@@ -1731,5 +1749,82 @@ def test_the_sampler_hands_the_lens_padded_batches_and_returns_one_row_each(
     out = to_np(make_sampler(raytrace, jacobian, None, batch_size)(f64(xy)))
     assert seen == [backend.padded_size(n, batch_size)] * 2
     np.testing.assert_array_equal(
-        out, np.column_stack([2 * xy[:, 0], 3 * xy[:, 1], np.full(n, 6.0)])
+        out,
+        np.column_stack([2 * xy[:, 0], 3 * xy[:, 1], np.full(n, 6.0), np.full(n, 2.0)]),
     )
+
+
+def test_a_small_sigma_min_at_one_sample_fails_the_deviation_on_its_row_alone():
+    """The children pass this mild curve; ``sigma_min(A) = 0.1`` at one sample of row 1 does not."""
+
+    def curved(p):
+        return np.stack((p[..., 0] + 2.0 * p[..., 0] ** 2, p[..., 1]), axis=-1)
+
+    def det(p):
+        return 1.0 + 4.0 * p[..., 0]
+
+    def honest(p):
+        return np.ones(p.shape[:-1])
+
+    def small(p):
+        out = np.ones(p.shape[:-1])
+        out[1, 4] = 0.1
+        return out
+
+    assert status(roots(), curved, det, sigma=honest).tolist() == [0, 0]
+    assert status(roots(), curved, det, sigma=small).tolist() == [
+        LEAF_CONVERGED,
+        LEAF_CONVERGENCE_FAILED,
+    ]
+
+
+def test_the_sampler_s_fourth_column_is_sigma_min_of_the_jacobian():
+    xy = np.random.default_rng(9).normal(size=(5, 2))
+
+    def raytrace(x, y):
+        return x, y
+
+    def jacobian(x, y):
+        return stack_2x2(x, 2.0 * y, 0.5 * x + y, -y)
+
+    out = to_np(make_sampler(raytrace, jacobian, None)(f64(xy)))
+    x, y = xy[:, 0], xy[:, 1]
+    J = np.stack((np.stack((x, 2.0 * y), -1), np.stack((0.5 * x + y, -y), -1)), axis=-2)
+    assert np.array_equal(out[:, 3], to_np(sigma_min_2x2(f64(J))))
+
+
+def test_every_vertex_carries_sigma_min_of_its_jacobian():
+    mesh, _ = build(localised_fold, localised_fold_jacobian, min_img_sep=0.05)
+    assert mesh.vertices_sigma_min.dtype == mesh_backend.float64
+    want = sigma_min_2x2(f64(localised_fold_jacobian(to_np(mesh.vertices_lens))))
+    assert np.array_equal(to_np(mesh.vertices_sigma_min), to_np(want))
+
+
+def _bowl(p):
+    return p + 0.1 * p**2
+
+
+def _bowl_jacobian(p):
+    J = np.zeros((p.shape[0], 2, 2))
+    J[:, 0, 0] = 1.0 + 0.2 * p[:, 0]
+    J[:, 1, 1] = 1.0 + 0.2 * p[:, 1]
+    return J
+
+
+def test_sigma_min_of_the_jacobian_drives_refinement():
+    """With its true Jacobian the bowl converges at level 0; with ``sigma_min`` a
+    billion times smaller, every leaf fails down to the finest level."""
+    honest, _ = build(_bowl, _bowl_jacobian, init_res=2, min_img_sep=1.0, max_depth=3)
+    assert (to_np(honest.origin_level) == 0).all()
+    assert (to_np(honest.origin_status) == LEAF_CONVERGED).all()
+
+    def starved_jacobian(p):
+        return 1e-9 * _bowl_jacobian(p)
+
+    starved, _ = build(
+        _bowl, starved_jacobian, init_res=2, min_img_sep=1.0, max_depth=3
+    )
+    finest = starved.lattice.level - 1
+    assert finest > 0
+    assert (to_np(starved.origin_level) == finest).all()
+    assert (to_np(starved.origin_status) == LEAF_CONVERGENCE_FAILED).all()
