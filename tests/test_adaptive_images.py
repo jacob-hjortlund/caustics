@@ -18,6 +18,7 @@ from caustics.lenses.func.adaptive.images import (
 )
 from caustics.lenses.func.adaptive.index import index_hits
 from caustics.lenses.func.adaptive.lens_mesh import build_lens_mesh
+from caustics.lenses.func.adaptive.curves import critical_curves_and_caustics
 
 from adaptive_maps import (
     AFFINE,
@@ -71,6 +72,42 @@ def _sie_like_jacobian(x, y):
 
 SIE_LIKE = lens(_sie_like, _sie_like_jacobian)
 BUILD = dict(fov=6.0, init_res=4, min_img_sep=0.1, max_depth=6)
+
+
+def _sis(x, y):
+    """A singular isothermal sphere of Einstein radius 1, non-finite at the origin."""
+    r = (x * x + y * y) ** 0.5
+    return x - x / r, y - y / r
+
+
+def _sis_jacobian(x, y):
+    r = (x * x + y * y) ** 0.5
+    k = 1.0 / r**3
+    xx, yy, xy = 1.0 - 1.0 / r + k * x * x, 1.0 - 1.0 / r + k * y * y, k * x * y
+    return backend.stack(
+        (backend.stack((xx, xy), dim=-1), backend.stack((xy, yy), dim=-1)), dim=-2
+    )
+
+
+SIS = lens(_sis, _sis_jacobian)
+
+
+def _fold(x, y):
+    """``localised_fold`` on backend arrays: inside ``|y| < 0.5``, ``beta_y = 0.6 y + y**2 - 0.25``."""
+    bend = backend.where(backend.abs(y) < 0.5, y * y - 0.25, 0.0 * y)
+    return x, 0.6 * y + bend
+
+
+def _missed(images, counts, want, tol):
+    """Sources ``b`` none of whose returned images lies within ``tol`` of ``want[b]``."""
+    images = to_np(images)
+    off = np.concatenate(([0], np.cumsum(to_np(counts))))
+    return [
+        b
+        for b, w in enumerate(np.asarray(want))
+        if off[b + 1] == off[b]
+        or np.linalg.norm(images[off[b] : off[b + 1]] - w, axis=-1).min() > tol
+    ]
 
 
 @pytest.fixture(scope="module")
@@ -353,6 +390,82 @@ def test_forward_raytrace_covers_every_sie_image(sie):
         nearest = np.linalg.norm(expected[:, None, :] - images[None, :, :], axis=-1)
         worst = nearest.min(axis=1).max()
         assert worst < 1e-2, f"{sp}: uncovered image, worst distance {worst:.3e}"
+
+
+@pytest.mark.xfail(strict=True, reason="no seed near the center; fixed on this branch")
+def test_forward_raytrace_finds_every_sis_inner_image_beyond_min_img_sep():
+    """Every inner image more than ``min_img_sep`` from the SIS center comes back.
+
+    ``|theta_minus| = b - beta``, so a source at ``beta = b - k * min_img_sep``
+    has its inner image ``k * min_img_sep`` from the center, ``k > 1`` here.
+    Near the center a finest leaf's source image is a curved arc, and a source
+    in the bulge between the arc and the leaf's straight edge is inside no
+    triangle. Before this branch 56 of these 600 inner images were missed.
+    Images within ``min_img_sep`` of the center may or may not come back;
+    nothing is asserted about them.
+    """
+    sep = 0.05
+    mesh = build_lens_mesh(
+        SIS.raytrace, SIS.jacobian_lens_equation, fov=4.0, init_res=4, min_img_sep=sep
+    )
+    rng = np.random.default_rng(7)
+    k = rng.uniform(1.0, 4.0, 600)
+    phi = rng.uniform(0.0, 2 * np.pi, 600)
+    u = np.stack((np.cos(phi), np.sin(phi)), axis=-1)
+    images, counts = fr(mesh, (1.0 - k * sep)[:, None] * u, _sis)
+    missed = _missed(images, counts, -(k * sep)[:, None] * u, sep / 4)
+    assert (
+        not missed
+    ), f"{len(missed)} of 600 inner images missed, at k = {np.round(k[missed], 3).tolist()[:10]}"
+
+
+@pytest.mark.xfail(
+    strict=True, reason="no seed in failing leaves; fixed on this branch"
+)
+def test_forward_raytrace_finds_every_sie_image_beyond_min_img_sep_of_a_critical_curve(
+    sie,
+):
+    """Every image at least the mesh's ``min_img_sep`` from a critical curve comes back.
+
+    Its fold partner is then at least the requested ``min_img_sep`` away.
+    Built backwards: lens-plane points ``theta`` between ``1.25`` and ``3``
+    times the mesh's ``min_img_sep`` from the vertices of the mesh's critical
+    curves, which lie at most ``min_img_sep`` apart, so each ``theta`` is at
+    least ``min_img_sep`` from the curve itself; their images are the sources.
+    Before this branch 21 of these 3000 were missed.
+    """
+    lens_, mesh = sie
+    sep = mesh.min_img_sep
+    curve = to_np(critical_curves_and_caustics(mesh).lens)
+    rng = np.random.default_rng(1)
+    theta = curve[rng.integers(0, len(curve), 12000)] + rng.uniform(
+        -3 * sep, 3 * sep, (12000, 2)
+    )
+    d = np.stack([np.linalg.norm(curve - t, axis=-1).min() for t in theta])
+    theta = theta[(d >= 1.25 * sep) & (d <= 3 * sep)][:3000]
+    assert theta.shape[0] == 3000
+    bx, by = lens_.raytrace(
+        backend.as_array(theta[:, 0]), backend.as_array(theta[:, 1])
+    )
+    images, counts = fr(mesh, np.stack((to_np(bx), to_np(by)), axis=-1), lens_.raytrace)
+    missed = _missed(images, counts, theta, sep / 2)
+    assert not missed, f"{len(missed)} of 3000 images missed"
+
+
+def test_forward_raytrace_finds_one_image_of_a_source_below_the_fold_s_caustic():
+    """Below the caustic ``beta_y = -0.34`` the fold has one image, ``y = beta_y / 0.6``.
+
+    Sources nearer the caustic than ``residual_tol`` are left out: the fold
+    point maps within ``residual_tol`` of them, a legitimate root.
+    """
+    mesh, _ = build(localised_fold, localised_fold_jacobian, min_img_sep=0.05)
+    tol = mesh.min_img_sep
+    rng = np.random.default_rng(5)
+    bx = rng.uniform(-1.5, 1.5, 200)
+    by = -0.34 - rng.uniform(1.5 * tol, 0.2, 200)
+    images, counts = fr(mesh, np.stack((bx, by), axis=-1), _fold)
+    assert to_np(counts).tolist() == [1] * 200
+    assert np.allclose(to_np(images), np.stack((bx, by / 0.6), axis=-1), atol=1e-6)
 
 
 def test_forward_raytrace_recovers_the_analytic_point_mass_pair():
