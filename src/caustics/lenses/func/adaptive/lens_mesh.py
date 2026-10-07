@@ -53,7 +53,7 @@ from .refine import (
     sample_points,
 )
 from .index import MeshIndex, build_index
-from .criterion import LEAF_CONVERGED, lens_status
+from .criterion import LEAF_CONVERGED, deviation_and_sigma_min, lens_status
 from .band import CriticalBand, build_band, in_band
 from .holes import CenterHoles, merge_centers, sample_holes
 from .curves import _critical_curves_and_caustics
@@ -110,6 +110,17 @@ class LensMesh(NamedTuple):
         ``(N,)`` int64 ``LEAF_*`` bitmask: ``LEAF_CONVERGED`` below the
         finest level, where every leaf passed the criterion, and the
         criterion's verdict at it.
+    origin_deviation: ArrayLike
+        ``(N,)`` float64 largest midpoint deviation of each origin, from
+        :func:`~.criterion.deviation_and_sigma_min`.
+
+        *Unit: arcsec*
+    origin_sigma_min: ArrayLike
+        ``(N,)`` float64 smallest singular value of each origin's affine
+        model: the smaller of its children's and of ``A`` at its six samples.
+        With ``origin_deviation`` it gives :func:`~.criterion.affine_error`,
+        how far a seed of the origin can lie from its image, below
+        ``min_img_sep`` on every converged origin.
     index: MeshIndex
         Over the source-plane images of the leaves whose origin converged.
     critical_band: CriticalBand
@@ -134,6 +145,8 @@ class LensMesh(NamedTuple):
     origin_level: ArrayLike
     origin_cls: ArrayLike
     origin_status: ArrayLike
+    origin_deviation: ArrayLike
+    origin_sigma_min: ArrayLike
     index: MeshIndex  # type: ignore[assignment]  # shadows tuple.index
     critical_band: CriticalBand
     holes: CenterHoles
@@ -345,13 +358,16 @@ def _freeze(lat, cache, store, sample, min_img_sep, holes, batch_size, seed=None
     """
     Close and index a refinement, finishing its finest level.
 
-    Each finest-level origin not carried over in ``seed`` gets its status
-    from :func:`~.criterion.lens_status` on its six samples, its three
-    midpoints sampled here and never cached, and the band is built from the
-    same values. ``seed`` is ``(status, band_rows, mid_keys, mid_values)``
-    from :func:`_seed`: the statuses of the store's first rows, the store
-    rows of the old band, and the old band's midpoint samples, read here
-    rather than sampled again.
+    Each origin not carried over in ``seed`` gets its deviation and smallest
+    singular value from :func:`~.criterion.deviation_and_sigma_min` on its
+    six samples: below the finest level its midpoints are in the cache,
+    ``refine`` having tested it; at the finest level they are sampled here
+    and never cached, and they also give its status
+    (:func:`~.criterion.lens_status`) and the band. ``seed`` is
+    ``(status, deviation, sigma_min, band_rows, mid_keys, mid_values)`` from
+    :func:`_seed`: the statuses, deviations and smallest singular values of
+    the store's first rows, the store rows of the old band, and the old
+    band's midpoint samples, read here rather than sampled again.
     """
     int64, f64 = mesh_backend.int64, mesh_backend.float64
     used, leaves, leaf_origin, origin, origin_leaves = close(lat, cache, store)
@@ -359,23 +375,32 @@ def _freeze(lat, cache, store, sample, min_img_sep, holes, batch_size, seed=None
     if seed is None:
         seed = (
             mesh_backend.zeros((0,), dtype=int64),
+            mesh_backend.zeros((0,), dtype=f64),
+            mesh_backend.zeros((0,), dtype=f64),
             mesh_backend.zeros((0,), dtype=int64),
             mesh_backend.zeros((0,), dtype=int64),
             mesh_backend.zeros((0, 4), dtype=f64),
         )
-    seed_status, band_rows, mid_keys, mid_values = seed
+    seed_status, seed_deviation, seed_sigma_min, band_rows, mid_keys, mid_values = seed
     n_seed = seed_status.shape[0]
+    n_new = n_rows - n_seed
     status = mesh_backend.concatenate(
-        (seed_status, mesh_backend.zeros((n_rows - n_seed,), dtype=int64)), dim=0
+        (seed_status, mesh_backend.zeros((n_new,), dtype=int64)), dim=0
+    )
+    deviation = mesh_backend.concatenate(
+        (seed_deviation, mesh_backend.zeros((n_new,), dtype=f64)), dim=0
+    )
+    sigma_min = mesh_backend.concatenate(
+        (seed_sigma_min, mesh_backend.zeros((n_new,), dtype=f64)), dim=0
     )
     row = mesh_backend.arange(n_rows, dtype=int64)
-    fresh = mesh_backend.flatnonzero(
-        store.valid & (store.level == lat.level - 1) & (row >= n_seed)
-    )
+    young = mesh_backend.flatnonzero(store.valid & (row >= n_seed))
+    finest = mesh_backend.flatnonzero(store.level[young] == lat.level - 1)
+    fresh = young[finest]
 
-    ij = cache.ij[store.v[fresh]]
+    ij = cache.ij[store.v[young]]
     mid = lattice_key(lat, midpoint_ij(ij))
-    todo = mesh_backend.unique(mid.reshape(-1))
+    todo = mesh_backend.unique(mid[finest].reshape(-1))
     todo = todo[~is_member(mid_keys, todo)]
     if todo.shape[0]:
         xy = lattice_xy(lat, lattice_ij_from_key(lat, todo))
@@ -391,6 +416,13 @@ def _freeze(lat, cache, store, sample, min_img_sep, holes, batch_size, seed=None
 
     keys6 = mesh_backend.concatenate((lattice_key(lat, ij), mid), dim=1)
     values6 = table_values[mesh_backend.searchsorted(table_keys, keys6)]
+    h0 = lattice_h0(lat)
+    young_deviation, young_sigma_min = deviation_and_sigma_min(
+        values6[..., :2], values6[..., 3], store.cls[young], store.level[young], h0
+    )
+    deviation = mesh_backend.fill_at_indices(deviation, young, young_deviation)
+    sigma_min = mesh_backend.fill_at_indices(sigma_min, young, young_sigma_min)
+    values6 = values6[finest]
     status = mesh_backend.fill_at_indices(
         status,
         fresh,
@@ -400,7 +432,7 @@ def _freeze(lat, cache, store, sample, min_img_sep, holes, batch_size, seed=None
             values6[..., 3],
             store.cls[fresh],
             store.level[fresh],
-            lattice_h0(lat),
+            h0,
             min_img_sep,
         ),
     )
@@ -438,6 +470,8 @@ def _freeze(lat, cache, store, sample, min_img_sep, holes, batch_size, seed=None
         origin_level=store.level[origin],
         origin_cls=store.cls[origin],
         origin_status=origin_status,
+        origin_deviation=deviation[origin],
+        origin_sigma_min=sigma_min[origin],
         index=build_index(vertices_source, leaves, converged),
         critical_band=band,
         holes=holes,
@@ -498,7 +532,14 @@ def _seed(mesh, lat, k):
         ),
         dim=1,
     )
-    seed = (mesh.origin_status, band.leaves, sample_keys[mid], values[mid])
+    seed = (
+        mesh.origin_status,
+        mesh.origin_deviation,
+        mesh.origin_sigma_min,
+        band.leaves,
+        sample_keys[mid],
+        values[mid],
+    )
     return cache, store, seed
 
 

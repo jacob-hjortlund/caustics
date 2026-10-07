@@ -20,7 +20,9 @@ from caustics.lenses.func.adaptive.criterion import (
     LEAF_JACOBIAN_NONFINITE,
     LEAF_JACOBIAN_PARITY_UNRESOLVED,
     LEAF_RAYTRACE_NONFINITE,
+    affine_error,
     child_shape_matrices,
+    deviation_and_sigma_min,
     lens_status,
     parity_from_children,
 )
@@ -36,6 +38,7 @@ from caustics.lenses.func.adaptive.index import index_hits
 from caustics.lenses.func.adaptive.lattice import (
     extend_lattice,
     lattice_fov,
+    lattice_h0,
     lattice_init_res,
     lattice_key,
     lattice_xy,
@@ -1828,3 +1831,66 @@ def test_sigma_min_of_the_jacobian_drives_refinement():
     assert finest > 0
     assert (to_np(starved.origin_level) == finest).all()
     assert (to_np(starved.origin_status) == LEAF_CONVERGENCE_FAILED).all()
+
+
+def test_deviation_and_sigma_min_on_an_affine_map_and_on_a_collapse():
+    theta6 = roots()
+    n = theta6.shape[0]
+    level = i64([0] * n)
+    s = np.linalg.svd(A, compute_uv=False).min()
+    dev, sig = deviation_and_sigma_min(
+        f64(affine(theta6)), f64(np.full((n, 6), s)), ROOT_CLASS, level, H0
+    )
+    assert np.allclose(to_np(dev), 0.0, atol=1e-15)
+    assert np.allclose(to_np(sig), s)
+    dev, sig = deviation_and_sigma_min(
+        f64(np.zeros_like(theta6)), f64(np.zeros((n, 6))), ROOT_CLASS, level, H0
+    )
+    assert to_np(sig).tolist() == [0.0, 0.0]
+    assert to_np(affine_error(dev, sig)).tolist() == [np.inf, np.inf]
+
+
+def test_affine_error_is_below_min_img_sep_exactly_where_the_deviation_checks_pass():
+    rng = np.random.default_rng(13)
+    n = 512
+    theta6 = np.repeat(roots(), n // 2, axis=0)
+    beta6 = affine(theta6) + rng.normal(scale=1e-3, size=theta6.shape)
+    sigma6 = rng.uniform(0.05, 1.0, (n, 6))
+    cls = mesh_backend.repeat(ROOT_CLASS, n // 2, axis=0)
+    level = i64([0] * n)
+    got = to_np(
+        lens_status(f64(beta6), f64(np.ones((n, 6))), f64(sigma6), cls, level, H0, 0.01)
+    )
+    passed = (got & LEAF_CONVERGENCE_FAILED) == 0
+    error = to_np(
+        affine_error(*deviation_and_sigma_min(f64(beta6), f64(sigma6), cls, level, H0))
+    )
+    assert 0 < passed.sum() < n
+    assert np.array_equal(error < 0.01, passed)
+
+
+def test_origin_deviation_and_sigma_min_match_their_samples_recomputed_independently():
+    mesh, _ = build(localised_fold, localised_fold_jacobian, min_img_sep=0.1)
+    rows = np.arange(to_np(mesh.origin_leaves).shape[0])
+    xy = origin_samples(mesh, rows)
+    beta6 = localised_fold(xy.reshape(-1, 2)).reshape(-1, 6, 2)
+    sigma6 = to_np(
+        sigma_min_2x2(f64(localised_fold_jacobian(xy.reshape(-1, 2))))
+    ).reshape(-1, 6)
+    dev, sig = deviation_and_sigma_min(
+        f64(beta6),
+        f64(sigma6),
+        mesh.origin_cls,
+        mesh.origin_level,
+        lattice_h0(mesh.lattice),
+    )
+    assert np.array_equal(to_np(mesh.origin_deviation), to_np(dev))
+    assert np.array_equal(to_np(mesh.origin_sigma_min), to_np(sig))
+
+
+def test_affine_error_is_below_sep_on_every_converged_origin(sie_mesh):
+    mesh = sie_mesh
+    error = to_np(affine_error(mesh.origin_deviation, mesh.origin_sigma_min))
+    converged = to_np(mesh.origin_status) == LEAF_CONVERGED
+    assert (error[converged] < mesh.min_img_sep).all()
+    assert (error[~converged] >= mesh.min_img_sep).any()

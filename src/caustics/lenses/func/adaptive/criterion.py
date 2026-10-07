@@ -248,3 +248,66 @@ def lens_status(beta6, det6, sigma6, cls, level, h0, min_img_sep):
     )
     finite = mesh_backend.all(mesh_backend.isfinite(beta6), dim=(1, 2))
     return mesh_backend.where(finite, status, LEAF_RAYTRACE_NONFINITE)
+
+
+def deviation_and_sigma_min(beta6, sigma6, cls, level, h0):
+    """
+    The largest midpoint deviation of each triangle, and the smaller of its two smallest singular values.
+
+    The two values the lens mesh stores per origin, from which
+    :func:`affine_error` forms how far its affine model's seeds can lie from
+    their images.
+
+    Parameters
+    ----------
+    beta6, sigma6, cls, level, h0:
+        As for :func:`lens_status`.
+
+    Returns
+    -------
+    deviation: ArrayLike
+        ``(n,)``, the largest of :func:`midpoint_deviation`.
+
+        *Unit: arcsec*
+    sigma_min: ArrayLike
+        ``(n,)``, the smaller of :func:`children_sigma_min` and the smallest
+        of ``sigma6``.
+    """
+    beta_v, beta_m = beta6[:, :3], beta6[:, 3:]
+    deviation = mesh_backend.max(midpoint_deviation(beta_v, beta_m), dim=1)
+    sigma_min = mesh_backend.minimum(
+        children_sigma_min(child_shape_matrices(beta_v, beta_m), cls, level, h0),
+        mesh_backend.min(sigma6, dim=1),
+    )
+    return deviation, sigma_min
+
+
+def affine_error(deviation, sigma_min):
+    """
+    ``deviation / sigma_min``: how far a seed of an affine model can lie from the image it approximates.
+
+    A source-plane error ``deviation`` pulls back to at most
+    ``deviation / sigma_min`` in the lens plane. ``+inf`` where ``sigma_min``
+    is zero, no bound. Below ``min_img_sep`` exactly where both deviation
+    checks of :func:`lens_status` pass, up to rounding.
+
+    Parameters
+    ----------
+    deviation: ArrayLike
+        ``(n,)`` from :func:`deviation_and_sigma_min`.
+
+        *Unit: arcsec*
+    sigma_min: ArrayLike
+        ``(n,)`` from :func:`deviation_and_sigma_min`.
+
+    Returns
+    -------
+    ArrayLike
+        ``(n,)``.
+
+        *Unit: arcsec*
+    """
+    zero = sigma_min == 0
+    return mesh_backend.where(
+        zero, float("inf"), deviation / mesh_backend.where(zero, 1.0, sigma_min)
+    )
