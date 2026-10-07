@@ -21,7 +21,7 @@ from .geometry import (
     triangle_weights,
 )
 from .index import as_points, index_hits
-from .lens_mesh import leaf_grow, make_sampler
+from .lens_mesh import inside_fov, inside_fov_image, leaf_grow, make_sampler
 
 
 def mesh_query(mesh, beta, batch_size=None):
@@ -290,7 +290,7 @@ def _images(mesh, beta, raytrace, tol, lm_kwargs, device):
     root = mesh_backend.to(to_mesh(root), device=mesh_device)
     trace = make_sampler(raytrace, None, device)
     converged = mesh_backend.sum((trace(root) - target) ** 2, dim=-1) < tol * tol
-    keep = converged & near_seed(mesh, idx, seed, root)
+    keep = converged & near_seed(mesh, idx, seed, root) & inside_fov(mesh, root)
     kept = _block_sums(mesh_backend.long(keep), offsets)
     root = root[mesh_backend.flatnonzero(keep)]
     unique = dedup_representatives(root, kept, mesh.min_img_sep)
@@ -310,9 +310,9 @@ def forward_raytrace(
     affine map. A root is kept when it maps to within ``residual_tol`` of
     the point and lies in its seed's leaf or within ``max(r, min_img_sep)``
     of the seed, ``r`` the leaf's :func:`~.criterion.affine_error`
-    (:func:`near_seed`): near a fold, a small residual alone admits points
-    far from any image. Kept roots closer than ``min_img_sep`` are one
-    image.
+    (:func:`near_seed`), and lies in the fov: near a fold, a small residual
+    alone admits points far from any image. Kept roots closer than
+    ``min_img_sep`` are one image.
 
     Parameters
     ----------
@@ -343,6 +343,12 @@ def forward_raytrace(
         *Unit: arcsec*
     counts: ArrayLike
         ``(B,)`` int64 images per source.
+
+    Raises
+    ------
+    ValueError
+        If any source lies outside the image of the mesh's fov boundary
+        (:func:`~.lens_mesh.inside_fov_image`), a NaN source included.
     """
     device = backend.device(mesh.vertices_lens)
     found = _forward_raytrace(
@@ -364,6 +370,15 @@ def _forward_raytrace(
     """:func:`forward_raytrace` on ``mesh_backend`` arrays; ``device`` is the lens's."""
     mesh_device = mesh_backend.device(mesh.vertices_lens)
     beta = as_points(bx, by, mesh_device)
+    outside = int(
+        mesh_backend.to_numpy(mesh_backend.sum(~inside_fov_image(mesh, beta)))
+    )
+    if outside:
+        raise ValueError(
+            f"{outside} source position(s) lie outside the image of the mesh's fov "
+            "boundary, so some of their images can lie outside the fov; grow the "
+            "mesh with extend_lens_mesh, or build it with build_closed_lens_mesh."
+        )
     tol = mesh.min_img_sep if residual_tol is None else float(residual_tol)
     lm_kwargs = {"jit": True, **(lm_kwargs or {})}
     n = beta.shape[0]

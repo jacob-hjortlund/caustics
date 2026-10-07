@@ -23,6 +23,7 @@ from .geometry import (
     segments_cross,
     sigma_min_2x2,
     to_device,
+    winding_number,
 )
 from .lattice import (
     Lattice,
@@ -706,6 +707,71 @@ def _fov_boundary(mesh):
     return on[mesh_backend.argsort(t[on])]
 
 
+def _fov_bounds(mesh):
+    """The lower and upper corners of ``mesh``'s fov, ``(2,)`` each: its vertices' extreme coordinates, lattice-exact."""
+    return mesh_backend.min(mesh.vertices_lens, dim=0), mesh_backend.max(
+        mesh.vertices_lens, dim=0
+    )
+
+
+def inside_fov(mesh, theta):
+    """
+    True where a lens-plane point lies in ``mesh``'s fov, its boundary included.
+
+    Parameters
+    ----------
+    mesh: LensMesh
+    theta: ArrayLike
+        ``(K, 2)`` lens-plane points.
+
+        *Unit: arcsec*
+
+    Returns
+    -------
+    ArrayLike
+        ``(K,)`` bool.
+    """
+    lo, hi = _fov_bounds(mesh)
+    return mesh_backend.all((theta >= lo) & (theta <= hi), dim=1)
+
+
+def inside_fov_image(mesh, beta):
+    """
+    True where a source-plane point lies inside the image of ``mesh``'s fov boundary.
+
+    The image is the closed polyline through the images of
+    :func:`_fov_boundary`'s vertices, as in :func:`_pseudo_caustics_crossed`,
+    and a point is inside where it winds about the point
+    (:func:`~.geometry.winding_number` nonzero), whichever its orientation.
+    A point outside can have images outside the fov, where the mesh cannot
+    find them. At most :data:`CROSSING_PAIRS` point-segment pairs are held
+    at once.
+
+    Parameters
+    ----------
+    mesh: LensMesh
+    beta: ArrayLike
+        ``(B, 2)`` source-plane points.
+
+        *Unit: arcsec*
+
+    Returns
+    -------
+    ArrayLike
+        ``(B,)`` bool.
+    """
+    polygon = mesh.vertices_source[_fov_boundary(mesh)]
+    step = max(1, CROSSING_PAIRS // max(1, polygon.shape[0]))
+    inside = [
+        mesh_backend.zeros(
+            (0,), dtype=mesh_backend.bool, device=mesh_backend.device(beta)
+        )
+    ]
+    for lo in range(0, beta.shape[0], step):
+        inside.append(winding_number(polygon, beta[lo : lo + step]) != 0)
+    return mesh_backend.concatenate(inside, dim=0)
+
+
 def _pseudo_caustics_crossed(mesh):
     """
     How many pseudo-caustics the image of ``mesh``'s fov boundary crosses.
@@ -773,8 +839,7 @@ def _curves_cut_by_fov(mesh, curves):
         (curves.offsets[open_curves], curves.offsets[open_curves + 1] - 1)
     )
     xy = curves.lens[ends]
-    lo = mesh_backend.min(mesh.vertices_lens, dim=0)
-    hi = mesh_backend.max(mesh.vertices_lens, dim=0)
+    lo, hi = _fov_bounds(mesh)
     on_boundary = mesh_backend.any((xy == lo) | (xy == hi), dim=1)
     cut = on_boundary[:n_open] | on_boundary[n_open:]
     return int(mesh_backend.to_numpy(mesh_backend.sum(cut)))

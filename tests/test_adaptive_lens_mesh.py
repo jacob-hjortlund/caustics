@@ -52,6 +52,8 @@ from caustics.lenses.func.adaptive.lens_mesh import (
     build_closed_lens_mesh,
     build_lens_mesh,
     extend_lens_mesh,
+    inside_fov,
+    inside_fov_image,
     leaf_grow,
     make_sampler,
 )
@@ -1911,3 +1913,30 @@ def test_affine_error_is_below_sep_on_every_converged_origin(sie_mesh):
     converged = to_np(mesh.origin_status) == LEAF_CONVERGED
     assert (error[converged] < mesh.min_img_sep).all()
     assert (error[~converged] >= mesh.min_img_sep).any()
+
+
+def test_inside_fov_keeps_points_inside_and_on_the_boundary_and_drops_those_outside():
+    mesh, _ = build(affine, affine_jacobian)
+    theta = f64([[0.0, 0.0], [2.0, -2.0], [2.0, 0.5], [2.0 + 1e-12, 0.0], [0.0, -2.5]])
+    assert to_np(inside_fov(mesh, theta)).tolist() == [True, True, True, False, False]
+
+
+def test_inside_fov_image_is_inside_the_image_of_the_fov_boundary():
+    """The fov ``[-2, 2]^2`` maps to the parallelogram ``AFFINE @ [-2, 2]^2``."""
+    mesh, _ = build(affine, affine_jacobian)
+    beta = f64([[0.0, 0.0], [1.0, 0.5], [5.0, 0.0], [np.nan, 0.0]])
+    assert to_np(inside_fov_image(mesh, beta)).tolist() == [True, True, False, False]
+
+
+def test_a_clockwise_image_of_the_fov_boundary_still_has_an_inside():
+    """A reflecting lens maps the boundary clockwise: winding -1, still inside."""
+
+    def flip(p):
+        return p * np.array([1.0, -1.0])
+
+    def flip_jacobian(p):
+        return np.tile(np.diag([1.0, -1.0]), (p.shape[0], 1, 1))
+
+    mesh, _ = build(flip, flip_jacobian)
+    beta = f64([[0.5, 0.5], [3.0, 0.0]])
+    assert to_np(inside_fov_image(mesh, beta)).tolist() == [True, False]

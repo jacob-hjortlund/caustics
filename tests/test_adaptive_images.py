@@ -198,11 +198,20 @@ def test_forward_raytrace_is_invariant_to_batch_size(mesh):
         assert np.allclose(got[0], whole[0])
 
 
-def test_forward_raytrace_returns_empty_outside_the_source_plane(mesh):
-    beta = _beta([[1e6, 1e6]])
-    img, counts = fr(mesh, beta, _sie_like)
-    assert to_np(counts).tolist() == [0]
-    assert to_np(img).shape == (0, 2)
+def test_forward_raytrace_raises_for_a_source_outside_the_image_of_the_fov_boundary(
+    mesh,
+):
+    with pytest.raises(ValueError, match="1 source position"):
+        fr(mesh, _beta([[1e6, 1e6]]), _sie_like)
+    with pytest.raises(ValueError, match="1 source position"):
+        fr(mesh, _beta([[0.05, 0.02], [1e6, 1e6]]), _sie_like)
+    with pytest.raises(ValueError, match="1 source position"):
+        fr(mesh, _beta([[0.05, 0.02], [1e6, 1e6]]), _sie_like, batch_size=1)
+
+
+def test_forward_raytrace_raises_for_a_nan_source(mesh):
+    with pytest.raises(ValueError, match="1 source position"):
+        fr(mesh, _beta([[np.nan, 0.0]]), _sie_like)
 
 
 def test_forward_raytrace_handles_empty_input(mesh):
