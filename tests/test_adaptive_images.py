@@ -8,7 +8,11 @@ from caustics.lenses.func.adaptive.mesh_backend import mesh_backend, to_mesh
 from caustics.cosmology import FlatLambdaCDM
 from caustics.lenses import SIE, Point
 from caustics.lenses.func import forward_raytrace_rootfind
-from caustics.lenses.func.adaptive.criterion import LEAF_CONVERGED
+from caustics.lenses.func.adaptive.criterion import (
+    LEAF_CONVERGED,
+    LEAF_JACOBIAN_NONFINITE,
+    LEAF_RAYTRACE_NONFINITE,
+)
 from caustics.lenses.func.adaptive.geometry import area2, contains, triangle_weights
 from caustics.lenses.func.adaptive.images import (
     dedup_representatives,
@@ -17,7 +21,7 @@ from caustics.lenses.func.adaptive.images import (
     mesh_seeds,
 )
 from caustics.lenses.func.adaptive.index import index_hits
-from caustics.lenses.func.adaptive.lens_mesh import build_lens_mesh
+from caustics.lenses.func.adaptive.lens_mesh import build_lens_mesh, leaf_grow
 from caustics.lenses.func.adaptive.curves import critical_curves_and_caustics
 
 from adaptive_maps import (
@@ -35,6 +39,7 @@ from adaptive_maps import (
 )
 
 RNG = np.random.default_rng(20260904)
+NONFINITE = LEAF_RAYTRACE_NONFINITE | LEAF_JACOBIAN_NONFINITE
 
 
 def fr(mesh, beta, raytrace, **kw):
@@ -572,9 +577,9 @@ def test_query_covers_points_on_the_source_bbox_upper_edge():
         tri = mesh_backend.as_array(vs[leaves])
         pts = mesh_backend.as_array(np.repeat(beta[None], leaves.shape[0], axis=0))
         truth = to_np(contains(triangle_weights(tri, pts)))
-        # Only LEAF_CONVERGED leaves are indexed (see `LensMesh`'s
-        # docstring): a leaf carrying any failure flag is never a candidate.
-        expected = set(np.flatnonzero(truth & (status == LEAF_CONVERGED)).tolist())
+        # Every leaf with a finite raytrace and Jacobian is indexed (see
+        # `LensMesh`'s docstring), converged or not.
+        expected = set(np.flatnonzero(truth & ((status & NONFINITE) == 0)).tolist())
         idx, off, _ = query_np(mesh, beta[None])
         assert (
             set(idx[off[0] : off[1]].tolist()) >= expected
@@ -607,10 +612,41 @@ def test_query_matches_brute_force_containment_on_multi_cell_leaves():
     for b in range(beta.shape[0]):
         pts = mesh_backend.as_array(np.repeat(beta[b][None], leaves.shape[0], axis=0))
         truth = to_np(contains(triangle_weights(tri_b, pts)))
-        # Only LEAF_CONVERGED leaves are indexed, as in
-        # test_query_covers_points_on_the_source_bbox_upper_edge above.
-        expected = set(np.flatnonzero(truth & (status == LEAF_CONVERGED)).tolist())
+        # Every leaf with a finite raytrace and Jacobian is indexed (see
+        # `LensMesh`'s docstring), converged or not.
+        expected = set(np.flatnonzero(truth & ((status & NONFINITE) == 0)).tolist())
         assert set(idx[off[b] : off[b + 1]].tolist()) >= expected
+
+
+def test_query_hits_a_failing_leaf_within_its_deviation_at_its_nearest_point(mesh):
+    """A point just outside a non-converged leaf's source triangle, within its
+    deviation, hits the leaf, with the coordinates of the triangle's nearest point."""
+    status = leaf_status(mesh)
+    grow = to_np(leaf_grow(mesh.origin_status, mesh.origin_deviation, mesh.leaf_origin))
+    vs, leaves = to_np(mesh.vertices_source), to_np(mesh.leaves)
+    tri = vs[leaves]
+    edge = np.linalg.norm(tri[:, 1] - tri[:, 0], axis=1)
+    pick = np.flatnonzero(
+        ((status & NONFINITE) == 0)
+        & (status != LEAF_CONVERGED)
+        & (grow > 0)
+        & (edge > 0)
+    )[:20]
+    assert pick.size > 0, "fixture must have non-converged finite leaves"
+    a, b, c = tri[pick, 0], tri[pick, 1], tri[pick, 2]
+    mid = (a + b) / 2
+    normal = np.stack(((b - a)[:, 1], -(b - a)[:, 0]), axis=1)
+    normal /= np.linalg.norm(normal, axis=1, keepdims=True)
+    inward = ((c - mid) * normal).sum(axis=1) > 0
+    outward = np.where(inward[:, None], -normal, normal)
+    points = mid + 0.5 * grow[pick][:, None] * outward
+    idx, off, bary = query_np(mesh, points)
+    for k, leaf in enumerate(pick):
+        block = idx[off[k] : off[k + 1]]
+        assert leaf in block, f"leaf {leaf} not hit by a point within its reach"
+        j = off[k] + int(np.flatnonzero(block == leaf)[0])
+        assert (bary[j] >= 0).all() and np.isclose(bary[j].sum(), 1.0)
+        assert np.allclose(bary[j] @ tri[leaf], mid[k], rtol=0, atol=1e-9)
 
 
 def test_query_csr_is_well_formed_on_a_folded_mesh():
@@ -681,21 +717,38 @@ def test_bary_is_in_the_simplex_on_every_leaf():
 
 
 def test_bary_reconstructs_beta_on_every_hit_leaf():
-    """Barycentric coordinates invert the source-plane map on every hit leaf."""
+    """Barycentric coordinates invert the source-plane map on every hit whose
+    triangle contains the point; a widened hit's coordinates instead give the
+    triangle's nearest point, within the leaf's deviation of beta."""
     mesh, _ = build(localised_fold, localised_fold_jacobian, min_img_sep=0.05)
     beta = RNG.uniform(-1.5, 1.5, size=(200, 2))
     idx, off, bary = query_np(mesh, beta)
     area = np.abs(to_np(area2(mesh.vertices_source[mesh.leaves])))[idx]
     vs = to_np(mesh.vertices_source)
     leaves = to_np(mesh.leaves)
+    tri = vs[leaves[idx]]
     owner = np.repeat(np.arange(len(beta)), np.diff(off))
     assert idx.shape[0] > 0, "fixture returned no candidates"
+    recon = np.einsum("kj,kjd->kd", bary, tri)
+    inside = to_np(
+        contains(
+            triangle_weights(
+                mesh_backend.as_array(tri), mesh_backend.as_array(beta[owner])
+            )
+        )
+    )
     good = area > 1e-10
+    assert good[
+        inside
+    ].all(), (
+        "fixture produced a degenerate contained leaf; the ~good branch needs writing"
+    )
+    assert np.allclose(recon[inside], beta[owner][inside], atol=1e-8)
+    grow = to_np(leaf_grow(mesh.origin_status, mesh.origin_deviation, mesh.leaf_origin))
     assert (
-        good.all()
-    ), "fixture produced a degenerate leaf; the ~good branch needs writing"
-    recon = np.einsum("kj,kjd->kd", bary, vs[leaves[idx]])
-    assert np.allclose(recon, beta[owner], atol=1e-8)
+        np.linalg.norm(recon[~inside] - beta[owner][~inside], axis=1)
+        <= grow[idx[~inside]] + 1e-12
+    ).all()
 
 
 def _pts(x):
@@ -857,7 +910,8 @@ def test_dedup_mixes_singleton_and_clustered_blocks_in_order():
 
 
 def test_index_hits_are_the_query_hits_with_raw_weights(mesh, beta):
-    qidx, tri, w = index_hits(mesh.index, mesh.vertices_source, mesh.leaves, beta)
+    grow = leaf_grow(mesh.origin_status, mesh.origin_deviation, mesh.leaf_origin)
+    qidx, tri, w = index_hits(mesh.index, mesh.vertices_source, mesh.leaves, beta, grow)
     idx, off, _ = mesh_query(mesh, beta)
     counts = np.diff(to_np(off))
     assert np.array_equal(to_np(tri), to_np(idx))

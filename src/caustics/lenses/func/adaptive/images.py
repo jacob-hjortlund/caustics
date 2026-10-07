@@ -1,26 +1,37 @@
 """
 Every image of each source-plane point, from a lens mesh.
 
-:func:`forward_raytrace` seeds Levenberg-Marquardt from each leaf whose
-source-plane image contains the point (:func:`mesh_query`,
-:func:`mesh_seeds`), keeps the roots that converge near their seed, and
-merges near-coincident roots (:func:`dedup_representatives`).
+:func:`forward_raytrace` seeds Levenberg-Marquardt from each finite leaf
+whose source-plane triangle contains the point, or reaches it
+(:func:`mesh_query`, :func:`mesh_seeds`), keeps the roots that converge near
+their seed and inside the fov, and merges near-coincident roots
+(:func:`dedup_representatives`).
 """
 
 from ....backend_obj import backend
 from .mesh_backend import mesh_backend, to_mesh, to_user
 from ....utils import batch_lm
-from .geometry import area2, contains, csr_offsets, sanitize_bary, triangle_weights
+from .geometry import (
+    area2,
+    contains,
+    csr_offsets,
+    edge_nearest,
+    sanitize_bary,
+    triangle_weights,
+)
 from .index import as_points, index_hits
-from .lens_mesh import make_sampler
+from .lens_mesh import leaf_grow, make_sampler
 
 
 def mesh_query(mesh, beta, batch_size=None):
     """
-    Leaves whose source-plane image contains each point.
+    Leaves whose source-plane triangle contains each point, or reaches it.
 
-    A point on an edge two leaves share returns both, and leaves near a
-    critical curve overlap, so the number of hits is not the image count.
+    A leaf that did not converge reaches its deviation beyond its triangle
+    (:func:`~.lens_mesh.leaf_grow`): near a lens center or a fold its true
+    image bulges past the straight-edged one. A point on an edge two leaves
+    share returns both, and leaves near a critical curve overlap, so the
+    number of hits is not the image count.
 
     Parameters
     ----------
@@ -39,11 +50,13 @@ def mesh_query(mesh, beta, batch_size=None):
     offsets: ArrayLike
         ``(B + 1,)`` int64 CSR offsets into ``leaf_indices``.
     bary: ArrayLike
-        ``(K, 3)`` float64 barycentric coordinates of each point in its
-        leaf's image, in the simplex.
+        ``(K, 3)`` float64 barycentric coordinates, in the simplex, of the
+        point of each leaf's triangle nearest the point: the point itself
+        where the triangle contains it.
     """
     device = mesh_backend.device(mesh.vertices_lens)
     beta = mesh_backend.as_array(beta, dtype=mesh_backend.float64, device=device)
+    grow = leaf_grow(mesh.origin_status, mesh.origin_deviation, mesh.leaf_origin)
     n = beta.shape[0]
     step = max(n, 1) if batch_size is None else max(1, int(batch_size))
     leaves = [mesh_backend.zeros((0,), dtype=mesh_backend.int64, device=device)]
@@ -51,13 +64,22 @@ def mesh_query(mesh, beta, batch_size=None):
     counts = [mesh_backend.zeros((0,), dtype=mesh_backend.int64, device=device)]
     for lo in range(0, n, step):
         chunk = beta[lo : lo + step]
-        qidx, cand, w = index_hits(mesh.index, mesh.vertices_source, mesh.leaves, chunk)
+        qidx, cand, w = index_hits(
+            mesh.index, mesh.vertices_source, mesh.leaves, chunk, grow
+        )
         counts.append(
             mesh_backend.long(mesh_backend.bincount(qidx, minlength=chunk.shape[0]))
         )
         leaves.append(cand)
         tri = mesh.vertices_source[mesh.leaves[cand]]
-        bary.append(sanitize_bary(w, area2(tri)))
+        _, nearest = edge_nearest(tri, chunk[qidx])
+        bary.append(
+            mesh_backend.where(
+                mesh_backend.unsqueeze(contains(w), -1),
+                sanitize_bary(w, area2(tri)),
+                nearest,
+            )
+        )
     return (
         mesh_backend.concatenate(leaves, dim=0),
         csr_offsets(mesh_backend.concatenate(counts, dim=0)),
@@ -69,8 +91,10 @@ def mesh_seeds(mesh, leaf_indices, bary):
     """
     Lens-plane preimage of each hit under its leaf's affine map, ``(K, 2)``.
 
-    Accurate to ``min_img_sep`` by the refinement criterion, and inside its
-    leaf, since ``bary`` lies in the simplex.
+    Inside its leaf, since ``bary`` lies in the simplex, and within about
+    the leaf's :func:`~.criterion.affine_error` of the image it
+    approximates: below ``min_img_sep`` on a converged leaf, by the
+    refinement criterion.
 
     *Unit: arcsec*
     """

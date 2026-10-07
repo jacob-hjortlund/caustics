@@ -53,7 +53,13 @@ from .refine import (
     sample_points,
 )
 from .index import MeshIndex, build_index
-from .criterion import LEAF_CONVERGED, deviation_and_sigma_min, lens_status
+from .criterion import (
+    LEAF_CONVERGED,
+    LEAF_JACOBIAN_NONFINITE,
+    LEAF_RAYTRACE_NONFINITE,
+    deviation_and_sigma_min,
+    lens_status,
+)
 from .band import CriticalBand, build_band, in_band
 from .holes import CenterHoles, merge_centers, sample_holes
 from .curves import _critical_curves_and_caustics
@@ -67,12 +73,15 @@ class LensMesh(NamedTuple):
     An adaptive triangulation of the lens plane, queryable from the source plane.
 
     Vertex ``v`` has a lens-plane position ``vertices_lens[v]`` and its image
-    ``vertices_source[v]``, so the two embeddings share one topology. Only
-    leaves whose origin is ``LEAF_CONVERGED`` are in ``index``: a leaf
-    failing the criterion at the finest level straddles a fold, a critical
-    curve or a non-finite point the mesh cannot resolve, and no query
-    returns it. The pre-closure leaves -- the origins -- are kept with their
-    level, class and status, which is what an extension refines from.
+    ``vertices_source[v]``, so the two embeddings share one topology. Every
+    leaf whose origin has a finite raytrace and Jacobian -- neither
+    ``LEAF_RAYTRACE_NONFINITE`` nor ``LEAF_JACOBIAN_NONFINITE`` -- is in
+    ``index``, converged or not. A leaf failing the criterion at the finest
+    level straddles a fold, a critical curve or a lens center the mesh
+    cannot resolve; its source triangle is queried grown by its deviation
+    (:func:`leaf_grow`), and ``forward_raytrace`` accepts its roots further
+    from their seeds. The pre-closure leaves -- the origins -- are kept with
+    their level, class and status, which is what an extension refines from.
 
     Parameters
     ----------
@@ -122,7 +131,8 @@ class LensMesh(NamedTuple):
         how far a seed of the origin can lie from its image, below
         ``min_img_sep`` on every converged origin.
     index: MeshIndex
-        Over the source-plane images of the leaves whose origin converged.
+        Over the source-plane images of the leaves whose origin is finite,
+        each grown by :func:`leaf_grow`.
     critical_band: CriticalBand
         The finest-level origins ``det A`` changes sign across.
     holes: CenterHoles
@@ -191,6 +201,22 @@ def make_sampler(raytrace, jacobian, device, batch_size=None):
         return out[:n] if size > n else out
 
     return sample
+
+
+def leaf_grow(origin_status, origin_deviation, leaf_origin):
+    """
+    How far each leaf's source-plane triangle reaches beyond itself when queried, ``(L,)``.
+
+    A leaf whose origin did not converge reaches its origin's largest
+    midpoint deviation: about how far the true image of one of its edges
+    bulges from the straight one. A converged leaf reaches no further than
+    its triangle.
+
+    *Unit: arcsec*
+    """
+    return mesh_backend.where(origin_status == LEAF_CONVERGED, 0.0, origin_deviation)[
+        leaf_origin
+    ]
 
 
 def _lens_split(h0, min_img_sep):
@@ -456,7 +482,12 @@ def _freeze(lat, cache, store, sample, min_img_sep, holes, batch_size, seed=None
 
     origin_status = status[origin]
     vertices_source = cache.values[used][:, :2]
-    converged = mesh_backend.flatnonzero(origin_status[leaf_origin] == LEAF_CONVERGED)
+    origin_deviation = deviation[origin]
+    finite = (
+        origin_status[leaf_origin] & (LEAF_RAYTRACE_NONFINITE | LEAF_JACOBIAN_NONFINITE)
+    ) == 0
+    indexed = mesh_backend.flatnonzero(finite)
+    grow = leaf_grow(origin_status, origin_deviation, leaf_origin)
     mesh = LensMesh(
         lattice=lat,
         vertices_ij=cache.ij[used],
@@ -470,9 +501,9 @@ def _freeze(lat, cache, store, sample, min_img_sep, holes, batch_size, seed=None
         origin_level=store.level[origin],
         origin_cls=store.cls[origin],
         origin_status=origin_status,
-        origin_deviation=deviation[origin],
+        origin_deviation=origin_deviation,
         origin_sigma_min=sigma_min[origin],
-        index=build_index(vertices_source, leaves, converged),
+        index=build_index(vertices_source, leaves, indexed, grow[indexed]),
         critical_band=band,
         holes=holes,
         min_img_sep=float(min_img_sep),

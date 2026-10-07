@@ -52,6 +52,7 @@ from caustics.lenses.func.adaptive.lens_mesh import (
     build_closed_lens_mesh,
     build_lens_mesh,
     extend_lens_mesh,
+    leaf_grow,
     make_sampler,
 )
 
@@ -357,7 +358,7 @@ def test_the_build_samples_no_point_twice_and_calls_both_callbacks_alike():
     assert [len(c) for c in calls.raytrace] == [len(c) for c in calls.jacobian]
 
 
-def test_statuses_are_set_only_at_the_finest_level_and_index_exactly_the_converged_leaves(
+def test_statuses_are_set_only_at_the_finest_level_and_index_exactly_the_finite_leaves(
     sie_mesh,
 ):
     mesh = sie_mesh
@@ -365,8 +366,10 @@ def test_statuses_are_set_only_at_the_finest_level_and_index_exactly_the_converg
     assert (status[level < mesh.lattice.level - 1] == LEAF_CONVERGED).all()
     assert (status != LEAF_CONVERGED).any()
     indexed = np.unique(to_np(mesh.index.cell_leaves))
-    want = np.flatnonzero(status[to_np(mesh.leaf_origin)] == LEAF_CONVERGED)
-    assert np.array_equal(indexed, want)
+    leaf = status[to_np(mesh.leaf_origin)]
+    finite = (leaf & (LEAF_RAYTRACE_NONFINITE | LEAF_JACOBIAN_NONFINITE)) == 0
+    assert np.array_equal(indexed, np.flatnonzero(finite))
+    assert (leaf[indexed] != LEAF_CONVERGED).any()
 
 
 def test_finest_leaves_are_no_longer_than_the_mesh_s_min_img_sep(sie_mesh):
@@ -465,7 +468,7 @@ def test_index_registers_every_leaf_in_the_cell_of_each_of_its_vertices():
     status = leaf_status(mesh)
     rng = np.random.default_rng(20260904)
     for leaf in rng.choice(len(leaves), size=50, replace=False):
-        if status[leaf] != LEAF_CONVERGED:
+        if status[leaf] & (LEAF_RAYTRACE_NONFINITE | LEAF_JACOBIAN_NONFINITE):
             continue
         for q in vs[leaves[leaf]]:
             # `build_index`'s own arithmetic: divide, truncate, clamp.
@@ -473,6 +476,17 @@ def test_index_registers_every_leaf_in_the_cell_of_each_of_its_vertices():
             iy = int(np.clip(np.trunc((q[1] - lo[1]) / cell[1]), 0, ny - 1))
             c = ix * ny + iy
             assert leaf in cells[offs[c] : offs[c + 1]]
+
+
+def test_leaf_grow_is_the_origin_s_deviation_where_it_did_not_converge(sie_mesh):
+    mesh = sie_mesh
+    grow = to_np(leaf_grow(mesh.origin_status, mesh.origin_deviation, mesh.leaf_origin))
+    origin = to_np(mesh.leaf_origin)
+    converged = to_np(mesh.origin_status)[origin] == LEAF_CONVERGED
+    assert (grow[converged] == 0).all()
+    deviation = to_np(mesh.origin_deviation)[origin]
+    assert np.array_equal(grow[~converged], deviation[~converged])
+    assert (grow[~converged] > 0).any()
 
 
 def test_build_halves_the_requested_min_img_sep():
@@ -487,12 +501,15 @@ def test_build_halves_the_requested_min_img_sep():
     assert mesh.min_img_sep == pytest.approx(0.2)
 
 
-def test_unconverged_leaves_are_kept_but_excluded_from_the_index():
+def test_unconverged_finite_leaves_are_indexed():
     mesh = build_lens_mesh(SIE_LIKE.raytrace, SIE_LIKE.jacobian_lens_equation, **BUILD)
     status = leaf_status(mesh)
     indexed = set(to_np(mesh.index.cell_leaves).tolist())
-    assert (status != LEAF_CONVERGED).any(), "fixture must flag some leaf"
-    assert indexed == set(np.flatnonzero(status == LEAF_CONVERGED).tolist())
+    finite = (status & (LEAF_RAYTRACE_NONFINITE | LEAF_JACOBIAN_NONFINITE)) == 0
+    assert (
+        finite & (status != LEAF_CONVERGED)
+    ).any(), "fixture must flag some finite leaf"
+    assert indexed == set(np.flatnonzero(finite).tolist())
 
 
 def test_mesh_arrays_are_float64():
