@@ -744,8 +744,10 @@ def inside_fov_image(mesh, beta):
     and a point is inside where it winds about the point
     (:func:`~.geometry.winding_number` nonzero), whichever its orientation.
     A point outside can have images outside the fov, where the mesh cannot
-    find them. At most :data:`CROSSING_PAIRS` point-segment pairs are held
-    at once.
+    find them. Where the lens is non-finite on the fov boundary, the
+    boundary's image has gaps, so sources near them may count as outside,
+    and growing the fov does not help. At most :data:`CROSSING_PAIRS`
+    point-segment pairs are held at once.
 
     Parameters
     ----------

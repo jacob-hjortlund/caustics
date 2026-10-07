@@ -144,7 +144,7 @@ def index_hits(index, vertices, triangles, beta, grow=None):
     cell's triangles. With ``grow``, a triangle that does not contain the
     point is a hit when the point lies within its ``grow`` of it
     (:func:`~.geometry.edge_nearest`); the index must have been built with
-    the same ``grow``. A point is tested against the stored ``hi``, never a
+    a ``grow`` at least as large. A point is tested against the stored ``hi``, never a
     recomputed ``lo + cell * n``, so a point on the upper edge of the
     bounding box still finds the triangles registered in the last column.
 
@@ -213,8 +213,9 @@ def index_hits(index, vertices, triangles, beta, grow=None):
     w = triangle_weights(tri, beta[qidx])
     hit = contains(w)
     if grow is not None:
-        dist, _ = edge_nearest(tri, beta[qidx])
-        hit = hit | (dist <= grow[cand])
+        reach = mesh_backend.flatnonzero(~hit & (grow[cand] > 0))
+        dist, _ = edge_nearest(tri[reach], beta[qidx[reach]])
+        hit = mesh_backend.fill_at_indices(hit, reach, dist <= grow[cand[reach]])
     hit = mesh_backend.flatnonzero(hit)
     return qidx[hit], cand[hit], w[hit]
 

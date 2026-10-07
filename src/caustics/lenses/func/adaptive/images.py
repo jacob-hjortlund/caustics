@@ -73,10 +73,15 @@ def mesh_query(mesh, beta, batch_size=None):
         )
         leaves.append(cand)
         tri = mesh.vertices_source[mesh.leaves[cand]]
-        _, nearest = edge_nearest(tri, chunk[qidx])
+        inside = contains(w)
+        outside = mesh_backend.flatnonzero(~inside)
+        _, found = edge_nearest(tri[outside], chunk[qidx[outside]])
+        nearest = mesh_backend.fill_at_indices(
+            mesh_backend.zeros_like(w), outside, found
+        )
         bary.append(
             mesh_backend.where(
-                mesh_backend.unsqueeze(contains(w), -1),
+                mesh_backend.unsqueeze(inside, -1),
                 sanitize_bary(w, area2(tri)),
                 nearest,
             )
@@ -314,6 +319,17 @@ def forward_raytrace(
     alone admits points far from any image. Kept roots closer than
     ``min_img_sep`` are one image.
 
+    On a leaf that did not converge, ``r`` can be far larger than
+    ``min_img_sep`` (near a fold it is unbounded), so the residual test is
+    then the only filter. Near a critical curve, a stalled solve can leave a
+    point within ``residual_tol`` of the source that is not an image, at a
+    very large magnification. A smaller ``residual_tol``, such as ``1e-6``,
+    removes such points.
+
+    Every image lies in the fov only on a mesh whose fov cuts no critical
+    curve (see :func:`~.lens_mesh.build_closed_lens_mesh`); elsewhere an
+    image outside the fov is lost silently.
+
     Parameters
     ----------
     bx, by: ArrayLike
@@ -348,7 +364,10 @@ def forward_raytrace(
     ------
     ValueError
         If any source lies outside the image of the mesh's fov boundary
-        (:func:`~.lens_mesh.inside_fov_image`), a NaN source included.
+        (:func:`~.lens_mesh.inside_fov_image`), a NaN source included. Where
+        the lens is non-finite on the fov boundary, the boundary's image has
+        gaps, so sources near them may count as outside, and growing the fov
+        does not help.
     """
     device = backend.device(mesh.vertices_lens)
     found = _forward_raytrace(

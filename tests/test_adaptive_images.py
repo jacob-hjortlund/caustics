@@ -361,9 +361,10 @@ def test_build_and_query_run_on_the_configured_device(device):
 def test_forward_raytrace_finds_no_spurious_sie_images(sie):
     """Every returned image is an image `lens.forward_raytrace` also finds.
 
-    The residual and leaf-or-ball filters exist for this: a stalled
-    Levenberg-Marquardt solve leaves a point that is not an image, and dedup will
-    not absorb it when it sits further than `min_img_sep` from a real one.
+    The residual and leaf-or-ball filters keep a stalled Levenberg-Marquardt
+    solve from being returned: the ball is `min_img_sep` on a converged leaf,
+    and on a leaf that did not converge it is `max(r, min_img_sep)`, which
+    can be large. These sources lie away from the caustics.
     """
     lens, mesh = sie
     for sp in ([0.2, 0.2], [0.05, -0.05]):
@@ -416,8 +417,9 @@ def test_forward_raytrace_finds_every_sis_inner_image_beyond_min_img_sep():
     has its inner image ``k * min_img_sep`` from the center, ``k > 1`` here.
     Near the center a finest leaf's source image is a curved arc, and a source
     in the bulge between the arc and the leaf's straight edge is inside no
-    triangle. Before this branch 56 of these 600 inner images were missed.
-    Images within ``min_img_sep`` of the center may or may not come back;
+    triangle. Seeding only from converged leaves, with a radius of
+    ``min_img_sep``, misses 56 of these 600. Images within ``min_img_sep`` of
+    the center may or may not come back;
     nothing is asserted about them.
     """
     sep = 0.05
@@ -445,7 +447,8 @@ def test_forward_raytrace_finds_every_sie_image_beyond_min_img_sep_of_a_critical
     times the mesh's ``min_img_sep`` from the vertices of the mesh's critical
     curves, which lie at most ``min_img_sep`` apart, so each ``theta`` is at
     least ``min_img_sep`` from the curve itself; their images are the sources.
-    Before this branch 21 of these 3000 were missed.
+    Seeding only from converged leaves, with a radius of ``min_img_sep``,
+    misses 21 of these 3000.
     """
     lens_, mesh = sie
     sep = mesh.min_img_sep
@@ -951,13 +954,11 @@ def test_near_seed_accepts_a_root_within_the_leaf_s_radius_and_rejects_one_beyon
     wide = np.flatnonzero(
         finite & (status != LEAF_CONVERGED) & np.isfinite(r) & (r > 2 * sep)
     )
-    # NOTE: the brief's selector read `diameter < 0.5 * sep`. Under this module's
-    # BUILD (max_depth=6, fov=6, init_res=4) the finest achievable leaf diagonal
-    # is sqrt(2) * (fov / init_res) / 2**6 ~= 0.0331, strictly above 0.5 * sep ==
-    # 0.025 for every leaf in the mesh (converged or not) -- a geometric floor
-    # independent of near_seed. Loosened to `sep` (still well below the smallest
-    # converged leaf's reach from its centroid, so the geometry the assertions
-    # below rely on still holds; 1656 converged leaves satisfy it here).
+    # NOTE: the fixture's leaves are no smaller than its finest level allows,
+    # so the selector is `diameter < sep`: no point of a triangle of diameter
+    # `d` lies more than `2 d / 3` from its centroid, under `0.67 * sep`, so
+    # the roots at `0.9` and `1.1` times the radius lie outside every
+    # selected leaf.
     tight = np.flatnonzero((status == LEAF_CONVERGED) & (diameter < sep))
     assert wide.size and tight.size, "fixture must have both kinds of leaf"
     chosen = np.concatenate((wide[:10], tight[:10]))

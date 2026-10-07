@@ -885,3 +885,18 @@ def test_index_hits_with_grow_returns_a_point_within_grow_of_a_triangle_and_not_
     assert np.array_equal(to_np(w), to_np(expected))
     plain_q, plain_t, _ = index_hits(idx, vs, leaves, beta)
     assert list(zip(to_np(plain_q).tolist(), to_np(plain_t).tolist())) == [(2, 0)]
+
+
+def test_index_hits_with_an_all_zero_grow_matches_a_plain_index():
+    rng = np.random.default_rng(11)
+    vs = f64(rng.uniform(-1, 1, (90, 2)))
+    leaves = i64(np.arange(90).reshape(30, 3))
+    rows = i64(np.arange(30))
+    grow = f64(np.zeros(30))
+    idx = build_index(vs, leaves, rows, grow)
+    beta = f64(rng.uniform(-1, 1, (200, 2)))
+    qidx_grow, tri_grow, w_grow = index_hits(idx, vs, leaves, beta, grow)
+    qidx_plain, tri_plain, w_plain = index_hits(idx, vs, leaves, beta)
+    assert np.array_equal(to_np(qidx_grow), to_np(qidx_plain))
+    assert np.array_equal(to_np(tri_grow), to_np(tri_plain))
+    assert np.array_equal(to_np(w_grow), to_np(w_plain))
