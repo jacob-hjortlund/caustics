@@ -23,6 +23,7 @@ from caustics.lenses.func.adaptive.geometry import (
     child_matrix_tables,
     contains,
     csr_offsets,
+    edge_nearest,
     is_member,
     min_angle,
     sanitize_bary,
@@ -31,6 +32,7 @@ from caustics.lenses.func.adaptive.geometry import (
     sigma_min_2x2,
     to_device,
     triangle_weights,
+    winding_number,
 )
 from caustics.lenses.func.adaptive.index import as_points, build_index
 from caustics.lenses.func.adaptive.lattice import (
@@ -761,3 +763,77 @@ def test_as_points_flattens_any_shape_into_float64_rows():
     got = as_points(f64([[0.0, 1.0]]), f64([[2.0, 3.0]]), None)
     assert to_np(got).tolist() == [[0.0, 2.0], [1.0, 3.0]]
     assert as_points(f64([]), f64([]), None).shape == (0, 2)
+
+
+def test_edge_nearest_projects_onto_the_nearest_edge():
+    tri = f64([[[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]]] * 3)
+    beta = f64([[0.25, -0.5], [0.75, 0.75], [-0.5, 0.25]])
+    dist, bary = edge_nearest(tri, beta)
+    assert np.allclose(to_np(dist), [0.5, np.sqrt(2) / 4, 0.5])
+    assert np.allclose(
+        to_np(bary), [[0.75, 0.25, 0.0], [0.0, 0.5, 0.5], [0.75, 0.0, 0.25]]
+    )
+
+
+def test_edge_nearest_gives_the_vertex_beyond_a_corner_and_the_end_of_a_zero_length_edge():
+    tri = f64(
+        [
+            [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]],
+            [[0.0, 0.0], [0.0, 0.0], [0.0, 1.0]],
+        ]
+    )
+    dist, bary = edge_nearest(tri, f64([[2.0, -1.0], [0.0, -1.0]]))
+    assert np.allclose(to_np(dist), [np.sqrt(2), 1.0])
+    b = to_np(bary)
+    assert np.allclose(b[0], [0.0, 1.0, 0.0])
+    assert np.allclose(b[1] @ to_np(tri)[1], [0.0, 0.0])
+
+
+def test_edge_nearest_is_the_nearest_boundary_point_in_the_simplex():
+    rng = np.random.default_rng(3)
+    tri = rng.normal(size=(200, 3, 2))
+    beta = 3.0 * rng.normal(size=(200, 2))
+    dist, bary = edge_nearest(f64(tri), f64(beta))
+    d, b = to_np(dist), to_np(bary)
+    assert (b >= 0).all() and np.allclose(b.sum(axis=1), 1.0)
+    nearest = np.einsum("kj,kjd->kd", b, tri)
+    assert np.allclose(np.linalg.norm(nearest - beta, axis=1), d)
+    s = np.linspace(0.0, 1.0, 401)[None, :, None]
+    sampled = np.concatenate(
+        [
+            tri[:, i, None] + s * (tri[:, (i + 1) % 3, None] - tri[:, i, None])
+            for i in range(3)
+        ],
+        axis=1,
+    )
+    brute = np.linalg.norm(sampled - beta[:, None], axis=-1).min(axis=1)
+    assert (d <= brute + 1e-12).all()
+
+
+SQUARE = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]
+
+
+def test_winding_number_of_a_square_is_one_inside_zero_outside_and_minus_one_reversed():
+    pts = f64([[0.5, 0.5], [1.5, 0.5], [0.5, -0.5], [-0.5, 0.5]])
+    assert to_np(winding_number(f64(SQUARE), pts)).tolist() == [1, 0, 0, 0]
+    assert to_np(winding_number(f64(SQUARE[::-1]), pts)).tolist() == [-1, 0, 0, 0]
+
+
+def test_winding_number_counts_a_ray_through_a_vertex_once():
+    diamond = f64([[1.0, 0.0], [2.0, 1.0], [1.0, 2.0], [0.0, 1.0]])
+    pts = f64([[1.0, 1.0], [-1.0, 1.0], [1.0, 0.5]])
+    assert to_np(winding_number(diamond, pts)).tolist() == [1, 0, 1]
+
+
+def test_winding_number_of_a_figure_eight_is_plus_and_minus_one_in_its_lobes():
+    eight = f64(
+        [[0.0, 0.0], [1.0, -1.0], [1.0, 1.0], [0.0, 0.0], [-1.0, -1.0], [-1.0, 1.0]]
+    )
+    pts = f64([[0.6, 0.1], [-0.6, 0.1], [2.0, 0.1]])
+    assert to_np(winding_number(eight, pts)).tolist() == [1, -1, 0]
+
+
+def test_winding_number_of_a_nan_point_or_past_a_nan_vertex_is_zero():
+    assert to_np(winding_number(f64(SQUARE), f64([[np.nan, 0.5]]))).tolist() == [0]
+    broken = f64([[0.0, 0.0], [1.0, 0.0], [np.nan, np.nan], [0.0, 1.0]])
+    assert to_np(winding_number(broken, f64([[0.5, 0.5]]))).tolist() == [0]

@@ -3,9 +3,9 @@ Triangle maths shared by both meshes, and small array helpers.
 
 The red-refinement child ordering and its integer group tables, the smallest
 singular value that scales the lens criterion, the minimum angle closure
-compares, the containment test and barycentric coordinates every
-source-plane lookup reads, and the segment crossing test. Nothing here calls
-the lens or knows about a mesh.
+compares, the containment test, nearest boundary points and barycentric
+coordinates every source-plane lookup reads, and the segment crossing and
+winding tests. Nothing here calls the lens or knows about a mesh.
 """
 
 from .mesh_backend import map_arrays, mesh_backend
@@ -299,6 +299,60 @@ def contains(w):
     return nonneg | nonpos
 
 
+def edge_nearest(tri, beta):
+    """
+    The point of each triangle's boundary nearest each point: its distance and barycentric coordinates.
+
+    Each edge is projected on, the projection clamped to the edge, and the
+    nearest of the three wins, ties taking the first edge in the order
+    ``(1, 2), (2, 3), (3, 1)``; a zero-length edge is its own endpoint.
+    Outside a triangle the boundary point is the triangle's point nearest
+    the point. A NaN point gives a NaN distance.
+
+    Parameters
+    ----------
+    tri: ArrayLike
+        ``(K, 3, 2)`` triangle vertices.
+
+        *Unit: arcsec*
+    beta: ArrayLike
+        ``(K, 2)`` points, one per triangle.
+
+        *Unit: arcsec*
+
+    Returns
+    -------
+    dist: ArrayLike
+        ``(K,)`` distance to the boundary.
+
+        *Unit: arcsec*
+    bary: ArrayLike
+        ``(K, 3)`` barycentric coordinates of the nearest boundary point, in
+        the simplex.
+    """
+    zero = mesh_backend.zeros_like(beta[:, 0])
+    dist, bary = None, None
+    for i in range(3):
+        j = (i + 1) % 3
+        a, ab = tri[:, i], tri[:, j] - tri[:, i]
+        length2 = mesh_backend.sum(ab * ab, dim=-1)
+        t = mesh_backend.sum((beta - a) * ab, dim=-1) / mesh_backend.where(
+            length2 > 0, length2, 1.0
+        )
+        t = mesh_backend.clamp(t, 0.0, 1.0)
+        d = mesh_backend.norm(beta - (a + mesh_backend.unsqueeze(t, -1) * ab), dim=-1)
+        columns = [zero, zero, zero]
+        columns[i], columns[j] = 1.0 - t, t
+        edge_bary = mesh_backend.stack(columns, dim=-1)
+        if dist is None:
+            dist, bary = d, edge_bary
+            continue
+        nearer = d < dist
+        dist = mesh_backend.where(nearer, d, dist)
+        bary = mesh_backend.where(mesh_backend.unsqueeze(nearer, -1), edge_bary, bary)
+    return dist, bary
+
+
 def _side(p, q, r):
     """Sign of the cross product ``(q - p) x (r - p)``: which side of ``p -> q`` each ``r`` is on."""
     d, e = q - p, r - p
@@ -334,6 +388,42 @@ def segments_cross(a0, a1, b0, b1):
     lo_b, hi_b = mesh_backend.minimum(b0, b1), mesh_backend.maximum(b0, b1)
     overlap = mesh_backend.all((lo_a <= hi_b) & (lo_b <= hi_a), dim=-1)
     return straddle & overlap
+
+
+def winding_number(polygon, points):
+    """
+    Winding number of a closed polyline about each point.
+
+    Segment ``p_k p_{k+1}``, the last closing back to the first, adds +1 where
+    it crosses the horizontal ray to the right of a point going up with the
+    point on its left, and -1 going down with the point on its right. A
+    segment holds its lower end and not its upper one, so a ray through a
+    vertex counts once. A point on the polyline gets the count of one side or
+    the other. A segment with a NaN end, and a NaN point, cross nothing.
+
+    Parameters
+    ----------
+    polygon: ArrayLike
+        ``(M, 2)`` vertices, in order.
+
+        *Unit: arcsec*
+    points: ArrayLike
+        ``(B, 2)``.
+
+        *Unit: arcsec*
+
+    Returns
+    -------
+    ArrayLike
+        ``(B,)`` int64.
+    """
+    a = mesh_backend.unsqueeze(polygon, 0)
+    b = mesh_backend.unsqueeze(mesh_backend.roll(polygon, -1, 0), 0)
+    p = mesh_backend.unsqueeze(points, 1)
+    side = _side(a, b, p)
+    up = (a[..., 1] <= p[..., 1]) & (b[..., 1] > p[..., 1]) & (side > 0)
+    down = (a[..., 1] > p[..., 1]) & (b[..., 1] <= p[..., 1]) & (side < 0)
+    return mesh_backend.sum(mesh_backend.long(up) - mesh_backend.long(down), dim=1)
 
 
 def sanitize_bary(w, d):
