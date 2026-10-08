@@ -143,7 +143,7 @@ def near_seed(mesh, idx, seed, root):
     )
 
 
-def dedup_block_group(points, rows, n_blocks, m, tol):
+def dedup_block_group(points, residual2, rows, n_blocks, m, tol):
     """
     Connected-component representatives for blocks of exactly ``m`` points.
 
@@ -156,6 +156,10 @@ def dedup_block_group(points, rows, n_blocks, m, tol):
         The caller's full point array, shape ``(K, 2)``.
 
         *Unit: arcsec*
+    residual2: ArrayLike
+        ``(K,)`` finite squared residual of each point.
+
+        *Unit: arcsec^2*
     rows: ArrayLike
         ``(n_blocks * m,)`` int64 indices into ``points``, block-major. A
         host-side sequence is accepted too; see :func:`dedup_representatives`.
@@ -173,8 +177,9 @@ def dedup_block_group(points, rows, n_blocks, m, tol):
     """
     device = mesh_backend.device(points)
     int64 = mesh_backend.int64
-    p = points[mesh_backend.as_array(rows, dtype=int64, device=device)]
-    p = p.reshape(n_blocks, m, 2)
+    rows = mesh_backend.as_array(rows, dtype=int64, device=device)
+    p = points[rows].reshape(n_blocks, m, 2)
+    r = residual2[rows].reshape(n_blocks, m)
 
     delta = mesh_backend.unsqueeze(p, 2) - mesh_backend.unsqueeze(p, 1)
     # Exact on the diagonal: every point is its own neighbour.
@@ -193,18 +198,25 @@ def dedup_block_group(points, rows, n_blocks, m, tol):
             break
         labels = updated
 
-    # Each component is labelled with its lowest slot, the one slot that keeps
-    # its own label.
-    return (labels == index).reshape(-1)
+    # A slot represents its component when no other slot of it is better: a
+    # smaller residual, or the same one at an earlier slot.
+    same = mesh_backend.unsqueeze(labels, 2) == mesh_backend.unsqueeze(labels, 1)
+    r_i, r_j = mesh_backend.unsqueeze(r, 2), mesh_backend.unsqueeze(r, 1)
+    earlier = mesh_backend.unsqueeze(index, 1) < mesh_backend.unsqueeze(index, 2)
+    better = same & ((r_j < r_i) | ((r_j == r_i) & earlier))
+    return (~mesh_backend.any(better, dim=2)).reshape(-1)
 
 
-def dedup_representatives(points, counts, tol):
+def dedup_representatives(points, residual2, counts, tol):
     """
     One representative per cluster of near-coincident points, within each block.
 
     Clusters are the connected components of the ``distance < tol`` graph,
     not greedy clusters, so they depend on the point set alone, not its
-    order; a pair exactly ``tol`` apart stays distinct. Blocks are grouped by
+    order; a pair exactly ``tol`` apart stays distinct. Each cluster is
+    represented by its point of smallest residual, ties going to the
+    earliest: the earliest root of an image can be the least converged one.
+    Blocks are grouped by
     size, and blocks of zero or one point skip the clustering. Block-major
     order is restored by gathering with the inverse permutation -- the
     ``argsort`` of the groups' rows -- since torch and jax resolve a scatter
@@ -217,6 +229,10 @@ def dedup_representatives(points, counts, tol):
         ``counts[b]`` rows following those of blocks ``0 .. b - 1``.
 
         *Unit: arcsec*
+    residual2: ArrayLike
+        ``(K,)`` finite squared residual of each point.
+
+        *Unit: arcsec^2*
     counts: ArrayLike
         Shape ``(B,)`` int, with ``counts.sum() == K``. Zero-length blocks are
         allowed.
@@ -260,7 +276,9 @@ def dedup_representatives(points, counts, tol):
             )
         ).reshape(-1)
         row_groups.append(rows)
-        keep_groups.append(dedup_block_group(points, rows, blocks.shape[0], m, tol))
+        keep_groups.append(
+            dedup_block_group(points, residual2, rows, blocks.shape[0], m, tol)
+        )
 
     # Every row is in exactly one group, so `perm` is a permutation.
     perm = mesh_backend.concatenate(row_groups, dim=0)
@@ -294,11 +312,13 @@ def _images(mesh, beta, raytrace, tol, lm_kwargs, device):
     )
     root = mesh_backend.to(to_mesh(root), device=mesh_device)
     trace = make_sampler(raytrace, None, device)
-    converged = mesh_backend.sum((trace(root) - target) ** 2, dim=-1) < tol * tol
+    residual2 = mesh_backend.sum((trace(root) - target) ** 2, dim=-1)
+    converged = residual2 < tol * tol
     keep = converged & near_seed(mesh, idx, seed, root) & inside_fov(mesh, root)
     kept = _block_sums(mesh_backend.long(keep), offsets)
-    root = root[mesh_backend.flatnonzero(keep)]
-    unique = dedup_representatives(root, kept, mesh.min_img_sep)
+    rows = mesh_backend.flatnonzero(keep)
+    root = root[rows]
+    unique = dedup_representatives(root, residual2[rows], kept, mesh.min_img_sep)
     return root[unique], _block_sums(mesh_backend.long(unique), csr_offsets(kept))
 
 
@@ -317,7 +337,7 @@ def forward_raytrace(
     of the seed, ``r`` the leaf's :func:`~.criterion.affine_error`
     (:func:`near_seed`), and lies in the fov: near a fold, a small residual
     alone admits points far from any image. Kept roots closer than
-    ``min_img_sep`` are one image.
+    ``min_img_sep`` are one image, the one of smallest residual.
 
     On a leaf that did not converge, ``r`` can be far larger than
     ``min_img_sep`` (near a fold it is unbounded), so the residual test is

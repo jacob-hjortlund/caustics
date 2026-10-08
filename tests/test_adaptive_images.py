@@ -592,6 +592,26 @@ def test_query_returns_the_leaves_around_a_lattice_point_where_det_a_is_exactly_
         assert held.any(), f"no queried leaf holds {image}"
 
 
+def test_forward_raytrace_returns_the_converged_root_of_an_image_by_a_point_caustic():
+    """The SIS's caustic is a point, so near it a residual says little about position.
+
+    Hand-derived: ``beta = 1e-4 (cos 30, sin 30)`` has its images at
+    ``theta = (1 + 1e-4) u`` and ``theta = (1e-4 - 1) u``, ``u`` the direction of
+    ``beta``. There the tangential eigenvalue ``1 - 1/|theta|`` is about
+    ``1e-4``, so a root up to ``1e-6 / 1e-4 = 1e-2`` from an image still passes
+    ``residual_tol`` and joins that image's cluster, beside the converged root.
+    """
+    t, u = 1e-4, np.array([np.cos(np.pi / 6), np.sin(np.pi / 6)])
+    mesh = build_lens_mesh(
+        SIS.raytrace, SIS.jacobian_lens_equation, fov=4.0, init_res=8, min_img_sep=0.02
+    )
+    images, counts = fr(mesh, _beta([t * u]), _sis)
+    assert to_np(counts).tolist() == [2]
+    for image in ((1 + t) * u, (t - 1) * u):
+        gap = np.linalg.norm(to_np(images) - image, axis=1).min()
+        assert gap < 1e-8, f"no image within 1e-8 of {image}, closest {gap:.3g}"
+
+
 def test_query_covers_points_on_the_source_bbox_upper_edge():
     """Regression: the upper bbox edge used to return zero candidates.
 
@@ -793,15 +813,29 @@ def _pts(x):
     )
 
 
+def _dedup(points, counts, tol):
+    """``dedup_representatives`` with every residual equal: each cluster keeps its earliest point."""
+    residual2 = _pts(np.zeros(points.shape[0]))
+    return to_np(dedup_representatives(points, residual2, counts, tol))
+
+
 def test_dedup_collapses_points_closer_than_the_tolerance():
     pts = _pts([[0.0, 0.0], [0.05, 0.0], [1.0, 0.0]])
-    keep = to_np(dedup_representatives(pts, np.array([3]), 0.1))
+    keep = _dedup(pts, np.array([3]), 0.1)
     assert keep.tolist() == [True, False, True]
+
+
+def test_dedup_keeps_the_point_of_smallest_residual_in_each_cluster():
+    """Not the earliest: the earliest root of an image can be the least converged."""
+    pts = _pts([[0.0, 0.0], [0.005, 0.0], [1.0, 0.0], [1.005, 0.0]])
+    residual2 = _pts([4e-12, 1e-30, 1.0, 1.0])
+    keep = to_np(dedup_representatives(pts, residual2, np.array([4]), 0.01))
+    assert keep.tolist() == [False, True, True, False]
 
 
 def test_dedup_keeps_points_separated_by_exactly_the_tolerance():
     pts = _pts([[0.0, 0.0], [0.1, 0.0]])
-    keep = to_np(dedup_representatives(pts, np.array([2]), 0.1))
+    keep = _dedup(pts, np.array([2]), 0.1)
     assert keep.tolist() == [True, True]
 
 
@@ -863,10 +897,10 @@ def test_dedup_counts_connected_components_regardless_of_point_order():
     """
     p = np.array([[0.0, 0.0], [0.009, 0.0], [0.018, 0.0]])
     counts = np.array([3])
-    base = to_np(dedup_representatives(_pts(p), counts, 0.01)).sum()
+    base = _dedup(_pts(p), counts, 0.01).sum()
     assert base == 1, f"one chained component expected, got {base}"
     for order in ([1, 0, 2], [2, 1, 0], [0, 2, 1], [2, 0, 1]):
-        got = to_np(dedup_representatives(_pts(p[order]), counts, 0.01)).sum()
+        got = _dedup(_pts(p[order]), counts, 0.01).sum()
         assert got == base, f"order {order} gave {got}, not {base}"
 
 
@@ -880,14 +914,14 @@ def test_dedup_keeps_identical_points_in_different_blocks_distinct():
     here, and it would silently halve a multiplicity map.
     """
     points = _pts([[0.0, 0.0], [0.0, 0.0]])
-    keep = to_np(dedup_representatives(points, np.array([1, 1]), 0.01))
+    keep = _dedup(points, np.array([1, 1]), 0.01)
     assert keep.sum() == 2, "identical points in different blocks are distinct"
 
 
 def test_dedup_handles_ragged_blocks_and_empty_blocks():
     """Padding must not invent images in a block that found none."""
     points = _pts([[0.0, 0.0], [5.0, 5.0], [5.0, 5.0005]])
-    keep = to_np(dedup_representatives(points, np.array([1, 0, 2]), 0.01))
+    keep = _dedup(points, np.array([1, 0, 2]), 0.01)
     assert keep.tolist() == [True, True, False]
 
 
@@ -913,11 +947,16 @@ def test_dedup_is_unchanged_by_bucketing_on_randomised_blocks():
     cases += [rng.integers(0, 6, size=rng.integers(1, 12)) for _ in range(20)]
     for counts in cases:
         pts = rng.normal(scale=0.01, size=(int(counts.sum()), 2)).reshape(-1, 2)
-        got = to_np(dedup_representatives(_pts(pts), counts, 0.01))
+        res = _pts(rng.random(int(counts.sum())))
+        got = to_np(dedup_representatives(_pts(pts), res, counts, 0.01))
         starts = np.cumsum(counts) - counts
         want = np.concatenate(
             [
-                to_np(dedup_representatives(_pts(pts[s : s + c]), np.array([c]), 0.01))
+                to_np(
+                    dedup_representatives(
+                        _pts(pts[s : s + c]), res[s : s + c], np.array([c]), 0.01
+                    )
+                )
                 for s, c in zip(starts, counts)
             ]
             + [np.zeros(0, dtype=bool)]
@@ -928,7 +967,7 @@ def test_dedup_is_unchanged_by_bucketing_on_randomised_blocks():
 def test_dedup_keeps_exactly_one_point_per_singleton_block():
     """Blocks of one bypass the clustering kernel; they must still be kept."""
     points = _pts([[0.0, 0.0], [1.0, 1.0], [2.0, 2.0]])
-    keep = to_np(dedup_representatives(points, np.array([1, 1, 1]), 0.01))
+    keep = _dedup(points, np.array([1, 1, 1]), 0.01)
     assert keep.tolist() == [True, True, True]
 
 
@@ -941,7 +980,7 @@ def test_dedup_mixes_singleton_and_clustered_blocks_in_order():
     representatives in the wrong rows.
     """
     points = _pts([[9.0, 9.0], [0.0, 0.0], [0.0, 0.001], [5.0, 5.0]])
-    keep = to_np(dedup_representatives(points, np.array([1, 2, 1]), 0.01))
+    keep = _dedup(points, np.array([1, 2, 1]), 0.01)
     assert keep.tolist() == [True, True, False, True]
 
 
