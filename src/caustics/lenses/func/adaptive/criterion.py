@@ -26,10 +26,12 @@ from .geometry import (
 # - `LEAF_APPROX_PARITY_UNRESOLVED`: the four red-split children disagree on
 #   their orientation in the source plane.
 # - `LEAF_JACOBIAN_PARITY_UNRESOLVED`: `det A` changes sign between the six
-#   samples.
+#   samples, or is exactly zero at one: a zero has no sign, and puts a
+#   critical point on the triangle. (The band instead counts a zero as
+#   positive, to trace the curve.)
 # - `LEAF_RAYTRACE_NONFINITE`: some image is non-finite; then it is the only
 #   flag.
-# - `LEAF_JACOBIAN_NONFINITE`: some `det A` is non-finite or exactly zero.
+# - `LEAF_JACOBIAN_NONFINITE`: some `det A` is non-finite.
 LEAF_CONVERGED = 0
 LEAF_CONVERGENCE_FAILED = 1 << 0
 LEAF_APPROX_PARITY_UNRESOLVED = 1 << 1
@@ -197,8 +199,8 @@ def lens_status(beta6, det6, sigma6, cls, level, h0, min_img_sep):
       prediction, both for ``s`` the smallest singular value of the
       children's affine maps and for ``s`` the smallest ``sigma_min(A)`` at
       the six samples (``LEAF_CONVERGENCE_FAILED``);
-    - ``det A`` is finite and nonzero at all six samples
-      (``LEAF_JACOBIAN_NONFINITE``) and of one sign
+    - ``det A`` is finite at all six samples (``LEAF_JACOBIAN_NONFINITE``)
+      and of one strict sign, an exact zero having none
       (``LEAF_JACOBIAN_PARITY_UNRESOLVED``).
 
     Parameters
@@ -238,7 +240,7 @@ def lens_status(beta6, det6, sigma6, cls, level, h0, min_img_sep):
     ) & converged_from_deviation(
         deviation, mesh_backend.min(sigma6, dim=1), min_img_sep
     )
-    det_ok = mesh_backend.all(mesh_backend.isfinite(det6) & (det6 != 0), dim=1)
+    det_ok = mesh_backend.all(mesh_backend.isfinite(det6), dim=1)
     one_sign = mesh_backend.all(det6 > 0, dim=1) | mesh_backend.all(det6 < 0, dim=1)
     status = (
         mesh_backend.long(~parity_from_children(Q)) * LEAF_APPROX_PARITY_UNRESOLVED

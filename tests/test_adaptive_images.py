@@ -567,6 +567,27 @@ def test_query_seeds_an_inner_image_that_runs_into_the_lens_center():
         assert gap <= 0.05, f"no seed within min_img_sep of {image}, closest {gap:.3g}"
 
 
+def test_query_returns_the_leaves_around_a_lattice_point_where_det_a_is_exactly_zero():
+    """A critical curve through a lattice point must not cost the leaves around it.
+
+    The SIS's critical curve ``|theta| = 1`` runs through the level-0 vertex
+    ``(1, 0)``, where ``A = diag(1, 0)`` and ``det A`` is exactly zero. Hand-derived:
+    ``beta = (0.005, 0)`` has its images at ``theta = 1.005`` and
+    ``theta = -0.995`` on the x axis, since ``1.005 * (1 - 1/1.005) = 0.005`` and
+    ``-0.995 * (1 - 1/0.995) = 0.005``, both well inside the finest leaves that
+    share ``(1, 0)`` and ``(-1, 0)``, whose legs are ``1/64``. The query must
+    return a leaf containing each: the solve alone does not show it, since
+    unconverged neighbours reach the images too.
+    """
+    mesh, _ = build(sis_raytrace, sis_jacobian, min_img_sep=0.05)
+    idx, _, _ = query_np(mesh, np.array([[0.005, 0.0]]))
+    tri = mesh_backend.as_array(to_np(mesh.vertices_lens)[to_np(mesh.leaves)[idx]])
+    for image in ([1.005, 0.0], [-0.995, 0.0]):
+        at = mesh_backend.as_array(np.repeat([image], idx.shape[0], axis=0))
+        held = to_np(contains(triangle_weights(tri, at)))
+        assert held.any(), f"no queried leaf holds {image}"
+
+
 def test_query_covers_points_on_the_source_bbox_upper_edge():
     """Regression: the upper bbox edge used to return zero candidates.
 

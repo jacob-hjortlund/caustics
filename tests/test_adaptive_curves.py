@@ -16,7 +16,6 @@ from caustics.lenses.func.adaptive import (
     CenterHoles,
     CriticalBand,
     CriticalCurvesAndCaustics,
-    LEAF_JACOBIAN_PARITY_UNRESOLVED,
     LensMesh,
     build_lens_mesh,
     critical_curves_and_caustics,
@@ -798,13 +797,12 @@ def test_the_fov_cuts_the_tangential_circle_into_four_open_arcs():
             assert np.abs(end).max() == 1.0
 
 
-def test_a_curve_through_lattice_points_is_traced_without_any_parity_flag():
+def test_a_curve_through_lattice_points_is_traced_exactly_along_the_row():
     """Every sample on ``y = 0.5`` has ``det A`` exactly zero.
 
-    So no leaf carries ``LEAF_JACOBIAN_PARITY_UNRESOLVED`` -- a mask on that
-    flag finds nothing -- yet the band's zero-is-positive rule traces one open
-    curve along the row, exactly. ``det A > 0`` below the row puts it on the
-    left of travel in ``-x``, so the curve runs from ``x = 2`` to ``x = -2``.
+    The band's zero-is-positive rule traces one open curve along the row,
+    exactly. ``det A > 0`` below the row puts it on the left of travel in
+    ``-x``, so the curve runs from ``x = 2`` to ``x = -2``.
     This also pins the spec's rule that coincident consecutive points --
     which tracing a curve through lattice points produces -- are kept, not
     removed.
@@ -816,8 +814,6 @@ def test_a_curve_through_lattice_points_is_traced_without_any_parity_flag():
         init_res=8,
         min_img_sep=2e-2,
     )
-    status = to_np(mesh.origin_status)
-    assert not ((status & LEAF_JACOBIAN_PARITY_UNRESOLVED) != 0).any()
     curves = _curves(mesh)
     assert len(curves) == 1
     lens, _, closed = curves[0]

@@ -179,14 +179,31 @@ def test_one_flipped_det_sign_flags_jacobian_parity_on_its_row_alone(sample):
     ]
 
 
-@pytest.mark.parametrize("bad", [np.nan, np.inf, 0.0])
-def test_a_nonfinite_or_zero_det_flags_jacobian_nonfinite_not_parity(bad):
+@pytest.mark.parametrize("bad", [np.nan, np.inf])
+def test_a_nonfinite_det_flags_jacobian_nonfinite_not_parity(bad):
     def det(p):
         out = np.full(p.shape[:-1], np.linalg.det(A))
         out[0, 3] = bad
         return out
 
     assert status(roots(), affine, det).tolist() == [LEAF_JACOBIAN_NONFINITE, 0]
+
+
+@pytest.mark.parametrize("sign", [1.0, -1.0])
+def test_an_exactly_zero_det_is_no_sign_so_it_flags_jacobian_parity_not_nonfinite(
+    sign,
+):
+    """A zero sample puts a critical curve on the triangle, whatever the others' sign."""
+
+    def det(p):
+        out = np.full(p.shape[:-1], sign)
+        out[0, 3] = 0.0
+        return out
+
+    assert status(roots(), affine, det).tolist() == [
+        LEAF_JACOBIAN_PARITY_UNRESOLVED,
+        0,
+    ]
 
 
 def test_the_sign_comes_from_det_a_itself_however_small():
@@ -677,9 +694,11 @@ def independent_band(mesh, jac):
 def test_band_is_the_sign_change_leaves_recomputed_independently(fn, jac, kw):
     """The band is exactly the finest origins whose six dets change class.
 
-    Every ``LEAF_JACOBIAN_PARITY_UNRESOLVED`` origin is in it; every other band
-    origin is ``LEAF_JACOBIAN_NONFINITE`` with an exactly zero sample.
-    `localised_fold`'s curve is never a lattice row, `row_fold`'s is one.
+    Every band origin is ``LEAF_JACOBIAN_PARITY_UNRESOLVED``. So is every
+    origin with an exactly zero sample, which has no sign; outside the band
+    those are the ones whose other samples are all positive, the class the
+    band gives a zero. `localised_fold`'s curve is never a lattice row,
+    `row_fold`'s is one.
     """
     mesh, _ = build(fn, jac, fov=4.0, **kw)
     band = mesh.critical_band
@@ -689,15 +708,20 @@ def test_band_is_the_sign_change_leaves_recomputed_independently(fn, jac, kw):
     assert sorted(got.tolist()) == sorted(want.tolist())
     status = to_np(mesh.origin_status)
     flagged = np.flatnonzero((status & LEAF_JACOBIAN_PARITY_UNRESOLVED) != 0)
-    assert set(flagged.tolist()) <= set(got.tolist())
-    extra = ~np.isin(got, flagged)
-    assert ((status[got[extra]] & LEAF_JACOBIAN_NONFINITE) != 0).all()
-    det = to_np(band.det)[to_np(band.samples)]
-    assert (det[extra] == 0).any(axis=1).all()
+    assert set(got.tolist()) <= set(flagged.tolist())
+    rows, xy = lattice_samples(mesh)
+    J = jac(xy.reshape(-1, 2)).reshape(-1, 6, 2, 2)
+    det = dict(
+        zip(rows.tolist(), J[..., 0, 0] * J[..., 1, 1] - J[..., 0, 1] * J[..., 1, 0])
+    )
+    zero = [r for r, d in det.items() if (d == 0).any() and np.isfinite(d).all()]
+    assert set(zero) <= set(flagged.tolist())
+    extra = np.setdiff1d(flagged, got).tolist()
+    assert all((det[r] == 0).any() and (det[r] >= 0).all() for r in extra)
     if fn is row_fold:
-        assert flagged.size == 0 and extra.all()
+        assert len(extra) > 0
     else:
-        assert not extra.any()
+        assert len(extra) == 0
 
 
 def test_band_samples_are_lattice_exact_and_carry_the_lens_values():
@@ -833,14 +857,13 @@ def _gaussian_bump_jacobian(p, w=0.08, amp=1.0, c=(0.13, 0.07)):
 
 
 def test_a_kappa_one_sheet_samples_every_lattice_point_once_and_converges_nothing():
-    """``A == 0`` everywhere: every triangle fails the deviation test and has zero dets."""
+    """``A == 0`` everywhere: every triangle fails the deviation test, and its dets, all zero, have no sign."""
     mesh, calls = build(collapse, collapse_jacobian, min_img_sep=1.0)
     level, status = to_np(mesh.origin_level), to_np(mesh.origin_status)
     assert (level == mesh.lattice.level - 1).all()
-    assert (status == (LEAF_CONVERGENCE_FAILED | LEAF_JACOBIAN_NONFINITE)).all()
+    assert (status == (LEAF_CONVERGENCE_FAILED | LEAF_JACOBIAN_PARITY_UNRESOLVED)).all()
     assert np.isfinite(to_np(mesh.vertices_source)).all()
     assert sum(len(c) for c in calls.raytrace) == (mesh.lattice.n + 1) ** 2
-    assert to_np(mesh.index.cell_leaves).size == 0
 
 
 def test_a_nonfinite_subregion_is_split_down_to_the_finest_level():
@@ -964,11 +987,11 @@ def test_failure_flags_are_mutually_consistent():
     assert (level[status != LEAF_CONVERGED] == mesh.lattice.level - 1).all()
 
 
-def test_a_kappa_one_sheet_indexes_no_leaf():
+def test_a_kappa_one_sheet_indexes_every_leaf():
+    """Its images and dets are finite, so no leaf is left out, though none converged."""
     mesh, _ = build(collapse, collapse_jacobian, min_img_sep=1.0)
-    status = to_np(mesh.origin_status)
-    assert not (status == LEAF_CONVERGED).any()
-    assert ((status & LEAF_JACOBIAN_NONFINITE) != 0).all()
+    indexed = np.unique(to_np(mesh.index.cell_leaves))
+    assert indexed.tolist() == list(range(mesh.leaves.shape[0]))
 
 
 def test_coverage_does_not_drop_at_level_transitions():
