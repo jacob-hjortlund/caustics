@@ -5,7 +5,7 @@ A lens mesh (:func:`build_lens_mesh`) is an adaptively refined
 triangulation of the lens plane that carries the lens map at its vertices.
 It is built once and then answers source-plane questions without further
 lens calls, except for root finding: every image of a source
-(:func:`forward_raytrace`), the critical curves and caustics
+(:func:`forward_raytrace`), the critical curves, caustics and pseudo-caustics
 (:func:`critical_curves_and_caustics`) and the total magnification
 (:func:`total_magnification`). A magnification map
 (:func:`build_magnification_map`) samples that magnification over a

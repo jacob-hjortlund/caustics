@@ -17,8 +17,9 @@ curve.
 A mesh built with ``centers`` also holds holes around them
 (:class:`~caustics.lenses.func.adaptive.CenterHoles`): the lens map can jump
 at a lens center, so the curves are cut at each hole's circle and re-joined
-along the stored hole curve (:func:`join_at_holes`). That too is a function
-of the mesh alone.
+along the stored hole curve (:func:`join_at_holes`), and each hole curve
+that is a pseudo-caustic is added whole, as a loop of its own
+(:func:`pseudo_caustics`). That too is a function of the mesh alone.
 """
 
 import math
@@ -31,22 +32,28 @@ from .geometry import _CHILD_VERTEX_INDEX_TABLE, csr_offsets
 
 class CriticalCurvesAndCaustics(NamedTuple):
     """
-    Critical curves and caustics, one ordered polyline per curve, CSR.
+    Critical curves, caustics and pseudo-caustics, one ordered polyline per curve, CSR.
 
     Curve ``c`` is rows ``offsets[c]:offsets[c + 1]`` of ``lens``, ``source``
     and ``hole``. Most points are crossings of ``det A = 0``: a critical-curve
     point in ``lens``, its caustic point in ``source``. On a mesh with holes,
     a curve that reaches a hole follows the hole's circle clockwise to the
     next curve leaving it (:func:`join_at_holes`); those points lie on the
-    circle in ``lens`` and on the hole curve in ``source``, which is the
-    pseudo-caustic where the mesh's ``holes.pseudo_caustic`` is True.
+    circle in ``lens`` and on the hole curve in ``source``. After every other
+    curve, each hole whose ``pseudo_caustic`` is True adds its whole hole
+    curve as a loop of its own, flagged in ``pseudo_caustic``
+    (:func:`pseudo_caustics`): its pseudo-caustic, arcs of which a curve
+    joined at the hole also holds.
 
-    Travel keeps ``det A > 0`` on the left. A curve the fov or missing data
-    cuts is open; ``closed`` marks the loops, whose last point joins back to
-    their first. The order of the curves, and where a loop starts, is
-    deterministic but has no physical meaning. Where ``det A`` is exactly
-    zero at a sample, as when a curve runs through lattice points,
-    consecutive points can coincide: zero-length segments are kept.
+    Travel keeps ``det A > 0`` on the left, except round a pseudo-caustic,
+    which follows its hole's samples in ascending angle, counter-clockwise
+    in the lens plane: ``det A`` usually has one sign all round a hole. A
+    curve the fov or missing data cuts is open; ``closed`` marks the loops,
+    whose last point joins back to their first. The order of the curves, and
+    where a loop starts, is deterministic but has no physical meaning. Where
+    ``det A`` is exactly zero at a sample, as when a curve runs through
+    lattice points, consecutive points can coincide: zero-length segments
+    are kept.
 
     Parameters
     ----------
@@ -66,6 +73,8 @@ class CriticalCurvesAndCaustics(NamedTuple):
         ``(P,)`` int64: -1 at a crossing of ``det A = 0``, otherwise the
         index into the mesh's ``holes`` of the hole whose circle the point
         lies on.
+    pseudo_caustic: ArrayLike
+        ``(C,)`` bool, True where the curve is a hole's pseudo-caustic.
     """
 
     lens: ArrayLike
@@ -73,6 +82,7 @@ class CriticalCurvesAndCaustics(NamedTuple):
     offsets: ArrayLike
     closed: ArrayLike
     hole: ArrayLike
+    pseudo_caustic: ArrayLike
 
 
 def _sorted_pair(a, b):
@@ -327,6 +337,7 @@ def _no_curves(band):
         offsets=mesh_backend.zeros((1,), dtype=mesh_backend.int64, device=device),
         closed=mesh_backend.zeros((0,), dtype=mesh_backend.bool, device=device),
         hole=mesh_backend.zeros((0,), dtype=mesh_backend.int64, device=device),
+        pseudo_caustic=mesh_backend.zeros((0,), dtype=mesh_backend.bool, device=device),
     )
 
 
@@ -346,8 +357,9 @@ def trace_band(band):
     Returns
     -------
     CriticalCurvesAndCaustics
-        ``hole`` is -1 at every point: tracing knows nothing of holes;
-        :func:`join_at_holes` applies them.
+        ``hole`` is -1 at every point and ``pseudo_caustic`` False on every
+        curve: tracing knows nothing of holes; :func:`join_at_holes` and
+        :func:`pseudo_caustics` apply them.
     """
     start, end = child_segments(band.samples, band.det)
     if start.shape[0] == 0:
@@ -364,6 +376,7 @@ def trace_band(band):
             (lens_points.shape[0],), dtype=mesh_backend.int64, device=device
         )
         - 1,
+        pseudo_caustic=mesh_backend.zeros_like(closed),
     )
 
 
@@ -488,6 +501,7 @@ def join_at_holes(curves, holes):
             offsets=mesh_backend.zeros((1,), dtype=int64, device=device),
             closed=curves.closed[:0],
             hole=curves.hole[:0],
+            pseudo_caustic=curves.pseudo_caustic[:0],
         )
 
     # 3b. Bridges: a step from one hole straight to another is a segment from
@@ -614,22 +628,81 @@ def join_at_holes(curves, holes):
         offsets=offsets,
         closed=closed,
         hole=pool_hole[gather],
+        pseudo_caustic=mesh_backend.zeros_like(closed),
+    )
+
+
+def pseudo_caustics(holes):
+    """
+    The pseudo-caustic of every hole whose ``pseudo_caustic`` is True, each as a closed curve.
+
+    A curve is its hole's samples as stored, in ascending angle: the circle
+    in ``lens``, the hole curve in ``source``, and the hole's index in
+    ``hole``. The image count changes across the whole hole curve, whether
+    or not a critical curve reaches the hole, so the whole of it is a curve,
+    even where :func:`join_at_holes` joins arcs of it into another.
+
+    Parameters
+    ----------
+    holes: CenterHoles
+
+    Returns
+    -------
+    CriticalCurvesAndCaustics
+        ``pseudo_caustic`` True on every curve.
+    """
+    int64 = mesh_backend.int64
+    device = mesh_backend.device(holes.offsets)
+    counts = holes.offsets[1:] - holes.offsets[:-1]
+    hole = mesh_backend.repeat(
+        mesh_backend.arange(counts.shape[0], dtype=int64, device=device),
+        counts,
+        axis=0,
+    )
+    rows = mesh_backend.flatnonzero(holes.pseudo_caustic[hole])
+    flagged = mesh_backend.flatnonzero(holes.pseudo_caustic)
+    loops = mesh_backend.ones(
+        (flagged.shape[0],), dtype=mesh_backend.bool, device=device
+    )
+    return CriticalCurvesAndCaustics(
+        lens=holes.lens[rows],
+        source=holes.source[rows],
+        offsets=csr_offsets(counts[flagged]),
+        closed=loops,
+        hole=hole[rows],
+        pseudo_caustic=loops,
+    )
+
+
+def _append(curves, more):
+    """``curves`` followed by ``more``, curve by curve."""
+    cat = mesh_backend.concatenate
+    return CriticalCurvesAndCaustics(
+        lens=cat((curves.lens, mesh_backend.to(more.lens, dtype=curves.lens.dtype))),
+        source=cat(
+            (curves.source, mesh_backend.to(more.source, dtype=curves.source.dtype))
+        ),
+        offsets=cat((curves.offsets, more.offsets[1:] + curves.offsets[-1])),
+        closed=cat((curves.closed, more.closed)),
+        hole=cat((curves.hole, more.hole)),
+        pseudo_caustic=cat((curves.pseudo_caustic, more.pseudo_caustic)),
     )
 
 
 def critical_curves_and_caustics(mesh):
     """
-    Critical curves and caustics of the lens a mesh was built from.
+    Critical curves, caustics and pseudo-caustics of the lens a mesh was built from.
 
     The zero set of ``det A`` traced through the critical band's red-split
     children, each crossing interpolated linearly on a child edge whose ends
     straddle it -- within half a finest leaf edge of the true curve -- and its
     caustic point interpolated the same way. On a mesh with holes the curves
     are cut at each hole's circle and re-joined along its hole curve
-    (:func:`join_at_holes`). A curve ends where the band does: at the fov
-    boundary or next to a non-finite leaf. Consecutive points can coincide
-    where ``det A`` is exactly zero at a sample; such zero-length segments
-    are kept. No lens call is made.
+    (:func:`join_at_holes`), and each hole curve that is a pseudo-caustic
+    follows them as a loop of its own (:func:`pseudo_caustics`). A curve
+    ends where the band does: at the fov boundary or next to a non-finite
+    leaf. Consecutive points can coincide where ``det A`` is exactly zero
+    at a sample; such zero-length segments are kept. No lens call is made.
 
     Parameters
     ----------
@@ -650,4 +723,4 @@ def _critical_curves_and_caustics(mesh):
     curves = trace_band(mesh.critical_band)
     if mesh.holes.centers.shape[0] == 0:
         return curves
-    return join_at_holes(curves, mesh.holes)
+    return _append(join_at_holes(curves, mesh.holes), pseudo_caustics(mesh.holes))

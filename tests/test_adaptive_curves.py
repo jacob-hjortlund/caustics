@@ -26,6 +26,7 @@ from caustics.lenses.func.adaptive.curves import (
     child_segments,
     edge_zeros,
     join_at_holes,
+    pseudo_caustics,
     trace_band,
     triangle_segments,
 )
@@ -306,6 +307,9 @@ def _traced(*curves):
             np.array([c for _, c in curves]), dtype=mesh_backend.bool
         ),
         hole=mesh_backend.as_array(np.full(len(pts), -1), dtype=mesh_backend.int64),
+        pseudo_caustic=mesh_backend.as_array(
+            np.zeros(len(curves), dtype=bool), dtype=mesh_backend.bool
+        ),
     )
 
 
@@ -630,6 +634,49 @@ def test_a_bridge_left_unjoined_at_both_holes_adds_no_empty_curve():
 
 
 # ---------------------------------------------------------------------------
+# pseudo_caustics: each pseudo-caustic hole's curve as a closed curve
+# ---------------------------------------------------------------------------
+
+
+def test_pseudo_caustics_are_the_flagged_holes_curves_in_stored_order():
+    """Only B, hole 1, is a pseudo-caustic: its 64 samples, as stored, make one loop."""
+    holes = _hole_pair()._replace(
+        pseudo_caustic=mesh_backend.as_array(
+            np.array([False, True]), dtype=mesh_backend.bool
+        )
+    )
+    got = pseudo_caustics(holes)
+    assert to_np(got.offsets).tolist() == [0, 64]
+    assert to_np(got.closed).tolist() == [True]
+    assert to_np(got.pseudo_caustic).tolist() == [True]
+    assert to_np(got.hole).tolist() == [1] * 64
+    assert np.array_equal(to_np(got.lens), to_np(holes.lens)[64:])
+    assert np.array_equal(to_np(got.source), to_np(holes.source)[64:])
+
+
+@pytest.mark.parametrize(
+    "holes",
+    [
+        _hole_pair()._replace(
+            pseudo_caustic=mesh_backend.as_array(
+                np.array([False, False]), dtype=mesh_backend.bool
+            )
+        ),
+        empty_holes(),
+    ],
+    ids=["no pseudo-caustic", "no hole"],
+)
+def test_holes_without_a_pseudo_caustic_give_no_curve(holes):
+    got = pseudo_caustics(holes)
+    assert to_np(got.offsets).tolist() == [0]
+    assert tuple(got.lens.shape) == (0, 2)
+    assert tuple(got.source.shape) == (0, 2)
+    assert tuple(got.hole.shape) == (0,)
+    assert tuple(got.closed.shape) == (0,)
+    assert tuple(got.pseudo_caustic.shape) == (0,)
+
+
+# ---------------------------------------------------------------------------
 # End to end, against known answers
 # ---------------------------------------------------------------------------
 
@@ -769,6 +816,7 @@ def test_without_holes_the_curves_are_trace_band_s_and_follow_no_hole():
     hole = to_np(got.hole)
     assert hole.dtype == np.int64 and hole.shape == (got.lens.shape[0],)
     assert (hole == -1).all()
+    assert to_np(got.pseudo_caustic).tolist() == [False] * got.closed.shape[0]
     assert mesh.holes.centers.shape[0] == 0
     assert to_np(mesh.holes.offsets).tolist() == [0]
 
@@ -953,7 +1001,9 @@ def _lens_winding(loop, s):
 def _count(curves, grid):
     """``N = 1 + 2 sum_c w(K_c) + sum_s sigma_s w(h_s)``, ``sigma_s = -1 - 2 sum_c w(loop_c, s)``."""
     x0, y0, dx, nx, ny = grid
-    parts = _parts(curves)
+    # The pseudo-caustic loops are the hole curves, which the second sum counts.
+    pseudo = to_np(curves.pseudo_caustic)
+    parts = [part for part, p in zip(_parts(curves), pseudo) if not p]
     N = np.ones((ny, nx), dtype=np.int64)
     for _, source, _, closed in parts:
         assert closed
@@ -1027,7 +1077,8 @@ def test_curves_through_singular_centers_come_out_closed_and_chord_free(two_sis)
     """Without holes a chord crosses a cut of radius ~1"; traced steps are below 0.01"."""
     mesh, curves = two_sis
     assert not to_np(trace_band(mesh.critical_band).closed).all()
-    parts = _parts(curves)
+    pseudo = to_np(curves.pseudo_caustic)
+    parts = [part for part, p in zip(_parts(curves), pseudo) if not p]
     assert parts and all(closed for *_, closed in parts)
     centers, radius = to_np(mesh.holes.centers), to_np(mesh.holes.radius)
     for lens, source, hole, _ in parts:
@@ -1070,6 +1121,64 @@ def test_moving_a_center_off_the_lattice_leaves_the_count_unchanged(two_sis):
     grid = _grid_of(curves)
     band = _curve_mask(curves, grid, 0.06) | _curve_mask(moved, grid, 0.06)
     assert np.array_equal(_count(moved, grid)[~band], _count(curves, grid)[~band])
+
+
+def _assert_ends_with_whole_pseudo_caustics(curves, holes):
+    """The last curves are one closed loop per pseudo-caustic hole: its stored circle and hole curve."""
+    pseudo = np.flatnonzero(to_np(holes.pseudo_caustic))
+    flags = to_np(curves.pseudo_caustic)
+    n = flags.shape[0] - pseudo.shape[0]
+    assert flags.tolist() == [False] * n + [True] * pseudo.shape[0]
+    offsets = to_np(holes.offsets)
+    parts = _parts(curves)[n:]
+    for h, (lens, source, hole, closed) in zip(pseudo, parts):
+        rows = slice(offsets[h], offsets[h + 1])
+        assert closed
+        assert hole.tolist() == [h] * (offsets[h + 1] - offsets[h])
+        assert np.array_equal(lens, to_np(holes.lens)[rows])
+        assert np.array_equal(source, to_np(holes.source)[rows])
+
+
+def test_an_sis_pseudo_caustic_no_critical_curve_reaches_is_among_the_curves():
+    """The critical circle ``|theta| = 1`` never nears the hole, so nothing is joined there.
+
+    The pseudo-caustic still comes out, as the hole's whole curve after the
+    critical circle.
+    """
+    lens = _sis_pair([(0.0, 0.0)])
+    mesh = to_mesh(
+        build_lens_mesh(
+            lens.raytrace,
+            lens.jacobian_lens_equation,
+            fov=4.0,
+            init_res=8,
+            min_img_sep=1e-2,
+            centers=[(0.0, 0.0)],
+        )
+    )
+    curves = critical_curves_and_caustics(mesh)
+    assert to_np(mesh.holes.pseudo_caustic).tolist() == [True]
+    assert to_np(curves.closed).tolist() == [True, True]
+    critical, _ = _parts(curves)
+    assert (critical[2] == -1).all()
+    assert np.abs(np.hypot(*critical[0].T) - 1.0).max() < 1e-2
+    _assert_ends_with_whole_pseudo_caustics(curves, mesh.holes)
+
+
+def test_holes_critical_curves_reach_still_add_their_whole_pseudo_caustics(two_sis):
+    """Arcs joined into the critical curves leave each pseudo-caustic whole as well."""
+    mesh, curves = two_sis
+    joined = join_at_holes(trace_band(mesh.critical_band), mesh.holes)
+    assert (to_np(joined.hole) >= 0).any()
+    n = joined.closed.shape[0]
+    assert np.array_equal(to_np(curves.offsets)[: n + 1], to_np(joined.offsets))
+    m = to_np(joined.offsets)[-1]
+    for field in ("lens", "source", "hole"):
+        assert np.array_equal(
+            to_np(getattr(curves, field))[:m], to_np(getattr(joined, field))
+        ), field
+    assert np.array_equal(to_np(curves.closed)[:n], to_np(joined.closed))
+    _assert_ends_with_whole_pseudo_caustics(curves, mesh.holes)
 
 
 # ---------------------------------------------------------------------------

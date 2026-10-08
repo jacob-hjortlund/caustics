@@ -877,7 +877,8 @@ def build_closed_lens_mesh(
     unjoined hole, or where ``max_depth`` bound -- grows nothing.
 
     The pseudo-caustics are the hole curves of the holes whose
-    ``pseudo_caustic`` is True, so only ``centers`` can give one. A source
+    ``pseudo_caustic`` is True, the curves ``curves`` flags in its own
+    ``pseudo_caustic``, so only ``centers`` can give one. A source
     inside an isothermal center's pseudo-caustic has an image far out from
     it; while the boundary's image crosses the pseudo-caustic, some of those
     images lie outside the fov. A hole curve that is no pseudo-caustic, such
@@ -896,7 +897,7 @@ def build_closed_lens_mesh(
     -------
     mesh: LensMesh
     curves: CriticalCurvesAndCaustics
-        The last mesh's critical curves and caustics.
+        The last mesh's critical curves, caustics and pseudo-caustics.
     """
     mesh, curves = _build_closed_lens_mesh(
         raytrace,
