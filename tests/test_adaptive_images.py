@@ -471,14 +471,18 @@ def test_forward_raytrace_finds_every_sie_image_beyond_min_img_sep_of_a_critical
 def test_forward_raytrace_finds_one_image_of_a_source_below_the_fold_s_caustic():
     """Below the caustic ``beta_y = -0.34`` the fold has one image, ``y = beta_y / 0.6``.
 
-    Sources nearer the caustic than ``residual_tol`` are left out: the fold
-    point maps within ``residual_tol`` of them, a legitimate root.
+    Every point of the fold strip ``|y| < 0.5`` maps at least as far from the
+    source as the source lies below the caustic, so a stalled solve at the
+    fold point is kept only for sources nearer the caustic than the default
+    ``residual_tol``, ``1e-6``, and those are left out. Three sources sit
+    just beyond that margin.
     """
     mesh, _ = build(localised_fold, localised_fold_jacobian, min_img_sep=0.05)
-    tol = mesh.min_img_sep
+    tol = 1e-6
     rng = np.random.default_rng(5)
     bx = rng.uniform(-1.5, 1.5, 200)
-    by = -0.34 - rng.uniform(1.5 * tol, 0.2, 200)
+    near = [2e-6, 1e-5, 1e-3]
+    by = -0.34 - np.concatenate((rng.uniform(1.5 * tol, 0.2, 197), near))
     images, counts = fr(mesh, np.stack((bx, by), axis=-1), _fold)
     assert to_np(counts).tolist() == [1] * 200
     assert np.allclose(to_np(images), np.stack((bx, by / 0.6), axis=-1), atol=1e-6)

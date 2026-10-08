@@ -303,7 +303,7 @@ def _images(mesh, beta, raytrace, tol, lm_kwargs, device):
 
 
 def forward_raytrace(
-    bx, by, raytrace, mesh, *, batch_size=None, residual_tol=None, lm_kwargs=None
+    bx, by, raytrace, mesh, *, batch_size=None, residual_tol=1e-6, lm_kwargs=None
 ):
     """
     Lens-plane positions of every image of each source-plane point.
@@ -323,8 +323,7 @@ def forward_raytrace(
     ``min_img_sep`` (near a fold it is unbounded), so the residual test is
     then the only filter. Near a critical curve, a stalled solve can leave a
     point within ``residual_tol`` of the source that is not an image, at a
-    very large magnification. A smaller ``residual_tol``, such as ``1e-6``,
-    removes such points.
+    very large magnification.
 
     Every image lies in the fov only on a mesh whose fov cuts no critical
     curve (see :func:`~.lens_mesh.build_closed_lens_mesh`); elsewhere an
@@ -342,13 +341,18 @@ def forward_raytrace(
     batch_size: Optional[int]
         Most source points per chunk, bounding memory. Image counts do not
         depend on it; positions can move within solver accuracy.
-    residual_tol: Optional[float]
-        Largest ``|raytrace(x) - beta|`` of a kept root, ``mesh.min_img_sep``
-        by default.
+    residual_tol: float
+        Largest ``|raytrace(x) - beta|`` of a kept root. It must exceed the
+        residual the raytrace can reach: one computed in float32 resolves
+        only about ``1e-7 * |x|``, coarser than ``1e-6`` beyond about 10
+        arcsec.
 
         *Unit: arcsec*
     lm_kwargs: Optional[dict]
-        Extra keyword arguments for :func:`~caustics.utils.batch_lm`.
+        Extra keyword arguments for :func:`~caustics.utils.batch_lm`,
+        overriding the defaults ``jit=True`` and ``stopping=1e-10``. Its own
+        ``stopping``, ``1e-4``, ends a solve with roots that can miss
+        ``1e-6``, even well conditioned ones.
 
     Returns
     -------
@@ -398,8 +402,8 @@ def _forward_raytrace(
             "boundary, so some of their images can lie outside the fov; grow the "
             "mesh with extend_lens_mesh, or build it with build_closed_lens_mesh."
         )
-    tol = mesh.min_img_sep if residual_tol is None else float(residual_tol)
-    lm_kwargs = {"jit": True, **(lm_kwargs or {})}
+    tol = float(residual_tol)
+    lm_kwargs = {"jit": True, "stopping": 1e-10, **(lm_kwargs or {})}
     n = beta.shape[0]
     step = max(n, 1) if batch_size is None else max(1, int(batch_size))
     images = [
