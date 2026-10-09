@@ -269,3 +269,58 @@ def finite_rows(mesh):
     return np.flatnonzero(
         (status & (LEAF_RAYTRACE_NONFINITE | LEAF_JACOBIAN_NONFINITE)) == 0
     )
+
+
+def index_point_cells(index, level, points):
+    """
+    The cell of each of ``points`` ``(N, 2)`` at the matching entry of ``level`` ``(N,)``, numpy ``(N, 2)``.
+
+    From the documented rule rather than ``index.py``'s code: the floor of
+    the point's offset from ``lo`` over the level's cell side
+    ``fine * 2**level``, clamped to the level's ``2**(KEY_BITS - level)``
+    cells per axis.
+    """
+    from caustics.lenses.func.adaptive.index import KEY_BITS
+
+    level = np.asarray(level)
+    lo, fine = to_np(index.lo), float(to_np(index.fine))
+    side = (fine * 2.0**level)[:, None]
+    top = (2 ** (KEY_BITS - level) - 1)[:, None]
+    return np.clip(np.floor((points - lo) / side), 0, top).astype(np.int64)
+
+
+def index_cell_ranges(index, tri, grow=None):
+    """
+    Each triangle's level in ``index``, and the cells of its lower and upper box corners there, numpy.
+
+    From the documented rule rather than ``index.py``'s code: the level is
+    the number of powers ``2**0 .. 2**(KEY_BITS - 1)`` below the longer side
+    of the triangle's box, grown by ``grow`` ``(n,)``, over
+    ``CELLS_PER_BOX * fine``. Returns ``level`` ``(n,)``, ``i0`` and ``i1``
+    ``(n, 2)``.
+    """
+    from caustics.lenses.func.adaptive.index import CELLS_PER_BOX, KEY_BITS
+
+    fine = float(to_np(index.fine))
+    box_lo, box_hi = tri.min(axis=1), tri.max(axis=1)
+    if grow is not None:
+        box_lo, box_hi = box_lo - grow[:, None], box_hi + grow[:, None]
+    size = (box_hi - box_lo).max(axis=1) / (CELLS_PER_BOX * fine)
+    level = np.searchsorted(2.0 ** np.arange(KEY_BITS), size)
+    return (
+        level,
+        index_point_cells(index, level, box_lo),
+        index_point_cells(index, level, box_hi),
+    )
+
+
+def index_cell(index, level, ix, iy):
+    """The rows ``index`` lists in cell ``(ix, iy)`` of ``level``, numpy; none where it stores no such cell."""
+    from caustics.lenses.func.adaptive.index import KEY_BITS
+
+    key = (int(level) << (2 * KEY_BITS)) | (int(ix) << KEY_BITS) | int(iy)
+    keys, offsets = to_np(index.keys), to_np(index.offsets)
+    u = int(np.searchsorted(keys, key))
+    if u == keys.size or keys[u] != key:
+        return np.zeros(0, dtype=np.int64)
+    return to_np(index.leaves)[offsets[u] : offsets[u + 1]]

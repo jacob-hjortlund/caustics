@@ -75,6 +75,9 @@ from adaptive_maps import (
     build,
     f64,
     i64,
+    index_cell,
+    index_cell_ranges,
+    index_point_cells,
     localised_fold,
     localised_fold_jacobian,
     row_fold,
@@ -384,7 +387,7 @@ def test_statuses_are_set_only_at_the_finest_level_and_index_exactly_the_finite_
     status, level = to_np(mesh.origin_status), to_np(mesh.origin_level)
     assert (status[level < mesh.lattice.level - 1] == LEAF_CONVERGED).all()
     assert (status != LEAF_CONVERGED).any()
-    indexed = np.unique(to_np(mesh.index.cell_leaves))
+    indexed = np.unique(to_np(mesh.index.leaves))
     leaf = status[to_np(mesh.leaf_origin)]
     finite = (leaf & (LEAF_RAYTRACE_NONFINITE | LEAF_JACOBIAN_NONFINITE)) == 0
     assert np.array_equal(indexed, np.flatnonzero(finite))
@@ -472,7 +475,7 @@ def test_every_indexed_leaf_has_finite_source_vertices():
     mesh, _ = build(fn, jac, min_img_sep=0.05)
     vs = to_np(mesh.vertices_source)
     leaves = to_np(mesh.leaves)
-    for leaf in np.unique(to_np(mesh.index.cell_leaves)):
+    for leaf in np.unique(to_np(mesh.index.leaves)):
         assert np.isfinite(vs[leaves[leaf]]).all()
 
 
@@ -480,21 +483,16 @@ def test_index_registers_every_leaf_in_the_cell_of_each_of_its_vertices():
     mesh, _ = build(localised_fold, localised_fold_jacobian, min_img_sep=0.05)
     vs = to_np(mesh.vertices_source)
     leaves = to_np(mesh.leaves)
-    offs = to_np(mesh.index.cell_offsets)
-    cells = to_np(mesh.index.cell_leaves)
-    lo, cell = to_np(mesh.index.lo), to_np(mesh.index.cell)
-    nx, ny = mesh.index.nx, mesh.index.ny
+    grow = to_np(leaf_grow(mesh.origin_status, mesh.origin_deviation, mesh.leaf_origin))
     status = leaf_status(mesh)
     rng = np.random.default_rng(20260904)
     for leaf in rng.choice(len(leaves), size=50, replace=False):
         if status[leaf] & (LEAF_RAYTRACE_NONFINITE | LEAF_JACOBIAN_NONFINITE):
             continue
-        for q in vs[leaves[leaf]]:
-            # `build_index`'s own arithmetic: divide, truncate, clamp.
-            ix = int(np.clip(np.trunc((q[0] - lo[0]) / cell[0]), 0, nx - 1))
-            iy = int(np.clip(np.trunc((q[1] - lo[1]) / cell[1]), 0, ny - 1))
-            c = ix * ny + iy
-            assert leaf in cells[offs[c] : offs[c + 1]]
+        level, _, _ = index_cell_ranges(mesh.index, vs[leaves[[leaf]]], grow[[leaf]])
+        corners = index_point_cells(mesh.index, np.repeat(level, 3), vs[leaves[leaf]])
+        for ix, iy in corners:
+            assert leaf in index_cell(mesh.index, level[0], ix, iy)
 
 
 def test_leaf_grow_is_the_origin_s_deviation_where_it_did_not_converge(sie_mesh):
@@ -523,7 +521,7 @@ def test_build_halves_the_requested_min_img_sep():
 def test_unconverged_finite_leaves_are_indexed():
     mesh = build_lens_mesh(SIE_LIKE.raytrace, SIE_LIKE.jacobian_lens_equation, **BUILD)
     status = leaf_status(mesh)
-    indexed = set(to_np(mesh.index.cell_leaves).tolist())
+    indexed = set(to_np(mesh.index.leaves).tolist())
     finite = (status & (LEAF_RAYTRACE_NONFINITE | LEAF_JACOBIAN_NONFINITE)) == 0
     assert (
         finite & (status != LEAF_CONVERGED)
@@ -611,7 +609,7 @@ def test_nonfinite_leaves_from_a_nonfinite_region_are_excluded_from_the_index():
     nonfinite = (status & LEAF_RAYTRACE_NONFINITE) != 0
     assert nonfinite.any()
     assert not np.isfinite(to_np(mesh.vertices_source)).all()
-    indexed = set(to_np(mesh.index.cell_leaves).tolist())
+    indexed = set(to_np(mesh.index.leaves).tolist())
     assert not indexed & set(np.flatnonzero(nonfinite).tolist())
 
 
@@ -990,7 +988,7 @@ def test_failure_flags_are_mutually_consistent():
 def test_a_kappa_one_sheet_indexes_every_leaf():
     """Its images and dets are finite, so no leaf is left out, though none converged."""
     mesh, _ = build(collapse, collapse_jacobian, min_img_sep=1.0)
-    indexed = np.unique(to_np(mesh.index.cell_leaves))
+    indexed = np.unique(to_np(mesh.index.leaves))
     assert indexed.tolist() == list(range(mesh.leaves.shape[0]))
 
 

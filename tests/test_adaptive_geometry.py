@@ -34,7 +34,14 @@ from caustics.lenses.func.adaptive.geometry import (
     triangle_weights,
     winding_number,
 )
-from caustics.lenses.func.adaptive.index import as_points, build_index, index_hits
+from caustics.lenses.func.adaptive.index import (
+    CELLS_PER_BOX,
+    KEY_BITS,
+    as_points,
+    build_index,
+    index_cells,
+    index_hits,
+)
 from caustics.lenses.func.adaptive.lattice import (
     check_lattice_keys,
     depth_floor,
@@ -52,7 +59,17 @@ from caustics.lenses.func.adaptive.lattice import (
     warn_depth_limited,
 )
 
-from adaptive_maps import assert_hits_equal, assert_same, brute_hits, f64, i64, to_np
+from adaptive_maps import (
+    assert_hits_equal,
+    assert_same,
+    brute_hits,
+    f64,
+    i64,
+    index_cell,
+    index_cell_ranges,
+    index_point_cells,
+    to_np,
+)
 
 RNG = np.random.default_rng(20260918)
 
@@ -712,10 +729,15 @@ def test_warn_depth_limited_is_silent_when_the_floor_is_reached(recwarn):
     assert not recwarn.list
 
 
-def test_build_index_of_an_empty_leaf_set_is_a_single_cell():
-    idx = build_index(f64(np.zeros((3, 2))), i64(np.zeros((0, 3))), i64(np.zeros(0)))
-    assert idx.nx == 1 and idx.ny == 1
-    assert to_np(idx.cell_leaves).size == 0
+def test_build_index_of_an_empty_leaf_set_has_no_levels_and_finds_nothing():
+    vs, leaves = f64(np.zeros((3, 2))), i64(np.zeros((0, 3)))
+    idx = build_index(vs, leaves, i64(np.zeros(0)))
+    assert tuple(idx.levels.shape) == (0,) and tuple(idx.keys.shape) == (0,)
+    assert to_np(idx.offsets).tolist() == [0] and tuple(idx.leaves.shape) == (0,)
+    start, count = index_cells(idx, f64([[0.5, 0.5]]))
+    assert tuple(start.shape) == tuple(count.shape) == (1, 0)
+    hits = index_hits(idx, vs, leaves, f64([[0.5, 0.5]]))
+    assert [tuple(a.shape) for a in hits] == [(0,), (0,), (0, 3)]
 
 
 @pytest.mark.skipif(
@@ -736,7 +758,7 @@ def test_build_index_allocates_on_its_inputs_device_not_the_default_one(n_rows):
     rows = i64(np.arange(n_rows))
     with torch.device("meta"):
         idx = build_index(vs, leaves, rows)
-    for name in ("lo", "hi", "cell", "cell_offsets", "cell_leaves"):
+    for name in ("lo", "hi", "fine", "levels", "keys", "offsets", "leaves"):
         assert getattr(idx, name).device == vs.device, name
 
 
@@ -745,8 +767,8 @@ def test_build_index_leaves_are_ascending_within_every_cell():
     vs = rng.normal(size=(50, 2))
     leaves = rng.integers(0, 50, (60, 3))
     idx = build_index(f64(vs), i64(leaves), i64(np.arange(60)))
-    offsets = to_np(idx.cell_offsets)
-    cell_leaves = to_np(idx.cell_leaves)
+    offsets = to_np(idx.offsets)
+    cell_leaves = to_np(idx.leaves)
     assert offsets[0] == 0 and offsets[-1] == cell_leaves.size
     exercised = 0
     for a, b in zip(offsets[:-1], offsets[1:]):
@@ -861,16 +883,11 @@ def test_build_index_registers_a_triangle_in_every_cell_its_grown_box_covers():
         i64(np.arange(200)),
         f64(grow),
     )
-    lo, cell = to_np(idx.lo), to_np(idx.cell)
-    offs, cells = to_np(idx.cell_offsets), to_np(idx.cell_leaves)
-    top = np.array([idx.nx - 1, idx.ny - 1])
-    i0 = np.clip(np.trunc((tri[0].min(axis=0) - 0.3 - lo) / cell), 0, top).astype(int)
-    i1 = np.clip(np.trunc((tri[0].max(axis=0) + 0.3 - lo) / cell), 0, top).astype(int)
-    assert (i1 - i0 >= 2).all(), "the grown box must span several cells"
-    for ix in range(i0[0], i1[0] + 1):
-        for iy in range(i0[1], i1[1] + 1):
-            c = ix * idx.ny + iy
-            assert 0 in cells[offs[c] : offs[c + 1]]
+    level, i0, i1 = index_cell_ranges(idx, tri[:1], grow[:1])
+    assert (i1[0] - i0[0] >= 2).all(), "the grown box must span several cells"
+    for ix in range(i0[0, 0], i1[0, 0] + 1):
+        for iy in range(i0[0, 1], i1[0, 1] + 1):
+            assert 0 in index_cell(idx, level[0], ix, iy)
 
 
 def test_index_hits_with_grow_returns_a_point_within_grow_of_a_triangle_and_not_beyond():
@@ -951,3 +968,80 @@ def test_index_hits_skip_nan_infinite_and_far_points_and_take_empty_input():
     assert_hits_equal((qidx, hit, w), (want_q + 4, want_t, want_w))
     empty = index_hits(idx, vs, leaves, f64(np.zeros((0, 2))))
     assert [tuple(a.shape) for a in empty] == [(0,), (0,), (0, 3)]
+
+
+def test_build_index_registers_each_row_at_one_level_in_exactly_the_cells_of_its_box():
+    tri = _scattered_triangles(21)
+    n = tri.shape[0]
+    rng = np.random.default_rng(22)
+    grow = np.where(rng.uniform(size=n) < 0.2, 10.0 ** rng.uniform(-9, 0, n), 0.0)
+    vs, leaves, rows = _as_mesh(tri)
+    idx = build_index(vs, leaves, rows, f64(grow))
+    level, i0, i1 = index_cell_ranges(idx, tri, grow)
+    assert np.unique(level).size > 5, "fixture must spread over many levels"
+    assert ((i1 - i0 + 1) <= CELLS_PER_BOX + 2).all()
+    keys, offsets = to_np(idx.keys), to_np(idx.offsets)
+    key_of_entry = np.repeat(keys, np.diff(offsets))
+    row_of_entry = to_np(idx.leaves)
+    for r in range(n):
+        ix, iy = np.meshgrid(
+            np.arange(i0[r, 0], i1[r, 0] + 1),
+            np.arange(i0[r, 1], i1[r, 1] + 1),
+            indexing="ij",
+        )
+        want = (level[r] << (2 * KEY_BITS)) | (ix.ravel() << KEY_BITS) | iy.ravel()
+        got = key_of_entry[row_of_entry == r]
+        assert np.array_equal(np.sort(got), np.sort(want)), r
+
+
+def test_build_index_keys_ascend_and_give_its_levels_and_fine_side():
+    vs, leaves, rows = _as_mesh(_scattered_triangles(23))
+    idx = build_index(vs, leaves, rows)
+    keys, offsets = to_np(idx.keys), to_np(idx.offsets)
+    assert (np.diff(keys) > 0).all()
+    assert offsets[0] == 0 and offsets[-1] == to_np(idx.leaves).size
+    assert (np.diff(offsets) > 0).all()
+    assert to_np(idx.levels).tolist() == np.unique(keys >> (2 * KEY_BITS)).tolist()
+    extent = (to_np(idx.hi) - to_np(idx.lo)).max()
+    assert float(to_np(idx.fine)) == extent / 2**KEY_BITS
+
+
+def test_index_cells_gives_the_cell_each_point_falls_in_at_every_level():
+    tri = _scattered_triangles(27)
+    vs, leaves, rows = _as_mesh(tri)
+    idx = build_index(vs, leaves, rows)
+    rng = np.random.default_rng(28)
+    beta = np.concatenate(
+        [tri[:, 0], rng.uniform(-1, 1, (100, 2)), [[np.nan, 0.0], [1e9, 1e9]]]
+    )
+    start, count = index_cells(idx, f64(beta))
+    start, count = to_np(start), to_np(count)
+    levels, entries = to_np(idx.levels), to_np(idx.leaves)
+    assert start.shape == count.shape == (beta.shape[0], levels.size)
+    lo, hi = to_np(idx.lo), to_np(idx.hi)
+    for b, point in enumerate(beta):
+        inside = bool(np.all((point >= lo) & (point <= hi)))
+        for j, level in enumerate(levels):
+            want = np.zeros(0, dtype=np.int64)
+            if inside:
+                ix, iy = index_point_cells(idx, [level], point[None])[0]
+                want = index_cell(idx, level, ix, iy)
+            got = entries[start[b, j] : start[b, j] + count[b, j]]
+            assert np.array_equal(got, want), (b, level)
+
+
+def test_index_hits_find_points_on_the_cell_lines_of_every_level():
+    """Points snapped onto each level's cell lines, and ``hi`` itself, are found as brute force finds them."""
+    tri = _scattered_triangles(25)[5:]
+    vs, leaves, rows = _as_mesh(tri)
+    idx = build_index(vs, leaves, rows)
+    lo, fine = to_np(idx.lo), float(to_np(idx.fine))
+    points = [to_np(idx.hi)[None]]
+    for level in to_np(idx.levels):
+        side = fine * 2.0**level
+        snapped = lo + np.floor((tri[::20, 0] - lo) / side) * side
+        points += [snapped, np.stack([snapped[:, 0], tri[::20, 0, 1]], axis=-1)]
+    beta = f64(np.concatenate(points))
+    assert_hits_equal(
+        index_hits(idx, vs, leaves, beta), brute_hits(vs, leaves, rows, beta)
+    )

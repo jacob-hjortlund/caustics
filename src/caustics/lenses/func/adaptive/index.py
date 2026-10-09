@@ -1,59 +1,124 @@
 """
-A uniform-grid spatial index over source-plane triangles, and lookups in it.
+A multi-level grid index over source-plane triangles, and lookups in it.
 
-A triangle is registered in every cell its bounding box covers, grown by
-how far the triangle reaches beyond itself, so one cell lookup per point
-finds every triangle that can contain it or reach it.
+Cells come in power-of-two levels. Each triangle is registered at the one
+level whose cells match its bounding box, grown by how far the triangle
+reaches beyond itself, in every cell that box covers there. A point reads
+one cell per occupied level, so the cells it reads are as fine as the
+triangles registered in them wherever those crowd: along caustics, and
+where outliers stretch the extent.
 """
 
-import math
 from typing import NamedTuple
 
 from ....backend_obj import ArrayLike
 from .mesh_backend import mesh_backend
-from .geometry import contains, csr_offsets, edge_nearest, triangle_weights
+from .geometry import contains, edge_nearest, triangle_weights
+
+# Level-0 cells divide the larger side of the index's extent into 2**KEY_BITS:
+# the finest grid whose cell keys, with their level, fit in an int64.
+KEY_BITS = 28
+# A triangle's box spans at most about this many cells per axis at its level.
+CELLS_PER_BOX = 6
 
 
 class MeshIndex(NamedTuple):
     """
-    Uniform-grid CSR index over triangle bounding boxes.
+    Multi-level CSR index over triangle bounding boxes.
 
-    Cell ``c``'s triangles are ``cell_leaves[cell_offsets[c]:cell_offsets[c + 1]]``,
+    Level ``l`` has square cells of side ``fine * 2**l``, counted from
+    ``lo``; cell ``(ix, iy)`` of it has key ``l * 2**56 + ix * 2**28 + iy``.
+    Cell ``keys[u]``'s triangles are ``leaves[offsets[u]:offsets[u + 1]]``,
     ascending.
 
     Parameters
     ----------
     lo, hi: ArrayLike
-        ``(2,)`` float64 corners of the bounding box of every indexed triangle.
+        ``(2,)`` float64 corners of the bounding box of every indexed
+        triangle, grown.
 
         *Unit: arcsec*
-    cell: ArrayLike
-        ``(2,)`` float64 cell size per axis.
+    fine: ArrayLike
+        ``()`` float64 side of the level-0 cells: the larger side of the
+        bounding box over ``2**KEY_BITS``.
 
         *Unit: arcsec*
-    nx, ny: int
-        Cells per axis.
-    cell_offsets: ArrayLike
-        ``(nx * ny + 1,)`` int64 CSR offsets.
-    cell_leaves: ArrayLike
+    levels: ArrayLike
+        ``(L,)`` int64 levels holding a triangle, ascending.
+    keys: ArrayLike
+        ``(U,)`` int64 keys of the cells holding a triangle, ascending.
+    offsets: ArrayLike
+        ``(U + 1,)`` int64 CSR offsets.
+    leaves: ArrayLike
         int64 triangle indices, cell by cell.
     """
 
     lo: ArrayLike
     hi: ArrayLike
-    cell: ArrayLike
-    nx: int
-    ny: int
-    cell_offsets: ArrayLike
-    cell_leaves: ArrayLike
+    fine: ArrayLike
+    levels: ArrayLike
+    keys: ArrayLike
+    offsets: ArrayLike
+    leaves: ArrayLike
+
+
+def _level_tables(device):
+    """``2.0**l`` ``(KEY_BITS + 1,)`` float64, and the cells per axis ``2**(KEY_BITS - l)`` int64, of every level ``l``."""
+    scale = mesh_backend.as_array(
+        [2.0**l for l in range(KEY_BITS + 1)], dtype=mesh_backend.float64, device=device
+    )
+    span = mesh_backend.as_array(
+        [1 << (KEY_BITS - l) for l in range(KEY_BITS + 1)],
+        dtype=mesh_backend.int64,
+        device=device,
+    )
+    return scale, span
+
+
+def _cell_of(x, lo, side, top):
+    """
+    Cell coordinates of points ``x`` ``(..., 2)`` in cells of side ``side``
+    counted from ``lo``, clamped to ``[0, top]``.
+
+    ``side`` and ``top`` broadcast against ``x``. :func:`build_index` and
+    :func:`index_cells` both locate points here, so they agree exactly.
+    """
+    u = mesh_backend.long(mesh_backend.floor((x - lo) / side))
+    return mesh_backend.minimum(mesh_backend.clamp(u, 0, None), top)
+
+
+def _cell_key(level, ix, iy):
+    """The int64 key of cell ``(ix, iy)`` of ``level``."""
+    return level * (1 << (2 * KEY_BITS)) + ix * (1 << KEY_BITS) + iy
+
+
+def _expand(counts, total=None):
+    """
+    The block of each of ``counts.sum()`` entries, and its position in the
+    block, for consecutive blocks of ``counts`` ``(n,)`` int64 entries.
+
+    ``total`` is ``counts.sum()`` where the caller already read it on the host.
+    """
+    device = mesh_backend.device(counts)
+    int64 = mesh_backend.int64
+    if total is None:
+        total = int(mesh_backend.to_numpy(mesh_backend.sum(counts)))
+    block = mesh_backend.repeat(
+        mesh_backend.arange(counts.shape[0], dtype=int64, device=device), counts, axis=0
+    )
+    within = mesh_backend.arange(
+        total, dtype=int64, device=device
+    ) - mesh_backend.repeat(mesh_backend.cumsum(counts, dim=0) - counts, counts, axis=0)
+    return block, within
 
 
 def build_index(vertices, triangles, rows, grow=None):
     """
     The :class:`MeshIndex` over the bounding boxes of ``triangles[rows]``, each grown by its ``grow``.
 
-    Cells are sized from the mean triangle density, and the cell arithmetic
-    is float64 so that it agrees exactly with :func:`index_hits`'.
+    A box's level is the fewest doublings of ``CELLS_PER_BOX * fine`` that
+    reach its longer side, so it spans at most about ``CELLS_PER_BOX``
+    cells per axis there; it is registered in every one of them.
 
     Parameters
     ----------
@@ -83,70 +148,143 @@ def build_index(vertices, triangles, rows, grow=None):
         return MeshIndex(
             lo=mesh_backend.zeros((2,), dtype=f64, device=device),
             hi=mesh_backend.ones((2,), dtype=f64, device=device),
-            cell=mesh_backend.ones((2,), dtype=f64, device=device),
-            nx=1,
-            ny=1,
-            cell_offsets=mesh_backend.zeros((2,), dtype=int64, device=device),
-            cell_leaves=mesh_backend.zeros((0,), dtype=int64, device=device),
+            fine=mesh_backend.as_array(1.0 / (1 << KEY_BITS), dtype=f64, device=device),
+            levels=mesh_backend.zeros((0,), dtype=int64, device=device),
+            keys=mesh_backend.zeros((0,), dtype=int64, device=device),
+            offsets=mesh_backend.zeros((1,), dtype=int64, device=device),
+            leaves=mesh_backend.zeros((0,), dtype=int64, device=device),
         )
     box_lo, box_hi = mesh_backend.min(tri, dim=1), mesh_backend.max(tri, dim=1)
     if grow is not None:
         reach = mesh_backend.unsqueeze(mesh_backend.to(grow, dtype=f64), -1)
         box_lo, box_hi = box_lo - reach, box_hi + reach
     lo, hi = mesh_backend.min(box_lo, dim=0), mesh_backend.max(box_hi, dim=0)
-    span = mesh_backend.where(hi > lo, hi - lo, 1.0)  # a degenerate axis is one cell
-
-    span_np = mesh_backend.to_numpy(span)
-    c = float(math.sqrt(span_np[0] * span_np[1] / tri.shape[0]))
-    c = max(c, float(mesh_backend.finfo(f64).tiny))
-    nx = max(1, int(math.ceil(span_np[0] / c)))
-    ny = max(1, int(math.ceil(span_np[1] / c)))
-    cell = span / mesh_backend.as_array([nx, ny], dtype=f64, device=device)
-
-    upper = mesh_backend.as_array([nx - 1, ny - 1], dtype=int64, device=device)
-    lower = mesh_backend.zeros((2,), dtype=int64, device=device)
-    i0 = mesh_backend.clamp(mesh_backend.long((box_lo - lo) / cell), lower, upper)
-    i1 = mesh_backend.clamp(mesh_backend.long((box_hi - lo) / cell), lower, upper)
-    tall = i1[:, 1] - i0[:, 1] + 1
-    counts = (i1[:, 0] - i0[:, 0] + 1) * tall
-    owner = mesh_backend.repeat(
-        mesh_backend.arange(counts.shape[0], dtype=int64, device=device), counts, axis=0
+    extent = mesh_backend.max(hi - lo)
+    extent = mesh_backend.where(extent > 0, extent, 1.0)  # every box one point
+    fine = mesh_backend.clamp(
+        extent / (1 << KEY_BITS), float(mesh_backend.finfo(f64).tiny), None
     )
-    total_pairs = int(mesh_backend.to_numpy(mesh_backend.sum(counts)))
-    within = mesh_backend.arange(
-        total_pairs, dtype=int64, device=device
-    ) - mesh_backend.repeat(mesh_backend.cumsum(counts, dim=0) - counts, counts, axis=0)
-    cell_id = (i0[owner, 0] + within // tall[owner]) * ny + (
-        i0[owner, 1] + within % tall[owner]
-    )
+
+    scale, span = _level_tables(device)
+    size = mesh_backend.max(box_hi - box_lo, dim=1) / (CELLS_PER_BOX * fine)
+    # The number of powers of two below `size`: ceil(log2(size)), from 0 to KEY_BITS.
+    level = mesh_backend.searchsorted(scale[:KEY_BITS], size)
+    side = mesh_backend.unsqueeze(fine * scale[level], -1)
+    top = mesh_backend.unsqueeze(span[level] - 1, -1)
+    i0 = _cell_of(box_lo, lo, side, top)
+    i1 = _cell_of(box_hi, lo, side, top)
+
+    # Each box's columns of cells, keyed by their bottom cell, then each column's cells.
+    column, dx = _expand(i1[:, 0] - i0[:, 0] + 1)
+    column_key = _cell_key(level, i0[:, 0], i0[:, 1])[column] + dx * (1 << KEY_BITS)
+    cell, dy = _expand((i1[:, 1] - i0[:, 1] + 1)[column])
+    key = column_key[cell] + dy
     # A stable sort keeps each cell's triangles in ascending row order.
-    order = mesh_backend.argsort(cell_id)
-    counts_per_cell = mesh_backend.long(
-        mesh_backend.bincount(cell_id, minlength=nx * ny)
+    order = mesh_backend.argsort(key)
+    key = key[order]
+    total = key.shape[0]
+    run = mesh_backend.concatenate(
+        (
+            mesh_backend.ones((1,), dtype=mesh_backend.bool, device=device),
+            key[1:] != key[:-1],
+        ),
+        dim=0,
     )
-    cell_offsets = csr_offsets(counts_per_cell)
+    starts = mesh_backend.flatnonzero(run)
     return MeshIndex(
         lo=lo,
         hi=hi,
-        cell=cell,
-        nx=nx,
-        ny=ny,
-        cell_offsets=cell_offsets,
-        cell_leaves=rows[owner[order]],
+        fine=fine,
+        levels=mesh_backend.unique(level),
+        keys=key[starts],
+        offsets=mesh_backend.concatenate(
+            (starts, mesh_backend.as_array([total], dtype=int64, device=device)),
+            dim=0,
+        ),
+        leaves=rows[column[cell[order]]],
     )
+
+
+def index_cells(index, beta):
+    """
+    The cell of each point at every level of ``index``, as CSR ranges into ``index.leaves``.
+
+    A point outside the stored ``[lo, hi]``, NaN included, gets empty
+    ranges, as does a cell that holds nothing.
+
+    Parameters
+    ----------
+    index: MeshIndex
+    beta: ArrayLike
+        ``(B, 2)`` points.
+
+        *Unit: arcsec*
+
+    Returns
+    -------
+    start, count: ArrayLike
+        ``(B, L)`` int64, one column per entry of ``index.levels``.
+    """
+    int64 = mesh_backend.int64
+    device = mesh_backend.device(beta)
+    n_levels = index.levels.shape[0]
+    if n_levels == 0:
+        empty = mesh_backend.zeros((beta.shape[0], 0), dtype=int64, device=device)
+        return empty, empty
+    scale, span = _level_tables(device)
+    side = (index.fine * scale[index.levels]).reshape(1, n_levels, 1)
+    top = (span[index.levels] - 1).reshape(1, n_levels, 1)
+    u = _cell_of(mesh_backend.unsqueeze(beta, 1), index.lo, side, top)
+    key = _cell_key(mesh_backend.unsqueeze(index.levels, 0), u[..., 0], u[..., 1])
+    pos = mesh_backend.clamp(
+        mesh_backend.searchsorted(index.keys, key), 0, index.keys.shape[0] - 1
+    )
+    inside = (
+        (beta[:, 0] >= index.lo[0])
+        & (beta[:, 0] <= index.hi[0])
+        & (beta[:, 1] >= index.lo[1])
+        & (beta[:, 1] <= index.hi[1])
+    )
+    found = (index.keys[pos] == key) & mesh_backend.unsqueeze(inside, -1)
+    start = index.offsets[pos]
+    count = mesh_backend.where(
+        found, index.offsets[pos + 1] - start, mesh_backend.zeros_like(start)
+    )
+    return start, count
+
+
+def _chunk_hits(index, vertices, triangles, beta, start, count, total, grow):
+    """
+    :func:`index_hits` for points ``beta`` whose cells are ``start``, ``count`` ``(B, L)``.
+
+    ``total`` is ``count.sum()``, read on the host by the caller.
+    """
+    block, within = _expand(count.reshape(-1), total)
+    cand = index.leaves[start.reshape(-1)[block] + within]
+    qidx = block // start.shape[1]
+    tri = vertices[triangles[cand]]
+    w = triangle_weights(tri, beta[qidx])
+    hit = contains(w)
+    if grow is not None:
+        reach = mesh_backend.flatnonzero(~hit & (grow[cand] > 0))
+        dist, _ = edge_nearest(tri[reach], beta[qidx[reach]])
+        hit = mesh_backend.fill_at_indices(hit, reach, dist <= grow[cand[reach]])
+    hit = mesh_backend.flatnonzero(hit)
+    qidx, cand, w = qidx[hit], cand[hit], w[hit]
+    # Each level's hits come in ascending order; merge them per point.
+    order = mesh_backend.lexsort((cand, qidx))
+    return qidx[order], cand[order], w[order]
 
 
 def index_hits(index, vertices, triangles, beta, grow=None):
     """
     Triangles of ``index`` whose image contains each point, zeros counting as inside, or reaches it.
 
-    One cell lookup per point, then :func:`~.geometry.contains` on that
-    cell's triangles. With ``grow``, a triangle that does not contain the
-    point is a hit when the point lies within its ``grow`` of it
+    One cell per level per point, then :func:`~.geometry.contains` on its
+    triangles. With ``grow``, a triangle that does not contain the point is
+    a hit when the point lies within its ``grow`` of it
     (:func:`~.geometry.edge_nearest`); the index must have been built with
-    a ``grow`` at least as large. A point is tested against the stored ``hi``, never a
-    recomputed ``lo + cell * n``, so a point on the upper edge of the
-    bounding box still finds the triangles registered in the last column.
+    a ``grow`` at least as large.
 
     Parameters
     ----------
@@ -177,47 +315,17 @@ def index_hits(index, vertices, triangles, beta, grow=None):
     w: ArrayLike
         ``(K, 3)`` :func:`~.geometry.triangle_weights` of each hit.
     """
-    int64 = mesh_backend.int64
-    device = mesh_backend.device(beta)
-    b = beta.shape[0]
-    u = mesh_backend.long(mesh_backend.floor((beta - index.lo) / index.cell))
-    inside = (
-        (beta[:, 0] >= index.lo[0])
-        & (beta[:, 0] <= index.hi[0])
-        & (beta[:, 1] >= index.lo[1])
-        & (beta[:, 1] <= index.hi[1])
-    )
-    cell = mesh_backend.clamp(u[:, 0], 0, index.nx - 1) * index.ny + mesh_backend.clamp(
-        u[:, 1], 0, index.ny - 1
-    )
-    start = index.cell_offsets[cell]
-    count = mesh_backend.where(
-        inside, index.cell_offsets[cell + 1] - start, mesh_backend.zeros_like(start)
-    )
+    start, count = index_cells(index, beta)
     total = int(mesh_backend.to_numpy(mesh_backend.sum(count)))
     if total == 0:
+        int64 = mesh_backend.int64
+        device = mesh_backend.device(beta)
         return (
             mesh_backend.zeros((0,), dtype=int64, device=device),
             mesh_backend.zeros((0,), dtype=int64, device=device),
             mesh_backend.zeros((0, 3), dtype=vertices.dtype, device=device),
         )
-    qidx = mesh_backend.repeat(
-        mesh_backend.arange(b, dtype=int64, device=device), count, axis=0
-    )
-    base = mesh_backend.cumsum(count, dim=0) - count
-    within = mesh_backend.arange(
-        total, dtype=int64, device=device
-    ) - mesh_backend.repeat(base, count, axis=0)
-    cand = index.cell_leaves[start[qidx] + within]
-    tri = vertices[triangles[cand]]
-    w = triangle_weights(tri, beta[qidx])
-    hit = contains(w)
-    if grow is not None:
-        reach = mesh_backend.flatnonzero(~hit & (grow[cand] > 0))
-        dist, _ = edge_nearest(tri[reach], beta[qidx[reach]])
-        hit = mesh_backend.fill_at_indices(hit, reach, dist <= grow[cand[reach]])
-    hit = mesh_backend.flatnonzero(hit)
-    return qidx[hit], cand[hit], w[hit]
+    return _chunk_hits(index, vertices, triangles, beta, start, count, total, grow)
 
 
 def as_points(bx, by, device):

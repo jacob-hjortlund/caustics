@@ -22,7 +22,7 @@ from caustics.lenses.func.adaptive.images import (
     mesh_seeds,
     near_seed,
 )
-from caustics.lenses.func.adaptive.index import index_hits
+from caustics.lenses.func.adaptive.index import index_cells, index_hits
 from caustics.lenses.func.adaptive.lens_mesh import build_lens_mesh, leaf_grow
 from caustics.lenses.func.adaptive.curves import critical_curves_and_caustics
 
@@ -36,6 +36,7 @@ from adaptive_maps import (
     f64,
     finite_rows,
     i64,
+    index_cell_ranges,
     lens,
     localised_fold,
     localised_fold_jacobian,
@@ -646,25 +647,25 @@ def test_query_covers_points_on_the_source_bbox_upper_edge():
 
 
 def test_query_matches_brute_force_containment_on_multi_cell_leaves():
-    """The one-cell-lookup completeness claim, on a mesh with wide leaf AABBs.
+    """The completeness claim, on a mesh whose leaves span several cells.
 
-    `build_index` registers each leaf across its full cell rectangle, not just
-    its three vertex cells -- and no other test distinguishes those, since the
-    vertex-cell test checks only vertices and the crack test's uniform reference
-    shares `build_index` so a common bug cancels. Measured on this fixture:
-    520 of 4932 leaves span three or more index cells on an axis.
+    `build_index` registers each leaf in every cell its box covers at its
+    level, not just its three vertex cells -- and no other test distinguishes
+    those, since the vertex-cell test checks only vertices and the crack test's
+    uniform reference shares `build_index` so a common bug cancels. On this
+    fixture every one of the 5,349 finite leaves spans three or more cells on
+    an axis at its level.
     """
     mesh, _ = build(localised_fold, localised_fold_jacobian, min_img_sep=0.05)
     vs = to_np(mesh.vertices_source)
     leaves = to_np(mesh.leaves)
     status = leaf_status(mesh)
-    lo = to_np(mesh.index.lo)
-    cell = to_np(mesh.index.cell)
     tri = vs[leaves]
-    i0 = np.floor((tri.min(axis=1) - lo) / cell).astype(np.int64)
-    i1 = np.floor((tri.max(axis=1) - lo) / cell).astype(np.int64)
+    finite = (status & NONFINITE) == 0
+    grow = to_np(leaf_grow(mesh.origin_status, mesh.origin_deviation, mesh.leaf_origin))
+    _, i0, i1 = index_cell_ranges(mesh.index, tri[finite], grow[finite])
     span = i1 - i0 + 1
-    assert (span >= 3).any(), "fixture must contain multi-cell leaf AABBs"
+    assert (span >= 3).any(), "fixture must contain leaves spanning several cells"
     beta = RNG.uniform(-0.9, 0.9, size=(200, 2))
     idx, off, _ = query_np(mesh, beta)
     tri_b = mesh_backend.as_array(tri)
@@ -1045,6 +1046,37 @@ def test_index_hits_equal_brute_force_on_a_point_mass_mesh(point_mesh):
     )
     qidx, _, _ = _hits_against_brute_force(point_mesh, f64(points))
     assert to_np(qidx).size > 0
+
+
+def test_point_mass_candidates_average_at_most_three_times_the_box_floor(point_mesh):
+    """Near a point mass's caustic, candidates per point average at most three times the floor.
+
+    The floor is the number of grown leaf boxes containing the point, which
+    no bounding-box index can go below. The single uniform grid this index
+    replaced read 700 to 2,700 times the floor here, and the multi-level
+    grid measured 1.3 to 2.0 times on 13 lens meshes. The bound is on the
+    mean: next to the point-like caustic the floor itself reaches the
+    thousands, and where the floor is small, candidates have exceeded four
+    times it by up to 219.
+    """
+    rows = finite_rows(point_mesh)
+    vs, leaves = to_np(point_mesh.vertices_source), to_np(point_mesh.leaves)
+    grow = to_np(
+        leaf_grow(
+            point_mesh.origin_status,
+            point_mesh.origin_deviation,
+            point_mesh.leaf_origin,
+        )
+    )[rows]
+    tri = vs[leaves[rows]]
+    box_lo, box_hi = tri.min(axis=1) - grow[:, None], tri.max(axis=1) + grow[:, None]
+    beta = np.random.default_rng(41).uniform(-0.3, 0.3, (300, 2))
+    floor = np.array(
+        [np.all((box_lo <= p) & (p <= box_hi), axis=1).sum() for p in beta]
+    )
+    _, count = index_cells(point_mesh.index, f64(beta))
+    candidates = to_np(count).sum(axis=1)
+    assert candidates.mean() <= 3 * floor.mean()
 
 
 def test_index_hits_are_the_query_hits_with_raw_weights(mesh, beta):
