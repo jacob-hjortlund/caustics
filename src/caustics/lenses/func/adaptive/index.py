@@ -11,6 +11,8 @@ where outliers stretch the extent.
 
 from typing import NamedTuple
 
+import numpy as np
+
 from ....backend_obj import ArrayLike
 from .mesh_backend import mesh_backend
 from .geometry import contains, edge_nearest, triangle_weights
@@ -20,6 +22,8 @@ from .geometry import contains, edge_nearest, triangle_weights
 KEY_BITS = 28
 # A triangle's box spans at most about this many cells per axis at its level.
 CELLS_PER_BOX = 6
+# Most (point, candidate) pairs one step of a query holds.
+PAIR_CAP = 1 << 20
 
 
 class MeshIndex(NamedTuple):
@@ -284,7 +288,10 @@ def index_hits(index, vertices, triangles, beta, grow=None):
     triangles. With ``grow``, a triangle that does not contain the point is
     a hit when the point lies within its ``grow`` of it
     (:func:`~.geometry.edge_nearest`); the index must have been built with
-    a ``grow`` at least as large.
+    a ``grow`` at least as large. Points run in chunks of whole points
+    holding at most ``PAIR_CAP`` (point, candidate) pairs, or one point
+    holding more, so memory stays bounded and the result does not depend
+    on the chunking.
 
     Parameters
     ----------
@@ -315,17 +322,44 @@ def index_hits(index, vertices, triangles, beta, grow=None):
     w: ArrayLike
         ``(K, 3)`` :func:`~.geometry.triangle_weights` of each hit.
     """
-    start, count = index_cells(index, beta)
-    total = int(mesh_backend.to_numpy(mesh_backend.sum(count)))
-    if total == 0:
-        int64 = mesh_backend.int64
-        device = mesh_backend.device(beta)
-        return (
-            mesh_backend.zeros((0,), dtype=int64, device=device),
-            mesh_backend.zeros((0,), dtype=int64, device=device),
-            mesh_backend.zeros((0, 3), dtype=vertices.dtype, device=device),
-        )
-    return _chunk_hits(index, vertices, triangles, beta, start, count, total, grow)
+    int64 = mesh_backend.int64
+    device = mesh_backend.device(beta)
+    qidx = [mesh_backend.zeros((0,), dtype=int64, device=device)]
+    tri = [mesh_backend.zeros((0,), dtype=int64, device=device)]
+    w = [mesh_backend.zeros((0, 3), dtype=vertices.dtype, device=device)]
+    step = max(1, PAIR_CAP // max(index.levels.shape[0], 1))
+    for first in range(0, beta.shape[0], step):
+        chunk = beta[first : first + step]
+        start, count = index_cells(index, chunk)
+        # Running candidate totals, read on the host once per chunk.
+        ends = np.cumsum(mesh_backend.to_numpy(mesh_backend.sum(count, dim=1)))
+        lo = 0
+        while lo < chunk.shape[0]:
+            before = int(ends[lo - 1]) if lo else 0
+            hi = max(
+                lo + 1, int(np.searchsorted(ends, before + PAIR_CAP, side="right"))
+            )
+            total = int(ends[hi - 1]) - before
+            if total:
+                found = _chunk_hits(
+                    index,
+                    vertices,
+                    triangles,
+                    chunk[lo:hi],
+                    start[lo:hi],
+                    count[lo:hi],
+                    total,
+                    grow,
+                )
+                qidx.append(found[0] + (first + lo))
+                tri.append(found[1])
+                w.append(found[2])
+            lo = hi
+    return (
+        mesh_backend.concatenate(qidx, dim=0),
+        mesh_backend.concatenate(tri, dim=0),
+        mesh_backend.concatenate(w, dim=0),
+    )
 
 
 def as_points(bx, by, device):

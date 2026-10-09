@@ -22,6 +22,7 @@ from caustics.lenses.func.adaptive.images import (
     mesh_seeds,
     near_seed,
 )
+from caustics.lenses.func.adaptive import index as index_module
 from caustics.lenses.func.adaptive.index import index_cells, index_hits
 from caustics.lenses.func.adaptive.lens_mesh import build_lens_mesh, leaf_grow
 from caustics.lenses.func.adaptive.curves import critical_curves_and_caustics
@@ -1077,6 +1078,34 @@ def test_point_mass_candidates_average_at_most_three_times_the_box_floor(point_m
     _, count = index_cells(point_mesh.index, f64(beta))
     candidates = to_np(count).sum(axis=1)
     assert candidates.mean() <= 3 * floor.mean()
+
+
+def test_index_hits_hold_at_most_pair_cap_pairs_per_step(mesh, beta, monkeypatch):
+    """Each step of a query holds at most ``PAIR_CAP`` pairs, or one point holding more, and the hits do not change."""
+    grow = leaf_grow(mesh.origin_status, mesh.origin_deviation, mesh.leaf_origin)
+    whole = index_hits(mesh.index, mesh.vertices_source, mesh.leaves, beta, grow)
+    steps = []
+    chunk_hits = index_module._chunk_hits
+
+    def spy(index, vertices, triangles, points, start, count, total, grow):
+        steps.append((points.shape[0], total))
+        return chunk_hits(index, vertices, triangles, points, start, count, total, grow)
+
+    monkeypatch.setattr(index_module, "_chunk_hits", spy)
+    over_cap = shared = False
+    for cap in (7, 64):
+        monkeypatch.setattr(index_module, "PAIR_CAP", cap)
+        steps.clear()
+        got = index_hits(mesh.index, mesh.vertices_source, mesh.leaves, beta, grow)
+        for name, a, b in zip(("qidx", "tri", "w"), got, whole):
+            np.testing.assert_array_equal(
+                to_np(a), to_np(b), err_msg=f"{name}, cap {cap}"
+            )
+        assert all(total <= cap or n == 1 for n, total in steps), steps
+        over_cap |= any(n == 1 and total > cap for n, total in steps)
+        shared |= any(n > 1 for n, _ in steps)
+    assert over_cap, "no point held more than the cap"
+    assert shared, "no step held several points"
 
 
 def test_index_hits_are_the_query_hits_with_raw_weights(mesh, beta):
