@@ -994,6 +994,17 @@ def test_a_kappa_one_sheet_indexes_every_leaf():
     assert indexed.tolist() == list(range(mesh.leaves.shape[0]))
 
 
+def test_a_kappa_one_sheet_s_single_source_point_hits_every_leaf():
+    """Every source vertex is one point, so the index has no extent; that point lies in every leaf."""
+    mesh, _ = build(collapse, collapse_jacobian, min_img_sep=1.0)
+    vs = mesh.vertices_source
+    assert (
+        np.unique(to_np(vs), axis=0).shape[0] == 1
+    ), "fixture must collapse every vertex"
+    _, hit, _ = index_hits(mesh.index, vs, mesh.leaves, vs[:1])
+    assert to_np(hit).tolist() == list(range(mesh.leaves.shape[0]))
+
+
 def test_coverage_does_not_drop_at_level_transitions():
     """Every point a uniform finest-level mesh covers, the adaptive mesh covers too."""
     fov, init_res, sep = 4.0, 4, 0.1

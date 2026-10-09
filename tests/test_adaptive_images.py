@@ -30,8 +30,11 @@ from adaptive_maps import (
     AFFINE,
     affine,
     affine_jacobian,
+    assert_hits_equal,
+    brute_hits,
     build,
     f64,
+    finite_rows,
     i64,
     lens,
     localised_fold,
@@ -982,6 +985,66 @@ def test_dedup_mixes_singleton_and_clustered_blocks_in_order():
     points = _pts([[9.0, 9.0], [0.0, 0.0], [0.0, 0.001], [5.0, 5.0]])
     keep = _dedup(points, np.array([1, 2, 1]), 0.01)
     assert keep.tolist() == [True, True, False, True]
+
+
+@pytest.fixture(scope="module")
+def point_mesh():
+    """A point mass of Einstein radius 1 with its center a hole: source triangles from about 1e-12 to 1e4 arcsec^2."""
+    lens = Point(
+        name="pt",
+        cosmology=FlatLambdaCDM(name="cosmo"),
+        z_l=0.5,
+        z_s=1.5,
+        x0=0.0,
+        y0=0.0,
+        Rein=1.0,
+        s=0.0,
+    )
+    mesh = build_lens_mesh(
+        lens.raytrace,
+        lens.jacobian_lens_equation,
+        fov=5.0,
+        init_res=32,
+        min_img_sep=1e-2,
+        centers=[[0.0, 0.0]],
+    )
+    return to_mesh(mesh)
+
+
+def _hits_against_brute_force(mesh, points):
+    """``index_hits`` on ``mesh`` at ``points``, asserted equal to brute force over every finite leaf."""
+    grow = leaf_grow(mesh.origin_status, mesh.origin_deviation, mesh.leaf_origin)
+    rows = i64(finite_rows(mesh))
+    got = index_hits(mesh.index, mesh.vertices_source, mesh.leaves, points, grow)
+    assert_hits_equal(
+        got, brute_hits(mesh.vertices_source, mesh.leaves, rows, points, grow)
+    )
+    return got
+
+
+def test_index_hits_equal_brute_force_on_the_sie_like_mesh(mesh, beta):
+    vs = to_np(mesh.vertices_source)
+    finite = vs[np.isfinite(vs).all(axis=1)]
+    hi = to_np(mesh.index.hi)
+    upper = np.array([hi, [hi[0], 0.0], [0.0, hi[1]]])
+    points = f64(np.concatenate([to_np(beta), finite[::7][:40], upper]))
+    qidx, _, _ = _hits_against_brute_force(mesh, points)
+    assert to_np(qidx).size > 0
+
+
+def test_index_hits_equal_brute_force_on_a_point_mass_mesh(point_mesh):
+    rng = np.random.default_rng(31)
+    vs = to_np(point_mesh.vertices_source)
+    finite = vs[np.isfinite(vs).all(axis=1)]
+    points = np.concatenate(
+        [
+            rng.uniform(-0.3, 0.3, (60, 2)),
+            rng.uniform(-5.0, 5.0, (30, 2)),
+            finite[rng.choice(len(finite), 20, replace=False)],
+        ]
+    )
+    qidx, _, _ = _hits_against_brute_force(point_mesh, f64(points))
+    assert to_np(qidx).size > 0
 
 
 def test_index_hits_are_the_query_hits_with_raw_weights(mesh, beta):

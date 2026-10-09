@@ -52,7 +52,7 @@ from caustics.lenses.func.adaptive.lattice import (
     warn_depth_limited,
 )
 
-from adaptive_maps import assert_same, f64, i64, to_np
+from adaptive_maps import assert_hits_equal, assert_same, brute_hits, f64, i64, to_np
 
 RNG = np.random.default_rng(20260918)
 
@@ -900,3 +900,54 @@ def test_index_hits_with_an_all_zero_grow_matches_a_plain_index():
     assert np.array_equal(to_np(qidx_grow), to_np(qidx_plain))
     assert np.array_equal(to_np(tri_grow), to_np(tri_plain))
     assert np.array_equal(to_np(w_grow), to_np(w_plain))
+
+
+def _scattered_triangles(seed, n=400):
+    """``n`` triangles with sides from 1e-9 to 1e2 arcsec, the first five moved out to about 1e6."""
+    rng = np.random.default_rng(seed)
+    size = 10.0 ** rng.uniform(-9, 2, n)
+    corner = rng.uniform(-1, 1, (n, 2))
+    corner[:5] *= 1e6
+    return corner[:, None, :] + size[:, None, None] * rng.uniform(-1, 1, (n, 3, 2))
+
+
+def _as_mesh(tri):
+    """``tri`` ``(n, 3, 2)`` as vertices, triangles and all their rows."""
+    n = tri.shape[0]
+    return (
+        f64(tri.reshape(-1, 2)),
+        i64(np.arange(3 * n).reshape(n, 3)),
+        i64(np.arange(n)),
+    )
+
+
+def test_index_hits_equal_brute_force_across_eleven_orders_of_magnitude():
+    tri = _scattered_triangles(9)
+    vs, leaves, rows = _as_mesh(tri)
+    rng = np.random.default_rng(10)
+    n = tri.shape[0]
+    grow = f64(np.where(rng.uniform(size=n) < 0.2, 10.0 ** rng.uniform(-9, 0, n), 0.0))
+    inner = tri[:, 0] + 0.3 * (tri[:, 1] - tri[:, 0]) + 0.3 * (tri[:, 2] - tri[:, 0])
+    beta = f64(np.concatenate([inner, tri[:, 1], rng.uniform(-1, 1, (200, 2))]))
+    idx = build_index(vs, leaves, rows, grow)
+    assert_hits_equal(
+        index_hits(idx, vs, leaves, beta, grow),
+        brute_hits(vs, leaves, rows, beta, grow),
+    )
+
+
+def test_index_hits_skip_nan_infinite_and_far_points_and_take_empty_input():
+    rng = np.random.default_rng(14)
+    tri = rng.uniform(-1, 1, (40, 1, 2)) + 0.2 * rng.uniform(-1, 1, (40, 3, 2))
+    vs, leaves, rows = _as_mesh(tri)
+    idx = build_index(vs, leaves, rows)
+    beta = f64(
+        [[np.nan, 0.0], [np.inf, 0.0], [0.0, -np.inf], [1e9, 1e9], tri[3].mean(axis=0)]
+    )
+    qidx, hit, w = index_hits(idx, vs, leaves, beta)
+    assert set(to_np(qidx).tolist()) == {4}
+    want_q, want_t, want_w = brute_hits(vs, leaves, rows, beta[4:])
+    assert want_t.size > 0
+    assert_hits_equal((qidx, hit, w), (want_q + 4, want_t, want_w))
+    empty = index_hits(idx, vs, leaves, f64(np.zeros((0, 2))))
+    assert [tuple(a.shape) for a in empty] == [(0,), (0,), (0, 3)]

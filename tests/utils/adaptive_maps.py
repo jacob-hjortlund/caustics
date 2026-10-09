@@ -213,3 +213,59 @@ def sis_jacobian(p, b=1.0):
     with np.errstate(divide="ignore", invalid="ignore"):
         r = np.linalg.norm(p, axis=-1)[:, None, None]
         return (1.0 - b / r) * np.eye(2) + b * p[:, :, None] * p[:, None, :] / r**3
+
+
+def brute_hits(vertices, triangles, rows, beta, grow=None):
+    """
+    ``index_hits``'s answer, found by testing every one of ``rows`` against every point.
+
+    Returns numpy ``qidx``, ``tri`` and ``w``, ordered by point and then by
+    triangle. It uses the geometry functions ``index_hits`` uses on the same
+    operands, so the weights agree bit for bit. ``grow`` is ``(T,)``, aligned
+    with ``triangles``.
+    """
+    from caustics.lenses.func.adaptive.geometry import (
+        contains,
+        edge_nearest,
+        triangle_weights,
+    )
+
+    rows_np = to_np(rows)
+    tri = vertices[triangles[rows]]
+    reach = None if grow is None else to_np(grow)[rows_np]
+    qidx, hits, weights = [], [], []
+    for b in range(beta.shape[0]):
+        point = mesh_backend.repeat(beta[b : b + 1], rows_np.size, axis=0)
+        w = triangle_weights(tri, point)
+        hit = to_np(contains(w))
+        if reach is not None:
+            dist, _ = edge_nearest(tri, point)
+            hit = hit | ((reach > 0) & (to_np(dist) <= reach))
+        sel = np.flatnonzero(hit)
+        qidx.append(np.full(sel.size, b, dtype=np.int64))
+        hits.append(rows_np[sel])
+        weights.append(to_np(w)[sel])
+    return (
+        np.concatenate(qidx),
+        np.concatenate(hits).astype(np.int64),
+        np.concatenate(weights).reshape(-1, 3),
+    )
+
+
+def assert_hits_equal(got, want):
+    """``index_hits`` output ``got`` equals numpy ``want`` from :func:`brute_hits`, bit for bit."""
+    for name, a, b in zip(("qidx", "tri", "w"), got, want):
+        np.testing.assert_array_equal(to_np(a), b, err_msg=name)
+
+
+def finite_rows(mesh):
+    """The leaves every index of ``mesh`` holds: those whose origin has a finite raytrace and Jacobian."""
+    from caustics.lenses.func.adaptive.criterion import (
+        LEAF_JACOBIAN_NONFINITE,
+        LEAF_RAYTRACE_NONFINITE,
+    )
+
+    status = to_np(mesh.origin_status)[to_np(mesh.leaf_origin)]
+    return np.flatnonzero(
+        (status & (LEAF_RAYTRACE_NONFINITE | LEAF_JACOBIAN_NONFINITE)) == 0
+    )
