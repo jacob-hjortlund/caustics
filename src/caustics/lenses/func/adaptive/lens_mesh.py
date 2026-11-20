@@ -560,14 +560,23 @@ def _finish(lat, cache, store, passed, sample, min_img_sep, holes, batch_size, s
     it, recomputed from the cache, where splitting put their midpoints, also
     in steps of :data:`STATUS_ROWS`.
 
-    With every mean final, the finest-level origins, old and new, are
-    taken in steps of at most :data:`STATUS_ROWS`. The six samples of each
-    one that is not :func:`~.band.resolved` and has no non-finite image are
-    measured (:func:`_measured_det`), each once; a sample ``seed``'s table
-    holds keeps its stored value. Then each origin's six ``det A`` are
-    :func:`~.band.jacobian_det6` of its vertex Jacobians, with the measured
-    value at every measured sample, and the band is the origins
-    :func:`~.band.in_band` holds for; status does not depend on it. Its
+    With every mean final, the finest-level origins, old and new, are read
+    once, in steps of at most :data:`STATUS_ROWS`: each one's vertex
+    Jacobians tell whether it is :func:`~.band.resolved`, and whether the
+    six ``det A`` they fit (:func:`~.band.jacobian_det6`) put it in the band
+    (:func:`~.band.in_band`). The six samples of each one that is not
+    resolved and has no non-finite image are measured
+    (:func:`_measured_det`), each once; a sample ``seed``'s table holds
+    keeps its stored value. Each origin's six ``det A`` are its fitted ones
+    with the measured value at every measured sample, and the band is the
+    origins ``in_band`` holds for; status does not depend on it. Measuring
+    changes ``det A`` only at a measured origin's samples, and a
+    finest-level origin shares one only through a vertex: a finest-level
+    midpoint is never a vertex, and two finest-level leaves sharing an edge
+    midpoint share that edge. So only the candidates -- the origins in the
+    band by their fit and those with a vertex of a measured origin -- are
+    taken again, in steps of at most :data:`STATUS_ROWS`, to read the
+    measured values; every other origin is out of the band either way. Its
     images are read from the table the status pass read. An old origin new
     to the band has midpoints that table lacks: those alone are raytraced,
     with ``sample``, and read from a table of their own.
@@ -751,17 +760,40 @@ def _finish(lat, cache, store, passed, sample, min_img_sep, holes, batch_size, s
         """Lattice keys of origins ``k``'s six samples, ``(n, 6)``."""
         return _six_keys(lat, cache.ij[store.v[origin[k]]])
 
-    def unresolved_step(k):
-        """The keys of the six samples of those of origins ``k`` measured, ``(6 n,)``."""
+    def finest_step(k):
+        """
+        One read of origins ``k``'s vertex Jacobians: what it measures and what the band may hold.
+
+        Returns the keys of the six samples of those of ``k`` measured,
+        ``(6 m,)``, those ``m`` origins, and the origins of ``k`` in the band
+        by their fitted ``det``.
+        """
+        jacobian3 = jacobian[origin_leaves[k]]
         finite = (status[origin[k]] & LEAF_RAYTRACE_NONFINITE) == 0
-        unresolved = ~resolved(jacobian[origin_leaves[k]])
-        return keys6_of(k[mesh_backend.flatnonzero(finite & unresolved)]).reshape(-1)
+        measure = k[mesh_backend.flatnonzero(finite & ~resolved(jacobian3))]
+        fitted = k[mesh_backend.flatnonzero(in_band(jacobian_det6(jacobian3)))]
+        return keys6_of(measure).reshape(-1), measure, fitted
 
     # Ascending origins, so the band comes out in origin order.
     finest = mesh_backend.flatnonzero(store.level[origin] == lat.level - 1)
-    measured_keys = mesh_backend.unique(
-        map_chunks(unresolved_step, finest, STATUS_ROWS)
+    measured_keys, measured_origins, candidates = map_chunks(
+        finest_step, finest, STATUS_ROWS
     )
+    measured_keys = mesh_backend.unique(measured_keys)
+    if measured_origins.shape[0]:
+        # A measured sample is shared only through a vertex: add every finest
+        # origin with a vertex of a measured origin.
+        near = mesh_backend.fill_at_indices(
+            mesh_backend.zeros((n_vertices,), dtype=mesh_backend.bool),
+            origin_leaves[measured_origins].reshape(-1),
+            True,
+        )
+        touched = mesh_backend.any(near[origin_leaves[finest]], dim=1)
+        candidates = mesh_backend.unique(
+            mesh_backend.concatenate(
+                (candidates, finest[mesh_backend.flatnonzero(touched)]), dim=0
+            )
+        )
     measured_det = _measured_det(
         lat,
         measured_keys,
@@ -785,7 +817,7 @@ def _finish(lat, cache, store, passed, sample, min_img_sep, holes, batch_size, s
         return k[keep], det6[keep], keys6, table_values[pos], found
 
     band_leaves, band_det6, band_keys6, band_source6, found = map_chunks(
-        band_step, finest, STATUS_ROWS
+        band_step, candidates, STATUS_ROWS
     )
     # The midpoints of an old origin new to the band, which the table lacks.
     missing = mesh_backend.flatnonzero(~found.reshape(-1))

@@ -432,6 +432,12 @@ BAND_CASES = [
         dict(init_res=4, min_img_sep=0.05),
         id="nan_region",
     ),
+    # Four band origins here enter only through a neighbour's measured sample.
+    pytest.param(
+        *sis(((0.0, 0.0), (0.6, 0.0))),
+        dict(fov=5.0, init_res=10, min_img_sep=2e-2),
+        id="two_sis",
+    ),
 ]
 
 
@@ -503,6 +509,63 @@ def test_the_band_is_the_sign_change_leaves_recomputed_independently(fn, jac, kw
     assert np.array_equal(to_np(band.leaves), rows) and rows.size > 0
     np.testing.assert_array_equal(to_np(band.det[band.samples]), det6)
     assert to_np(in_band(band.det[band.samples])).all()
+
+
+def independent_candidates(mesh):
+    """Finest origins in the band by their fitted det, or sharing a vertex with a finite unresolved finest origin, ascending."""
+    finest = np.flatnonzero(to_np(mesh.origin_level) == mesh.lattice.level - 1)
+    det6, spread = fitted_det6(mesh, finest)
+    by_fit = np.isfinite(det6).all(1) & (det6 >= 0).any(1) & (det6 < 0).any(1)
+    finite = (to_np(mesh.origin_status)[finest] & LEAF_RAYTRACE_NONFINITE) == 0
+    leaves = to_np(mesh.origin_leaves)
+    mark = np.zeros(mesh.vertices_lens.shape[0], bool)
+    mark[leaves[finest[~(spread < RESOLVED_SPREAD) & finite]].reshape(-1)] = True
+    return finest[by_fit | mark[leaves[finest]].any(1)]
+
+
+def test_the_band_pass_reads_each_finest_origin_once_and_rechecks_only_its_candidates(
+    monkeypatch,
+):
+    """
+    One pass gathers every finest origin's vertex Jacobians before any det is measured; afterwards only the candidates are taken again.
+
+    A measured sample is shared only through a vertex -- a finest-level
+    midpoint is never a vertex, and two finest leaves sharing an edge
+    midpoint share that edge -- so the candidates are the origins in the
+    band by their fit and those sharing a vertex with a measured origin.
+    """
+    calls = []
+    for name in ("resolved", "jacobian_det6", "_measured_det"):
+        real = getattr(lens_mesh_module, name)
+
+        def spy(*args, _name=name, _real=real):
+            rows = None if _name == "_measured_det" else args[0].shape[0]
+            calls.append((_name, rows))
+            return _real(*args)
+
+        monkeypatch.setattr(lens_mesh_module, name, spy)
+    mesh, _ = build(
+        *sis(((0.0, 0.0), (0.6, 0.0))), fov=5.0, init_res=10, min_img_sep=2e-2
+    )
+    cut = [n for n, _ in calls].index("_measured_det")
+    before, after = calls[:cut], calls[cut + 1 :]
+    finest = np.flatnonzero(to_np(mesh.origin_level) == mesh.lattice.level - 1)
+
+    def rows(part, name):
+        return sum(r for n, r in part if n == name)
+
+    assert rows(before, "resolved") == rows(before, "jacobian_det6") == finest.size
+    assert rows(after, "resolved") == 0
+    candidates = independent_candidates(mesh)
+    assert rows(after, "jacobian_det6") == candidates.size < finest.size
+    band = to_np(mesh.critical_band.leaves)
+    assert np.isin(band, candidates).all()
+    # Fixture strength: some band origin is in only through a neighbour's
+    # measured sample, neither in the band by its fit nor measured itself.
+    det6, spread = fitted_det6(mesh, finest)
+    by_fit = np.isfinite(det6).all(1) & (det6 >= 0).any(1) & (det6 < 0).any(1)
+    plain = finest[by_fit | ~(spread < RESOLVED_SPREAD)]
+    assert not np.isin(band, plain).all()
 
 
 SINGULAR = dict(fov=4.0, init_res=8, min_img_sep=0.02)
@@ -1041,9 +1104,10 @@ def test_every_stepped_pass_holds_at_most_status_rows_rows_per_step(
     Each pass is seen through the call it makes once per step, on that
     step's rows: the status pass through ``_status_rows``; the refit of the
     old rows an extension splits through ``_six_values`` called outside
-    ``_status_rows``; the measuring pass's leaf selection through
-    ``resolved``; the band pass through ``in_band``. The extension is
-    ``ring_fold(2.0)``'s, which splits old rows.
+    ``_status_rows``; the pass over the finest origins through ``resolved``;
+    that pass and the band's re-check of its candidates through ``in_band``,
+    once per step of each. The extension is ``ring_fold(2.0)``'s, which
+    splits old rows.
     """
     fn, jac = ring_fold(2.0) if extend else (localised_fold, localised_fold_jacobian)
 
@@ -1090,7 +1154,7 @@ def test_every_stepped_pass_holds_at_most_status_rows_rows_per_step(
     calls = {name: len(got) for name, got in steps.items()}
     rows = {name: sum(got) for name, got in steps.items()}
     assert calls == dict(
-        status=freezes, split=int(extend), measure=freezes, band=freezes
+        status=freezes, split=int(extend), measure=freezes, band=2 * freezes
     ), "the default cap must hold each freeze's pass in one step"
     assert whole.critical_band.leaves.shape[0] > 0, "fixture must have a band"
     if extend:
