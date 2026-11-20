@@ -1105,6 +1105,28 @@ def test_every_stepped_pass_holds_at_most_status_rows_rows_per_step(
 
 
 @pytest.mark.parametrize("extend", [False, True], ids=["build", "extension"])
+def test_the_status_pass_judges_only_finest_level_rows(extend, monkeypatch):
+    """Below the finest level the status pass reads refine's verdicts; ``_status_rows`` sees finest-level rows alone."""
+    fn, jac = ring_fold(2.0) if extend else (localised_fold, localised_fold_jacobian)
+    seen = []
+    status_rows = lens_mesh_module._status_rows
+
+    def spy(lat, cache, store, rows, *rest):
+        seen.append(to_np(store.level[rows]) == lat.level - 1)
+        return status_rows(lat, cache, store, rows, *rest)
+
+    monkeypatch.setattr(lens_mesh_module, "_status_rows", spy)
+    mesh, lens_ = build(fn, jac, 4.0, 4, 0.05)
+    if extend:
+        seen.clear()
+        mesh = extend_lens_mesh(mesh, lens_.raytrace, 6.0)
+    finest = to_np(mesh.origin_level) == mesh.lattice.level - 1
+    assert (~finest).any() and seen and all(s.all() for s in seen)
+    if not extend:
+        assert sum(s.size for s in seen) == finest.sum()
+
+
+@pytest.mark.parametrize("extend", [False, True], ids=["build", "extension"])
 def test_the_refinement_and_the_status_table_are_freed_before_the_index_is_built(
     extend, monkeypatch
 ):
@@ -1115,9 +1137,9 @@ def test_the_refinement_and_the_status_table_are_freed_before_the_index_is_built
     build_index = lens_mesh_module.build_index
 
     def spy_refine(*args):
-        cache, store = refine(*args)
-        held.extend(weakref.ref(a) for a in (*cache, *store))
-        return cache, store
+        cache, store, passed = refine(*args)
+        held.extend(weakref.ref(a) for a in (*cache, *store, *passed))
+        return cache, store, passed
 
     def spy_status_rows(lat, cache, store, rows, table_keys, table_values, sep):
         held.extend((weakref.ref(table_keys), weakref.ref(table_values)))

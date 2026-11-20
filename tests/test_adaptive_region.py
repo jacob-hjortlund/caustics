@@ -119,7 +119,9 @@ def _split(ij, mu, size, marks=NO_MARKS, mu_max=None):
     """``_source_split`` at ``mu_min = 3`` on one level-0 row whose six samples share ``size``."""
     values6 = f64([np.stack((np.asarray(mu), np.full(6, size)), axis=-1)])
     split = _source_split(LAT, VALID, marks, 3.0, mu_max)
-    return bool(to_np(split(ij, values6, i64([0]), i64([0])))[0])
+    fail, kept = split(ij, values6, i64([0]), i64([0]))
+    assert kept == ()
+    return bool(to_np(fail)[0])
 
 
 def test_a_triangle_the_threshold_crosses_splits_while_longer_than_the_leaf_images():
@@ -236,9 +238,8 @@ def test_every_source_leaf_below_the_finest_level_passes_the_split(point_mesh):
     values6 = sample(lattice_xy(src.lattice, six.reshape(-1, 2))).reshape(-1, 6, 2)
     marks = _caustic_marks(curves, src.lattice, src.max_level)
     split = _source_split(src.lattice, src.cell_valid, marks, 3.0, None)
-    assert not to_np(
-        split(ij, values6, src.origin_cls[rows], src.origin_level[rows])
-    ).any()
+    fail, _ = split(ij, values6, src.origin_cls[rows], src.origin_level[rows])
+    assert not to_np(fail).any()
 
 
 def test_source_vertices_carry_mu_tot_and_cost_no_lens_call():

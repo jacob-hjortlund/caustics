@@ -273,7 +273,7 @@ def _straddles(mu6, c):
 
 def _source_split(lat, valid, marks, mu_min, mu_max):
     """
-    The source mesh's criterion as :func:`~.refine.refine`'s ``split``.
+    The source mesh's criterion as :func:`~.refine.refine`'s ``split``, keeping nothing.
 
     A triangle splits when its level-0 cell is valid and either the
     threshold can cross it -- ``mu_tot - mu_min``, or ``mu_tot - mu_max``,
@@ -307,7 +307,7 @@ def _source_split(lat, valid, marks, mu_min, mu_max):
                 marked, rows, is_member(marks[l], at[:, 0] * (r << l) + at[:, 1])
             )
         caustic = marked & ~mesh_backend.all(mu > upper, dim=1)
-        return ok & ((crossed & coarse) | caustic)
+        return ok & ((crossed & coarse) | caustic), ()
 
     return split
 
@@ -345,7 +345,7 @@ def _source_mesh(mesh, curves, mu_min, mu_max):
     cache, store, rows = add_roots(
         empty_cache(2), empty_store(), lat, ij, cls, sample, None
     )
-    cache, store = refine(cache, store, rows, lat, sample, split, max_level, None)
+    cache, store, _ = refine(cache, store, rows, lat, sample, split, max_level, None)
     caustic = _caustic_cells(curves, lat)
     return _freeze_source(lat, max_level, cache, store, valid, caustic)
 
@@ -596,7 +596,7 @@ def _extend_source_mesh(src, mesh, curves, mu_min, mu_max):
     split = _source_split(
         lat, valid, _caustic_marks(curves, lat, src.max_level), mu_min, mu_max
     )
-    cache, store = refine(
+    cache, store, _ = refine(
         cache, store, untested, lat, sample, split, src.max_level, None
     )
     caustic = _caustic_cells(curves, lat)

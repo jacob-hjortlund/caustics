@@ -6,8 +6,9 @@ float64 values. Every lattice point it is called on is kept in a
 :class:`VertexCache`, so no point is sampled twice. :func:`refine` replaces
 every leaf below ``max_level`` that ``split`` rejects by its four red-split
 children, balances the leaves to 2:1 and tests the leaves the balance
-created, until every leaf below ``max_level`` passes. :func:`close` makes
-the result conforming.
+created, until every leaf below ``max_level`` passes, and returns what
+``split`` kept of the leaves it passed. :func:`close` makes the result
+conforming.
 """
 
 import math
@@ -278,14 +279,47 @@ def split_rows(cache, store, lat, rows):
 
 
 def _split_failures(cache, store, lat, rows, sample, split, batch_size):
-    """Sample the midpoints of ``rows``, and split every row ``split`` rejects."""
+    """
+    Sample the midpoints of ``rows``, and split every row ``split`` rejects.
+
+    Returns the cache, the store and the children's rows, as
+    :func:`split_rows` does, and ``[passed, *kept]``: the rows ``split``
+    passed and, row for row, what it kept of them.
+    """
     v = store.v[rows]
     ij = cache.ij[v]
     mid = lattice_key(lat, midpoint_ij(ij))
     cache = evaluate(cache, lat, mid.reshape(-1), sample, batch_size)
     six = mesh_backend.concatenate((v, cache_lookup(cache, mid)), dim=1)
-    fail = split(ij, cache.values[six], store.cls[rows], store.level[rows])
-    return split_rows(cache, store, lat, rows[mesh_backend.flatnonzero(fail)])
+    fail, kept = split(ij, cache.values[six], store.cls[rows], store.level[rows])
+    ok = mesh_backend.flatnonzero(~fail)
+    passed = [rows[ok], *(k[ok] for k in kept)]
+    cache, store, kids = split_rows(
+        cache, store, lat, rows[mesh_backend.flatnonzero(fail)]
+    )
+    return cache, store, kids, passed
+
+
+def _still_leaves(store, passed):
+    """
+    ``passed`` -- a list of :func:`_split_failures`'s ``[rows, *kept]`` -- joined, keeping the rows still valid.
+
+    Joined field by field, each field's parts dropped once joined, so that
+    at most one field is held twice.
+    """
+    if not passed:
+        return (mesh_backend.zeros((0,), dtype=mesh_backend.int64),)
+    keep = [mesh_backend.flatnonzero(store.valid[part[0]]) for part in passed]
+    joined = []
+    for f in range(len(passed[0])):
+        joined.append(
+            mesh_backend.concatenate(
+                [part[f][k] for part, k in zip(passed, keep)], dim=0
+            )
+        )
+        for part in passed:
+            part[f] = None
+    return tuple(joined)
 
 
 def unbalanced(cache, store, lat, max_level):
@@ -360,11 +394,13 @@ def refine(cache, store, untested, lat, sample, split, max_level, batch_size):
     sample: Callable[[ArrayLike], ArrayLike]
         ``(N, 2)`` float64 positions to ``(N, C)`` float64 values.
     split: Callable
-        ``split(ij, values6, cls, level) -> (n,) bool``, True where a row
-        must split. ``ij`` is ``(n, 3, 2)`` int64, the rows' vertex lattice
-        coordinates; ``values6`` is ``(n, 6, C)``, the values at the
-        vertices and the edge midpoints ``m_1, m_2, m_3``, ``m_i`` opposite
-        vertex ``i``; ``cls`` and ``level`` are ``(n,)`` int64.
+        ``split(ij, values6, cls, level) -> (fail, kept)``. ``fail`` is
+        ``(n,)`` bool, True where a row must split; ``kept`` is a tuple,
+        possibly empty, of arrays with one row per tested row, what
+        ``split`` keeps of each. ``ij`` is ``(n, 3, 2)`` int64, the rows'
+        vertex lattice coordinates; ``values6`` is ``(n, 6, C)``, the values
+        at the vertices and the edge midpoints ``m_1, m_2, m_3``, ``m_i``
+        opposite vertex ``i``; ``cls`` and ``level`` are ``(n,)`` int64.
     max_level: int
     batch_size: Optional[int]
         Most rows per ``sample`` call.
@@ -373,20 +409,27 @@ def refine(cache, store, untested, lat, sample, split, max_level, batch_size):
     -------
     cache: VertexCache
     store: LeafStore
+    passed: tuple
+        ``(rows, *kept)``: ``rows`` ``(K,)`` int64, every row ``split``
+        passed that is still a leaf -- a later balance may have split one
+        -- each once, and each of ``kept`` restricted to them, row for row.
+        Only ``(rows,)``, empty, when ``split`` was never called.
     """
+    passed = []
     while True:
         rows = untested[store.level[untested] < max_level]
         while rows.shape[0]:
-            cache, store, kids = _split_failures(
+            cache, store, kids, judged = _split_failures(
                 cache, store, lat, rows, sample, split, batch_size
             )
+            passed.append(judged)
             rows = kids[store.level[kids] < max_level]
         cache, store, created = balance(
             cache, store, lat, max_level, sample, batch_size
         )
         untested = created[store.valid[created]]
         if untested.shape[0] == 0:
-            return cache, store
+            return cache, store, _still_leaves(store, passed)
 
 
 def canonical_order(lat, cache, v):

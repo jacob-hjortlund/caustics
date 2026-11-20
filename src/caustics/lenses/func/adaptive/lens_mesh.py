@@ -296,11 +296,19 @@ def leaf_grow(mesh):
 
 
 def _lens_split(h0, min_img_sep):
-    """The lens criterion as :func:`~.refine.refine`'s ``split``."""
+    """
+    The lens criterion as :func:`~.refine.refine`'s ``split``.
+
+    A row splits unless :func:`~.criterion.lens_status` converges it, and
+    the split keeps the rest of the verdict, ``(deviation, sigma_min,
+    corners)`` as ``lens_status`` returns them, for :func:`_finish` to read.
+    """
 
     def split(ij, values6, cls, level):
-        status, _, _, _ = lens_status(values6, cls, level, h0, min_img_sep)
-        return status != LEAF_CONVERGED
+        status, deviation, sigma_min, corners = lens_status(
+            values6, cls, level, h0, min_img_sep
+        )
+        return status != LEAF_CONVERGED, (deviation, sigma_min, corners)
 
     return split
 
@@ -477,8 +485,9 @@ def _status_rows(lat, cache, store, rows, table_keys, table_values, min_img_sep)
     """
     :func:`~.criterion.lens_status` of store ``rows``, with their corner fits.
 
-    Each row's six images are read from ``table_keys``, ascending, and
-    ``table_values``, ``(T, 2)`` (:func:`_six_values`).
+    The status pass calls it on finest-level rows, which refine never
+    tests. Each row's six images are read from ``table_keys``, ascending,
+    and ``table_values``, ``(T, 2)`` (:func:`_six_values`).
 
     Returns
     -------
@@ -497,10 +506,10 @@ def _freeze(lat, cache, store, rows, sample, min_img_sep, holes, batch_size, see
     Refine from store ``rows``, then close and index the result, finishing its finest level.
 
     :func:`~.refine.refine` splits by :func:`_lens_split` down to the
-    lattice's finest level. Its state is held only while :func:`_finish`
-    reads it, so that it, and everything the status pass built, is freed
-    before the index, the largest step, is built. ``seed`` is
-    :func:`_finish`'s.
+    lattice's finest level. Its state, and the verdicts it kept, are held
+    only while :func:`_finish` reads them, so that they, and everything the
+    status pass built, are freed before the index, the largest step, is
+    built. ``seed`` is :func:`_finish`'s.
     """
     split = _lens_split(lat.h0, min_img_sep)
     mesh = _finish(
@@ -523,16 +532,20 @@ def _mesh_index(mesh):
     )
 
 
-def _finish(lat, cache, store, sample, min_img_sep, holes, batch_size, seed):
+def _finish(lat, cache, store, passed, sample, min_img_sep, holes, batch_size, seed):
     """
     Close a refinement and finish its finest level: its :class:`LensMesh`, with no index yet.
 
-    Each origin not carried over in ``seed`` gets its status, deviation and
-    smallest singular value from :func:`~.criterion.lens_status` on its six
-    images: below the finest level its midpoints are in the cache,
-    ``refine`` having tested and passed it; at the finest level they are
-    sampled here, with ``sample``, and never cached. The origins are tested
-    in canonical order, in steps of at most :data:`STATUS_ROWS` rows.
+    Each origin not carried over in ``seed`` gets its status, deviation,
+    smallest singular value and corner fits from
+    :func:`~.criterion.lens_status` on its six images. Below the finest
+    level ``refine`` tested and passed it, so its status is
+    ``LEAF_CONVERGED`` and the rest is read from ``passed``, the verdicts
+    :func:`_lens_split` kept: the same values ``lens_status`` gives here.
+    At the finest level, which ``refine`` never tests, ``lens_status`` runs
+    here (:func:`_status_rows`), on midpoints sampled with ``sample`` and
+    never cached. The origins are taken in canonical order, in steps of at
+    most :data:`STATUS_ROWS` rows.
 
     ``vertices_jacobian``, the mean of :class:`LensMesh`, is a sum by
     vertex over the count of holders. Each step of the status pass adds its
@@ -559,7 +572,8 @@ def _finish(lat, cache, store, sample, min_img_sep, holes, batch_size, seed):
     to the band has midpoints that table lacks: those alone are raytraced,
     with ``sample``, and read from a table of their own.
 
-    ``sample`` is :func:`make_sampler`'s. ``seed`` is ``(status,
+    ``passed`` is :func:`~.refine.refine`'s ``(rows, deviation, sigma_min,
+    corners)``. ``sample`` is :func:`make_sampler`'s. ``seed`` is ``(status,
     deviation, sigma_min, mid_keys, mid_values, vertices_jacobian,
     measured_keys, measured_det)`` from :func:`_seed`: the statuses,
     deviations and smallest singular values of the store's first rows, the
@@ -669,12 +683,42 @@ def _finish(lat, cache, store, sample, min_img_sep, holes, batch_size, seed):
         )
 
     bad = mesh_backend.zeros((n_vertices,), dtype=mesh_backend.bool)
+    # Where each row refine passed and kept holds its verdict in ``passed``.
+    position = mesh_backend.fill_at_indices(
+        mesh_backend.zeros((n_rows,), dtype=int64) - 1,
+        passed[0],
+        mesh_backend.arange(passed[0].shape[0], dtype=int64),
+    )
+
+    def step_verdict(rows):
+        """The verdict of young ``rows``: read from ``passed`` below the finest level, judged at it."""
+        n = rows.shape[0]
+        at_finest = store.level[rows] == lat.level - 1
+        below = mesh_backend.flatnonzero(~at_finest)
+        finest = mesh_backend.flatnonzero(at_finest)
+        verdict = [
+            mesh_backend.zeros((n,), dtype=int64),
+            mesh_backend.zeros((n,), dtype=f64),
+            mesh_backend.zeros((n,), dtype=f64),
+            mesh_backend.zeros((n, 3, 2, 2), dtype=f64),
+        ]
+        if below.shape[0]:
+            at = position[rows[below]]
+            for f in range(1, 4):
+                verdict[f] = mesh_backend.fill_at_indices(
+                    verdict[f], below, passed[f][at]
+                )
+        # Called on every step, with no row if none is at the finest level.
+        judged = _status_rows(
+            lat, cache, store, rows[finest], table_keys, table_values, min_img_sep
+        )
+        for f in range(4):
+            verdict[f] = mesh_backend.fill_at_indices(verdict[f], finest, judged[f])
+        return verdict
 
     def status_step(rows):
         nonlocal total, bad
-        *verdict, corners = _status_rows(
-            lat, cache, store, rows, table_keys, table_values, min_img_sep
-        )
+        *verdict, corners = step_verdict(rows)
         is_finite = (verdict[0] & LEAF_RAYTRACE_NONFINITE) == 0
         finite = mesh_backend.flatnonzero(is_finite)
         adds = rows[finite]
@@ -693,6 +737,7 @@ def _finish(lat, cache, store, sample, min_img_sep, holes, batch_size, seed):
     young_status, young_deviation, young_sigma_min = map_chunks(
         status_step, young, STATUS_ROWS
     )
+    del position
     status = mesh_backend.fill_at_indices(status, young, young_status)
     deviation = mesh_backend.fill_at_indices(deviation, young, young_deviation)
     sigma_min = mesh_backend.fill_at_indices(sigma_min, young, young_sigma_min)

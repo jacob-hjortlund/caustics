@@ -43,8 +43,19 @@ def run(split, sample=positions, batch_size=None, max_level=MAX_LEVEL, order=Non
     cache, store, rows = add_roots(
         empty_cache(2), empty_store(), lat, ij, cls, sample, batch_size
     )
-    cache, store = refine(cache, store, rows, lat, sample, split, max_level, batch_size)
+    cache, store, _ = refine(
+        cache, store, rows, lat, sample, judged(split), max_level, batch_size
+    )
     return lat, cache, store
+
+
+def judged(rejects):
+    """``rejects`` -- True where a row must split -- as :func:`refine`'s ``split``, keeping nothing."""
+
+    def split(ij, values6, cls, level):
+        return rejects(ij, values6, cls, level), ()
+
+    return split
 
 
 def never(ij, values6, cls, level):
@@ -363,10 +374,39 @@ def test_refining_the_roots_in_two_passes_gives_the_one_pass_mesh():
     cache, store, rows = add_roots(
         empty_cache(2), empty_store(), lat, ij[first], cls[first], positions, None
     )
-    cache, store = refine(cache, store, rows, lat, positions, split, MAX_LEVEL, None)
+    cache, store, _ = refine(
+        cache, store, rows, lat, positions, judged(split), MAX_LEVEL, None
+    )
     cache, store, rows = add_roots(
         cache, store, lat, ij[second], cls[second], positions, None
     )
-    cache, store = refine(cache, store, rows, lat, positions, split, MAX_LEVEL, None)
+    cache, store, _ = refine(
+        cache, store, rows, lat, positions, judged(split), MAX_LEVEL, None
+    )
     for a, b in zip(closed(*run(split)), closed(lat, cache, store)):
         assert np.array_equal(a, b)
+
+
+def test_refine_returns_what_split_kept_for_every_row_it_passed_that_is_still_a_leaf():
+    """Row for row, and only for rows balance did not split after ``split`` passed them."""
+    passed_by_split = [0]
+
+    def split(ij, values6, cls, level):
+        fail = seam_and_right_level_one(ij, values6, cls, level)
+        passed_by_split[0] += int(to_np(mesh_backend.sum(mesh_backend.long(~fail))))
+        return fail, (ij, level)
+
+    lat = make_lattice(FOV, 0.0, 0.0, INIT_RES, MAX_LEVEL + 1)
+    ij, cls = initial_triangles(INIT_RES, lat.level, ROOT_CLASS)
+    cache, store, rows = add_roots(
+        empty_cache(2), empty_store(), lat, ij, cls, positions, None
+    )
+    cache, store, (rows, kept_ij, kept_level) = refine(
+        cache, store, rows, lat, positions, split, MAX_LEVEL, None
+    )
+    rows = to_np(rows)
+    want = np.flatnonzero(to_np(store.valid) & (to_np(store.level) < MAX_LEVEL))
+    assert np.array_equal(np.sort(rows), want) and np.unique(rows).size == rows.size
+    assert np.array_equal(to_np(kept_ij), to_np(cache.ij[store.v[i64(rows)]]))
+    assert np.array_equal(to_np(kept_level), to_np(store.level)[rows])
+    assert passed_by_split[0] > rows.size, "balance must split rows split had passed"
