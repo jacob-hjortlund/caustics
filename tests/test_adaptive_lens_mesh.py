@@ -1192,6 +1192,33 @@ def test_the_status_pass_judges_only_finest_level_rows(extend, monkeypatch):
 
 
 @pytest.mark.parametrize("extend", [False, True], ids=["build", "extension"])
+def test_refine_s_verdicts_are_freed_once_the_status_pass_has_read_them(
+    extend, monkeypatch
+):
+    """By the time a freeze measures ``det A`` -- after the status pass -- no verdict ``refine`` kept is alive."""
+    held, alive = [], []
+    refine = lens_mesh_module.refine
+    measured_det = lens_mesh_module._measured_det
+
+    def spy_refine(*args):
+        cache, store, passed = refine(*args)
+        held.extend(weakref.ref(a) for a in passed)
+        return cache, store, passed
+
+    def spy_measured_det(*args):
+        alive.append(sum(ref() is not None for ref in held))
+        held.clear()
+        return measured_det(*args)
+
+    monkeypatch.setattr(lens_mesh_module, "refine", spy_refine)
+    monkeypatch.setattr(lens_mesh_module, "_measured_det", spy_measured_det)
+    mesh, lens_ = build(localised_fold, localised_fold_jacobian, 4.0, 4, 0.05)
+    if extend:
+        extend_lens_mesh(mesh, lens_.raytrace, 6.0)
+    assert alive == [0] * (2 if extend else 1)
+
+
+@pytest.mark.parametrize("extend", [False, True], ids=["build", "extension"])
 def test_the_refinement_and_the_status_table_are_freed_before_the_index_is_built(
     extend, monkeypatch
 ):

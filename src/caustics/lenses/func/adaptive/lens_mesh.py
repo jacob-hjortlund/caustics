@@ -736,7 +736,8 @@ def _finish(lat, cache, store, passed, sample, min_img_sep, holes, batch_size, s
     young_status, young_deviation, young_sigma_min = map_chunks(
         status_step, young, STATUS_ROWS
     )
-    del position
+    # The verdicts are read: free them before measuring and the band.
+    del passed, position
     status = mesh_backend.fill_at_indices(status, young, young_status)
     deviation = mesh_backend.fill_at_indices(deviation, young, young_deviation)
     sigma_min = mesh_backend.fill_at_indices(sigma_min, young, young_sigma_min)
