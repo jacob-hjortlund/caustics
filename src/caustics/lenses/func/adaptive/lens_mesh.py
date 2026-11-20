@@ -18,7 +18,6 @@ from warnings import warn
 from ....backend_obj import ArrayLike, backend
 from .mesh_backend import mesh_backend, to_mesh, to_user
 from .geometry import (
-    CORNER_SECTOR,
     ROOT_CLASS,
     build_device,
     is_member,
@@ -98,9 +97,10 @@ class LensMesh(NamedTuple):
     vertex are the origins with it as one of their three corners, six at an
     interior vertex, three at a hanging node and fewer on the fov boundary,
     and the vertex carries the mean of their fits there. The mean is a float
-    sum, so its last bits depend on the order of its terms: two builds by
-    the same route agree bit for bit, and an extension and a fresh build of
-    the same mesh agree to rounding.
+    sum, its terms taken in canonical origin order, so its last bits depend
+    on the order of its terms: two builds by the same route agree bit for
+    bit, and an extension and a fresh build of the same mesh agree to
+    rounding.
 
     Parameters
     ----------
@@ -225,32 +225,26 @@ def make_sampler(raytrace, device, batch_size=None):
     return sample
 
 
-def _add_corner_fits(total, vertices, cls, corners):
+def _add_corner_fits(total, vertices, corners):
     """
-    ``total`` ``(V, 2, 2)`` with each of ``corners`` added at its vertex, one add per sector.
+    ``total`` ``(V, 2, 2)`` with each of ``corners`` added at its vertex, in one accumulating add.
 
-    Each corner covers one of six sectors around its vertex
-    (:data:`~.geometry.CORNER_SECTOR`), and triangles that tile the plane
-    cover each sector of a vertex at most once, so the corners of one sector
-    have distinct vertices: ``add_at_indices``, which under torch does not
-    accumulate a repeated index, sees none.
+    Each vertex's sum takes its terms in row order, then corner order
+    (:meth:`~caustics.backend_obj.Backend.accumulate_at_indices`), on the
+    CPU the mesh is built on.
 
     Parameters
     ----------
     total: ArrayLike
         ``(V, 2, 2)`` float64, written in place.
     vertices: ArrayLike
-        ``(n, 3)`` int64 vertex indices of ``n`` non-overlapping triangles.
-    cls: ArrayLike
-        ``(n,)`` int64 their orientation classes.
+        ``(n, 3)`` int64 vertex indices of ``n`` triangles.
     corners: ArrayLike
         ``(n, 3, 2, 2)`` float64 the value at each corner.
     """
-    sector = CORNER_SECTOR[cls]
-    for s in range(6):
-        at = sector == s
-        total = mesh_backend.add_at_indices(total, vertices[at], corners[at])
-    return total
+    return mesh_backend.accumulate_at_indices(
+        total, vertices.reshape(-1), corners.reshape(-1, 2, 2)
+    )
 
 
 def finite_leaves(mesh):
@@ -551,8 +545,9 @@ def _finish(lat, cache, store, passed, sample, min_img_sep, holes, batch_size, s
     vertex over the count of holders. Each step of the status pass adds its
     origins' corner fits to the sum (:func:`_add_corner_fits`); an origin
     with a non-finite image adds nothing, and the vertices it holds are
-    NaN. The sum is a float sum taken in canonical origin order, so a fresh
-    build's mean depends on the mesh and on :data:`STATUS_ROWS` alone, not
+    NaN. The sum is a float sum, each vertex's terms taken in canonical
+    origin order (:func:`_add_corner_fits`) whatever the steps, so a fresh
+    build's mean depends on the mesh alone: not on :data:`STATUS_ROWS`, nor
     on the order refinement made the rows. A vertex held by no new origin
     and by no old one split here keeps the mean ``seed`` stored, bit for
     bit. At any other old vertex the sum starts as that mean times its old
@@ -687,9 +682,7 @@ def _finish(lat, cache, store, passed, sample, min_img_sep, holes, batch_size, s
         *_, corners = lens_status(
             beta6, store.cls[rows], store.level[rows], lat.h0, min_img_sep
         )
-        total = _add_corner_fits(
-            total, split_vertices[lo : lo + STATUS_ROWS], store.cls[rows], -corners
-        )
+        total = _add_corner_fits(total, split_vertices[lo : lo + STATUS_ROWS], -corners)
 
     bad = mesh_backend.zeros((n_vertices,), dtype=mesh_backend.bool)
     # Where each row refine passed and kept holds its verdict in ``passed``.
@@ -732,10 +725,7 @@ def _finish(lat, cache, store, passed, sample, min_img_sep, holes, batch_size, s
         finite = mesh_backend.flatnonzero(is_finite)
         adds = rows[finite]
         total = _add_corner_fits(
-            total,
-            origin_leaves[origin_of_row[adds]],
-            store.cls[adds],
-            corners[finite],
+            total, origin_leaves[origin_of_row[adds]], corners[finite]
         )
         drops = rows[mesh_backend.flatnonzero(~is_finite)]
         bad = mesh_backend.fill_at_indices(

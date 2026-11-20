@@ -1162,7 +1162,8 @@ def test_every_stepped_pass_holds_at_most_status_rows_rows_per_step(
     monkeypatch.setattr(lens_mesh_module, "STATUS_ROWS", 7)
     for got in steps.values():
         got.clear()
-    assert_same(run(), whole, rounding=("vertices_jacobian", "critical_band.det"))
+    # Each vertex's sum is taken in canonical origin order whatever the step.
+    assert_same(run(), whole)
     for name, got in steps.items():
         assert sum(got) == rows[name] and max(got, default=0) <= 7, (name, got)
         assert len(got) > calls[name] or rows[name] == 0, (name, got)

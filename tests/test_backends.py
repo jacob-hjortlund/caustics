@@ -116,6 +116,16 @@ class TestBackendFull:
         arr = b.fill_at_indices(arr, idx, vals)
         np.testing.assert_array_equal(to_np(b, arr), [10.0, 0.0, 20.0])
 
+    def test_accumulate_at_indices(self, b):
+        """Repeated indices accumulate, unlike ``add_at_indices`` under torch."""
+        arr = b.zeros((3, 2))
+        idx = b.make_array([2, 0, 2], dtype=b.int64)
+        vals = b.make_array([[1.0, 2.0], [10.0, 20.0], [100.0, 200.0]])
+        arr = b.accumulate_at_indices(arr, idx, vals)
+        np.testing.assert_array_equal(
+            to_np(b, arr), [[10.0, 20.0], [0.0, 0.0], [101.0, 202.0]]
+        )
+
     def test_fft_logic(self, b):
         n = 16
         data = np.random.randn(n, n).astype(np.float32)

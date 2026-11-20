@@ -78,6 +78,7 @@ class Backend:
         self.long = self._long_torch
         self.fill_at_indices = self._fill_at_indices_torch
         self.add_at_indices = self._add_at_indices_torch
+        self.accumulate_at_indices = self._accumulate_at_indices_torch
         self.and_at_indices = self._and_at_indices_torch
         self.unsqueeze = self._unsqueeze_torch
         self.cat = self._cat_torch
@@ -155,6 +156,7 @@ class Backend:
         self.long = self._long_jax
         self.fill_at_indices = self._fill_at_indices_jax
         self.add_at_indices = self._add_at_indices_jax
+        self.accumulate_at_indices = self._accumulate_at_indices_jax
         self.and_at_indices = self._and_at_indices_jax
         self.unsqueeze = self._unsqueeze_jax
         self.cat = self._cat_jax
@@ -488,6 +490,21 @@ class Backend:
     def _add_at_indices_jax(self, array, indices, values):
         array = array.at[indices].add(values)
         return array
+
+    def _accumulate_at_indices_torch(self, array, indices, values):
+        """
+        ``values[i]`` added to ``array[indices[i]]`` along dim 0, in place; repeated indices accumulate.
+
+        Unlike ``add_at_indices``, which under torch keeps one of the
+        values at a repeated index. On the CPU each row's sum is taken in
+        index order, so it is deterministic; on CUDA ``index_add_`` uses
+        atomics and its order, and so the last bits, can vary.
+        """
+        return array.index_add_(0, indices, values)
+
+    def _accumulate_at_indices_jax(self, array, indices, values):
+        """``values[i]`` added to ``array[indices[i]]`` along dim 0; repeated indices accumulate."""
+        return array.at[indices].add(values)
 
     def _and_at_indices_torch(self, array, indices, values):
         array[indices] &= values
