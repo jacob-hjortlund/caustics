@@ -380,8 +380,9 @@ def refine(cache, store, untested, lat, sample, split, max_level, batch_size):
     Each round samples the midpoints of the untested rows below
     ``max_level`` in one batch and replaces the rows ``split`` rejects by
     their children, which are untested in turn. Once none fails,
-    :func:`balance` runs, and the rows it created are tested like any other.
-    ``max_level`` rows are never tested.
+    :func:`balance` runs, and the rows it created are tested like any other,
+    unless one has already run and nothing was split since: its result would
+    be no new row. ``max_level`` rows are never tested.
 
     Parameters
     ----------
@@ -416,6 +417,7 @@ def refine(cache, store, untested, lat, sample, split, max_level, batch_size):
         Only ``(rows,)``, empty, when ``split`` was never called.
     """
     passed = []
+    balanced = False
     while True:
         rows = untested[store.level[untested] < max_level]
         while rows.shape[0]:
@@ -423,10 +425,15 @@ def refine(cache, store, untested, lat, sample, split, max_level, batch_size):
                 cache, store, lat, rows, sample, split, batch_size
             )
             passed.append(judged)
+            if kids.shape[0]:
+                balanced = False
             rows = kids[store.level[kids] < max_level]
+        if balanced:
+            return cache, store, _still_leaves(store, passed)
         cache, store, created = balance(
             cache, store, lat, max_level, sample, batch_size
         )
+        balanced = True
         untested = created[store.valid[created]]
         if untested.shape[0] == 0:
             return cache, store, _still_leaves(store, passed)

@@ -59,6 +59,9 @@ from caustics.lenses.func.adaptive.lens_mesh import (
 )
 
 from adaptive_maps import (
+    idle_balances,
+    last_balance_created,
+    record_refines,
     AFFINE,
     affine,
     affine_jacobian,
@@ -2031,3 +2034,15 @@ def test_two_builds_give_the_same_vertex_jacobians_bit_for_bit():
     a, _ = build(sie_like, sie_like_jacobian, min_img_sep=0.05)
     b, _ = build(sie_like, sie_like_jacobian, min_img_sep=0.05)
     assert_same(a, b)
+
+
+def test_a_build_and_its_extension_run_no_balance_without_a_split_since_the_last_one(
+    monkeypatch,
+):
+    logs = record_refines(monkeypatch)
+    mesh, lens_ = build(localised_fold, localised_fold_jacobian, 4.0, 4, 0.05)
+    extend_lens_mesh(mesh, lens_.raytrace, 6.0)
+    assert len(logs) == 2
+    assert [idle_balances(l) for l in logs] == [0, 0]
+    assert all(last_balance_created(l) > 0 for l in logs)
+    assert all(l[-1] == ("unbalanced", 0) for l in logs)

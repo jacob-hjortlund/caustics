@@ -81,6 +81,72 @@ def numpy_lens(fn, jac):
     )
 
 
+def record_refines(monkeypatch, *modules):
+    """
+    Log what each call to ``refine`` does, and return the list of logs.
+
+    ``balance`` and ``_split_failures`` are patched in the refine module, and
+    ``refine`` in that module, in ``lens_mesh``, in ``region`` and in each
+    of ``modules``. Each call to ``refine`` appends one log: ``("split",
+    children)`` for each ``_split_failures`` call, ``children`` the rows it
+    returned; ``("balance", created)`` for each ``balance`` call; and
+    finally ``("unbalanced", n)``, ``n`` the rows ``unbalanced`` finds in
+    the state ``refine`` returned.
+    """
+    from caustics.lenses.func.adaptive import lens_mesh, region
+    from caustics.lenses.func.adaptive import refine as refine_module
+
+    logs, current = [], []
+    real_refine = refine_module.refine
+    real_balance = refine_module.balance
+    real_split = refine_module._split_failures
+
+    def balance(*args, **kw):
+        out = real_balance(*args, **kw)
+        current.append(("balance", int(out[2].shape[0])))
+        return out
+
+    def split_failures(*args, **kw):
+        out = real_split(*args, **kw)
+        current.append(("split", int(out[2].shape[0])))
+        return out
+
+    def refine(
+        cache, store, untested, lat, sample, split, max_level, batch_size, **kw
+    ):
+        current.clear()
+        out = real_refine(
+            cache, store, untested, lat, sample, split, max_level, batch_size, **kw
+        )
+        rows = refine_module.unbalanced(out[0], out[1], lat, max_level)
+        logs.append([*current, ("unbalanced", int(rows.shape[0]))])
+        return out
+
+    monkeypatch.setattr(refine_module, "balance", balance)
+    monkeypatch.setattr(refine_module, "_split_failures", split_failures)
+    for module in (refine_module, lens_mesh, region, *modules):
+        monkeypatch.setattr(module, "refine", refine)
+    return logs
+
+
+def idle_balances(log):
+    """The balances after the first one in ``log`` with no split of any child since the previous balance."""
+    idle, seen, split = 0, False, False
+    for kind, n in log:
+        if kind == "split" and n > 0:
+            split = True
+        elif kind == "balance":
+            if seen and not split:
+                idle += 1
+            seen, split = True, False
+    return idle
+
+
+def last_balance_created(log):
+    """Rows the last balance of ``log`` created."""
+    return [n for kind, n in log if kind == "balance"][-1]
+
+
 def user_build(fn, jac, fov=4.0, init_res=4, min_img_sep=0.25, **kw):
     """``build_lens_mesh`` of numpy maps, in the user's backend, and its recording lens; the build is handed its ``raytrace`` alone."""
     from caustics.lenses.func.adaptive.lens_mesh import build_lens_mesh

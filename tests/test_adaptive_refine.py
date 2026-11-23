@@ -1,5 +1,7 @@
 """The shared refinement loop -- refine, balance and close -- on toy samplers."""
 
+import sys
+
 import numpy as np
 import pytest
 
@@ -26,7 +28,13 @@ from caustics.lenses.func.adaptive.refine import (
     split_rows,
 )
 
-from adaptive_maps import i64, to_np
+from adaptive_maps import (
+    i64,
+    idle_balances,
+    last_balance_created,
+    record_refines,
+    to_np,
+)
 
 FOV, INIT_RES, MAX_LEVEL = 4.0, 2, 4
 
@@ -410,3 +418,13 @@ def test_refine_returns_what_split_kept_for_every_row_it_passed_that_is_still_a_
     assert np.array_equal(to_np(kept_ij), to_np(cache.ij[store.v[i64(rows)]]))
     assert np.array_equal(to_np(kept_level), to_np(store.level)[rows])
     assert passed_by_split[0] > rows.size, "balance must split rows split had passed"
+
+
+def test_refine_runs_no_balance_without_a_split_since_the_last_one(monkeypatch):
+    """The skip fires: the last balance created rows, which were tested and none split."""
+    logs = record_refines(monkeypatch, sys.modules[__name__])
+    run(around(0.31, -0.57))
+    assert len(logs) == 1
+    assert [idle_balances(l) for l in logs] == [0]
+    assert all(last_balance_created(l) > 0 for l in logs)
+    assert all(l[-1] == ("unbalanced", 0) for l in logs)

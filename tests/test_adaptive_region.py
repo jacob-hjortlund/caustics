@@ -48,6 +48,9 @@ from caustics.lenses.func.adaptive.region import (
     _source_split,
 )
 from adaptive_maps import (
+    idle_balances,
+    last_balance_created,
+    record_refines,
     AFFINE,
     affine,
     affine_jacobian,
@@ -571,3 +574,16 @@ def test_the_closed_build_warns_when_no_fov_bounds_the_region():
             centers=[(0.0, 0.0)],
         )
     assert math.isnan(region.area)
+
+
+def test_the_closed_region_build_runs_no_balance_without_a_split_since_the_last_one(
+    monkeypatch,
+):
+    logs = record_refines(monkeypatch)
+    build_closed_magnification_region(
+        numpy_lens(*sis()).raytrace, 6.0, 16, 0.02, 3.0, centers=[(0.0, 0.0)]
+    )
+    assert len(logs) == 2
+    assert [idle_balances(l) for l in logs] == [0, 0]
+    assert all(last_balance_created(l) > 0 for l in logs)
+    assert all(l[-1] == ("unbalanced", 0) for l in logs)
