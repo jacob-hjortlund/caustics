@@ -289,7 +289,7 @@ def leaf_grow(mesh):
     )
 
 
-def _lens_split(h0, min_img_sep):
+def _lens_split(h0, min_img_sep, *, compile_bookkeeping=False):
     """
     The lens criterion as :func:`~.refine.refine`'s ``split``.
 
@@ -300,7 +300,12 @@ def _lens_split(h0, min_img_sep):
 
     def split(ij, values6, cls, level):
         status, deviation, sigma_min, corners = lens_status(
-            values6, cls, level, h0, min_img_sep
+            values6,
+            cls,
+            level,
+            h0,
+            min_img_sep,
+            compile_bookkeeping=compile_bookkeeping,
         )
         return status != LEAF_CONVERGED, (deviation, sigma_min, corners)
 
@@ -324,6 +329,7 @@ def build_lens_mesh(
     centers=None,
     device=None,
     batch_size=None,
+    compile_bookkeeping=False,
 ):
     """
     Build an adaptive mesh of the lens plane.
@@ -402,6 +408,20 @@ def build_lens_mesh(
         and the mesh is stored there.
     batch_size: Optional[int]
         Most points per ``raytrace`` call.
+    compile_bookkeeping: bool
+        Run the criterion, :func:`~.criterion.lens_status`, and the
+        balance's :func:`~.refine.unbalanced` under ``torch.compile``. Each
+        is compiled on its first use in the process, and later builds reuse
+        it. Compiling needs a working C++ compiler; where it fails, one
+        warning is given and the bookkeeping runs eagerly for the rest of
+        the process. Bookkeeping on a GPU, torch's default device being
+        one, runs eagerly. Compiled results agree with eager ones to
+        rounding in ``origin_deviation``, ``origin_sigma_min`` and the
+        fitted corner Jacobians, and so in ``vertices_jacobian``, the
+        band's fitted ``det`` and the source-plane index's boxes, which
+        :func:`leaf_grow` grows by ``origin_deviation``: a status, a band
+        membership, a resolved flag or the cells an index box covers can
+        differ only where a value lies within rounding of its threshold.
 
     Returns
     -------
@@ -415,6 +435,7 @@ def build_lens_mesh(
         centers=to_mesh(centers),
         device=device,
         batch_size=batch_size,
+        compile_bookkeeping=compile_bookkeeping,
     )
     return to_user(mesh, device)
 
@@ -431,6 +452,7 @@ def _build_lens_mesh(
     centers,
     device,
     batch_size,
+    compile_bookkeeping=False,
 ):
     """:func:`build_lens_mesh` on ``mesh_backend`` arrays, on the build device."""
     min_img_sep = min_img_sep / 2
@@ -454,7 +476,17 @@ def _build_lens_mesh(
     cache, store, rows = add_roots(
         empty_cache(2), empty_store(), lat, ij, cls, sample, batch_size
     )
-    return _freeze(lat, cache, store, rows, sample, min_img_sep, holes, batch_size)
+    return _freeze(
+        lat,
+        cache,
+        store,
+        rows,
+        sample,
+        min_img_sep,
+        holes,
+        batch_size,
+        compile_bookkeeping=compile_bookkeeping,
+    )
 
 
 def _six_keys(lat, ij):
@@ -475,7 +507,17 @@ def _six_values(lat, cache, store, rows, table_keys, table_values):
     return table_values[mesh_backend.searchsorted(table_keys, keys6)]
 
 
-def _status_rows(lat, cache, store, rows, table_keys, table_values, min_img_sep):
+def _status_rows(
+    lat,
+    cache,
+    store,
+    rows,
+    table_keys,
+    table_values,
+    min_img_sep,
+    *,
+    compile_bookkeeping=False,
+):
     """
     :func:`~.criterion.lens_status` of store ``rows``, with their corner fits.
 
@@ -492,10 +534,29 @@ def _status_rows(lat, cache, store, rows, table_keys, table_values, min_img_sep)
         in the row's own order, as :func:`~.criterion.lens_status` gives it.
     """
     beta6 = _six_values(lat, cache, store, rows, table_keys, table_values)
-    return lens_status(beta6, store.cls[rows], store.level[rows], lat.h0, min_img_sep)
+    return lens_status(
+        beta6,
+        store.cls[rows],
+        store.level[rows],
+        lat.h0,
+        min_img_sep,
+        compile_bookkeeping=compile_bookkeeping,
+    )
 
 
-def _freeze(lat, cache, store, rows, sample, min_img_sep, holes, batch_size, seed=None):
+def _freeze(
+    lat,
+    cache,
+    store,
+    rows,
+    sample,
+    min_img_sep,
+    holes,
+    batch_size,
+    seed=None,
+    *,
+    compile_bookkeeping=False,
+):
     """
     Refine from store ``rows``, then close and index the result, finishing its finest level.
 
@@ -505,15 +566,26 @@ def _freeze(lat, cache, store, rows, sample, min_img_sep, holes, batch_size, see
     status pass built, are freed before the index, the largest step, is
     built. ``seed`` is :func:`_finish`'s.
     """
-    split = _lens_split(lat.h0, min_img_sep)
+    split = _lens_split(lat.h0, min_img_sep, compile_bookkeeping=compile_bookkeeping)
     mesh = _finish(
         lat,
-        *refine(cache, store, rows, lat, sample, split, lat.level - 1, batch_size),
+        *refine(
+            cache,
+            store,
+            rows,
+            lat,
+            sample,
+            split,
+            lat.level - 1,
+            batch_size,
+            compile_bookkeeping=compile_bookkeeping,
+        ),
         sample,
         min_img_sep,
         holes,
         batch_size,
         seed,
+        compile_bookkeeping=compile_bookkeeping,
     )
     return mesh._replace(index=_mesh_index(mesh))
 
@@ -526,7 +598,19 @@ def _mesh_index(mesh):
     )
 
 
-def _finish(lat, cache, store, passed, sample, min_img_sep, holes, batch_size, seed):
+def _finish(
+    lat,
+    cache,
+    store,
+    passed,
+    sample,
+    min_img_sep,
+    holes,
+    batch_size,
+    seed,
+    *,
+    compile_bookkeeping=False,
+):
     """
     Close a refinement and finish its finest level: its :class:`LensMesh`, with no index yet.
 
@@ -680,7 +764,12 @@ def _finish(lat, cache, store, passed, sample, min_img_sep, holes, batch_size, s
         rows = split[lo : lo + STATUS_ROWS]
         beta6 = _six_values(lat, cache, store, rows, table_keys, table_values)
         *_, corners = lens_status(
-            beta6, store.cls[rows], store.level[rows], lat.h0, min_img_sep
+            beta6,
+            store.cls[rows],
+            store.level[rows],
+            lat.h0,
+            min_img_sep,
+            compile_bookkeeping=compile_bookkeeping,
         )
         total = _add_corner_fits(total, split_vertices[lo : lo + STATUS_ROWS], -corners)
 
@@ -712,7 +801,14 @@ def _finish(lat, cache, store, passed, sample, min_img_sep, holes, batch_size, s
                 )
         # Called on every step, with no row if none is at the finest level.
         judged = _status_rows(
-            lat, cache, store, rows[finest], table_keys, table_values, min_img_sep
+            lat,
+            cache,
+            store,
+            rows[finest],
+            table_keys,
+            table_values,
+            min_img_sep,
+            compile_bookkeeping=compile_bookkeeping,
         )
         for f in range(4):
             verdict[f] = mesh_backend.fill_at_indices(verdict[f], finest, judged[f])
@@ -959,7 +1055,9 @@ def _seed(mesh, lat, k):
     return cache, store, seed
 
 
-def extend_lens_mesh(mesh, raytrace, fov, *, batch_size=None):
+def extend_lens_mesh(
+    mesh, raytrace, fov, *, batch_size=None, compile_bookkeeping=False
+):
     """
     Grow a lens mesh to a larger fov about the same center, reusing its refinement.
 
@@ -993,6 +1091,10 @@ def extend_lens_mesh(mesh, raytrace, fov, *, batch_size=None):
         *Unit: arcsec*
     batch_size: Optional[int]
         As for :func:`build_lens_mesh`.
+    compile_bookkeeping: bool
+        As for :func:`build_lens_mesh`. The bit-for-bit match with a fresh
+        build holds with ``compile_bookkeeping=False``; a mesh extended
+        with a setting other than its build's matches neither fresh build.
 
     Returns
     -------
@@ -1002,12 +1104,19 @@ def extend_lens_mesh(mesh, raytrace, fov, *, batch_size=None):
     device = backend.device(mesh.vertices_lens)
     on_mesh = to_mesh(mesh)
     out = _extend_lens_mesh(
-        on_mesh, raytrace, to_mesh(fov), device=device, batch_size=batch_size
+        on_mesh,
+        raytrace,
+        to_mesh(fov),
+        device=device,
+        batch_size=batch_size,
+        compile_bookkeeping=compile_bookkeeping,
     )
     return mesh if out is on_mesh else to_user(out, device)
 
 
-def _extend_lens_mesh(mesh, raytrace, fov, *, device, batch_size):
+def _extend_lens_mesh(
+    mesh, raytrace, fov, *, device, batch_size, compile_bookkeeping=False
+):
     """:func:`extend_lens_mesh` on ``mesh_backend`` arrays; ``device`` is the lens's."""
     h0 = mesh.lattice.h0
     k = max(0, math.ceil((float(fov) - mesh.lattice.fov) / (2.0 * h0) - 1e-9))
@@ -1035,6 +1144,7 @@ def _extend_lens_mesh(mesh, raytrace, fov, *, device, batch_size):
         mesh.holes,
         batch_size,
         seed,
+        compile_bookkeeping=compile_bookkeeping,
     )
 
 
@@ -1255,6 +1365,7 @@ def build_closed_lens_mesh(
     centers=None,
     device=None,
     batch_size=None,
+    compile_bookkeeping=False,
 ):
     """
     Build a lens mesh, then grow its fov until it cuts no critical curve and its boundary's image crosses no pseudo-caustic.
@@ -1279,7 +1390,7 @@ def build_closed_lens_mesh(
 
     Parameters
     ----------
-    raytrace, fov, init_res, min_img_sep, max_depth, x0, y0, centers, device, batch_size:
+    raytrace, fov, init_res, min_img_sep, max_depth, x0, y0, centers, device, batch_size, compile_bookkeeping:
         As for :func:`build_lens_mesh`.
     growth: float
         Factor each extension asks to multiply the fov by.
@@ -1302,6 +1413,7 @@ def build_closed_lens_mesh(
         centers=to_mesh(centers),
         device=device,
         batch_size=batch_size,
+        compile_bookkeeping=compile_bookkeeping,
     )
     return to_user(mesh, device), to_user(curves, device)
 
@@ -1320,6 +1432,7 @@ def _build_closed_lens_mesh(
     centers,
     device,
     batch_size,
+    compile_bookkeeping=False,
 ):
     """:func:`build_closed_lens_mesh` on ``mesh_backend`` arrays, on the build device."""
     k, outside = _hole_rings(fov, init_res, x0, y0, centers, min_img_sep / 2)
@@ -1343,6 +1456,7 @@ def _build_closed_lens_mesh(
         centers=centers,
         device=device,
         batch_size=batch_size,
+        compile_bookkeeping=compile_bookkeeping,
     )
     curves = _critical_curves_and_caustics(mesh)
     cut, crossed = _curves_cut_by_fov(mesh, curves), _pseudo_caustics_crossed(mesh)
@@ -1355,6 +1469,7 @@ def _build_closed_lens_mesh(
             growth * mesh.lattice.fov,
             device=device,
             batch_size=batch_size,
+            compile_bookkeeping=compile_bookkeeping,
         )
         curves = _critical_curves_and_caustics(mesh)
         cut, crossed = _curves_cut_by_fov(mesh, curves), _pseudo_caustics_crossed(mesh)

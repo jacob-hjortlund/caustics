@@ -15,7 +15,7 @@ import math
 from typing import NamedTuple
 
 from ....backend_obj import ArrayLike
-from .mesh_backend import mesh_backend
+from .mesh_backend import Compiled, mesh_backend
 from .geometry import COMPOSE, _CHILD_VERTEX_INDEX_TABLE, expand, min_angle, sorted_find
 from .lattice import lattice_ij_from_key, lattice_key, lattice_xy, midpoint_ij
 
@@ -322,14 +322,22 @@ def _still_leaves(store, passed):
     return tuple(joined)
 
 
-def unbalanced(cache, store, lat, max_level):
+def unbalanced(cache, store, lat, max_level, *, compile_bookkeeping=False):
     """
     Valid rows with a leaf vertex at a quarter point of an edge.
 
     Such a vertex belongs to a neighbour two or more levels finer. Only a row
     at ``level <= max_level - 2`` can have one, and its quarter points are
-    lattice points.
+    lattice points. With ``compile_bookkeeping``, a copy compiled by
+    ``torch.compile`` runs (:class:`~.mesh_backend.Compiled`).
     """
+    if compile_bookkeeping:
+        return _COMPILED_UNBALANCED(cache, store, lat, max_level)
+    return _unbalanced(cache, store, lat, max_level)
+
+
+def _unbalanced(cache, store, lat, max_level):
+    """:func:`unbalanced`, eagerly."""
     rows = mesh_backend.flatnonzero(store.valid & (store.level <= max_level - 2))
     if rows.shape[0] == 0:
         return rows
@@ -346,14 +354,19 @@ def unbalanced(cache, store, lat, max_level):
     return rows[hit]
 
 
-def balance(cache, store, lat, max_level, sample, batch_size):
+_COMPILED_UNBALANCED = Compiled(_unbalanced)
+
+
+def balance(
+    cache, store, lat, max_level, sample, batch_size, *, compile_bookkeeping=False
+):
     """
     Force-split until no leaf has a neighbour two or more levels finer.
 
     A split row has a leaf vertex at a quarter point, and leaf vertices are
     never removed, so every 2:1-balanced refinement of the leaves splits it
     too: the fixed point is the coarsest balanced refinement, whatever order
-    rows are met in.
+    rows are met in. ``compile_bookkeeping`` is passed to :func:`unbalanced`.
 
     Returns
     -------
@@ -364,7 +377,9 @@ def balance(cache, store, lat, max_level, sample, batch_size):
     """
     created = [mesh_backend.zeros((0,), dtype=mesh_backend.int64)]
     while True:
-        rows = unbalanced(cache, store, lat, max_level)
+        rows = unbalanced(
+            cache, store, lat, max_level, compile_bookkeeping=compile_bookkeeping
+        )
         if rows.shape[0] == 0:
             return cache, store, mesh_backend.concatenate(created, dim=0)
         mid = lattice_key(lat, midpoint_ij(cache.ij[store.v[rows]]))
@@ -373,7 +388,18 @@ def balance(cache, store, lat, max_level, sample, batch_size):
         created.append(kids)
 
 
-def refine(cache, store, untested, lat, sample, split, max_level, batch_size):
+def refine(
+    cache,
+    store,
+    untested,
+    lat,
+    sample,
+    split,
+    max_level,
+    batch_size,
+    *,
+    compile_bookkeeping=False,
+):
     """
     Split until every leaf below ``max_level`` passes ``split`` and the leaves are 2:1 balanced.
 
@@ -405,6 +431,8 @@ def refine(cache, store, untested, lat, sample, split, max_level, batch_size):
     max_level: int
     batch_size: Optional[int]
         Most rows per ``sample`` call.
+    compile_bookkeeping: bool
+        Passed to :func:`balance`.
 
     Returns
     -------
@@ -431,7 +459,13 @@ def refine(cache, store, untested, lat, sample, split, max_level, batch_size):
         if balanced:
             return cache, store, _still_leaves(store, passed)
         cache, store, created = balance(
-            cache, store, lat, max_level, sample, batch_size
+            cache,
+            store,
+            lat,
+            max_level,
+            sample,
+            batch_size,
+            compile_bookkeeping=compile_bookkeeping,
         )
         balanced = True
         untested = created[store.valid[created]]

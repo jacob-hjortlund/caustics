@@ -1127,11 +1127,11 @@ def test_every_stepped_pass_holds_at_most_status_rows_rows_per_step(
     resolved = lens_mesh_module.resolved
     in_band_ = lens_mesh_module.in_band
 
-    def spy_status_rows(lat, cache, store, rows, *rest):
+    def spy_status_rows(lat, cache, store, rows, *rest, **kw):
         steps["status"].append(rows.shape[0])
         in_status_rows.append(True)
         try:
-            return status_rows(lat, cache, store, rows, *rest)
+            return status_rows(lat, cache, store, rows, *rest, **kw)
         finally:
             in_status_rows.pop()
 
@@ -1179,9 +1179,9 @@ def test_the_status_pass_judges_only_finest_level_rows(extend, monkeypatch):
     seen = []
     status_rows = lens_mesh_module._status_rows
 
-    def spy(lat, cache, store, rows, *rest):
+    def spy(lat, cache, store, rows, *rest, **kw):
         seen.append(to_np(store.level[rows]) == lat.level - 1)
-        return status_rows(lat, cache, store, rows, *rest)
+        return status_rows(lat, cache, store, rows, *rest, **kw)
 
     monkeypatch.setattr(lens_mesh_module, "_status_rows", spy)
     mesh, lens_ = build(fn, jac, 4.0, 4, 0.05)
@@ -1203,8 +1203,8 @@ def test_refine_s_verdicts_are_freed_once_the_status_pass_has_read_them(
     refine = lens_mesh_module.refine
     measured_det = lens_mesh_module._measured_det
 
-    def spy_refine(*args):
-        cache, store, passed = refine(*args)
+    def spy_refine(*args, **kw):
+        cache, store, passed = refine(*args, **kw)
         held.extend(weakref.ref(a) for a in passed)
         return cache, store, passed
 
@@ -1231,14 +1231,14 @@ def test_the_refinement_and_the_status_table_are_freed_before_the_index_is_built
     status_rows = lens_mesh_module._status_rows
     build_index = lens_mesh_module.build_index
 
-    def spy_refine(*args):
-        cache, store, passed = refine(*args)
+    def spy_refine(*args, **kw):
+        cache, store, passed = refine(*args, **kw)
         held.extend(weakref.ref(a) for a in (*cache, *store, *passed))
         return cache, store, passed
 
-    def spy_status_rows(lat, cache, store, rows, table_keys, table_values, sep):
+    def spy_status_rows(lat, cache, store, rows, table_keys, table_values, sep, **kw):
         held.extend((weakref.ref(table_keys), weakref.ref(table_values)))
-        return status_rows(lat, cache, store, rows, table_keys, table_values, sep)
+        return status_rows(lat, cache, store, rows, table_keys, table_values, sep, **kw)
 
     def spy_build_index(*args):
         alive.append(sum(ref() is not None for ref in held))

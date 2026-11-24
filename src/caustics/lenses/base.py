@@ -157,6 +157,7 @@ class Lens(Module):
         centers: Optional[ArrayLike] = None,
         device=None,
         batch_size: Optional[int] = None,
+        compile_bookkeeping: bool = False,
     ) -> tuple[
         func.LensMesh,
         func.CriticalCurvesAndCaustics,
@@ -241,6 +242,10 @@ class Lens(Module):
         batch_size: Optional[int]
             Most points per lens call.
 
+        compile_bookkeeping: bool
+            Run the mesh's bookkeeping under ``torch.compile``, as
+            :func:`~caustics.lenses.func.build_lens_mesh` describes.
+
         Returns
         -------
         mesh: LensMesh
@@ -265,6 +270,7 @@ class Lens(Module):
             centers=holes,
             device=device,
             batch_size=batch_size,
+            compile_bookkeeping=compile_bookkeeping,
         )
         if mu_min is None:
             mesh, curves = func.build_closed_lens_mesh(
@@ -303,6 +309,7 @@ class Lens(Module):
         centers: Optional[ArrayLike] = None,
         device=None,
         batch_size: Optional[int] = None,
+        compile_bookkeeping: bool = False,
         residual_tol: float = 1e-6,
         lm_kwargs: Optional[dict] = None,
     ) -> tuple[ArrayLike, ArrayLike, ArrayLike]:
@@ -342,6 +349,11 @@ class Lens(Module):
         batch_size: Optional[int]
             Most points per lens call in the build, and most sources per chunk
             in the solve.
+
+        compile_bookkeeping: bool
+            Run the build's bookkeeping under ``torch.compile``, as
+            :func:`~caustics.lenses.func.build_lens_mesh` describes; used only
+            to build a mesh.
 
         residual_tol: float
             Largest ``|raytrace(x) - beta|`` of a kept image.
@@ -389,6 +401,7 @@ class Lens(Module):
                 centers=centers,
                 device=device,
                 batch_size=batch_size,
+                compile_bookkeeping=compile_bookkeeping,
             )
         raytrace = jit_forward(self.raytrace)
         lm_map = (raytrace.on_points, (raytrace.values(),)) if raytrace.jitted else None

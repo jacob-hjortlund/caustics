@@ -6,7 +6,7 @@ affine model of the lens map is accurate to ``min_img_sep`` and whether a
 critical curve runs between its samples.
 """
 
-from .mesh_backend import mesh_backend
+from .mesh_backend import Compiled, mesh_backend
 from .geometry import (
     CHILD_VERTEX_INDICES,
     COMPOSE,
@@ -252,7 +252,7 @@ def _maps_fit(beta_v, maps, cls, level, h0):
     )
 
 
-def lens_status(beta6, cls, level, h0, min_img_sep):
+def lens_status(beta6, cls, level, h0, min_img_sep, *, compile_bookkeeping=False):
     """
     Why each triangle's affine model of the lens map is not trusted, the deviation and smallest singular value its error bound reads, and its fitted Jacobian at the vertices.
 
@@ -299,6 +299,11 @@ def lens_status(beta6, cls, level, h0, min_img_sep):
         Lens-plane tolerance.
 
         *Unit: arcsec*
+    compile_bookkeeping: bool
+        Run a copy compiled by ``torch.compile``
+        (:class:`~.mesh_backend.Compiled`), handed ``h0`` and
+        ``min_img_sep`` as 0-d float64 arrays on ``beta6``'s device. Fewer
+        than two rows run eagerly.
 
     Returns
     -------
@@ -315,6 +320,21 @@ def lens_status(beta6, cls, level, h0, min_img_sep):
         ``(n, 3, 2, 2)`` float64, the fit's Jacobian at ``theta_1, theta_2,
         theta_3``.
     """
+    if not compile_bookkeeping or beta6.shape[0] < 2:
+        return _lens_status(beta6, cls, level, h0, min_img_sep)
+    # As arrays, so that a new value of either is not a new graph.
+    f64, device = mesh_backend.float64, mesh_backend.device(beta6)
+    return _COMPILED_LENS_STATUS(
+        beta6,
+        cls,
+        level,
+        mesh_backend.as_array(h0, dtype=f64, device=device),
+        mesh_backend.as_array(min_img_sep, dtype=f64, device=device),
+    )
+
+
+def _lens_status(beta6, cls, level, h0, min_img_sep):
+    """:func:`lens_status`, eagerly."""
     beta_v, beta_m = beta6[:, :3], beta6[:, 3:]
     Q = child_shape_matrices(beta_v, beta_m)
     maps = child_maps(Q, cls)
@@ -324,6 +344,9 @@ def lens_status(beta6, cls, level, h0, min_img_sep):
         beta6, Q, maps, det6, sigma_min_2x2(A), level, h0, min_img_sep
     )
     return status, deviation, sigma_min, A[:, :3]
+
+
+_COMPILED_LENS_STATUS = Compiled(_lens_status)
 
 
 def _status(beta6, Q, maps, det6, sigma6, level, h0, min_img_sep):

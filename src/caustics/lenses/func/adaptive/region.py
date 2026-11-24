@@ -619,6 +619,7 @@ def build_closed_magnification_region(
     centers=None,
     device=None,
     batch_size=None,
+    compile_bookkeeping=False,
 ):
     """
     Build a closed lens mesh, then grow its fov until the region ``mu_min <= mu_tot <= mu_max`` is bounded.
@@ -633,7 +634,7 @@ def build_closed_magnification_region(
 
     Parameters
     ----------
-    raytrace, fov, init_res, min_img_sep, max_depth, x0, y0, centers, device, batch_size:
+    raytrace, fov, init_res, min_img_sep, max_depth, x0, y0, centers, device, batch_size, compile_bookkeeping:
         As for :func:`~.lens_mesh.build_lens_mesh`.
     mu_min, mu_max:
         As for :func:`magnification_region`.
@@ -662,6 +663,7 @@ def build_closed_magnification_region(
         centers=to_mesh(centers),
         device=device,
         batch_size=batch_size,
+        compile_bookkeeping=compile_bookkeeping,
     )
     return to_user(mesh, device), to_user(curves, device), to_user(region, device)
 
@@ -682,6 +684,7 @@ def _build_closed_magnification_region(
     centers,
     device,
     batch_size,
+    compile_bookkeeping=False,
 ):
     """:func:`build_closed_magnification_region` on ``mesh_backend`` arrays, on the build device."""
     mesh, curves = _build_closed_lens_mesh(
@@ -697,6 +700,7 @@ def _build_closed_magnification_region(
         centers=centers,
         device=device,
         batch_size=batch_size,
+        compile_bookkeeping=compile_bookkeeping,
     )
     src = _source_mesh(mesh, curves, mu_min, mu_max)
     region = _region(src, mu_min, mu_max)
@@ -709,6 +713,7 @@ def _build_closed_magnification_region(
             growth * mesh.lattice.fov,
             device=device,
             batch_size=batch_size,
+            compile_bookkeeping=compile_bookkeeping,
         )
         curves = _critical_curves_and_caustics(mesh)
         src = _extend_source_mesh(src, mesh, curves, mu_min, mu_max)
