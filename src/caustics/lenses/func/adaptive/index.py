@@ -26,6 +26,12 @@ CELLS_PER_BOX = 6
 PAIR_CAP = 1 << 20
 # Most entries one step of a build holds.
 ENTRY_CAP = 1 << 18
+# The low bits of a packed column, holding its box: the codes of a level and
+# x take the KEY_BITS + 1 bits above them, below an int64's sign bit.
+ROW_BITS = 62 - KEY_BITS
+# A step sorts int32 local keys where every one, and every entry's position
+# in the step, is below this many; int64 otherwise.
+INT32_KEYS = 1 << 31
 
 
 class MeshIndex(NamedTuple):
@@ -98,6 +104,55 @@ def _cell_key(level, ix, iy):
     return level * (1 << (2 * KEY_BITS)) + ix * (1 << KEY_BITS) + iy
 
 
+def _code_offsets(device):
+    """``(KEY_BITS + 1,)`` int64 offset of each level ``l``'s codes: the sum of ``2**(KEY_BITS - k)`` over ``k < l``."""
+    return mesh_backend.as_array(
+        [(2 << KEY_BITS) - ((2 << KEY_BITS) >> l) for l in range(KEY_BITS + 1)],
+        dtype=mesh_backend.int64,
+        device=device,
+    )
+
+
+def _level_code(level, x):
+    """
+    The int64 code of column ``x`` of ``level``: ``offset[level] + x``.
+
+    ``offset[l]`` is the sum of the cells per axis ``2**(KEY_BITS - k)`` of
+    the levels ``k < l``, so codes ascend in level, then in x, and stay
+    below ``2**(KEY_BITS + 1)``.
+    """
+    return _code_offsets(mesh_backend.device(level))[level] + x
+
+
+def _code_base(code):
+    """The int64 key of the cell at ``y = 0`` of the level and x of each :func:`_level_code` ``code``."""
+    offset = _code_offsets(mesh_backend.device(code))
+    # The last level whose offset is at most the code.
+    level = mesh_backend.searchsorted(offset, code + 1) - 1
+    return _cell_key(level, code - offset[level], 0)
+
+
+def _blocks(counts, total):
+    """
+    The block of each entry of consecutive blocks of ``counts`` ``(n,)`` int64 entries, each at least 1.
+
+    A cumulative sum of flags set where each block but the first starts.
+    ``total`` is ``counts.sum()``, read on the host by the caller.
+
+    Returns
+    -------
+    ArrayLike
+        ``(total,)`` int64.
+    """
+    flag = mesh_backend.zeros(
+        (total,), dtype=mesh_backend.module.uint8, device=mesh_backend.device(counts)
+    )
+    flag = mesh_backend.fill_at_indices(
+        flag, mesh_backend.cumsum(counts, dim=0)[:-1], 1
+    )
+    return mesh_backend.cumsum(flag, dim=0)
+
+
 def _boxes(vertices, triangles, rows, grow):
     """
     The level of each grown box of ``triangles[rows]``, and the cells it covers there.
@@ -108,8 +163,8 @@ def _boxes(vertices, triangles, rows, grow):
         As :class:`MeshIndex`'s.
     level: ArrayLike
         ``(K,)`` int64.
-    bottom: ArrayLike
-        ``(K,)`` int64 key of each box's lower-left cell.
+    lower: ArrayLike
+        ``(K, 2)`` int64 cell coordinates of each box's lower-left cell.
     cells: ArrayLike
         ``(K, 2)`` int64 cells each box covers per axis.
     """
@@ -135,45 +190,71 @@ def _boxes(vertices, triangles, rows, grow):
     top = mesh_backend.unsqueeze(span[level] - 1, -1)
     i0 = _cell_of(box_lo, lo, side, top)
     i1 = _cell_of(box_hi, lo, side, top)
-    return lo, hi, fine, level, _cell_key(level, i0[:, 0], i0[:, 1]), i1 - i0 + 1
+    return lo, hi, fine, level, i0, i1 - i0 + 1
+
+
+def _run_flags(values):
+    """``(n,)`` bool, True at the first entry of each run of equal values of ``values`` ``(n,)``, ``n >= 1``."""
+    return mesh_backend.concatenate(
+        (
+            mesh_backend.ones(
+                (1,), dtype=mesh_backend.bool, device=mesh_backend.device(values)
+            ),
+            values[1:] != values[:-1],
+        ),
+        dim=0,
+    )
 
 
 def _columns(vertices, triangles, rows, grow):
     """
     The columns of cells of the grown boxes of ``triangles[rows]``, by level and x.
 
-    Each box's columns are keyed by their bottom cell, boxes in ascending
-    row order; a stable sort on level and x keeps the columns of one level
-    and x in that order.
+    Each column is packed in one int64, ``code << ROW_BITS | box``, with
+    ``code`` the :func:`_level_code` of its level and x and ``box`` its
+    box's position in ``rows``, and these are sorted by value: by level,
+    x, then row, since ``rows`` ascend. ``code`` and ``box`` are read off
+    the sorted values, and the rest is gathered per box.
 
     Returns
     -------
     lo, hi, fine, levels: ArrayLike
         As :class:`MeshIndex`'s.
-    column_key: ArrayLike
-        ``(C,)`` int64 key of each column's bottom cell.
+    code: ArrayLike
+        ``(C,)`` int64 code of each column's level and x, non-decreasing.
+    first: ArrayLike
+        ``(C,)`` int64 lowest cell in y of each column.
     height: ArrayLike
         ``(C,)`` int64 cells in each column.
     column_rows: ArrayLike
         ``(C,)`` int64 row of each column's triangle.
     """
-    lo, hi, fine, level, bottom, cells = _boxes(vertices, triangles, rows, grow)
-    column, dx = expand(cells[:, 0])
-    column_key = bottom[column] + dx * (1 << KEY_BITS)
-    height, column_rows = cells[:, 1][column], rows[column]
-    order = mesh_backend.argsort(column_key >> KEY_BITS)
-    return (
-        lo,
-        hi,
-        fine,
-        mesh_backend.unique(level),
-        column_key[order],
-        height[order],
-        column_rows[order],
+    lo, hi, fine, level, lower, cells = _boxes(vertices, triangles, rows, grow)
+    device = mesh_backend.device(lower)
+    int64 = mesh_backend.int64
+    wide = cells[:, 0]
+    n_columns = int(mesh_backend.to_numpy(mesh_backend.sum(wide)))
+    box_of = _blocks(wide, n_columns)
+    dx = (
+        mesh_backend.arange(n_columns, dtype=int64, device=device)
+        - (mesh_backend.cumsum(wide, dim=0) - wide)[box_of]
     )
+    packed = (_level_code(level, lower[:, 0]) << ROW_BITS) + mesh_backend.arange(
+        rows.shape[0], dtype=int64, device=device
+    )
+    packed = mesh_backend.sort(packed[box_of] + (dx << ROW_BITS))
+    # Freed before the columns' own arrays are made.
+    del box_of, dx
+    box = packed & ((1 << ROW_BITS) - 1)
+    code = packed >> ROW_BITS
+    del packed
+    levels = mesh_backend.flatnonzero(
+        mesh_backend.bincount(level, minlength=KEY_BITS + 1)
+    )
+    return lo, hi, fine, levels, code, lower[:, 1][box], cells[:, 1][box], rows[box]
 
 
-def _steps(column_key, height):
+def _steps(code, height):
     """
     Where each run of columns of one level and x starts, and the entries before it, on the host.
 
@@ -183,30 +264,29 @@ def _steps(column_key, height):
         ``(G + 1,)`` int64 for ``G`` runs, closed by the column and entry
         totals.
     """
-    x = column_key >> KEY_BITS
-    run = mesh_backend.concatenate(
-        (
-            mesh_backend.ones(
-                (1,), dtype=mesh_backend.bool, device=mesh_backend.device(x)
-            ),
-            x[1:] != x[:-1],
-        ),
-        dim=0,
-    )
-    first = mesh_backend.flatnonzero(run)
+    run_start = mesh_backend.flatnonzero(_run_flags(code))
     ends = mesh_backend.cumsum(height, dim=0)
-    starts = np.append(mesh_backend.to_numpy(first), column_key.shape[0])
+    starts = np.append(mesh_backend.to_numpy(run_start), code.shape[0])
     before = np.append(
-        mesh_backend.to_numpy((ends - height)[first]), mesh_backend.to_numpy(ends[-1])
+        mesh_backend.to_numpy((ends - height)[run_start]),
+        mesh_backend.to_numpy(ends[-1]),
     )
     return starts, before
 
 
-def _chunk_cells(column_key, height, column_rows, total):
+def _step_cells(code, first, height, column_rows, total):
     """
-    One step of :func:`build_index`: the cells of columns ``column_key``, ``height`` cells tall.
+    One step of :func:`build_index`: the cells of columns ``code``, from cell ``first`` in y, ``height`` cells tall.
 
-    ``total`` is ``height.sum()``, read on the host by the caller.
+    The columns come as :func:`_columns` gives them; ``total`` is
+    ``height.sum()``, read on the host by the caller. Each entry is put in
+    order by a stable sort on a local key, ``run * span + (y - ymin)``:
+    ``run`` the index of its run of one code in the step, ``y`` its cell,
+    ``ymin`` and ``span`` the step's lowest cell in y and its range. That
+    orders the entries as their cells' keys do, and keeps each cell's
+    triangles in ascending row order. The local keys are int32 where every
+    one, and every entry's position in the step, is below ``INT32_KEYS``,
+    int64 otherwise, and the cells' keys are rebuilt from them.
 
     Returns
     -------
@@ -217,22 +297,32 @@ def _chunk_cells(column_key, height, column_rows, total):
     leaves: ArrayLike
         ``(total,)`` int64 triangle rows, cell by cell, ascending.
     """
-    column, dy = expand(height, total)
-    key = column_key[column] + dy
-    # A stable sort keeps each cell's triangles in ascending row order.
-    order = mesh_backend.argsort(key)
-    key = key[order]
-    run = mesh_backend.concatenate(
-        (
-            mesh_backend.ones(
-                (1,), dtype=mesh_backend.bool, device=mesh_backend.device(key)
-            ),
-            key[1:] != key[:-1],
-        ),
-        dim=0,
+    int64 = mesh_backend.int64
+    new_run = _run_flags(code)
+    run_code = code[mesh_backend.flatnonzero(new_run)]
+    ymin, top = mesh_backend.to_numpy(
+        mesh_backend.stack((mesh_backend.min(first), mesh_backend.max(first + height)))
+    ).tolist()
+    span = top - ymin
+    fits = max(run_code.shape[0] * span, total) <= INT32_KEYS
+    dtype = mesh_backend.int32 if fits else int64
+    column = _blocks(height, total)
+    # The local key of each column's lowest cell, less the position of the
+    # column's first entry: an entry's local key is this plus its position.
+    shift = (
+        (mesh_backend.cumsum(new_run, dim=0) - 1) * span
+        + (first - ymin)
+        - (mesh_backend.cumsum(height, dim=0) - height)
     )
-    starts = mesh_backend.flatnonzero(run)
-    return key[starts], starts, column_rows[column[order]]
+    local = mesh_backend.to(shift, dtype=dtype)[column] + mesh_backend.arange(
+        total, dtype=dtype, device=mesh_backend.device(code)
+    )
+    # A stable sort keeps each cell's triangles in ascending row order.
+    local, order = mesh_backend.module.sort(local, stable=True)
+    starts = mesh_backend.flatnonzero(_run_flags(local))
+    cell = mesh_backend.to(local[starts], dtype=int64)
+    keys = _code_base(run_code)[cell // span] + (ymin + cell % span)
+    return keys, starts, column_rows[column[order]]
 
 
 def build_index(vertices, triangles, rows, grow=None):
@@ -241,12 +331,15 @@ def build_index(vertices, triangles, rows, grow=None):
 
     A box's level is the fewest doublings of ``CELLS_PER_BOX * fine`` that
     reach its longer side, so it spans at most about ``CELLS_PER_BOX``
-    cells per axis there; it is registered in every one of them. The
-    boxes' columns of cells are put in order of level and x, then keyed
-    cell by cell and sorted in steps of whole runs of one level and x,
-    holding at most ``ENTRY_CAP`` entries or one run holding more: no two
-    steps share a cell, so memory stays bounded and the index does not
-    depend on the steps.
+    cells per axis there; it is registered in every one of them.
+
+    The boxes' columns of cells are put in order of level, x and row by
+    one sort of int64s, each packing a column's level and x above its
+    box (:func:`_columns`). Their cells are then sorted in steps of whole
+    runs of one level and x, holding at most ``ENTRY_CAP`` entries or one
+    run holding more, each on a local key of the run in the step and the
+    cell's y (:func:`_step_cells`): no two steps share a cell, so memory
+    stays bounded and the index does not depend on the steps.
 
     Parameters
     ----------
@@ -268,10 +361,18 @@ def build_index(vertices, triangles, rows, grow=None):
     Returns
     -------
     MeshIndex
+
+    Raises
+    ------
+    ValueError
+        With ``2**ROW_BITS`` rows or more: a packed column holds fewer.
     """
     device = mesh_backend.device(vertices)
     f64, int64 = mesh_backend.float64, mesh_backend.int64
-    if rows.shape[0] == 0:
+    n = rows.shape[0]
+    if n >= 1 << ROW_BITS:
+        raise ValueError(f"build_index takes fewer than {1 << ROW_BITS} rows; got {n}")
+    if n == 0:
         return MeshIndex(
             lo=mesh_backend.zeros((2,), dtype=f64, device=device),
             hi=mesh_backend.ones((2,), dtype=f64, device=device),
@@ -281,10 +382,10 @@ def build_index(vertices, triangles, rows, grow=None):
             offsets=mesh_backend.zeros((1,), dtype=int64, device=device),
             leaves=mesh_backend.zeros((0,), dtype=int64, device=device),
         )
-    lo, hi, fine, levels, column_key, height, column_rows = _columns(
+    lo, hi, fine, levels, code, first, height, column_rows = _columns(
         vertices, triangles, rows, grow
     )
-    starts, before = _steps(column_key, height)
+    starts, before = _steps(code, height)
     total = int(before[-1])
     keys, offsets = [], []
     leaves = mesh_backend.zeros((total,), dtype=int64, device=device)
@@ -296,8 +397,8 @@ def build_index(vertices, triangles, rows, grow=None):
         )
         a, b = int(starts[run]), int(starts[end])
         e0, e1 = int(before[run]), int(before[end])
-        cell_keys, cell_starts, cell_leaves = _chunk_cells(
-            column_key[a:b], height[a:b], column_rows[a:b], e1 - e0
+        cell_keys, cell_starts, cell_leaves = _step_cells(
+            code[a:b], first[a:b], height[a:b], column_rows[a:b], e1 - e0
         )
         keys.append(cell_keys)
         offsets.append(cell_starts + e0)

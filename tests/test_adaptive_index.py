@@ -52,8 +52,12 @@ def test_build_index_of_an_empty_leaf_set_has_no_levels_and_finds_nothing():
 @pytest.mark.skipif(
     backend.backend != "torch", reason="needs torch's meta default device"
 )
-@pytest.mark.parametrize("n_rows", [0, 60], ids=["empty", "filled"])
-def test_build_index_allocates_on_its_inputs_device_not_the_default_one(n_rows):
+@pytest.mark.parametrize(
+    ("n_rows", "grown"),
+    [(0, False), (60, False), (60, True)],
+    ids=["empty", "filled", "grown"],
+)
+def test_build_index_allocates_on_its_inputs_device_not_the_default_one(n_rows, grown):
     """The index is built where its inputs live, which need not be the default device.
 
     With the default device set to ``meta``, anything ``build_index``
@@ -65,8 +69,9 @@ def test_build_index_allocates_on_its_inputs_device_not_the_default_one(n_rows):
     vs = f64(rng.normal(size=(50, 2)))
     leaves = i64(rng.integers(0, 50, (60, 3)))
     rows = i64(np.arange(n_rows))
+    grow = f64(rng.uniform(0, 0.1, n_rows)) if grown else None
     with torch.device("meta"):
-        idx = build_index(vs, leaves, rows)
+        idx = build_index(vs, leaves, rows, grow)
     for name in ("lo", "hi", "fine", "levels", "keys", "offsets", "leaves"):
         assert getattr(idx, name).device == vs.device, name
 
@@ -409,13 +414,13 @@ def test_build_index_holds_at_most_entry_cap_entries_per_step(mesh, monkeypatch)
     rows = i64(finite_rows(mesh))
     grow = leaf_grow(mesh)[rows]
     steps = []
-    chunk_cells = index_module._chunk_cells
+    step_cells = index_module._step_cells
 
-    def spy(column_key, height, column_rows, total):
-        steps.append((np.unique(to_np(column_key) >> KEY_BITS).size, total))
-        return chunk_cells(column_key, height, column_rows, total)
+    def spy(code, first, height, column_rows, total):
+        steps.append((np.unique(to_np(code)).size, total))
+        return step_cells(code, first, height, column_rows, total)
 
-    monkeypatch.setattr(index_module, "_chunk_cells", spy)
+    monkeypatch.setattr(index_module, "_step_cells", spy)
     whole = build_index(mesh.vertices_source, mesh.leaves, rows, grow)
     assert len(steps) == 1, "the default cap must hold the fixture in one step"
     over_cap = shared = False
@@ -428,3 +433,20 @@ def test_build_index_holds_at_most_entry_cap_entries_per_step(mesh, monkeypatch)
         shared |= any(columns > 1 for columns, _ in steps)
     assert over_cap, "no column held more than the cap"
     assert shared, "no step held several columns"
+
+
+def test_build_index_sorts_int64_local_keys_to_the_same_index(mesh, monkeypatch):
+    rows = i64(finite_rows(mesh))
+    args = (mesh.vertices_source, mesh.leaves, rows, leaf_grow(mesh)[rows])
+    whole = build_index(*args)
+    monkeypatch.setattr(index_module, "INT32_KEYS", 0)
+    assert_same(build_index(*args), whole)
+    monkeypatch.setattr(index_module, "ENTRY_CAP", 7)
+    assert_same(build_index(*args), whole)
+
+
+def test_build_index_refuses_more_rows_than_a_packed_column_holds(monkeypatch):
+    vs, leaves, rows = _as_mesh(_scattered_triangles(5, n=9))
+    monkeypatch.setattr(index_module, "ROW_BITS", 3)
+    with pytest.raises(ValueError, match="fewer than 8 rows; got 9"):
+        build_index(vs, leaves, rows)
