@@ -114,25 +114,42 @@ def sample_points(xy, sample, batch_size):
 
 def evaluate(cache, lat, keys, sample, batch_size):
     """
-    ``cache`` with every one of ``keys`` sampled; a cached key is not sampled again.
+    ``cache`` with every one of ``keys`` sampled, and the slot of each of ``keys``.
 
-    The new keys are merged into the sorted key index rather than re-sorted:
-    all keys being distinct, a new key lands at its ``searchsorted``
-    position plus its rank among the new keys.
+    A cached key is not sampled again. The new keys are merged into the
+    sorted key index rather than re-sorted: all keys being distinct, a new
+    key lands at its ``searchsorted`` position plus its rank among the new
+    keys.
+
+    Returns
+    -------
+    cache: VertexCache
+        The cache itself when there is nothing new to sample.
+    slots: ArrayLike
+        ``(len(keys),)`` int64 slot of each key, in the order of ``keys``,
+        repeats included.
     """
-    new = mesh_backend.unique(keys)
-    new = new[cache_lookup(cache, new) < 0]
-    k = new.shape[0]
-    if k == 0:
-        return cache
     int64 = mesh_backend.int64
+    unique, inverse = mesh_backend.unique(keys, return_inverse=True)
+    n = cache.keys.shape[0]
+    if n == 0:
+        pos = mesh_backend.zeros_like(unique)
+        known = mesh_backend.zeros_like(unique) - 1
+    else:
+        pos = mesh_backend.searchsorted(cache.keys, unique)
+        at = mesh_backend.clamp(pos, 0, n - 1)
+        known = mesh_backend.where(cache.keys[at] == unique, cache.slots[at], -1)
+    fresh = mesh_backend.flatnonzero(known < 0)
+    k = fresh.shape[0]
+    if k == 0:
+        return cache, known[inverse]
+    new = unique[fresh]
     ij = lattice_ij_from_key(lat, new)
     values = sample_points(lattice_xy(lat, ij), sample, batch_size)
     start = cache.ij.shape[0]
-    total = cache.keys.shape[0] + k
-    dest = mesh_backend.searchsorted(cache.keys, new) + mesh_backend.arange(
-        k, dtype=int64
-    )
+    total = n + k
+    new_slots = mesh_backend.arange(start, start + k, dtype=int64)
+    dest = pos[fresh] + mesh_backend.arange(k, dtype=int64)
     rest = mesh_backend.flatnonzero(
         mesh_backend.fill_at_indices(
             mesh_backend.ones((total,), dtype=mesh_backend.bool), dest, False
@@ -142,11 +159,9 @@ def evaluate(cache, lat, keys, sample, batch_size):
         mesh_backend.zeros((total,), dtype=int64), dest, new
     )
     slots_out = mesh_backend.fill_at_indices(
-        mesh_backend.zeros((total,), dtype=int64),
-        dest,
-        mesh_backend.arange(start, start + k, dtype=int64),
+        mesh_backend.zeros((total,), dtype=int64), dest, new_slots
     )
-    return VertexCache(
+    cache = VertexCache(
         keys=mesh_backend.fill_at_indices(keys_out, rest, cache.keys),
         slots=mesh_backend.fill_at_indices(slots_out, rest, cache.slots),
         ij=mesh_backend.concatenate((cache.ij, ij), dim=0),
@@ -155,6 +170,8 @@ def evaluate(cache, lat, keys, sample, batch_size):
             (cache.active, mesh_backend.zeros((k,), dtype=mesh_backend.bool)), dim=0
         ),
     )
+    slot_of = mesh_backend.fill_at_indices(mesh_backend.copy(known), fresh, new_slots)
+    return cache, slot_of[inverse]
 
 
 def activate(cache, slots):
@@ -199,8 +216,8 @@ def add_roots(cache, store, lat, ij, cls, sample, batch_size):
         ``(T,)`` int64 rows of the new triangles.
     """
     keys = lattice_key(lat, ij)
-    cache = evaluate(cache, lat, keys.reshape(-1), sample, batch_size)
-    v = cache_lookup(cache, keys)
+    cache, v = evaluate(cache, lat, keys.reshape(-1), sample, batch_size)
+    v = v.reshape(keys.shape)
     level = mesh_backend.zeros((v.shape[0],), dtype=mesh_backend.int64)
     store, rows = add_leaves(store, v, level, cls)
     return activate(cache, v.reshape(-1)), store, rows
@@ -260,16 +277,20 @@ def red_split(v, m, cls):
     return six[:, _CHILD_VERTEX_INDEX_TABLE].reshape(-1, 3), COMPOSE[cls].reshape(-1)
 
 
-def split_rows(cache, store, lat, rows):
+def split_rows(cache, store, lat, rows, mid=None):
     """
     Replace ``rows`` by their red-split children, whose midpoints must be cached.
+
+    ``mid`` is the ``(len(rows), 3)`` int64 slots of the midpoints, ``m_i``
+    opposite vertex ``i``; ``None`` looks them up.
 
     Returns the cache with the children's vertices active, the store, and
     the children's rows.
     """
     v = store.v[rows]
-    m = cache_lookup(cache, lattice_key(lat, midpoint_ij(cache.ij[v])))
-    kid_v, kid_cls = red_split(v, m, store.cls[rows])
+    if mid is None:
+        mid = cache_lookup(cache, lattice_key(lat, midpoint_ij(cache.ij[v])))
+    kid_v, kid_cls = red_split(v, mid, store.cls[rows])
     kid_level = mesh_backend.repeat(store.level[rows] + 1, 4, axis=0)
     store = store._replace(
         valid=mesh_backend.fill_at_indices(mesh_backend.copy(store.valid), rows, False)
@@ -289,13 +310,18 @@ def _split_failures(cache, store, lat, rows, sample, split, batch_size):
     v = store.v[rows]
     ij = cache.ij[v]
     mid = lattice_key(lat, midpoint_ij(ij))
-    cache = evaluate(cache, lat, mid.reshape(-1), sample, batch_size)
-    six = mesh_backend.concatenate((v, cache_lookup(cache, mid)), dim=1)
+    cache, slots = evaluate(cache, lat, mid.reshape(-1), sample, batch_size)
+    slots = slots.reshape(mid.shape)
+    six = mesh_backend.concatenate((v, slots), dim=1)
     fail, kept = split(ij, cache.values[six], store.cls[rows], store.level[rows])
     ok = mesh_backend.flatnonzero(~fail)
     passed = [rows[ok], *(k[ok] for k in kept)]
     cache, store, kids = split_rows(
-        cache, store, lat, rows[mesh_backend.flatnonzero(fail)]
+        cache,
+        store,
+        lat,
+        rows[mesh_backend.flatnonzero(fail)],
+        slots[mesh_backend.flatnonzero(fail)],
     )
     return cache, store, kids, passed
 
@@ -383,8 +409,10 @@ def balance(
         if rows.shape[0] == 0:
             return cache, store, mesh_backend.concatenate(created, dim=0)
         mid = lattice_key(lat, midpoint_ij(cache.ij[store.v[rows]]))
-        cache = evaluate(cache, lat, mid.reshape(-1), sample, batch_size)
-        cache, store, kids = split_rows(cache, store, lat, rows)
+        cache, slots = evaluate(cache, lat, mid.reshape(-1), sample, batch_size)
+        cache, store, kids = split_rows(
+            cache, store, lat, rows, slots.reshape(mid.shape)
+        )
         created.append(kids)
 
 

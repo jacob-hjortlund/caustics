@@ -14,6 +14,7 @@ from caustics.lenses.func.adaptive.lattice import (
     make_lattice,
     midpoint_ij,
 )
+from caustics.lenses.func.adaptive import refine as refine_module
 from caustics.lenses.func.adaptive.refine import (
     activate,
     add_leaves,
@@ -29,6 +30,7 @@ from caustics.lenses.func.adaptive.refine import (
 )
 
 from adaptive_maps import (
+    assert_same,
     i64,
     idle_balances,
     last_balance_created,
@@ -227,7 +229,7 @@ def test_evaluate_keeps_the_key_index_sorted_and_the_values_by_slot():
     rng = np.random.default_rng(3)
     for _ in range(6):
         keys = i64(rng.integers(0, (lat.n + 1) ** 2, 40))
-        cache = evaluate(cache, lat, keys, positions, None)
+        cache, _ = evaluate(cache, lat, keys, positions, None)
     keys = to_np(cache.keys)
     assert (np.diff(keys) > 0).all()
     ij = to_np(cache.ij)[to_np(cache.slots)]
@@ -238,7 +240,7 @@ def test_evaluate_keeps_the_key_index_sorted_and_the_values_by_slot():
 
 def test_cache_lookup_finds_cached_keys_and_misses_the_rest():
     lat = make_lattice(FOV, 0.0, 0.0, INIT_RES, 3)
-    cache = evaluate(empty_cache(2), lat, i64([5, 9, 2]), positions, None)
+    cache, _ = evaluate(empty_cache(2), lat, i64([5, 9, 2]), positions, None)
     assert to_np(cache_lookup(cache, i64([9, 3, 2]))).tolist() == [2, -1, 0]
     assert to_np(cache_lookup(empty_cache(2), i64([1]))).tolist() == [-1]
 
@@ -249,13 +251,19 @@ def test_activate_and_split_rows_never_write_into_their_inputs():
     cache, store, rows = add_roots(
         empty_cache(2), empty_store(), lat, ij, cls, positions, None
     )
-    cache = evaluate(
+    cache, mid = evaluate(
         cache, lat, lattice_key(lat, midpoint_ij(ij)).reshape(-1), positions, None
     )
-    active, valid = to_np(cache.active).copy(), to_np(store.valid).copy()
+    mid = mid.reshape(-1, 3)
+    fields = ("keys", "slots", "ij", "values", "active")
+    before = {f: to_np(getattr(cache, f)).copy() for f in fields}
+    valid = to_np(store.valid).copy()
     activate(cache, i64([cache.ij.shape[0] - 1]))
+    evaluate(cache, lat, i64([1, 3]), positions, None)
     split_rows(cache, store, lat, rows[:1])
-    assert np.array_equal(to_np(cache.active), active)
+    split_rows(cache, store, lat, rows[:1], mid[:1])
+    for f in fields:
+        assert np.array_equal(to_np(getattr(cache, f)), before[f])
     assert np.array_equal(to_np(store.valid), valid)
 
 
@@ -289,10 +297,41 @@ def test_evaluate_is_bit_identical_under_chunking():
         return mesh_backend.stack((x * x - y, y * y + x), dim=-1)
 
     keys = i64(np.arange((lat.n + 1) ** 2))
-    whole = to_np(evaluate(empty_cache(2), lat, keys, curved, None).values)
+    whole = to_np(evaluate(empty_cache(2), lat, keys, curved, None)[0].values)
     for size in (1, 7, 33):
-        got = evaluate(empty_cache(2), lat, keys, curved, size)
+        got, _ = evaluate(empty_cache(2), lat, keys, curved, size)
         assert (to_np(got.values) == whole).all()
+
+
+def test_evaluate_returns_the_slot_of_each_key_repeats_included():
+    lat = make_lattice(FOV, 0.0, 0.0, INIT_RES, 3)
+    cache, slots = evaluate(empty_cache(2), lat, i64([5, 9, 2, 9]), positions, None)
+    assert to_np(slots).tolist() == [1, 2, 0, 2]
+    keys = i64([7, 2, 7, 11, 5])
+    cache, slots = evaluate(cache, lat, keys, positions, None)
+    assert to_np(slots).tolist() == [3, 0, 3, 4, 1]
+    assert np.array_equal(to_np(slots), to_np(cache_lookup(cache, keys)))
+    same, slots = evaluate(cache, lat, i64([9, 9]), positions, None)
+    assert same is cache and to_np(slots).tolist() == [2, 2]
+    assert tuple(evaluate(cache, lat, i64([]), positions, None)[1].shape) == (0,)
+
+
+def test_split_rows_given_the_midpoints_searches_nothing(monkeypatch):
+    lat = make_lattice(FOV, 0.0, 0.0, INIT_RES, 3)
+    ij, cls = initial_triangles(INIT_RES, lat.level, ROOT_CLASS)
+    cache, store, rows = add_roots(
+        empty_cache(2), empty_store(), lat, ij, cls, positions, None
+    )
+    cache, mid = evaluate(
+        cache, lat, lattice_key(lat, midpoint_ij(ij)).reshape(-1), positions, None
+    )
+    want = split_rows(cache, store, lat, rows[:3])
+    monkeypatch.setattr(
+        refine_module, "cache_lookup", lambda *a: pytest.fail("split_rows searched")
+    )
+    got = split_rows(cache, store, lat, rows[:3], mid.reshape(-1, 3)[:3])
+    for g, w in zip(got, want):
+        assert_same(g, w)
 
 
 def test_evaluate_only_samples_uncached_points():
@@ -304,9 +343,9 @@ def test_evaluate_only_samples_uncached_points():
 
     lat = make_lattice(4.0, 0.0, 0.0, 2, 2)
     keys = i64([3, 7, 3, 11])
-    cache = evaluate(empty_cache(2), lat, keys, sample, None)
+    cache, _ = evaluate(empty_cache(2), lat, keys, sample, None)
     assert calls["n"] == 3
-    cache = evaluate(cache, lat, keys, sample, None)
+    cache, _ = evaluate(cache, lat, keys, sample, None)
     assert calls["n"] == 3
 
 
