@@ -3,10 +3,11 @@ A multi-level grid index over source-plane triangles, and lookups in it.
 
 Cells come in power-of-two levels. Each triangle is registered at the one
 level whose cells match its bounding box, grown by how far the triangle
-reaches beyond itself, in every cell that box covers there. A point reads
-one cell per occupied level, so the cells it reads are as fine as the
-triangles registered in them wherever those crowd: along caustics, and
-where outliers stretch the extent.
+reaches beyond itself, in the cells of that box it reaches, grown: in each
+column of the box's cells, from the first to the last cell it reaches
+there. A point reads one cell per occupied level, so the cells it reads
+are as fine as the triangles registered in them wherever those crowd:
+along caustics, and where outliers stretch the extent.
 """
 
 from typing import NamedTuple
@@ -32,11 +33,20 @@ ROW_BITS = 62 - KEY_BITS
 # A step sorts int32 local keys where every one, and every entry's position
 # in the step, is below this many; int64 otherwise.
 INT32_KEYS = 1 << 31
+# The margin by which the cells a triangle reaches are widened, against
+# rounding: this much of a cell, far above the rounding of coordinates of the
+# order of the index's extent...
+PAD = 2.0**-10
+# ...plus this many ulps of the index's largest coordinate, for an index far
+# from the origin against its extent.
+PAD_ULPS = 8
+# Columns the eager step finding the cells each triangle reaches takes at once.
+REACH_BLOCK = 1 << 18
 
 
 class MeshIndex(NamedTuple):
     """
-    Multi-level CSR index over triangle bounding boxes.
+    Multi-level CSR index over triangles, each registered at the level its grown bounding box sets, in the cells of that box it reaches.
 
     Level ``l`` has square cells of side ``fine * 2**l``, counted from
     ``lo``; cell ``(ix, iy)`` of it has key ``l * 2**56 + ix * 2**28 + iy``.
@@ -206,15 +216,190 @@ def _run_flags(values):
     )
 
 
+def _by_x(px, py, qx, qy):
+    """Points ``p`` and ``q``, by their coordinates, in order of x, ``p`` first where they tie: a compare-and-swap of arrays."""
+    swap = px > qx
+    where = mesh_backend.where
+    return (
+        where(swap, qx, px),
+        where(swap, qy, py),
+        where(swap, px, qx),
+        where(swap, py, qy),
+    )
+
+
+def _slope(px, py, qx, qy):
+    """The slope of the line from ``p`` to ``q`` where ``qx > px``; 0 elsewhere."""
+    wide = qx > px
+    return mesh_backend.where(
+        wide, (qy - py) / mesh_backend.where(wide, qx - px, 1.0), 0.0
+    )
+
+
+def _reached(tx, ty, side, reach, i0x, i0y, i1y, box, dx, lo):
+    """
+    The cells of each column that its box's triangle, grown, reaches: the first in y, and how many.
+
+    Column ``dx`` of box ``box`` is the box's column ``i0x + dx`` in x, a
+    slab of x. With A, B, C the triangle's vertices in order of x, the
+    triangle lies between its long edge AC and the chain A-B-C. Over the
+    slab, widened by ``reach`` on both sides and clipped to ``[Ax, Cx]``,
+    both are extreme at the slab's ends, and the chain also at B where B
+    lies in it: the triangle there spans the interval of y from the least
+    to the greatest of those values. That interval, widened by ``reach``,
+    gives the column's first and last cell, located as :func:`_cell_of`
+    locates points and clamped to the box's cells ``[i0y, i1y]``. As the
+    triangle is convex, with no grow every cell between them holds a point
+    of it.
+
+    No cell a lookup can find the triangle from is dropped. A point within
+    its grow of the triangle, in this column, is within that grow in x and
+    in y of a point of the triangle; that point lies in the widened slab,
+    so its y lies in the interval, and the first point's y in the widened
+    one. The slab is where :func:`_cell_of` puts a point, its clamp
+    included: a point on the index's upper edge is put in the last cell,
+    and its x is that column's upper end, which the slab holds. Beyond the
+    grow, ``reach`` holds a margin of ``PAD`` of a cell and ``PAD_ULPS``
+    ulps of the index's largest coordinate, above the rounding of the slab,
+    of the interval and of where a lookup puts a point; and the interval's
+    ends are located by the arithmetic of :func:`_cell_of`, whose rounding
+    never reverses the order of two values. A triangle of no width in x,
+    and a column whose interval comes out empty or not a number, keep the
+    box's cells.
+
+    Gathers and arithmetic only: no search, no sort, no branch on data,
+    nothing written in place.
+
+    Parameters
+    ----------
+    tx, ty: ArrayLike
+        ``(K, 3)`` float64 coordinates of each box's triangle's vertices.
+
+        *Unit: arcsec*
+    side: ArrayLike
+        ``(K,)`` float64 side of the cells of each box's level.
+
+        *Unit: arcsec*
+    reach: ArrayLike
+        ``(K,)`` float64 each triangle's grow, plus the margin.
+
+        *Unit: arcsec*
+    i0x, i0y, i1y: ArrayLike
+        ``(K,)`` int64 each box's first cell in x, and its first and last
+        cell in y.
+    box, dx: ArrayLike
+        ``(n,)`` int64 each column's box, and its offset in x from the
+        box's first column.
+    lo: ArrayLike
+        ``(2,)`` float64 the index's lower corner.
+
+        *Unit: arcsec*
+
+    Returns
+    -------
+    first, count: ArrayLike
+        ``(n,)`` int64 each column's first cell in y and its number of
+        cells, within ``[i0y, i1y]``.
+    """
+    where, minimum, maximum = (
+        mesh_backend.where,
+        mesh_backend.minimum,
+        mesh_backend.maximum,
+    )
+    # Per box: A, B, C by three compare-and-swaps, and the slopes of AC, AB
+    # and BC.
+    ax, ay, bx, by = _by_x(tx[:, 0], ty[:, 0], tx[:, 1], ty[:, 1])
+    bx, by, cx, cy = _by_x(bx, by, tx[:, 2], ty[:, 2])
+    ax, ay, bx, by = _by_x(ax, ay, bx, by)
+    s_ac, s_ab, s_bc = (
+        _slope(ax, ay, cx, cy),
+        _slope(ax, ay, bx, by),
+        _slope(bx, by, cx, cy),
+    )
+    # Per column.
+    side, reach, i0y, i1y = side[box], reach[box], i0y[box], i1y[box]
+    ax, ay, bx, by, cx = ax[box], ay[box], bx[box], by[box], cx[box]
+    s_ac, s_ab, s_bc = s_ac[box], s_ab[box], s_bc[box]
+    xa = (
+        lo[0]
+        + mesh_backend.to(i0x[box] + dx, dtype=mesh_backend.float64) * side
+        - reach
+    )
+    xl = maximum(xa, ax)
+    xr = minimum(xa + side + 2.0 * reach, cx)
+    long_l, long_r = ay + s_ac * (xl - ax), ay + s_ac * (xr - ax)
+    chain_l = where(xl <= bx, ay + s_ab * (xl - ax), by + s_bc * (xl - bx))
+    chain_r = where(xr <= bx, ay + s_ab * (xr - ax), by + s_bc * (xr - bx))
+    ymin = minimum(minimum(long_l, long_r), minimum(chain_l, chain_r))
+    ymax = maximum(maximum(long_l, long_r), maximum(chain_l, chain_r))
+    at_b = (xl <= bx) & (bx <= xr)
+    ymin = where(at_b, minimum(ymin, by), ymin)
+    ymax = where(at_b, maximum(ymax, by), ymax)
+    c0 = maximum(
+        mesh_backend.long(mesh_backend.floor((ymin - reach - lo[1]) / side)), i0y
+    )
+    c1 = minimum(
+        mesh_backend.long(mesh_backend.floor((ymax + reach - lo[1]) / side)), i1y
+    )
+    # NaN, from a slope too steep for a float, fails the last comparison.
+    keep = (c1 >= c0) & (cx > ax) & (ymin <= ymax)
+    first = where(keep, c0, i0y)
+    return first, where(keep, c1, i1y) - first + 1
+
+
+def _reached_in_blocks(tx, ty, side, reach, i0x, i0y, i1y, box, dx, lo):
+    """
+    :func:`_reached`, ``REACH_BLOCK`` columns at a time, so that its temporaries stay bounded.
+
+    Each block is handed only its boxes, from the lowest to the highest it
+    holds: few where ``box`` ascends, as :func:`_columns`' does.
+
+    Returns
+    -------
+    first, count: ArrayLike
+        As :func:`_reached`'s.
+    """
+    n = box.shape[0]
+    device = mesh_backend.device(box)
+    first = mesh_backend.empty((n,), dtype=mesh_backend.int64, device=device)
+    count = mesh_backend.empty((n,), dtype=mesh_backend.int64, device=device)
+    for start in range(0, n, REACH_BLOCK):
+        block = slice(start, start + REACH_BLOCK)
+        b = box[block]
+        low, high = mesh_backend.to_numpy(
+            mesh_backend.stack((mesh_backend.min(b), mesh_backend.max(b)))
+        ).tolist()
+        boxes = slice(low, high + 1)
+        f, c = _reached(
+            tx[boxes],
+            ty[boxes],
+            side[boxes],
+            reach[boxes],
+            i0x[boxes],
+            i0y[boxes],
+            i1y[boxes],
+            b - low,
+            dx[block],
+            lo,
+        )
+        first = mesh_backend.fill_at_indices(first, block, f)
+        count = mesh_backend.fill_at_indices(count, block, c)
+    return first, count
+
+
 def _columns(vertices, triangles, rows, grow):
     """
-    The columns of cells of the grown boxes of ``triangles[rows]``, by level and x.
+    The columns of cells of the grown boxes of ``triangles[rows]``, by level and x, each holding the cells its triangle reaches.
 
-    Each column is packed in one int64, ``code << ROW_BITS | box``, with
+    A box's column holds the cells from the first to the last in y that
+    the box's triangle, grown, reaches there (:func:`_reached`). Each
+    column is packed in one int64, ``code << ROW_BITS | box``, with
     ``code`` the :func:`_level_code` of its level and x and ``box`` its
     box's position in ``rows``, and these are sorted by value: by level,
     x, then row, since ``rows`` ascend. ``code`` and ``box`` are read off
-    the sorted values, and the rest is gathered per box.
+    the sorted values, and the row is gathered per box; a column's first
+    cell and count, packed in one int64, are gathered through the sort's
+    order.
 
     Returns
     -------
@@ -231,7 +416,7 @@ def _columns(vertices, triangles, rows, grow):
     """
     lo, hi, fine, level, lower, cells = _boxes(vertices, triangles, rows, grow)
     device = mesh_backend.device(lower)
-    int64 = mesh_backend.int64
+    f64, int64 = mesh_backend.float64, mesh_backend.int64
     wide = cells[:, 0]
     n_columns = int(mesh_backend.to_numpy(mesh_backend.sum(wide)))
     box_of = _blocks(wide, n_columns)
@@ -239,19 +424,54 @@ def _columns(vertices, triangles, rows, grow):
         mesh_backend.arange(n_columns, dtype=int64, device=device)
         - (mesh_backend.cumsum(wide, dim=0) - wide)[box_of]
     )
+    # The triangles' vertices in float64, as in _boxes; freed with the rest
+    # of the step's inputs once it has run.
+    corner = triangles[rows]
+    tx = mesh_backend.to(vertices[:, 0][corner], dtype=f64)
+    ty = mesh_backend.to(vertices[:, 1][corner], dtype=f64)
+    del corner
+    scale, _ = _level_tables(device)
+    side = fine * scale[level]
+    largest = mesh_backend.max(mesh_backend.abs(mesh_backend.concatenate((lo, hi))))
+    margin = PAD * side + PAD_ULPS * mesh_backend.finfo(f64).eps * largest
+    reach = margin if grow is None else mesh_backend.to(grow, dtype=f64) + margin
+    del margin
+    first, height = _reached_in_blocks(
+        tx,
+        ty,
+        side,
+        reach,
+        lower[:, 0],
+        lower[:, 1],
+        lower[:, 1] + cells[:, 1] - 1,
+        box_of,
+        dx,
+        lo,
+    )
+    del tx, ty, side, reach
+    # A count is at most CELLS_PER_BOX + 2.
+    bits = (CELLS_PER_BOX + 2).bit_length()
+    reached = (first << bits) | height
+    del first, height
     packed = (_level_code(level, lower[:, 0]) << ROW_BITS) + mesh_backend.arange(
         rows.shape[0], dtype=int64, device=device
     )
-    packed = mesh_backend.sort(packed[box_of] + (dx << ROW_BITS))
+    packed = packed[box_of] + (dx << ROW_BITS)
     # Freed before the columns' own arrays are made.
     del box_of, dx
+    packed, order = mesh_backend.module.sort(packed, stable=True)
+    reached = reached[order]
+    del order
     box = packed & ((1 << ROW_BITS) - 1)
     code = packed >> ROW_BITS
     del packed
+    column_rows = rows[box]
+    del box
     levels = mesh_backend.flatnonzero(
         mesh_backend.bincount(level, minlength=KEY_BITS + 1)
     )
-    return lo, hi, fine, levels, code, lower[:, 1][box], cells[:, 1][box], rows[box]
+    first, height = reached >> bits, reached & ((1 << bits) - 1)
+    return lo, hi, fine, levels, code, first, height, column_rows
 
 
 def _steps(code, height):
@@ -327,11 +547,15 @@ def _step_cells(code, first, height, column_rows, total):
 
 def build_index(vertices, triangles, rows, grow=None):
     """
-    The :class:`MeshIndex` over the bounding boxes of ``triangles[rows]``, each grown by its ``grow``.
+    The :class:`MeshIndex` over ``triangles[rows]``, each grown by its ``grow``.
 
-    A box's level is the fewest doublings of ``CELLS_PER_BOX * fine`` that
-    reach its longer side, so it spans at most about ``CELLS_PER_BOX``
-    cells per axis there; it is registered in every one of them.
+    A triangle's level is set by its grown bounding box: the fewest
+    doublings of ``CELLS_PER_BOX * fine`` that reach the box's longer side,
+    so the box spans at most about ``CELLS_PER_BOX`` cells per axis there.
+    The triangle is registered in the cells of that box it reaches, grown:
+    in each column of the box's cells, from the first to the last cell it
+    reaches there (:func:`_reached`). No cell a lookup can find it from is
+    left out.
 
     The boxes' columns of cells are put in order of level, x and row by
     one sort of int64s, each packing a column's level and x above its

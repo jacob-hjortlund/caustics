@@ -156,7 +156,9 @@ class LensMesh(NamedTuple):
         to 0.6.
     index: MeshIndex
         Over the source-plane images of the leaves whose origin is finite,
-        each grown by :func:`leaf_grow`.
+        each grown by :func:`leaf_grow`: a leaf is registered at the one
+        level its grown box sets, in the cells of that box it reaches,
+        grown, column by column.
     critical_band: CriticalBand
         The finest-level origins across which ``det`` of the mesh's
         Jacobian changes sign, with that ``det`` at their samples: from

@@ -493,6 +493,35 @@ def brute_hits(vertices, triangles, rows, beta, grow=None):
     )
 
 
+def box_hits(index, vertices, triangles, rows, beta, grow=None):
+    """
+    What an index registering each triangle in every cell of its grown box returns, numpy.
+
+    :func:`brute_hits` restricted to the pairs whose point lies within the
+    index's ``[lo, hi]`` and, at the triangle's level, in a cell of its
+    grown box: from the documented rule (:func:`index_cell_ranges`,
+    :func:`index_point_cells`), not from ``index.py``'s code. Brute force
+    alone also finds pairs no index can: a triangle of no area contains,
+    by :func:`~caustics.lenses.func.adaptive.geometry.contains`, every
+    point on the line through it, and a point-triangle every point; and
+    rounding can make a tiny triangle contain a point far from it.
+    ``grow`` is ``(T,)``, aligned with ``triangles``.
+    """
+    rows_np = to_np(rows)
+    tri = to_np(vertices)[to_np(triangles)[rows_np]]
+    reach = None if grow is None else to_np(grow)[rows_np]
+    level, i0, i1 = index_cell_ranges(index, tri, reach)
+    qidx, hit, w = brute_hits(vertices, triangles, rows, beta, grow)
+    pos = np.searchsorted(rows_np, hit)
+    points = to_np(beta)[qidx]
+    cell = index_point_cells(index, level[pos], points)
+    lo, hi = to_np(index.lo), to_np(index.hi)
+    keep = ((cell >= i0[pos]) & (cell <= i1[pos])).all(axis=1) & (
+        (points >= lo) & (points <= hi)
+    ).all(axis=1)
+    return qidx[keep], hit[keep], w[keep]
+
+
 def assert_hits_equal(got, want):
     """``index_hits`` output ``got`` equals numpy ``want`` from :func:`brute_hits`, bit for bit."""
     for name, a, b in zip(("qidx", "tri", "w"), got, want):
@@ -560,6 +589,39 @@ def index_cell(index, level, ix, iy):
     if u == keys.size or keys[u] != key:
         return np.zeros(0, dtype=np.int64)
     return to_np(index.leaves)[offsets[u] : offsets[u + 1]]
+
+
+def cell_meets_triangle(cell_lo, cell_hi, tri):
+    """
+    True where the closed rectangle ``[cell_lo, cell_hi]`` and the closed triangle ``tri`` ``(3, 2)`` share a point, numpy bool.
+
+    By the separating-axis test: two convex polygons are disjoint exactly
+    when their projections on one of their edges' normals do not meet,
+    here the two axes and the triangle's three edge normals. A triangle
+    with no area keeps the test exact: its edges' normals are its segment's
+    normal, or zero, which separates nothing. ``cell_lo`` and ``cell_hi``
+    ``(..., 2)`` broadcast, giving ``(...)``.
+    """
+    lo, hi = np.broadcast_arrays(
+        np.asarray(cell_lo, dtype=np.float64), np.asarray(cell_hi, dtype=np.float64)
+    )
+    tri = np.asarray(tri, dtype=np.float64)
+    corners = np.stack(
+        [
+            lo,
+            np.stack([hi[..., 0], lo[..., 1]], -1),
+            hi,
+            np.stack([lo[..., 0], hi[..., 1]], -1),
+        ],
+        axis=-2,
+    )
+    edge = np.roll(tri, -1, axis=0) - tri
+    normals = np.concatenate([np.eye(2), np.stack([-edge[:, 1], edge[:, 0]], -1)])
+    cell, triangle = corners @ normals.T, tri @ normals.T
+    meets = (cell.min(axis=-2) <= triangle.max(axis=0)) & (
+        triangle.min(axis=0) <= cell.max(axis=-2)
+    )
+    return np.all(meets, axis=-1)
 
 
 SECTOR_OF_ANGLE = {0: 0, 45: 1, 90: 2, 180: 3, 225: 4, 270: 5}

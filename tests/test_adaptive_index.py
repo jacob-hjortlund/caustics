@@ -19,8 +19,10 @@ from caustics.lenses.func.adaptive.index import (
 from adaptive_maps import (
     assert_hits_equal,
     assert_same,
+    box_hits,
     brute_hits,
     build,
+    cell_meets_triangle,
     collapse,
     collapse_jacobian,
     f64,
@@ -159,7 +161,7 @@ def test_index_hits_skip_nan_infinite_and_far_points_and_take_empty_input():
     assert [tuple(a.shape) for a in empty] == [(0,), (0,), (0, 3)]
 
 
-def test_build_index_registers_each_row_at_one_level_in_exactly_the_cells_of_its_box():
+def test_build_index_registers_each_row_at_one_level_in_cells_of_its_box_only():
     tri = _scattered_triangles(21)
     n = tri.shape[0]
     rng = np.random.default_rng(22)
@@ -180,7 +182,9 @@ def test_build_index_registers_each_row_at_one_level_in_exactly_the_cells_of_its
         )
         want = (level[r] << (2 * KEY_BITS)) | (ix.ravel() << KEY_BITS) | iy.ravel()
         got = key_of_entry[row_of_entry == r]
-        assert np.array_equal(np.sort(got), np.sort(want)), r
+        assert got.size > 0, r
+        assert np.unique(got).size == got.size, r
+        assert np.isin(got, want).all(), r
 
 
 def test_build_index_keys_ascend_and_give_its_levels_and_fine_side():
@@ -241,6 +245,154 @@ def test_index_hits_find_points_on_the_cell_lines_of_every_level():
     assert_hits_equal(
         index_hits(idx, vs, leaves, beta), brute_hits(vs, leaves, rows, beta)
     )
+
+
+def _grown(seed, n, share=0.2):
+    rng = np.random.default_rng(seed)
+    return np.where(rng.uniform(size=n) < share, 10.0 ** rng.uniform(-9, 0, n), 0.0)
+
+
+def _edge_and_cell_line_points(idx, tri, grow):
+    """The triangles' vertices and the points where their edges cross their level's cell lines, each also moved one float every way."""
+    level, i0, i1 = index_cell_ranges(idx, tri, grow)
+    lo, fine = to_np(idx.lo), float(to_np(idx.fine))
+    points = [tri.reshape(-1, 2)]
+    for t in range(tri.shape[0]):
+        side = fine * 2.0 ** level[t]
+        for axis in (0, 1):
+            lines = lo[axis] + side * np.arange(i0[t, axis], i1[t, axis] + 2)
+            for e in range(3):
+                p, q = tri[t, e], tri[t, (e + 1) % 3]
+                if p[axis] == q[axis]:
+                    continue
+                s = (lines - p[axis]) / (q[axis] - p[axis])
+                on = (s >= 0) & (s <= 1)
+                cross = p + s[on, None] * (q - p)
+                cross[:, axis] = lines[on]
+                points.append(cross)
+    points = np.concatenate(points)
+    moved = [points]
+    for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (-1, -1)):
+        p = points.copy()
+        if dx:
+            p[:, 0] = np.nextafter(p[:, 0], dx * np.inf)
+        if dy:
+            p[:, 1] = np.nextafter(p[:, 1], dy * np.inf)
+        moved.append(p)
+    return np.concatenate(moved)
+
+
+@pytest.mark.parametrize("grown", [False, True], ids=["plain", "grown"])
+def test_index_hits_equal_brute_force_on_edges_and_cell_lines(grown):
+    tri = _scattered_triangles(31, n=120)
+    grow = _grown(32, 120) if grown else None
+    vs, leaves, rows = _as_mesh(tri)
+    idx = build_index(vs, leaves, rows, None if grow is None else f64(grow))
+    beta = f64(_edge_and_cell_line_points(idx, tri, grow))
+    g = None if grow is None else f64(grow)
+    assert_hits_equal(
+        index_hits(idx, vs, leaves, beta, g), brute_hits(vs, leaves, rows, beta, g)
+    )
+
+
+def _slivers(seed, n=60):
+    """Thin triangles along the diagonal of their boxes, counter-clockwise."""
+    rng = np.random.default_rng(seed)
+    a = rng.uniform(-1, 1, (n, 2))
+    b = a + rng.uniform(0.2, 1.0, (n, 1)) * np.array([1.0, 1.0])
+    c = b + rng.uniform(0.01, 0.02, (n, 1)) * np.array([0.0, 1.0])
+    return np.stack([a, b, c], axis=1)
+
+
+def test_a_leaf_is_registered_only_in_cells_of_its_box_that_it_reaches():
+    tri = _slivers(33)
+    n = tri.shape[0]
+    vs, leaves, rows = _as_mesh(tri)
+    idx = build_index(vs, leaves, rows)
+    level, i0, i1 = index_cell_ranges(idx, tri)
+    keys, offsets = to_np(idx.keys), to_np(idx.offsets)
+    key_of_entry = np.repeat(keys, np.diff(offsets))
+    row_of_entry = to_np(idx.leaves)
+    box_cells = np.prod(i1 - i0 + 1, axis=1)
+    assert row_of_entry.size < 0.5 * box_cells.sum()
+    lo, fine = to_np(idx.lo), float(to_np(idx.fine))
+    mask = (1 << KEY_BITS) - 1
+    for r in range(n):
+        got = key_of_entry[row_of_entry == r]
+        assert got.size > 0 and (got >> (2 * KEY_BITS) == level[r]).all()
+        cell = np.stack([(got >> KEY_BITS) & mask, got & mask], axis=1)
+        assert ((cell >= i0[r]) & (cell <= i1[r])).all()
+        side = fine * 2.0 ** level[r]
+        margin = 2 * index_module.PAD * side
+        for c in cell:
+            assert cell_meets_triangle(
+                lo + c * side - margin, lo + (c + 1) * side + margin, tri[r]
+            )
+
+
+def _degenerate():
+    """A vertical and a horizontal segment, a diagonal one, a point, and two proper triangles beside them."""
+    return np.array(
+        [
+            [[0.0, 0.0], [0.0, 1.0], [0.0, 0.4]],
+            [[0.2, 0.3], [1.1, 0.3], [0.6, 0.3]],
+            [[-1.0, -1.0], [0.0, 0.0], [-0.5, -0.5]],
+            [[0.7, -0.6], [0.7, -0.6], [0.7, -0.6]],
+            [[-0.9, 0.1], [-0.2, 0.2], [-0.6, 0.9]],
+            [[0.3, -0.9], [0.9, -0.8], [0.5, -0.2]],
+        ]
+    )
+
+
+@pytest.mark.parametrize(
+    "offset", [0.0, 1e7], ids=["at the origin", "1e6 extents away"]
+)
+@pytest.mark.parametrize("grown", [False, True], ids=["plain", "grown"])
+def test_index_hits_on_degenerate_triangles_are_those_of_every_cell_of_their_boxes(
+    grown, offset
+):
+    """Brute force finds more here than any index can (:func:`box_hits`): an index of every box cell finds these."""
+    tri = _degenerate() + np.array([offset, -3 * offset])
+    grow = np.array([0.0, 0.05, 0.0, 0.1, 0.02, 0.0]) if grown else None
+    vs, leaves, rows = _as_mesh(tri)
+    g = None if grow is None else f64(grow)
+    idx = build_index(vs, leaves, rows, g)
+    beta = f64(_edge_and_cell_line_points(idx, tri, grow))
+    want = box_hits(idx, vs, leaves, rows, beta, g)
+    assert np.isin(np.arange(4), want[1]).all(), "every degenerate triangle has a hit"
+    assert_hits_equal(index_hits(idx, vs, leaves, beta, g), want)
+
+
+def test_index_hits_find_sources_on_the_index_s_outer_edge():
+    tri = _scattered_triangles(34, n=80)
+    vs, leaves, rows = _as_mesh(tri)
+    idx = build_index(vs, leaves, rows)
+    lo, hi = to_np(idx.lo), to_np(idx.hi)
+    flat = tri.reshape(-1, 2)
+    on_edge = flat[((flat == lo) | (flat == hi)).any(axis=1)]
+    assert on_edge.shape[0] >= 2
+    beta = f64(np.concatenate([on_edge, [lo, hi, [lo[0], hi[1]], [hi[0], lo[1]]]]))
+    want = box_hits(idx, vs, leaves, rows, beta)
+    assert (want[0] < on_edge.shape[0]).any(), "a source on the edge has a hit"
+    assert_hits_equal(index_hits(idx, vs, leaves, beta), want)
+
+
+def test_build_index_of_float32_vertices_is_that_of_their_float64_values():
+    vs, leaves, rows = _as_mesh(_scattered_triangles(35, n=80).astype(np.float32))
+    vs32 = mesh_backend.to(vs, dtype=mesh_backend.float32)
+    assert_same(build_index(vs32, leaves, rows), build_index(vs, leaves, rows))
+
+
+def test_build_index_of_vertices_that_carry_gradients_is_that_of_the_detached_ones():
+    vs, leaves, rows = _as_mesh(_scattered_triangles(36, n=80))
+    grow = f64(_grown(37, 80))
+    tracked = build_index(vs.clone().requires_grad_(True), leaves, rows, grow)
+    assert not tracked.keys.requires_grad and not tracked.leaves.requires_grad
+    plain = build_index(vs, leaves, rows, grow)
+    for name in ("levels", "keys", "offsets", "leaves"):
+        assert np.array_equal(
+            to_np(getattr(tracked, name)), to_np(getattr(plain, name))
+        )
 
 
 def test_a_kappa_one_sheet_s_single_source_point_hits_every_leaf():
@@ -436,13 +588,25 @@ def test_build_index_holds_at_most_entry_cap_entries_per_step(mesh, monkeypatch)
 
 
 def test_build_index_sorts_int64_local_keys_to_the_same_index(mesh, monkeypatch):
+    """With ``INT32_KEYS = 0`` every sort of a build is on int64 keys, and the index does not change."""
     rows = i64(finite_rows(mesh))
     args = (mesh.vertices_source, mesh.leaves, rows, leaf_grow(mesh)[rows])
+    sorted_dtypes = []
+    real_sort = mesh_backend.module.sort
+
+    def spy(keys, *a, **kw):
+        sorted_dtypes.append(keys.dtype)
+        return real_sort(keys, *a, **kw)
+
+    monkeypatch.setattr(mesh_backend.module, "sort", spy)
     whole = build_index(*args)
+    assert mesh_backend.int32 in sorted_dtypes, "the default build sorts int32 keys"
     monkeypatch.setattr(index_module, "INT32_KEYS", 0)
-    assert_same(build_index(*args), whole)
-    monkeypatch.setattr(index_module, "ENTRY_CAP", 7)
-    assert_same(build_index(*args), whole)
+    for cap in (index_module.ENTRY_CAP, 7):
+        monkeypatch.setattr(index_module, "ENTRY_CAP", cap)
+        sorted_dtypes.clear()
+        assert_same(build_index(*args), whole)
+        assert sorted_dtypes and set(sorted_dtypes) == {mesh_backend.int64}, cap
 
 
 def test_build_index_refuses_more_rows_than_a_packed_column_holds(monkeypatch):
