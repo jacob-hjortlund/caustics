@@ -105,6 +105,9 @@ def _cell_of(x, lo, side, top):
 
     ``side`` and ``top`` broadcast against ``x``. :func:`build_index` and
     :func:`index_cells` both locate points here, so they agree exactly.
+    :func:`_reached` locates the ends of its intervals with an inline copy
+    of the same arithmetic, clamped to a box's cells; the two must stay
+    identical, or a cell can be lost.
     """
     u = mesh_backend.long(mesh_backend.floor((x - lo) / side))
     return mesh_backend.minimum(mesh_backend.clamp(u, 0, None), top)

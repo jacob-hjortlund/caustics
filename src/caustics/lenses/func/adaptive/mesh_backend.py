@@ -89,16 +89,16 @@ class Compiled:
     the process, or when the first array among its arguments, searched
     through tuples and NamedTuples, is not on the CPU.
 
-    When building or calling the copy raises an ``Exception``, ``eager``
-    is rerun on the same arguments. If the rerun raises too, its error
-    propagates and compiling stays on, the fault not being the compiler's.
-    Otherwise ``Compiled.failed`` keeps a description of the exception,
-    not the exception itself: its traceback, and attributes torch sets on
-    it, hold frames and the inputs it traced, and through each frame every
-    caller's, with their locals. One warning is given, and every
-    ``Compiled`` runs eagerly from then on in this process. ``fn`` must
-    therefore write nothing in place: a failed compiled call is rerun
-    eagerly on the same arguments.
+    When building or calling the copy raises an ``Exception``, the call is
+    rerun through ``eager`` on the same arguments. If the rerun raises
+    too, its error propagates and compiling stays on, the fault not being
+    the compiler's. Otherwise ``Compiled.failed`` keeps a description of
+    the exception, not the exception itself: its traceback, and attributes
+    torch sets on it, hold frames and the inputs it traced, and through
+    each frame every caller's, with their locals. One warning is given,
+    and every ``Compiled`` runs eagerly from then on in this process.
+    ``fn`` must therefore write nothing in place: a failed compiled call is
+    rerun eagerly on the same arguments.
 
     Parameters
     ----------
