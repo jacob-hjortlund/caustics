@@ -6,7 +6,7 @@ import pytest
 from caustics.backend_obj import backend
 from caustics.lenses.func.adaptive.mesh_backend import mesh_backend, to_mesh
 from caustics.lenses.func.adaptive.criterion import LEAF_CONVERGED
-from caustics.lenses.func.adaptive.geometry import triangle_weights
+from caustics.lenses.func.adaptive.geometry import contains, triangle_weights
 from caustics.lenses.func.adaptive.index import (
     CELLS_PER_BOX,
     KEY_BITS,
@@ -252,8 +252,19 @@ def _grown(seed, n, share=0.2):
     return np.where(rng.uniform(size=n) < share, 10.0 ** rng.uniform(-9, 0, n), 0.0)
 
 
-def _edge_and_cell_line_points(idx, tri, grow):
-    """The triangles' vertices and the points where their edges cross their level's cell lines, each also moved one float every way."""
+# Where _edge_and_cell_line_points puts points beyond an edge's ends, with
+# beyond_ends: these multiples of the edge, from its first end.
+PAST_ENDS = np.array([-0.5, -0.2, -0.05, -0.01, 1.01, 1.05, 1.2, 1.5])
+
+
+def _edge_and_cell_line_points(idx, tri, grow, beyond_ends=False):
+    """
+    The triangles' vertices and the points where their edges cross their level's cell lines, each also moved one float every way.
+
+    With ``beyond_ends``, the lines through the edges go on beyond the
+    edges' ends: their crossings with the cell lines there are kept too,
+    and points at ``PAST_ENDS`` multiples of each edge are added.
+    """
     level, i0, i1 = index_cell_ranges(idx, tri, grow)
     lo, fine = to_np(idx.lo), float(to_np(idx.fine))
     points = [tri.reshape(-1, 2)]
@@ -266,10 +277,16 @@ def _edge_and_cell_line_points(idx, tri, grow):
                 if p[axis] == q[axis]:
                     continue
                 s = (lines - p[axis]) / (q[axis] - p[axis])
-                on = (s >= 0) & (s <= 1)
+                on = ((s >= 0) & (s <= 1)) | beyond_ends
                 cross = p + s[on, None] * (q - p)
                 cross[:, axis] = lines[on]
                 points.append(cross)
+        if not beyond_ends:
+            continue
+        for e in range(3):
+            p, q = tri[t, e], tri[t, (e + 1) % 3]
+            if (p != q).any():
+                points.append(p + PAST_ENDS[:, None] * (q - p))
     points = np.concatenate(points)
     moved = [points]
     for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (-1, -1)):
@@ -351,16 +368,140 @@ def _degenerate():
 def test_index_hits_on_degenerate_triangles_are_those_of_every_cell_of_their_boxes(
     grown, offset
 ):
-    """Brute force finds more here than any index can (:func:`box_hits`): an index of every box cell finds these."""
+    """
+    Brute force finds more here than any index can (:func:`box_hits`): an index of every box cell finds these.
+
+    The points go on beyond the segments' ends, along the lines through
+    them: a triangle of no area contains every point of its line, so
+    those in its box's cells are hits. Grown, the diagonal's box reaches
+    cells beyond its end that no point of the segment lies in.
+    """
     tri = _degenerate() + np.array([offset, -3 * offset])
-    grow = np.array([0.0, 0.05, 0.0, 0.1, 0.02, 0.0]) if grown else None
+    grow = np.array([0.0, 0.05, 0.1, 0.1, 0.02, 0.0]) if grown else None
     vs, leaves, rows = _as_mesh(tri)
     g = None if grow is None else f64(grow)
     idx = build_index(vs, leaves, rows, g)
-    beta = f64(_edge_and_cell_line_points(idx, tri, grow))
+    beta = f64(_edge_and_cell_line_points(idx, tri, grow, beyond_ends=True))
     want = box_hits(idx, vs, leaves, rows, beta, g)
     assert np.isin(np.arange(4), want[1]).all(), "every degenerate triangle has a hit"
+    on_segment = (want[1] < 3) & contains(want[2])
+    ends = tri[want[1][on_segment]]
+    point = to_np(beta)[want[0][on_segment]]
+    past = (point < ends.min(axis=1) - 1e-6) | (point > ends.max(axis=1) + 1e-6)
+    assert past.any(), "a point on a segment's line beyond its ends is a hit"
+    if grown:
+        level, _, i1 = index_cell_ranges(idx, tri, grow)
+        end = index_point_cells(idx, level[2:3], tri[2].max(axis=0, keepdims=True))
+        assert (end != i1[2]).any(), "the diagonal's end must miss its corner cell"
+        diagonal = want[0][want[1] == 2]
+        cell = index_point_cells(idx, level[[2] * diagonal.size], to_np(beta)[diagonal])
+        assert (cell == i1[2]).all(axis=1).any(), "a hit must lie in that corner cell"
     assert_hits_equal(index_hits(idx, vs, leaves, beta, g), want)
+
+
+def _steep():
+    """
+    Triangles with an edge ``5e-324`` wide in x, the smallest float, and a proper one beside them.
+
+    The narrow edges' slopes overflow. In the first column of each of the
+    first three, and in more where grown, ``inf * 0`` at the edge's left
+    end is not a number, and the column must keep its box's cells; the
+    fourth's slope is infinite only. The first three lie on the index's
+    lowest row of cells, where an interval end of NaN cast to 0, as arm64
+    casts it, would fall in the box.
+    """
+    tiny = 5e-324
+    return np.array(
+        [
+            [[0.0, 0.0], [tiny, 1.0], [1.0, 0.5]],
+            [[0.0, 1.0], [tiny, 0.0], [1.0, 0.5]],
+            [[0.0, 0.0], [tiny, 1.0], [2 * tiny, 0.0]],
+            [[-1.0, 0.2], [0.0, 0.5], [tiny, 1.0]],
+            [[0.2, 0.6], [0.9, 0.7], [0.5, 1.0]],
+        ]
+    )
+
+
+@pytest.mark.parametrize("grown", [False, True], ids=["plain", "grown"])
+def test_index_hits_on_triangles_whose_slopes_overflow_are_those_of_every_cell_of_their_boxes(
+    grown,
+):
+    tri = _steep()
+    edge = np.roll(tri, -1, axis=1) - tri
+    wide = edge[..., 0] != 0
+    with np.errstate(over="ignore"):
+        slope = np.abs(edge[..., 1]) / np.where(wide, np.abs(edge[..., 0]), 1.0)
+    assert np.isinf(slope[:4]).any(axis=1).all(), "fixture must overflow slopes"
+    grow = np.array([0.0, 0.01, 0.05, 0.0, 0.02]) if grown else None
+    vs, leaves, rows = _as_mesh(tri)
+    g = None if grow is None else f64(grow)
+    idx = build_index(vs, leaves, rows, g)
+    rng = np.random.default_rng(38)
+    lo, hi = to_np(idx.lo), to_np(idx.hi)
+    with np.errstate(over="ignore"):
+        lines = _edge_and_cell_line_points(idx, tri, grow)
+    spread = rng.uniform(lo, hi, (600, 2))
+    # In the boxes' first columns, and on the floats nearest x = 0.
+    y = rng.uniform(lo[1], hi[1], (2, 300))
+    near = np.stack([rng.uniform(0, 0.3, 300), y[0]], -1)
+    nearest = np.stack([rng.integers(-1, 4, 300) * 5e-324, y[1]], -1)
+    beta = f64(np.concatenate([lines, spread, near, nearest]))
+    want = box_hits(idx, vs, leaves, rows, beta, g)
+    assert np.isin(np.arange(4), want[1]).all(), "every steep triangle has a hit"
+    assert_hits_equal(index_hits(idx, vs, leaves, beta, g), want)
+
+
+def _far_from_the_origin(seed, n=8, offset=2.0**27):
+    """
+    ``n`` small grown triangles ``offset`` from the origin, where an ulp of ``offset`` is four level-0 cells, and points around each.
+
+    Two triangles 2 apart set the index's extent. Each other triangle's
+    vertices lie 0 to 12 ulps of ``offset`` from a corner of its own, and
+    it is grown by 0.3 to 2.5 such ulps; its points are the 21 x 21 of
+    the grid of such ulps from 4 below that corner to 16 above it, per
+    axis. Returns the triangles, their grows and the points.
+    """
+    rng = np.random.default_rng(seed)
+    ulp = np.spacing(offset)
+    apart = offset + np.array(
+        [
+            [[-1.0, -1.0], [-0.99, -1.0], [-1.0, -0.99]],
+            [[1.0, 1.0], [0.99, 1.0], [1.0, 0.99]],
+        ]
+    )
+    corner = offset + np.round(rng.uniform(-0.9, 0.9, (n, 1, 2)) / ulp) * ulp
+    tri = corner + rng.integers(0, 13, (n, 3, 2)) * ulp
+    grow = rng.choice([0.3, 0.7, 1.2, 2.5], n) * ulp
+    k = np.arange(-4, 17) * ulp
+    patch = np.stack(np.meshgrid(k, k, indexing="ij"), -1).reshape(-1, 2)
+    return (
+        np.concatenate([apart, tri]),
+        np.concatenate([[0.0, 0.0], grow]),
+        (corner + patch).reshape(-1, 2),
+    )
+
+
+def test_index_hits_far_from_the_origin_need_the_margin_of_ulps(monkeypatch):
+    """
+    Far from the origin against the index's extent, the hits are those of every cell of their boxes, and some are lost without ``PAD_ULPS``.
+
+    :func:`~caustics.lenses.func.adaptive.geometry.edge_nearest` rounds a
+    triangle's nearest point to the floats, an ulp of the coordinates
+    apart, so a point a little more than its grow from the triangle can be
+    a hit. Here an ulp is four level-0 cells, which ``PAD`` of a cell does
+    not cover.
+    """
+    tri, grow, beta = _far_from_the_origin(82)
+    vs, leaves, rows = _as_mesh(tri)
+    g, beta = f64(grow), f64(beta)
+    idx = build_index(vs, leaves, rows, g)
+    want = box_hits(idx, vs, leaves, rows, beta, g)
+    assert_hits_equal(index_hits(idx, vs, leaves, beta, g), want)
+    monkeypatch.setattr(index_module, "PAD_ULPS", 0)
+    qidx, hit, _ = index_hits(build_index(vs, leaves, rows, g), vs, leaves, beta, g)
+    kept = set(zip(to_np(qidx).tolist(), to_np(hit).tolist()))
+    lost = set(zip(want[0].tolist(), want[1].tolist())) - kept
+    assert lost, "the fixture must lose a hit without PAD_ULPS"
 
 
 def test_index_hits_find_sources_on_the_index_s_outer_edge():

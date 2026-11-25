@@ -484,6 +484,33 @@ def test_arrays_off_the_cpu_run_the_eager_function(fresh_compiling, monkeypatch)
     assert names == []
 
 
+def test_arrays_on_the_meta_device_run_the_eager_function(fresh_compiling, monkeypatch):
+    """
+    :func:`test_arrays_off_the_cpu_run_the_eager_function` without a GPU: ``meta`` is off the CPU too.
+
+    A ``meta`` tensor holds no values, so only the calls are checked.
+    """
+    names = fake_compile(monkeypatch, cannot_compile)
+    calls = []
+    double = Compiled(
+        lambda x: calls.append("fn") or 2 * x,
+        eager=lambda x: calls.append("eager") or 2 * x,
+    )
+    add = Compiled(
+        lambda pair: calls.append("fn") or pair[0] + pair[1],
+        eager=lambda pair: calls.append("eager") or pair[0] + pair[1],
+    )
+    x = torch.empty(3, device="meta")
+    with warnings.catch_warnings(record=True) as record:
+        warnings.simplefilter("always")
+        doubled, added = double(x), add((x, x))
+    assert doubled.device.type == added.device.type == "meta"
+    assert calls == ["eager", "eager"]
+    assert not compile_warnings(record)
+    assert double.copy is None and add.copy is None
+    assert names == []
+
+
 def test_compiled_runs_its_eager_function_wherever_it_runs_eagerly(
     fresh_compiling, monkeypatch
 ):
@@ -737,7 +764,7 @@ def test_the_compiled_index_is_the_eager_one(working_compile, monkeypatch):
     pad = index_module.PAD
     for moved in (pad * (1 - 1e-3), pad * (1 + 1e-3)):
         monkeypatch.setattr(index_module, "PAD", moved)
-        # No interval end lies within 1e-6 of a cell line.
+        # No interval end lies within 1e-6 of a cell from a cell line.
         assert_same(build_index(*args), eager)
     monkeypatch.setattr(index_module, "PAD", pad)
     copy = index_module._COMPILED_REACHED

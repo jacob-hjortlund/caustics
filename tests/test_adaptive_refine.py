@@ -12,11 +12,13 @@ from caustics.lenses.func.adaptive import (
 from caustics.lenses.func.adaptive.mesh_backend import mesh_backend
 from caustics.lenses.func.adaptive.geometry import COMPOSE, ROOT_CLASS, area2
 from caustics.lenses.func.adaptive.lattice import (
+    extend_lattice,
     initial_triangles,
     lattice_key,
     lattice_xy,
     make_lattice,
     midpoint_ij,
+    ring_triangles,
 )
 from caustics.lenses.func.adaptive import refine as refine_module
 from caustics.lenses.func.adaptive.refine import (
@@ -30,6 +32,7 @@ from caustics.lenses.func.adaptive.refine import (
     evaluate,
     red_split,
     refine,
+    resume,
     split_rows,
     unbalanced,
 )
@@ -504,6 +507,56 @@ def test_close_reads_stored_midpoints_as_it_reads_searched_ones(split):
     lat, cache, store = run(split)
     unknown = store._replace(mid=mesh_backend.zeros_like(store.mid) - 1)
     for got, want in zip(close(lat, cache, store), close(lat, cache, unknown)):
+        assert np.array_equal(to_np(got), to_np(want))
+
+
+def test_close_reads_stored_midpoints_as_it_reads_searched_ones_on_a_resumed_store():
+    """
+    A closed refinement resumed, then refined a little: its store mixes rows of known midpoints, rows below the finest level of unknown ones, and finest-level rows.
+
+    It is resumed on its lattice grown by a level-0 cell a side, as an
+    extension resumes; the ring's roots, and every other old row below the
+    finest level, are tested, and some of the ring's rows split.
+    """
+    lat, cache, store = run(around(0.31, -0.57))
+    used, _, _, origin, origin_leaves = close(lat, cache, store)
+    grown = extend_lattice(lat, 1)
+    cache, store = resume(
+        grown,
+        1,
+        cache.ij[used],
+        cache.values[used],
+        origin_leaves,
+        store.level[origin],
+        store.cls[origin],
+    )
+    old = mesh_backend.flatnonzero(store.level < MAX_LEVEL)[::2]
+    ij, cls = ring_triangles(INIT_RES + 2, 1, grown.level, ROOT_CLASS)
+    cache, store, roots = add_roots(cache, store, grown, ij, cls, positions, None)
+    cache, store, _ = refine(
+        cache,
+        store,
+        mesh_backend.concatenate((roots, old), dim=0),
+        grown,
+        positions,
+        judged(around(2.3, -0.57)),
+        MAX_LEVEL,
+        None,
+    )
+    valid, level = to_np(store.valid), to_np(store.level)
+    known = (to_np(store.mid) >= 0).all(axis=1)
+    searched = cache_lookup(cache, lattice_key(grown, midpoint_ij(cache.ij[store.v])))
+    hanging = to_np(
+        (searched >= 0) & cache.active[mesh_backend.where(searched >= 0, searched, 0)]
+    ).any(axis=1)
+    assert (valid & known & hanging).any(), "a row of known midpoints must hang"
+    assert (
+        valid & ~known & hanging & (level < MAX_LEVEL)
+    ).any(), "a row below the finest level of unknown midpoints must hang"
+    assert (valid & (level == MAX_LEVEL)).any(), "a finest-level row must be a leaf"
+    assert not valid[to_np(roots)].all(), "a ring row must split"
+    unknown = store._replace(mid=mesh_backend.zeros_like(store.mid) - 1)
+    for got, want in zip(close(grown, cache, store), close(grown, cache, unknown)):
         assert np.array_equal(to_np(got), to_np(want))
 
 
