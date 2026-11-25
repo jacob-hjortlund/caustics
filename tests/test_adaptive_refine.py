@@ -251,19 +251,23 @@ def test_activate_and_split_rows_never_write_into_their_inputs():
     cache, store, rows = add_roots(
         empty_cache(2), empty_store(), lat, ij, cls, positions, None
     )
-    cache, mid = evaluate(
-        cache, lat, lattice_key(lat, midpoint_ij(ij)).reshape(-1), positions, None
-    )
+    roots = cache
+    mid_keys = lattice_key(lat, midpoint_ij(ij)).reshape(-1)
+    cache, mid = evaluate(cache, lat, mid_keys, positions, None)
     mid = mid.reshape(-1, 3)
     fields = ("keys", "slots", "ij", "values", "active")
     before = {f: to_np(getattr(cache, f)).copy() for f in fields}
+    roots_before = {f: to_np(getattr(roots, f)).copy() for f in fields}
     valid = to_np(store.valid).copy()
     activate(cache, i64([cache.ij.shape[0] - 1]))
-    evaluate(cache, lat, i64([1, 3]), positions, None)
+    # the midpoints are not cached in ``roots``: this merges new keys
+    merged, _ = evaluate(roots, lat, mid_keys[:2], positions, None)
+    assert merged.keys.shape[0] == roots.keys.shape[0] + 2
     split_rows(cache, store, lat, rows[:1])
     split_rows(cache, store, lat, rows[:1], mid[:1])
     for f in fields:
         assert np.array_equal(to_np(getattr(cache, f)), before[f])
+        assert np.array_equal(to_np(getattr(roots, f)), roots_before[f])
     assert np.array_equal(to_np(store.valid), valid)
 
 
@@ -467,3 +471,48 @@ def test_refine_runs_no_balance_without_a_split_since_the_last_one(monkeypatch):
     assert [idle_balances(l) for l in logs] == [0]
     assert all(last_balance_created(l) > 0 for l in logs)
     assert all(l[-1] == ("unbalanced", 0) for l in logs)
+
+
+def test_refine_keeps_the_midpoint_slots_of_every_row_it_tested():
+    lat, cache, store = run(seam_and_right_level_one)
+    mid = to_np(store.mid)
+    assert mid.shape == (store.v.shape[0], 3) and mid.dtype == np.int64
+    known = (mid >= 0).all(axis=1)
+    assert ((mid >= 0).any(axis=1) == known).all()
+    searched = to_np(cache_lookup(cache, lattice_key(lat, midpoint_ij(cache.ij[store.v]))))
+    assert np.array_equal(mid[known], searched[known])
+    assert known[to_np(store.valid) & (to_np(store.level) < MAX_LEVEL)].all()
+    _, _, uniform = run(always, max_level=2)
+    assert (to_np(uniform.mid)[to_np(uniform.level) == 2] == -1).all()
+
+
+@pytest.mark.parametrize("split", [around(0.31, -0.57), seam_and_right_level_one])
+def test_close_reads_stored_midpoints_as_it_reads_searched_ones(split):
+    lat, cache, store = run(split)
+    unknown = store._replace(mid=mesh_backend.zeros_like(store.mid) - 1)
+    for got, want in zip(close(lat, cache, store), close(lat, cache, unknown)):
+        assert np.array_equal(to_np(got), to_np(want))
+
+
+def test_close_searches_no_midpoint_of_a_finest_level_row(monkeypatch):
+    lat, cache, store = run(always, max_level=3)
+    searched, real = [], refine_module.cache_lookup
+
+    def counting(cache_, keys):
+        searched.append(int(keys.numel()))
+        return real(cache_, keys)
+
+    monkeypatch.setattr(refine_module, "cache_lookup", counting)
+    close(lat, cache, store)
+    assert sum(searched) == 0
+
+
+def test_refine_never_writes_into_the_store_it_is_handed():
+    lat = make_lattice(FOV, 0.0, 0.0, INIT_RES, MAX_LEVEL + 1)
+    ij, cls = initial_triangles(INIT_RES, lat.level, ROOT_CLASS)
+    cache, store, rows = add_roots(
+        empty_cache(2), empty_store(), lat, ij, cls, positions, None
+    )
+    before = [to_np(a).copy() for a in store]
+    refine(cache, store, rows, lat, positions, judged(around(0.31, -0.57)), MAX_LEVEL, None)
+    assert all(np.array_equal(to_np(a), b) for a, b in zip(store, before))

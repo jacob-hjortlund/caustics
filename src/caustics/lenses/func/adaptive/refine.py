@@ -9,6 +9,10 @@ children, balances the leaves to 2:1 and tests the leaves the balance
 created, until every leaf below ``max_level`` passes, and returns what
 ``split`` kept of the leaves it passed. :func:`close` makes the result
 conforming.
+
+Every row :func:`refine` tests also has the slots of its three edge
+midpoints recorded in the store, so that :func:`close` reads them instead of
+searching the cache.
 """
 
 import math
@@ -60,12 +64,17 @@ class LeafStore(NamedTuple):
         :func:`~caustics.lenses.func.adaptive.geometry.child_matrix_tables`.
     valid: ArrayLike
         ``(R,)`` bool.
+    mid: ArrayLike
+        ``(R, 3)`` int64 slot of the midpoint of the edge opposite each
+        vertex, for a row whose midpoints were sampled when it was tested;
+        ``-1`` in all three for any other row.
     """
 
     v: ArrayLike
     level: ArrayLike
     cls: ArrayLike
     valid: ArrayLike
+    mid: ArrayLike
 
 
 def empty_cache(n_values):
@@ -88,6 +97,7 @@ def empty_store():
         level=mesh_backend.zeros((0,), dtype=int64),
         cls=mesh_backend.zeros((0,), dtype=int64),
         valid=mesh_backend.zeros((0,), dtype=mesh_backend.bool),
+        mid=mesh_backend.zeros((0, 3), dtype=int64),
     )
 
 
@@ -170,7 +180,7 @@ def evaluate(cache, lat, keys, sample, batch_size):
             (cache.active, mesh_backend.zeros((k,), dtype=mesh_backend.bool)), dim=0
         ),
     )
-    slot_of = mesh_backend.fill_at_indices(mesh_backend.copy(known), fresh, new_slots)
+    slot_of = mesh_backend.fill_at_indices(known, fresh, new_slots)
     return cache, slot_of[inverse]
 
 
@@ -183,9 +193,21 @@ def activate(cache, slots):
     )
 
 
-def add_leaves(store, v, level, cls):
-    """``store`` with rows ``v`` appended, and the new rows' indices."""
+def add_leaves(store, v, level, cls, tested=None):
+    """
+    ``store`` with rows ``v`` appended, and the new rows' indices.
+
+    The new rows have no known midpoints. ``tested`` is ``(rows, mid)``, rows
+    of ``store`` and their ``(len(rows), 3)`` int64 midpoint slots, recorded
+    in the returned store; ``store`` itself is untouched.
+    """
+    int64 = mesh_backend.int64
     start, k = store.v.shape[0], v.shape[0]
+    mid = mesh_backend.concatenate(
+        (store.mid, mesh_backend.zeros((k, 3), dtype=int64) - 1), dim=0
+    )
+    if tested is not None:
+        mid = mesh_backend.fill_at_indices(mid, *tested)
     store = LeafStore(
         v=mesh_backend.concatenate((store.v, v), dim=0),
         level=mesh_backend.concatenate((store.level, level), dim=0),
@@ -193,8 +215,9 @@ def add_leaves(store, v, level, cls):
         valid=mesh_backend.concatenate(
             (store.valid, mesh_backend.ones((k,), dtype=mesh_backend.bool)), dim=0
         ),
+        mid=mid,
     )
-    return store, mesh_backend.arange(start, start + k, dtype=mesh_backend.int64)
+    return store, mesh_backend.arange(start, start + k, dtype=int64)
 
 
 def add_roots(cache, store, lat, ij, cls, sample, batch_size):
@@ -251,6 +274,7 @@ def resume(lat, k, vertices_ij, values, origin_leaves, origin_level, origin_cls)
         level=origin_level,
         cls=origin_cls,
         valid=mesh_backend.ones((n_origins,), dtype=mesh_backend.bool),
+        mid=mesh_backend.zeros((n_origins, 3), dtype=int64) - 1,
     )
     return cache, store
 
@@ -277,12 +301,13 @@ def red_split(v, m, cls):
     return six[:, _CHILD_VERTEX_INDEX_TABLE].reshape(-1, 3), COMPOSE[cls].reshape(-1)
 
 
-def split_rows(cache, store, lat, rows, mid=None):
+def split_rows(cache, store, lat, rows, mid=None, tested=None):
     """
     Replace ``rows`` by their red-split children, whose midpoints must be cached.
 
     ``mid`` is the ``(len(rows), 3)`` int64 slots of the midpoints, ``m_i``
-    opposite vertex ``i``; ``None`` looks them up.
+    opposite vertex ``i``; ``None`` looks them up. ``tested`` is passed to
+    :func:`add_leaves`.
 
     Returns the cache with the children's vertices active, the store, and
     the children's rows.
@@ -295,7 +320,7 @@ def split_rows(cache, store, lat, rows, mid=None):
     store = store._replace(
         valid=mesh_backend.fill_at_indices(mesh_backend.copy(store.valid), rows, False)
     )
-    store, kids = add_leaves(store, kid_v, kid_level, kid_cls)
+    store, kids = add_leaves(store, kid_v, kid_level, kid_cls, tested)
     return activate(cache, kid_v.reshape(-1)), store, kids
 
 
@@ -305,7 +330,8 @@ def _split_failures(cache, store, lat, rows, sample, split, batch_size):
 
     Returns the cache, the store and the children's rows, as
     :func:`split_rows` does, and ``[passed, *kept]``: the rows ``split``
-    passed and, row for row, what it kept of them.
+    passed and, row for row, what it kept of them. The midpoint slots of
+    every row of ``rows`` are recorded in the returned store's ``mid``.
     """
     v = store.v[rows]
     ij = cache.ij[v]
@@ -315,13 +341,10 @@ def _split_failures(cache, store, lat, rows, sample, split, batch_size):
     six = mesh_backend.concatenate((v, slots), dim=1)
     fail, kept = split(ij, cache.values[six], store.cls[rows], store.level[rows])
     ok = mesh_backend.flatnonzero(~fail)
+    bad = mesh_backend.flatnonzero(fail)
     passed = [rows[ok], *(k[ok] for k in kept)]
     cache, store, kids = split_rows(
-        cache,
-        store,
-        lat,
-        rows[mesh_backend.flatnonzero(fail)],
-        slots[mesh_backend.flatnonzero(fail)],
+        cache, store, lat, rows[bad], slots[bad], tested=(rows, slots)
     )
     return cache, store, kids, passed
 
@@ -520,6 +543,10 @@ def close(lat, cache, store):
     split for three. Every triangle emitted is positively oriented, and its
     vertices are among its origin's six samples.
 
+    A row's midpoints are read from ``store.mid``; a row without them is
+    searched for in the cache, except at the finest level, whose midpoints
+    have an odd lattice coordinate and are never vertices.
+
     Returns
     -------
     used: ArrayLike
@@ -538,7 +565,14 @@ def close(lat, cache, store):
     origin = mesh_backend.flatnonzero(store.valid)
     origin = origin[canonical_order(lat, cache, store.v[origin])]
     v = store.v[origin]
-    m = cache_lookup(cache, lattice_key(lat, midpoint_ij(cache.ij[v])))
+    m = store.mid[origin]
+    rows = mesh_backend.flatnonzero((m[:, 0] < 0) & (store.level[origin] < lat.level - 1))
+    if rows.shape[0]:
+        m = mesh_backend.fill_at_indices(
+            m,
+            rows,
+            cache_lookup(cache, lattice_key(lat, midpoint_ij(cache.ij[v[rows]]))),
+        )
     hanging = (m >= 0) & cache.active[mesh_backend.where(m >= 0, m, 0)]
     count = mesh_backend.sum(mesh_backend.long(hanging), dim=1)
     n_children = count + 1
