@@ -129,6 +129,33 @@ def record_refines(monkeypatch, *modules):
     return logs
 
 
+def quarter_point_rows(cache, store, lat, max_level):
+    """
+    The valid rows at ``level <= max_level - 2`` with a leaf vertex at a quarter point of an edge.
+
+    The definition :func:`~caustics.lenses.func.adaptive.refine.unbalanced`
+    is tested against: the six quarter points of every such row are
+    searched in the cache, whatever its midpoints.
+    """
+    from caustics.lenses.func.adaptive.lattice import lattice_key
+    from caustics.lenses.func.adaptive.refine import cache_lookup
+
+    rows = mesh_backend.flatnonzero(store.valid & (store.level <= max_level - 2))
+    if rows.shape[0] == 0:
+        return rows
+    ij = cache.ij[store.v[rows]]
+    hit = mesh_backend.zeros((rows.shape[0],), dtype=mesh_backend.bool)
+    for e in range(3):
+        a, b = ij[:, e], ij[:, (e + 1) % 3]
+        delta = (b - a) // 4
+        for quarter in (a + delta, b - delta):
+            slot = cache_lookup(cache, lattice_key(lat, quarter))
+            hit = hit | (
+                (slot >= 0) & cache.active[mesh_backend.where(slot >= 0, slot, 0)]
+            )
+    return rows[hit]
+
+
 def idle_balances(log):
     """The balances after the first one in ``log`` with no split of any child since the previous balance."""
     idle, seen, split = 0, False, False

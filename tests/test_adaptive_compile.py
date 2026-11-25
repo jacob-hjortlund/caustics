@@ -1,6 +1,7 @@
-"""``compile_bookkeeping``: ``lens_status`` and ``unbalanced`` under ``torch.compile``, and the fallback to eager."""
+"""``compile_bookkeeping``: ``lens_status`` under ``torch.compile``, and the fallback to eager."""
 
 import gc
+import inspect
 import json
 import subprocess
 import sys
@@ -17,7 +18,6 @@ from caustics.lenses import SIE
 from caustics.lenses.func.adaptive import criterion as criterion_module
 from caustics.lenses.func.adaptive import lens_mesh as lens_mesh_module
 from caustics.lenses.func.adaptive import refine as refine_module
-from caustics.lenses.func.adaptive import region as region_module
 from caustics.lenses.func.adaptive.criterion import LEAF_RAYTRACE_NONFINITE, lens_status
 from caustics.lenses.func.adaptive.lens_mesh import (
     build_closed_lens_mesh,
@@ -55,10 +55,7 @@ ROUNDING = (
 def fresh_compiling(monkeypatch):
     """Compiling as at the start of a process: nothing failed, no copy built, no compiled run."""
     monkeypatch.setattr(Compiled, "failed", None)
-    for c in (
-        criterion_module._COMPILED_LENS_STATUS,
-        refine_module._COMPILED_UNBALANCED,
-    ):
+    for c in (criterion_module._COMPILED_LENS_STATUS,):
         monkeypatch.setattr(c, "copy", None)
         monkeypatch.setattr(c, "runs", 0)
 
@@ -520,24 +517,20 @@ def test_a_build_whose_compiling_fails_warns_once_and_equals_the_eager_build(
         "Lens.forward_raytrace",
     ],
 )
-def test_every_build_hands_compile_bookkeeping_to_lens_status_and_unbalanced(
+def test_every_build_hands_compile_bookkeeping_to_lens_status(
     entry, fresh_compiling, monkeypatch
 ):
     """
-    Every ``lens_status`` call of two rows or more, and every ``unbalanced`` call, goes through the compiled copy.
+    Every ``lens_status`` call of two rows or more goes through the compiled copy.
 
-    Each copy runs ``fn`` itself, so a call that reaches ``_lens_status`` or
-    ``_unbalanced`` directly was not handed the flag. The source mesh's
-    ``refine`` keeps the default, so its calls do not count. The extension
-    splits old rows, so it reaches ``_finish``'s refit of them, with two
-    rows or more.
+    The copy runs ``fn`` itself, so a call that reaches ``_lens_status``
+    directly was not handed the flag. The extension splits old rows, so it
+    reaches ``_finish``'s refit of them, with two rows or more.
     """
     names = fake_compile(monkeypatch, lambda fn: fn)
-    status_rows, unbalanced_calls, in_source_mesh = [], [], []
-    refit_rows = []
-    status_fn, unbalanced_fn = criterion_module._lens_status, refine_module._unbalanced
+    status_rows, refit_rows = [], []
+    status_fn = criterion_module._lens_status
     status_in_lens_mesh = lens_mesh_module.lens_status
-    source_refine = region_module.refine
 
     def status_from_lens_mesh(beta6, *args, **kw):
         # Called by ``_finish`` itself, it refits the old rows split.
@@ -549,31 +542,24 @@ def test_every_build_hands_compile_bookkeeping_to_lens_status_and_unbalanced(
         status_rows.append(beta6.shape[0])
         return status_fn(beta6, *args)
 
-    def direct_unbalanced(*args):
-        if not in_source_mesh:
-            unbalanced_calls.append(None)
-        return unbalanced_fn(*args)
-
-    def marked_source_refine(*args, **kw):
-        in_source_mesh.append(None)
-        try:
-            return source_refine(*args, **kw)
-        finally:
-            in_source_mesh.pop()
-
     monkeypatch.setattr(criterion_module, "_lens_status", direct_status)
-    monkeypatch.setattr(refine_module, "_unbalanced", direct_unbalanced)
-    monkeypatch.setattr(region_module, "refine", marked_source_refine)
     monkeypatch.setattr(lens_mesh_module, "lens_status", status_from_lens_mesh)
     with warnings.catch_warnings(record=True) as record:
         warnings.simplefilter("always")
         entry(compile_bookkeeping=True)
-    assert {"_lens_status", "_unbalanced"} <= set(names)
+    assert "_lens_status" in names
     assert [n for n in status_rows if n >= 2] == []
-    assert unbalanced_calls == []
     assert not compile_warnings(record)
     if entry is fold_extension:
         assert [n for n in refit_rows if n >= 2] != []
+
+
+def test_nothing_in_refine_is_compiled(fresh_compiling, monkeypatch):
+    names = fake_compile(monkeypatch, lambda fn: fn)
+    fold_extension(compile_bookkeeping=True)
+    assert set(names) == {"_lens_status"}
+    for fn in (refine_module.refine, refine_module.balance, refine_module.unbalanced):
+        assert "compile_bookkeeping" not in inspect.signature(fn).parameters
 
 
 @pytest.mark.parametrize(
@@ -591,14 +577,13 @@ def test_a_compiled_build_agrees_with_the_eager_build_to_rounding(
     eager = build_and_extend(*maps)
     assert clear_of_thresholds(eager), "the config must keep clear of the thresholds"
     status_copy = criterion_module._COMPILED_LENS_STATUS
-    unbalanced_copy = refine_module._COMPILED_UNBALANCED
-    runs = status_copy.runs, unbalanced_copy.runs
+    runs = status_copy.runs
     with warnings.catch_warnings(record=True) as record:
         warnings.simplefilter("always")
         compiled = build_and_extend(*maps, compile_bookkeeping=True)
     assert_same(compiled, eager, rounding=ROUNDING)
     assert not compile_warnings(record)
-    assert status_copy.runs > runs[0] and unbalanced_copy.runs > runs[1]
+    assert status_copy.runs > runs
 
 
 def test_a_compiled_build_extended_eagerly_agrees_with_eager_to_rounding(
@@ -608,8 +593,7 @@ def test_a_compiled_build_extended_eagerly_agrees_with_eager_to_rounding(
     eager = build_and_extend(localised_fold, localised_fold_jacobian)
     assert clear_of_thresholds(eager), "the config must keep clear of the thresholds"
     status_copy = criterion_module._COMPILED_LENS_STATUS
-    unbalanced_copy = refine_module._COMPILED_UNBALANCED
-    runs = status_copy.runs, unbalanced_copy.runs
+    runs = status_copy.runs
     with warnings.catch_warnings(record=True) as record:
         warnings.simplefilter("always")
         mesh, lens_ = build(
@@ -623,7 +607,7 @@ def test_a_compiled_build_extended_eagerly_agrees_with_eager_to_rounding(
         mixed = extend_lens_mesh(mesh, lens_.raytrace, 6.0, compile_bookkeeping=False)
     assert_same(mixed, eager, rounding=ROUNDING)
     assert not compile_warnings(record)
-    assert status_copy.runs > runs[0] and unbalanced_copy.runs > runs[1]
+    assert status_copy.runs > runs
 
 
 def test_compiled_lens_status_keeps_the_images_gradient(working_compile, monkeypatch):

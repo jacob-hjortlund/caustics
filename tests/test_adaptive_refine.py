@@ -5,6 +5,10 @@ import sys
 import numpy as np
 import pytest
 
+from caustics.lenses.func.adaptive import (
+    build_closed_magnification_region,
+    extend_lens_mesh,
+)
 from caustics.lenses.func.adaptive.mesh_backend import mesh_backend
 from caustics.lenses.func.adaptive.geometry import COMPOSE, ROOT_CLASS, area2
 from caustics.lenses.func.adaptive.lattice import (
@@ -27,14 +31,21 @@ from caustics.lenses.func.adaptive.refine import (
     red_split,
     refine,
     split_rows,
+    unbalanced,
 )
 
 from adaptive_maps import (
     assert_same,
+    build,
     i64,
     idle_balances,
     last_balance_created,
+    localised_fold,
+    localised_fold_jacobian,
+    numpy_lens,
+    quarter_point_rows,
     record_refines,
+    sis,
     to_np,
 )
 
@@ -479,7 +490,9 @@ def test_refine_keeps_the_midpoint_slots_of_every_row_it_tested():
     assert mid.shape == (store.v.shape[0], 3) and mid.dtype == np.int64
     known = (mid >= 0).all(axis=1)
     assert ((mid >= 0).any(axis=1) == known).all()
-    searched = to_np(cache_lookup(cache, lattice_key(lat, midpoint_ij(cache.ij[store.v]))))
+    searched = to_np(
+        cache_lookup(cache, lattice_key(lat, midpoint_ij(cache.ij[store.v])))
+    )
     assert np.array_equal(mid[known], searched[known])
     assert known[to_np(store.valid) & (to_np(store.level) < MAX_LEVEL)].all()
     _, _, uniform = run(always, max_level=2)
@@ -514,5 +527,104 @@ def test_refine_never_writes_into_the_store_it_is_handed():
         empty_cache(2), empty_store(), lat, ij, cls, positions, None
     )
     before = [to_np(a).copy() for a in store]
-    refine(cache, store, rows, lat, positions, judged(around(0.31, -0.57)), MAX_LEVEL, None)
+    refine(
+        cache, store, rows, lat, positions, judged(around(0.31, -0.57)), MAX_LEVEL, None
+    )
     assert all(np.array_equal(to_np(a), b) for a, b in zip(store, before))
+
+
+def unbalanced_state(rounds=3):
+    """A refinement stopped after ``rounds`` rounds of splitting round a point, never balanced."""
+    lat = make_lattice(FOV, 0.0, 0.0, INIT_RES, MAX_LEVEL + 1)
+    ij, cls = initial_triangles(INIT_RES, lat.level, ROOT_CLASS)
+    cache, store, rows = add_roots(
+        empty_cache(2), empty_store(), lat, ij, cls, positions, None
+    )
+    for _ in range(rounds):
+        cache, store, rows, _ = refine_module._split_failures(
+            cache, store, lat, rows, positions, judged(around(0.31, -0.57)), None
+        )
+    return lat, cache, store
+
+
+@pytest.mark.parametrize("known", ["as refined", "none", "every other row"])
+def test_unbalanced_finds_the_rows_with_a_leaf_vertex_at_a_quarter_point(known):
+    lat, cache, store = unbalanced_state()
+    mid = mesh_backend.copy(store.mid)
+    if known == "none":
+        mid = mesh_backend.zeros_like(mid) - 1
+    elif known == "every other row":
+        mid[::2] = -1
+    store = store._replace(mid=mid)
+    want = to_np(quarter_point_rows(cache, store, lat, MAX_LEVEL))
+    assert want.size > 0, "the state must be unbalanced"
+    assert np.array_equal(to_np(unbalanced(cache, store, lat, MAX_LEVEL)), want)
+
+
+def test_a_quarter_point_is_a_leaf_vertex_only_where_its_edge_s_midpoint_is_one():
+    lat, cache, store = unbalanced_state()
+    rows = mesh_backend.flatnonzero(store.valid & (store.level <= MAX_LEVEL - 2))
+    ij = cache.ij[store.v[rows]]
+
+    def leaf_vertex(points):
+        slot = cache_lookup(cache, lattice_key(lat, points))
+        return to_np((slot >= 0) & cache.active[mesh_backend.where(slot >= 0, slot, 0)])
+
+    seen = 0
+    for e in range(3):
+        a, b = ij[:, e], ij[:, (e + 1) % 3]
+        quarter = leaf_vertex(a + (b - a) // 4) | leaf_vertex(b - (b - a) // 4)
+        assert leaf_vertex((a + b) // 2)[quarter].all()
+        seen += int(quarter.sum())
+    assert seen > 0
+
+
+def test_unbalanced_equals_its_definition_in_every_call_of_real_builds(monkeypatch):
+    real, found = refine_module.unbalanced, []
+
+    def checked(cache, store, lat, max_level):
+        got = real(cache, store, lat, max_level)
+        want = quarter_point_rows(cache, store, lat, max_level)
+        assert np.array_equal(to_np(got), to_np(want))
+        found.append(int(got.shape[0]))
+        return got
+
+    monkeypatch.setattr(refine_module, "unbalanced", checked)
+    mesh, lens_ = build(localised_fold, localised_fold_jacobian, 4.0, 4, 0.05)
+    extend_lens_mesh(mesh, lens_.raytrace, 6.0)
+    build_closed_magnification_region(
+        numpy_lens(*sis()).raytrace, 6.0, 16, 0.02, 3.0, centers=[(0.0, 0.0)]
+    )
+    assert len(found) > 4 and any(n > 0 for n in found)
+
+
+def test_unbalanced_with_nothing_to_find_returns_no_row():
+    lat, cache, store = run(always, max_level=1)
+    assert unbalanced(cache, store, lat, 1).shape[0] == 0
+    lat, cache, store = run(never)
+    unknown = store._replace(mid=mesh_backend.zeros_like(store.mid) - 1)
+    assert unbalanced(cache, unknown, lat, MAX_LEVEL).shape[0] == 0
+    ij, cls = initial_triangles(INIT_RES, lat.level, ROOT_CLASS)
+    bare, roots, _ = add_roots(
+        empty_cache(2), empty_store(), lat, ij, cls, positions, None
+    )
+    assert unbalanced(bare, roots, lat, MAX_LEVEL).shape[0] == 0  # no midpoint cached
+
+
+def test_unbalanced_searches_at_most_two_quarter_points_per_hanging_edge(
+    monkeypatch,
+):
+    lat, cache, store = unbalanced_state()
+    rows = mesh_backend.flatnonzero(store.valid & (store.level <= MAX_LEVEL - 2))
+    mid = store.mid[rows]
+    assert bool(mesh_backend.all(mid >= 0)), "every coarse leaf here was tested"
+    hanging = int(to_np(cache.active[mid]).sum())
+    searched, real = [], refine_module.cache_lookup
+
+    def counting(cache_, keys):
+        searched.append(int(keys.numel()))
+        return real(cache_, keys)
+
+    monkeypatch.setattr(refine_module, "cache_lookup", counting)
+    unbalanced(cache, store, lat, MAX_LEVEL)
+    assert hanging > 0 and 0 < sum(searched) <= 2 * hanging

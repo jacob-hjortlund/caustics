@@ -11,15 +11,16 @@ created, until every leaf below ``max_level`` passes, and returns what
 conforming.
 
 Every row :func:`refine` tests also has the slots of its three edge
-midpoints recorded in the store, so that :func:`close` reads them instead of
-searching the cache.
+midpoints recorded in the store, so that :func:`unbalanced` and
+:func:`close` read them instead of searching the cache. Nothing here is
+compiled.
 """
 
 import math
 from typing import NamedTuple
 
 from ....backend_obj import ArrayLike
-from .mesh_backend import Compiled, mesh_backend
+from .mesh_backend import mesh_backend
 from .geometry import COMPOSE, _CHILD_VERTEX_INDEX_TABLE, expand, min_angle, sorted_find
 from .lattice import lattice_ij_from_key, lattice_key, lattice_xy, midpoint_ij
 
@@ -307,7 +308,9 @@ def split_rows(cache, store, lat, rows, mid=None, tested=None):
 
     ``mid`` is the ``(len(rows), 3)`` int64 slots of the midpoints, ``m_i``
     opposite vertex ``i``; ``None`` looks them up. ``tested`` is passed to
-    :func:`add_leaves`.
+    :func:`add_leaves`: ``(rows, mid)`` of rows of ``store``, whose midpoint
+    slots it records in the returned store's ``mid``; :func:`_split_failures`
+    hands it every row it tested, the passed ones included.
 
     Returns the cache with the children's vertices active, the store, and
     the children's rows.
@@ -371,51 +374,73 @@ def _still_leaves(store, passed):
     return tuple(joined)
 
 
-def unbalanced(cache, store, lat, max_level, *, compile_bookkeeping=False):
+def unbalanced(cache, store, lat, max_level):
     """
-    Valid rows with a leaf vertex at a quarter point of an edge.
+    Valid rows with a leaf vertex at a quarter point of an edge, ascending.
 
     Such a vertex belongs to a neighbour two or more levels finer. Only a row
     at ``level <= max_level - 2`` can have one, and its quarter points are
-    lattice points. With ``compile_bookkeeping``, a copy compiled by
-    ``torch.compile`` runs (:class:`~.mesh_backend.Compiled`).
+    lattice points. A row's edge midpoints are read from ``store.mid``, or
+    searched for in the cache where the row has none recorded; an edge
+    hangs where its midpoint is cached and a leaf vertex. Only the two
+    quarter points of each hanging edge are searched.
+
+    No row is missed: a quarter point of an edge can be a leaf vertex only
+    where the edge's midpoint is one. For a leaf at level ``d``, the quarter
+    point lies on the level-``d + 2`` grid but not on the level-``d + 1``
+    one, so a triangle with it as a vertex has level ``d + 2`` or more. A
+    leaf has no descendant, so that triangle lies across the edge and
+    descends from the level-``d`` triangle there, which was therefore
+    split. A split marks the midpoints of its row as leaf vertices
+    (:func:`activate`), and no mark is ever cleared; a split made before a
+    mesh was frozen is covered by :func:`resume`, which marks every vertex
+    of the frozen mesh, that midpoint among them. An edge on the fov
+    boundary has no triangle across it, so neither of its quarter points is
+    a leaf vertex. None of this reads a sample or a verdict of ``split``,
+    so it holds for every refinement: the lens mesh, the source mesh of a
+    magnification region, and their extensions.
     """
-    if compile_bookkeeping:
-        return _COMPILED_UNBALANCED(cache, store, lat, max_level)
-    return _unbalanced(cache, store, lat, max_level)
-
-
-def _unbalanced(cache, store, lat, max_level):
-    """:func:`unbalanced`, eagerly."""
     rows = mesh_backend.flatnonzero(store.valid & (store.level <= max_level - 2))
     if rows.shape[0] == 0:
         return rows
-    ij = cache.ij[store.v[rows]]
-    hit = mesh_backend.zeros((rows.shape[0],), dtype=mesh_backend.bool)
-    for e in range(3):
-        a, b = ij[:, e], ij[:, (e + 1) % 3]
-        delta = (b - a) // 4
-        for quarter in (a + delta, b - delta):
-            slot = cache_lookup(cache, lattice_key(lat, quarter))
-            hit = hit | (
-                (slot >= 0) & cache.active[mesh_backend.where(slot >= 0, slot, 0)]
-            )
+    v = store.v[rows]
+    mid = store.mid[rows]
+    unknown = mesh_backend.flatnonzero(mid[:, 0] < 0)
+    if unknown.shape[0]:
+        mid = mesh_backend.fill_at_indices(
+            mid,
+            unknown,
+            cache_lookup(cache, lattice_key(lat, midpoint_ij(cache.ij[v[unknown]]))),
+        )
+    hanging = mesh_backend.flatnonzero(
+        (mid >= 0) & cache.active[mesh_backend.where(mid >= 0, mid, 0)]
+    )
+    if hanging.shape[0] == 0:
+        return rows[:0]
+    # The edge opposite vertex i runs from vertex i + 1 to vertex i + 2.
+    row, i = hanging // 3, hanging % 3
+    a = cache.ij[v[row, (i + 1) % 3]]
+    b = cache.ij[v[row, (i + 2) % 3]]
+    delta = (b - a) // 4
+    quarter = mesh_backend.concatenate((a + delta, b - delta), dim=0)
+    slot = cache_lookup(cache, lattice_key(lat, quarter))
+    leaf = (slot >= 0) & cache.active[mesh_backend.where(slot >= 0, slot, 0)]
+    hit = mesh_backend.fill_at_indices(
+        mesh_backend.zeros((rows.shape[0],), dtype=mesh_backend.bool),
+        mesh_backend.concatenate((row, row), dim=0)[leaf],
+        True,
+    )
     return rows[hit]
 
 
-_COMPILED_UNBALANCED = Compiled(_unbalanced)
-
-
-def balance(
-    cache, store, lat, max_level, sample, batch_size, *, compile_bookkeeping=False
-):
+def balance(cache, store, lat, max_level, sample, batch_size):
     """
     Force-split until no leaf has a neighbour two or more levels finer.
 
     A split row has a leaf vertex at a quarter point, and leaf vertices are
     never removed, so every 2:1-balanced refinement of the leaves splits it
     too: the fixed point is the coarsest balanced refinement, whatever order
-    rows are met in. ``compile_bookkeeping`` is passed to :func:`unbalanced`.
+    rows are met in.
 
     Returns
     -------
@@ -426,9 +451,7 @@ def balance(
     """
     created = [mesh_backend.zeros((0,), dtype=mesh_backend.int64)]
     while True:
-        rows = unbalanced(
-            cache, store, lat, max_level, compile_bookkeeping=compile_bookkeeping
-        )
+        rows = unbalanced(cache, store, lat, max_level)
         if rows.shape[0] == 0:
             return cache, store, mesh_backend.concatenate(created, dim=0)
         mid = lattice_key(lat, midpoint_ij(cache.ij[store.v[rows]]))
@@ -439,18 +462,7 @@ def balance(
         created.append(kids)
 
 
-def refine(
-    cache,
-    store,
-    untested,
-    lat,
-    sample,
-    split,
-    max_level,
-    batch_size,
-    *,
-    compile_bookkeeping=False,
-):
+def refine(cache, store, untested, lat, sample, split, max_level, batch_size):
     """
     Split until every leaf below ``max_level`` passes ``split`` and the leaves are 2:1 balanced.
 
@@ -482,8 +494,6 @@ def refine(
     max_level: int
     batch_size: Optional[int]
         Most rows per ``sample`` call.
-    compile_bookkeeping: bool
-        Passed to :func:`balance`.
 
     Returns
     -------
@@ -510,13 +520,7 @@ def refine(
         if balanced:
             return cache, store, _still_leaves(store, passed)
         cache, store, created = balance(
-            cache,
-            store,
-            lat,
-            max_level,
-            sample,
-            batch_size,
-            compile_bookkeeping=compile_bookkeeping,
+            cache, store, lat, max_level, sample, batch_size
         )
         balanced = True
         untested = created[store.valid[created]]
@@ -566,7 +570,9 @@ def close(lat, cache, store):
     origin = origin[canonical_order(lat, cache, store.v[origin])]
     v = store.v[origin]
     m = store.mid[origin]
-    rows = mesh_backend.flatnonzero((m[:, 0] < 0) & (store.level[origin] < lat.level - 1))
+    rows = mesh_backend.flatnonzero(
+        (m[:, 0] < 0) & (store.level[origin] < lat.level - 1)
+    )
     if rows.shape[0]:
         m = mesh_backend.fill_at_indices(
             m,

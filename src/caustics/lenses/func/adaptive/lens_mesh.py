@@ -409,15 +409,14 @@ def build_lens_mesh(
     batch_size: Optional[int]
         Most points per ``raytrace`` call.
     compile_bookkeeping: bool
-        Run the criterion, :func:`~.criterion.lens_status`, and the
-        balance's :func:`~.refine.unbalanced` under ``torch.compile``. Each
-        is compiled on its first use in the process, and later builds reuse
-        it. Compiling needs a working C++ compiler; where it fails, one
-        warning is given and the bookkeeping runs eagerly for the rest of
-        the process. Bookkeeping on a GPU, torch's default device being
-        one, runs eagerly. Compiled results agree with eager ones to
-        rounding in ``origin_deviation``, ``origin_sigma_min`` and the
-        fitted corner Jacobians, and so in ``vertices_jacobian``, the
+        Run the criterion, :func:`~.criterion.lens_status`, under
+        ``torch.compile``. It is compiled on its first use in the process,
+        and later builds reuse it. Compiling needs a working C++ compiler;
+        where it fails, one warning is given and the criterion runs eagerly
+        for the rest of the process. On a GPU, torch's default device being
+        one, the criterion runs eagerly. Compiled results agree with eager
+        ones to rounding in ``origin_deviation``, ``origin_sigma_min`` and
+        the fitted corner Jacobians, and so in ``vertices_jacobian``, the
         band's fitted ``det`` and the source-plane index's boxes, which
         :func:`leaf_grow` grows by ``origin_deviation``: a status, a band
         membership, a resolved flag or the cells an index box covers can
@@ -564,22 +563,14 @@ def _freeze(
     lattice's finest level. Its state, and the verdicts it kept, are held
     only while :func:`_finish` reads them, so that they, and everything the
     status pass built, are freed before the index, the largest step, is
-    built. ``seed`` is :func:`_finish`'s.
+    built. ``seed`` is :func:`_finish`'s. ``compile_bookkeeping`` goes to
+    :func:`_lens_split` and :func:`_finish`, which run
+    :func:`~.criterion.lens_status`; ``refine`` itself compiles nothing.
     """
     split = _lens_split(lat.h0, min_img_sep, compile_bookkeeping=compile_bookkeeping)
     mesh = _finish(
         lat,
-        *refine(
-            cache,
-            store,
-            rows,
-            lat,
-            sample,
-            split,
-            lat.level - 1,
-            batch_size,
-            compile_bookkeeping=compile_bookkeeping,
-        ),
+        *refine(cache, store, rows, lat, sample, split, lat.level - 1, batch_size),
         sample,
         min_img_sep,
         holes,
