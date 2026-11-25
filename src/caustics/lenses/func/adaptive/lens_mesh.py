@@ -411,18 +411,23 @@ def build_lens_mesh(
     batch_size: Optional[int]
         Most points per ``raytrace`` call.
     compile_bookkeeping: bool
-        Run the criterion, :func:`~.criterion.lens_status`, under
-        ``torch.compile``. It is compiled on its first use in the process,
-        and later builds reuse it. Compiling needs a working C++ compiler;
-        where it fails, one warning is given and the criterion runs eagerly
-        for the rest of the process. On a GPU, torch's default device being
-        one, the criterion runs eagerly. Compiled results agree with eager
-        ones to rounding in ``origin_deviation``, ``origin_sigma_min`` and
-        the fitted corner Jacobians, and so in ``vertices_jacobian``, the
-        band's fitted ``det`` and the source-plane index's boxes, which
-        :func:`leaf_grow` grows by ``origin_deviation``: a status, a band
-        membership, a resolved flag or the cells an index box covers can
-        differ only where a value lies within rounding of its threshold.
+        Run the criterion, :func:`~.criterion.lens_status`, and the step of
+        the source-plane index that finds the cells each leaf reaches,
+        under ``torch.compile``. Each is compiled on its first use in the
+        process, and later builds reuse it. Compiling needs a working C++
+        compiler; where it fails, one warning is given and both run
+        eagerly for the rest of the process. On a GPU, torch's default
+        device being one, both run eagerly. Compiled results agree with
+        eager ones to rounding in ``origin_deviation``,
+        ``origin_sigma_min`` and the fitted corner Jacobians, and so in
+        ``vertices_jacobian``, the band's fitted ``det`` and the
+        source-plane index's boxes, which :func:`leaf_grow` grows by
+        ``origin_deviation``: a status, a band membership, a resolved flag
+        or the cells an index box covers can differ only where a value
+        lies within rounding of its threshold. Compiled, the index's step
+        can also register a leaf in cells other than the eager ones where
+        a value lies within rounding of a cell line; that changes nothing
+        a lookup returns.
 
     Returns
     -------
@@ -567,7 +572,8 @@ def _freeze(
     status pass built, are freed before the index, the largest step, is
     built. ``seed`` is :func:`_finish`'s. ``compile_bookkeeping`` goes to
     :func:`_lens_split` and :func:`_finish`, which run
-    :func:`~.criterion.lens_status`; ``refine`` itself compiles nothing.
+    :func:`~.criterion.lens_status`, and to :func:`_mesh_index`;
+    ``refine`` itself compiles nothing.
     """
     split = _lens_split(lat.h0, min_img_sep, compile_bookkeeping=compile_bookkeeping)
     mesh = _finish(
@@ -580,14 +586,24 @@ def _freeze(
         seed,
         compile_bookkeeping=compile_bookkeeping,
     )
-    return mesh._replace(index=_mesh_index(mesh))
+    return mesh._replace(
+        index=_mesh_index(mesh, compile_bookkeeping=compile_bookkeeping)
+    )
 
 
-def _mesh_index(mesh):
-    """``mesh.index``: over the source-plane images of the leaves whose origin is finite, each grown by :func:`leaf_grow`."""
+def _mesh_index(mesh, *, compile_bookkeeping=False):
+    """
+    ``mesh.index``: over the source-plane images of the leaves whose origin is finite, each grown by :func:`leaf_grow`.
+
+    ``compile_bookkeeping`` goes to :func:`~.index.build_index`.
+    """
     indexed = mesh_backend.flatnonzero(finite_leaves(mesh))
     return build_index(
-        mesh.vertices_source, mesh.leaves, indexed, leaf_grow(mesh)[indexed]
+        mesh.vertices_source,
+        mesh.leaves,
+        indexed,
+        leaf_grow(mesh)[indexed],
+        compile_bookkeeping=compile_bookkeeping,
     )
 
 

@@ -3,11 +3,12 @@ A multi-level grid index over source-plane triangles, and lookups in it.
 
 Cells come in power-of-two levels. Each triangle is registered at the one
 level whose cells match its bounding box, grown by how far the triangle
-reaches beyond itself, in the cells of that box it reaches, grown: in each
-column of the box's cells, from the first to the last cell it reaches
-there. A point reads one cell per occupied level, so the cells it reads
-are as fine as the triangles registered in them wherever those crowd:
-along caustics, and where outliers stretch the extent.
+reaches beyond itself. There it is registered column by column: in each
+column of the box's cells, in the cells from the first to the last that
+the grown triangle reaches. A point reads one cell per occupied level, so
+the cells it reads are as fine as the triangles registered in them
+wherever those crowd: along caustics, and where outliers stretch the
+extent.
 """
 
 from typing import NamedTuple
@@ -15,7 +16,7 @@ from typing import NamedTuple
 import numpy as np
 
 from ....backend_obj import ArrayLike
-from .mesh_backend import mesh_backend
+from .mesh_backend import Compiled, mesh_backend
 from .geometry import contains, edge_nearest, expand, sorted_find, triangle_weights
 
 # Level-0 cells divide the larger side of the index's extent into 2**KEY_BITS:
@@ -46,7 +47,7 @@ REACH_BLOCK = 1 << 18
 
 class MeshIndex(NamedTuple):
     """
-    Multi-level CSR index over triangles, each registered at the level its grown bounding box sets, in the cells of that box it reaches.
+    Multi-level CSR index over triangles, each registered at the level its grown bounding box sets, in the cells of that box it reaches, grown, column by column.
 
     Level ``l`` has square cells of side ``fine * 2**l``, counted from
     ``lo``; cell ``(ix, iy)`` of it has key ``l * 2**56 + ix * 2**28 + iy``.
@@ -249,8 +250,9 @@ def _reached(tx, ty, side, reach, i0x, i0y, i1y, box, dx, lo):
     to the greatest of those values. That interval, widened by ``reach``,
     gives the column's first and last cell, located as :func:`_cell_of`
     locates points and clamped to the box's cells ``[i0y, i1y]``. As the
-    triangle is convex, with no grow every cell between them holds a point
-    of it.
+    triangle is convex, with no grow every cell strictly between the first
+    and the last holds, in y, a point of the triangle over the widened
+    slab; the first and the last may hold only the margin beyond it.
 
     No cell a lookup can find the triangle from is dropped. A point within
     its grow of the triangle, in this column, is within that grow in x and
@@ -335,6 +337,7 @@ def _reached(tx, ty, side, reach, i0x, i0y, i1y, box, dx, lo):
     at_b = (xl <= bx) & (bx <= xr)
     ymin = where(at_b, minimum(ymin, by), ymin)
     ymax = where(at_b, maximum(ymax, by), ymax)
+    # As _cell_of locates points; the two must stay identical, or a cell can be lost.
     c0 = maximum(
         mesh_backend.long(mesh_backend.floor((ymin - reach - lo[1]) / side)), i0y
     )
@@ -387,7 +390,12 @@ def _reached_in_blocks(tx, ty, side, reach, i0x, i0y, i1y, box, dx, lo):
     return first, count
 
 
-def _columns(vertices, triangles, rows, grow):
+# _reached compiled, called once over every column; in blocks wherever it
+# runs eagerly.
+_COMPILED_REACHED = Compiled(_reached, eager=_reached_in_blocks)
+
+
+def _columns(vertices, triangles, rows, grow, *, compile_bookkeeping=False):
     """
     The columns of cells of the grown boxes of ``triangles[rows]``, by level and x, each holding the cells its triangle reaches.
 
@@ -400,6 +408,13 @@ def _columns(vertices, triangles, rows, grow):
     the sorted values, and the row is gathered per box; a column's first
     cell and count, packed in one int64, are gathered through the sort's
     order.
+
+    The step finding the cells reached runs in blocks of columns
+    (:func:`_reached_in_blocks`). With ``compile_bookkeeping`` and two
+    rows or more, it is one call, over every column, of
+    ``_COMPILED_REACHED``: :func:`_reached` compiled by ``torch.compile``
+    (:class:`~.mesh_backend.Compiled`), which runs in blocks wherever it
+    runs eagerly.
 
     Returns
     -------
@@ -436,7 +451,13 @@ def _columns(vertices, triangles, rows, grow):
     margin = PAD * side + PAD_ULPS * mesh_backend.finfo(f64).eps * largest
     reach = margin if grow is None else mesh_backend.to(grow, dtype=f64) + margin
     del margin
-    first, height = _reached_in_blocks(
+    # dynamo specializes sizes 0 and 1, so one row runs eagerly.
+    step = (
+        _COMPILED_REACHED
+        if compile_bookkeeping and rows.shape[0] >= 2
+        else _reached_in_blocks
+    )
+    first, height = step(
         tx,
         ty,
         side,
@@ -545,7 +566,7 @@ def _step_cells(code, first, height, column_rows, total):
     return keys, starts, column_rows[column[order]]
 
 
-def build_index(vertices, triangles, rows, grow=None):
+def build_index(vertices, triangles, rows, grow=None, *, compile_bookkeeping=False):
     """
     The :class:`MeshIndex` over ``triangles[rows]``, each grown by its ``grow``.
 
@@ -581,6 +602,14 @@ def build_index(vertices, triangles, rows, grow=None):
         nothing.
 
         *Unit: arcsec*
+    compile_bookkeeping: bool
+        Run the step finding the cells each triangle reaches as one call,
+        over every column, of a copy of :func:`_reached` compiled by
+        ``torch.compile`` (:class:`~.mesh_backend.Compiled`), which runs
+        the step in blocks wherever it runs eagerly. Fewer than two rows
+        run eagerly. Compiled, the step can register a triangle in cells
+        other than the eager ones where a value lies within rounding of a
+        cell line; that changes nothing a lookup returns.
 
     Returns
     -------
@@ -607,7 +636,7 @@ def build_index(vertices, triangles, rows, grow=None):
             leaves=mesh_backend.zeros((0,), dtype=int64, device=device),
         )
     lo, hi, fine, levels, code, first, height, column_rows = _columns(
-        vertices, triangles, rows, grow
+        vertices, triangles, rows, grow, compile_bookkeeping=compile_bookkeeping
     )
     starts, before = _steps(code, height)
     total = int(before[-1])

@@ -85,12 +85,12 @@ class Compiled:
     whatever the sizes it was compiled for, its threads chosen when it
     runs.
 
-    A call runs ``fn`` itself when compiling is off for the process, or
-    when the first array among its arguments, searched through tuples and
-    NamedTuples, is not on the CPU.
+    A call runs ``eager`` in place of the copy when compiling is off for
+    the process, or when the first array among its arguments, searched
+    through tuples and NamedTuples, is not on the CPU.
 
-    When building or calling the copy raises an ``Exception``, ``fn`` is
-    rerun eagerly on the same arguments. If the rerun raises too, its error
+    When building or calling the copy raises an ``Exception``, ``eager``
+    is rerun on the same arguments. If the rerun raises too, its error
     propagates and compiling stays on, the fault not being the compiler's.
     Otherwise ``Compiled.failed`` keeps a description of the exception,
     not the exception itself: its traceback, and attributes torch sets on
@@ -104,10 +104,16 @@ class Compiled:
     ----------
     fn: Callable
         Takes positional arguments alone.
+    eager: Optional[Callable]
+        Run in place of the copy wherever a call runs eagerly, such as
+        ``fn`` in steps that bound its temporaries: on ``fn``'s arguments
+        it must return what ``fn`` returns. None is ``fn`` itself.
 
     Attributes
     ----------
     fn: Callable
+    eager: Callable
+        ``eager``, or ``fn`` where it is None.
     copy: Optional[Callable]
         The compiled copy; None until it is built.
     runs: int
@@ -122,8 +128,9 @@ class Compiled:
 
     failed = None
 
-    def __init__(self, fn):
+    def __init__(self, fn, eager=None):
         self.fn = fn
+        self.eager = fn if eager is None else eager
         self.copy = None
         self.runs = 0
 
@@ -132,7 +139,7 @@ class Compiled:
         if Compiled.failed is not None or (
             first is not None and first.device.type != "cpu"
         ):
-            return self.fn(*args)
+            return self.eager(*args)
         try:
             if self.copy is None:
                 # Looked up now, not at import, so that it can be replaced.
@@ -148,7 +155,7 @@ class Compiled:
             self.runs += 1
             return out
         # Outside the handler, so that an error of the rerun is raised alone.
-        out = self.fn(*args)
+        out = self.eager(*args)
         Compiled.failed = RuntimeError(text)
         warn(
             f"torch.compile failed ({text}); the mesh bookkeeping runs eagerly "

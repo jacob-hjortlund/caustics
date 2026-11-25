@@ -1240,10 +1240,10 @@ def test_the_refinement_and_the_status_table_are_freed_before_the_index_is_built
         held.extend((weakref.ref(table_keys), weakref.ref(table_values)))
         return status_rows(lat, cache, store, rows, table_keys, table_values, sep, **kw)
 
-    def spy_build_index(*args):
+    def spy_build_index(*args, **kw):
         alive.append(sum(ref() is not None for ref in held))
         held.clear()
-        return build_index(*args)
+        return build_index(*args, **kw)
 
     monkeypatch.setattr(lens_mesh_module, "refine", spy_refine)
     monkeypatch.setattr(lens_mesh_module, "_status_rows", spy_status_rows)
